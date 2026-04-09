@@ -2,3 +2,12 @@ __pycache__/
 results*/
 convert_ckpt_to_params.py
 *.pt
+*.pth
+.DS_Store
+*-checkpoint.ipynb
+.venv
+*.egg*
+build/*
+_C.*
+outputs/*
+checkpoints/*.pt
