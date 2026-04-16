@@ -11,3 +11,5 @@ build/*
 _C.*
 outputs/*
 checkpoints/*.pt
+*.mp4
+mobileclip_blt.ts

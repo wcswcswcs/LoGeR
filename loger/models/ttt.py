@@ -72,7 +72,6 @@ def zeropower_via_newtonschulz5(G, steps):
 
 
 @torch.compile
-# TODO: add a version that uses the torch.compile
 def fast_weight_swish_glu_weight_norm_mini_batch_apply(
     w0: torch.Tensor,
     w1: torch.Tensor,
@@ -89,17 +88,12 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
     ttt_update_steps: int = 1,
 ):
     """
-    Note:
-    Forward:
-    (silu(x @ w0) * (x @ w2)) @ w1
+    Forward:  (silu(x @ w0) * (x @ w2)) @ w1
 
     w0, w2: [b, d, dh]
     w1:     [b, dh, d]
-    q: [b, l, d]
-    k: [b, l, d]
-    v: [b, l, d]
+    q, k, v: [b, l, d]
     lr0, lr1, lr2: [b, l, 1]
-    
     """
     w0_norm = w0.detach().norm(dim=1, keepdim=True)
     w1_norm = w1.detach().norm(dim=1, keepdim=True)
@@ -111,24 +105,23 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
         dw2_momentum = torch.zeros_like(w2)
 
     output = []
-    
+
     for start, end, update, apply in ttt_ua_order:
         w0_now, w1_now, w2_now = w0, w1, w2
 
         if update:
-            ki, vi = k[:, start:end, :], v[:, start:end, :]  # bf16 [b, l, d]
-            
-            lr0i = lr0[:, start:end, :]  # [b, l, d/1] fp32
-            lr1i = lr1[:, start:end, :]  # [b, l, d/1] fp32
-            lr2i = lr2[:, start:end, :]  # [b, l, d/1] fp32
+            ki, vi = k[:, start:end, :], v[:, start:end, :]
 
-            gate_before_act = ki @ w0_now       # b[b, l, dh] = [b, l, d] @ [b, d, dh]
-            hidden_before_mul = ki @ w2_now     # b[b, l, dh] = [b, l, d] @ [b, d, dh]
+            lr0i = lr0[:, start:end, :]
+            lr1i = lr1[:, start:end, :]
+            lr2i = lr2[:, start:end, :]
+
+            gate_before_act = ki @ w0_now
+            hidden_before_mul = ki @ w2_now
             hidden = F.silu(gate_before_act, inplace=False) * hidden_before_mul
 
             for _ in range(ttt_update_steps):
-                # Fixed objective: neg_dot_product (gradient ascent)
-                dhidden = vi @ w1_now.transpose(-1, -2)  # [b, l, dh] = [b, l, d] @ [b, d, dh]
+                dhidden = vi @ w1_now.transpose(-1, -2)
                 dhidden_before_mul = dhidden * F.silu(gate_before_act, inplace=False)
                 dgate = dhidden * hidden_before_mul
                 dgate_before_act = silu_backprop(dgate, gate_before_act)
@@ -151,13 +144,11 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
                     dw0_momentum = w0_grad
                     dw1_momentum = w1_grad
                     dw2_momentum = w2_grad
-                
-                # Gradient ascent: add gradients
+
                 w1_now = w1_now + w1_grad
                 w0_now = w0_now + w0_grad
                 w2_now = w2_now + w2_grad
 
-                # do weight norm here
                 w0_now = w0_now / (w0_now.norm(dim=1, keepdim=True) + 1e-5) * w0_norm
                 w1_now = w1_now / (w1_now.norm(dim=1, keepdim=True) + 1e-5) * w1_norm
                 w2_now = w2_now / (w2_now.norm(dim=1, keepdim=True) + 1e-5) * w2_norm
@@ -165,7 +156,6 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
             w0, w1, w2 = w0_now, w1_now, w2_now
 
         if apply:
-            # Only calculate the output in the last repeat.
             qi = q[:, start:end, :]
             oi = (F.silu(qi @ w0_now, inplace=True) * (qi @ w2_now)) @ w1_now
             output.append(oi)
@@ -173,6 +163,113 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
     output = torch.cat(output, dim=1)
 
     return output, w0, w1, w2
+
+
+def fast_weight_replay_update(
+    w0_old: torch.Tensor,
+    w1_old: torch.Tensor,
+    w2_old: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    lr0: torch.Tensor,
+    lr1: torch.Tensor,
+    lr2: torch.Tensor,
+    token_prior: torch.Tensor,
+    ttt_ua_order: list,
+    muon_update_steps: int = 0,
+    momentum: torch.Tensor | None = None,
+    ttt_update_steps: int = 1,
+):
+    """Replay TTT update with token-wise prior weighting.
+
+    Same math as ``fast_weight_swish_glu_weight_norm_mini_batch_apply``
+    but only the *update* path — no apply output is computed.  The
+    per-token learning rates are scaled by ``token_prior`` before
+    aggregation so that low-prior tokens contribute less to the weight
+    update.
+
+    Parameters
+    ----------
+    w0_old, w1_old, w2_old : [b, d, dh] / [b, dh, d]
+        The **old** fast weights (W_m) that were read during apply.
+    k, v : [b, l, d]
+        Cached key / value sequences from the original forward.
+    lr0, lr1, lr2 : [b, l, 1]
+        Cached per-token learning rates (η) from the original forward.
+    token_prior : [b, l, 1]  or  [1, l, 1]
+        Write-allow prior p ∈ [0, 1] per token.  Multiplied onto lr.
+    ttt_ua_order, muon_update_steps, momentum, ttt_update_steps :
+        Same config as the original forward.
+
+    Returns
+    -------
+    w0_new, w1_new, w2_new : updated fast weights (W_{m+1}).
+    """
+    w0 = w0_old.clone()
+    w1 = w1_old.clone()
+    w2 = w2_old.clone()
+
+    w0_norm = w0.detach().norm(dim=1, keepdim=True)
+    w1_norm = w1.detach().norm(dim=1, keepdim=True)
+    w2_norm = w2.detach().norm(dim=1, keepdim=True)
+
+    if momentum is not None:
+        dw0_momentum = torch.zeros_like(w0)
+        dw1_momentum = torch.zeros_like(w1)
+        dw2_momentum = torch.zeros_like(w2)
+
+    for start, end, update, _apply in ttt_ua_order:
+        if not update:
+            continue
+
+        w0_now, w1_now, w2_now = w0, w1, w2
+
+        ki = k[:, start:end, :]
+        vi = v[:, start:end, :]
+        lr0i = lr0[:, start:end, :] * token_prior[:, start:end, :]
+        lr1i = lr1[:, start:end, :] * token_prior[:, start:end, :]
+        lr2i = lr2[:, start:end, :] * token_prior[:, start:end, :]
+
+        gate_before_act = ki @ w0_now
+        hidden_before_mul = ki @ w2_now
+        hidden = F.silu(gate_before_act, inplace=False) * hidden_before_mul
+
+        for _ in range(ttt_update_steps):
+            dhidden = vi @ w1_now.transpose(-1, -2)
+            dhidden_before_mul = dhidden * F.silu(gate_before_act, inplace=False)
+            dgate = dhidden * hidden_before_mul
+            dgate_before_act = silu_backprop(dgate, gate_before_act)
+
+            w1_grad = zeropower_via_newtonschulz5(
+                (hidden * lr1i).transpose(-1, -2) @ vi, muon_update_steps
+            )
+            w0_grad = zeropower_via_newtonschulz5(
+                (ki * lr0i).transpose(-1, -2) @ dgate_before_act, muon_update_steps
+            )
+            w2_grad = zeropower_via_newtonschulz5(
+                (ki * lr2i).transpose(-1, -2) @ dhidden_before_mul, muon_update_steps
+            )
+
+            if momentum is not None:
+                m_i = momentum[:, start:end, :].mean(dim=1, keepdim=True)
+                w0_grad = w0_grad + dw0_momentum * m_i
+                w1_grad = w1_grad + dw1_momentum * m_i
+                w2_grad = w2_grad + dw2_momentum * m_i
+                dw0_momentum = w0_grad
+                dw1_momentum = w1_grad
+                dw2_momentum = w2_grad
+
+            w1_now = w1_now + w1_grad
+            w0_now = w0_now + w0_grad
+            w2_now = w2_now + w2_grad
+
+            w0_now = w0_now / (w0_now.norm(dim=1, keepdim=True) + 1e-5) * w0_norm
+            w1_now = w1_now / (w1_now.norm(dim=1, keepdim=True) + 1e-5) * w1_norm
+            w2_now = w2_now / (w2_now.norm(dim=1, keepdim=True) + 1e-5) * w2_norm
+
+        w0, w1, w2 = w0_now, w1_now, w2_now
+
+    return w0, w1, w2
 
 
 class FastWeightGluMLPMultihead(nn.Module):
@@ -244,14 +341,26 @@ class FastWeightGluMLPMultihead(nn.Module):
         
         self.o_norm = torch.nn.RMSNorm(head_dim, eps=1e-5, elementwise_affine=True)
 
-    def forward(self, x: torch.Tensor, info: dict | None = None, *args):
+    def forward(
+        self,
+        x: torch.Tensor,
+        info: dict | None = None,
+        *args,
+        cache_primitives: bool = False,
+    ):
         """
         x: (b, t, l, d) -> (b, t*l, d)
+
+        When *cache_primitives* is True the returned state dict contains
+        extra entries (``q``, ``k``, ``v``, ``lr0``, ``lr1``, ``lr2``,
+        ``w0_old``, ``w1_old``, ``w2_old``) that the
+        :func:`fast_weight_replay_update` function needs for delayed
+        write-back.
         """
         num_dims = len(x.shape)
         if num_dims == 3:
             x = x.unsqueeze(1)
-            
+
         b, t, l, d = x.shape
 
         if self.ttt_pre_norm:
@@ -268,7 +377,7 @@ class FastWeightGluMLPMultihead(nn.Module):
         k = k / (k.norm(dim=2, keepdim=True) + 1e-5)
 
         with torch.autocast(device_type="cuda", enabled=False):
-            lr = self.lr_fc(x.float())  # [b, l, lr_dim]
+            lr = self.lr_fc(x.float())
 
         if self.use_momentum:
             momentum = torch.sigmoid(lr[..., -1:])
@@ -293,6 +402,10 @@ class FastWeightGluMLPMultihead(nn.Module):
             w1 = self.w1.repeat(x.shape[0], 1, 1)
             w2 = self.w2.repeat(x.shape[0], 1, 1)
 
+        w0_old = w0.detach().clone() if cache_primitives else None
+        w1_old = w1.detach().clone() if cache_primitives else None
+        w2_old = w2.detach().clone() if cache_primitives else None
+
         output, w0, w1, w2 = fast_weight_swish_glu_weight_norm_mini_batch_apply(
             w0, w1, w2, q, k, v, lr0, lr1, lr2,
             info["ttt_op_order"] if info else [],
@@ -302,7 +415,7 @@ class FastWeightGluMLPMultihead(nn.Module):
         )
 
         output = self.o_norm(output)
-        
+
         output = rearrange(
             output, "(b h) l d -> b l (h d)", h=self.num_heads, b=x.shape[0]
         )
@@ -312,10 +425,26 @@ class FastWeightGluMLPMultihead(nn.Module):
 
         if num_dims == 3:
             output = rearrange(output, "b t l d -> b (t l) d", t=t)
-        
-        return output, {
-            "w0": w0, "w1": w1, "w2": w2,
-        }
+
+        state = {"w0": w0, "w1": w1, "w2": w2}
+
+        if cache_primitives:
+            state.update({
+                "q": q.detach(),
+                "k": k.detach(),
+                "v": v.detach(),
+                "lr0": lr0.detach(),
+                "lr1": lr1.detach(),
+                "lr2": lr2.detach(),
+                "w0_old": w0_old,
+                "w1_old": w1_old,
+                "w2_old": w2_old,
+                "momentum": momentum.detach() if momentum is not None else None,
+                "muon_update_steps": self.muon_update_steps,
+                "ttt_update_steps": self.ttt_update_steps,
+            })
+
+        return output, state
 
     def extra_repr(self) -> str:
         return (f"w0 shape: {self.w0.shape}, w1 shape: {self.w1.shape}, w2 shape: {self.w2.shape}, "

@@ -330,7 +330,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         self._initialize_ttt_layers_from_global(self.swa_layers, "swa", self.attn_insert_after)
 
     def decode(self, hidden, N, H, W, ttt_dict: Optional[dict] = None, window_size: Optional[int] = None, overlap_size: Optional[int] = None, is_first_window: bool = False,
-               turn_off_ttt=False, turn_off_swa=False) -> torch.Tensor:
+               turn_off_ttt=False, turn_off_swa=False, cache_ttt_primitives: bool = False) -> torch.Tensor:
         BN, hw, _ = hidden.shape
         B = BN // N
 
@@ -408,7 +408,6 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             hidden = blk(hidden_for_block, xpos=pos_for_block)
 
             if ttt_state is not None and i in ttt_state.get("insert_after", []):
-                # Help static analyzers: ensure non-None
                 assert self.ttt_gate_projs is not None and self.ttt_layers is not None
                 insert_after_list = ttt_state.get("insert_after", [])
                 layer_idx = insert_after_list.index(i)
@@ -418,9 +417,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 tokens_in = tokens_post
 
                 gate_scale = torch.nn.functional.silu(self.ttt_gate_projs[layer_idx](tokens_in))
-                # keep the gate scale to be always 0
-                # if i <= 19: gate_scale = torch.zeros_like(gate_scale)  # turn off ttt
-                if turn_off_ttt: gate_scale = torch.zeros_like(gate_scale)  # turn off ttt
+                if turn_off_ttt: gate_scale = torch.zeros_like(gate_scale)
                 gate_scales.append(gate_scale)
                 info = {
                     "ttt_op_order": ttt_state.get("ttt_op_order", []),
@@ -428,8 +425,10 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                     "w1": ttt_state["w1"][layer_idx],
                     "w2": ttt_state["w2"][layer_idx],
                 }
-                ttt_output, output = self.ttt_layers[layer_idx](tokens_in, info)
-                
+                ttt_output, output = self.ttt_layers[layer_idx](
+                    tokens_in, info, cache_primitives=cache_ttt_primitives,
+                )
+
                 update_term = ttt_output * gate_scale
 
                 tokens_out = update_term + tokens_post
@@ -442,9 +441,30 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                         "w1": [None] * len(insert_after_list),
                         "w2": [None] * len(insert_after_list),
                     }
+                    if cache_ttt_primitives:
+                        ttt_output_info["write_cache"] = [None] * len(insert_after_list)
                 ttt_output_info["w0"][layer_idx] = output["w0"]
                 ttt_output_info["w1"][layer_idx] = output["w1"]
                 ttt_output_info["w2"][layer_idx] = output["w2"]
+
+                if cache_ttt_primitives:
+                    if "write_cache" not in ttt_output_info:
+                        ttt_output_info["write_cache"] = [None] * len(insert_after_list)
+                    ttt_output_info["write_cache"][layer_idx] = {
+                        "q": output["q"],
+                        "k": output["k"],
+                        "v": output["v"],
+                        "lr0": output["lr0"],
+                        "lr1": output["lr1"],
+                        "lr2": output["lr2"],
+                        "w0_old": output["w0_old"],
+                        "w1_old": output["w1_old"],
+                        "w2_old": output["w2_old"],
+                        "momentum": output.get("momentum"),
+                        "muon_update_steps": output.get("muon_update_steps", 0),
+                        "ttt_update_steps": output.get("ttt_update_steps", 1),
+                        "ttt_op_order": info["ttt_op_order"],
+                    }
 
             # Sliding Window Attention (SWA)
             if attn_state is not None and i in attn_state.get("insert_after", []):
@@ -587,10 +607,12 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         no_detach = kwargs.pop('no_detach', False)
         sim3 = kwargs.pop('sim3', False)
         se3 = kwargs.pop('se3', False)
-        reset_every = kwargs.pop('reset_every', 0)  # reset TTT / adapter state every N windows (0 disables)
+        reset_every = kwargs.pop('reset_every', 0)
         turn_off_ttt = kwargs.pop('turn_off_ttt', False)
         turn_off_swa = kwargs.pop('turn_off_swa', False)
         sim3_scale_mode = kwargs.pop('sim3_scale_mode', 'median')
+        cache_ttt_primitives = kwargs.pop('cache_ttt_primitives', False)
+        ttt_state_input = kwargs.pop('ttt_state_input', None)
 
         if sim3 and se3:
             raise ValueError("'sim3' and 'se3' alignments are mutually exclusive; enable only one.")
@@ -640,11 +662,16 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         self._last_window_size = eff_window_size
         self._last_overlap_size = eff_overlap
 
-        # Prepare TTT states across windows
+        # Prepare TTT states across windows — accept external W_m
         if self.ttt_layers is not None:
-            w0 = [None] * len(self.ttt_insert_after)
-            w1 = [None] * len(self.ttt_insert_after)
-            w2 = [None] * len(self.ttt_insert_after)
+            if ttt_state_input is not None:
+                w0 = ttt_state_input["w0"]
+                w1 = ttt_state_input["w1"]
+                w2 = ttt_state_input["w2"]
+            else:
+                w0 = [None] * len(self.ttt_insert_after)
+                w1 = [None] * len(self.ttt_insert_after)
+                w2 = [None] * len(self.ttt_insert_after)
         else:
             w0 = w1 = w2 = None
 
@@ -724,6 +751,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                     is_first_window=(start_idx == 0),
                     turn_off_ttt=turn_off_ttt,
                     turn_off_swa=turn_off_swa,
+                    cache_ttt_primitives=cache_ttt_primitives,
                 )
                 if decode_avg_gate_scale is not None:
                     all_gate_scales.append(decode_avg_gate_scale.detach().cpu())
@@ -847,7 +875,10 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             merged["avg_gate_scale"] = torch.stack(all_gate_scales).mean()
         if all_attn_gate_scales:
             merged["attn_gate_scale"] = torch.stack(all_attn_gate_scales).mean()
-        
+
+        if cache_ttt_primitives and ttt_output_info is not None:
+            merged["ttt_output_info"] = ttt_output_info
+
         return merged
 
     def _merge_windowed_predictions(self, all_predictions, window_size, overlap_size):
