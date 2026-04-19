@@ -259,6 +259,7 @@ class LoGeRGeometryBackbone:
         turn_off_ttt: bool = False,
         turn_off_swa: bool = False,
         edge_rtol: float = 0.03,
+        update_ttt_weights: bool = False,
     ):
         self.model = model.to(device).eval()
         self.device = device
@@ -281,6 +282,8 @@ class LoGeRGeometryBackbone:
             turn_off_swa=turn_off_swa,
         )
         self.edge_rtol = edge_rtol
+        self.update_ttt_weights = bool(update_ttt_weights)
+        self._ttt_state: Optional[Dict[str, Any]] = None
 
     # -- Factory -----------------------------------------------------------
 
@@ -311,6 +314,51 @@ class LoGeRGeometryBackbone:
         return cls(model, **kwargs)
 
     # -- Inference ---------------------------------------------------------
+
+    def reset_ttt_state(self) -> None:
+        """Clear the internally tracked TTT fast weights."""
+        self._ttt_state = None
+
+    def get_ttt_state(self) -> Optional[Dict[str, Any]]:
+        """Return a shallow copy of the internal TTT state, if any."""
+        if self._ttt_state is None:
+            return None
+        return {
+            "w0": list(self._ttt_state["w0"]),
+            "w1": list(self._ttt_state["w1"]),
+            "w2": list(self._ttt_state["w2"]),
+        }
+
+    def _move_ttt_state_to_device(
+        self,
+        ttt_state: Optional[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        """Move a TTT state dict to the backbone device."""
+        if ttt_state is None:
+            return None
+        return {
+            "w0": [x.to(self.device, dtype=self.dtype) if x is not None else None for x in ttt_state["w0"]],
+            "w1": [x.to(self.device, dtype=self.dtype) if x is not None else None for x in ttt_state["w1"]],
+            "w2": [x.to(self.device, dtype=self.dtype) if x is not None else None for x in ttt_state["w2"]],
+        }
+
+    def _extract_ttt_state(self, raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Extract provisional fast weights from raw model output."""
+        ttt_info = raw.get("ttt_output_info")
+        if not ttt_info:
+            return None
+
+        w0 = ttt_info.get("w0")
+        w1 = ttt_info.get("w1")
+        w2 = ttt_info.get("w2")
+        if w0 is None or w1 is None or w2 is None:
+            return None
+
+        return {
+            "w0": [x.detach().cpu() if x is not None else None for x in w0],
+            "w1": [x.detach().cpu() if x is not None else None for x in w1],
+            "w2": [x.detach().cpu() if x is not None else None for x in w2],
+        }
 
     @torch.no_grad()
     def run(
@@ -358,13 +406,23 @@ class LoGeRGeometryBackbone:
         fwd_kwargs = {**self.forward_kwargs, **override_kwargs}
         if cache_ttt_primitives:
             fwd_kwargs["cache_ttt_primitives"] = True
-        if ttt_state is not None:
-            fwd_kwargs["ttt_state_input"] = ttt_state
+        elif self.update_ttt_weights:
+            # Need only updated fast weights, not full replay caches (q/k/v/lr).
+            fwd_kwargs["return_ttt_state"] = True
+
+        ttt_state_input = ttt_state
+        if ttt_state_input is None and self.update_ttt_weights:
+            ttt_state_input = self._ttt_state
+        if ttt_state_input is not None:
+            fwd_kwargs["ttt_state_input"] = self._move_ttt_state_to_device(ttt_state_input)
 
         with torch.cuda.amp.autocast(
             enabled=torch.cuda.is_available(), dtype=self.dtype
         ):
             raw = self.model(images, **fwd_kwargs)
+
+        if self.update_ttt_weights:
+            self._ttt_state = self._extract_ttt_state(raw)
 
         geo = self._postprocess(raw, images, T, H, W, patch_h, patch_w)
 

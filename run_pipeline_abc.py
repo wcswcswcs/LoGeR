@@ -32,7 +32,6 @@ Usage::
 from __future__ import annotations
 
 import argparse
-import glob
 import os
 import sys
 import time
@@ -42,7 +41,6 @@ import cv2
 import numpy as np
 import torch
 import torch.nn.functional as F
-from natsort import natsorted
 from PIL import Image
 from torchvision import transforms
 
@@ -116,19 +114,6 @@ def score_masklets_by_cdyn(
 _to_tensor = transforms.ToTensor()
 
 
-def collect_image_paths(input_path: str, start: int, end: int, stride: int) -> list:
-    if os.path.isdir(input_path):
-        paths = natsorted(
-            glob.glob(os.path.join(input_path, "*.png"))
-            + glob.glob(os.path.join(input_path, "*.jpg"))
-            + glob.glob(os.path.join(input_path, "*.jpeg"))
-        )
-        paths = [p for p in paths if "depth" not in os.path.basename(p).lower()]
-        end_idx = None if end == -1 else end
-        return paths[start:end_idx:stride]
-    raise FileNotFoundError(f"Input not found: {input_path}")
-
-
 def load_images_tensor(paths: list) -> torch.Tensor:
     return torch.stack([_to_tensor(Image.open(p).convert("RGB")) for p in paths])
 
@@ -161,7 +146,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    p.add_argument("--input", required=True, help="Image folder.")
+    p.add_argument("--input", required=True, help="Image folder or video file.")
     p.add_argument("--output_video", default="results/pipeline_full.mp4")
     p.add_argument("--output_pt", default=None, help="Save outputs as .pt file.")
     p.add_argument("--save_frames", default=None)

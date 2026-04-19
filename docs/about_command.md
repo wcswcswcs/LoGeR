@@ -1,6 +1,21 @@
 # 各模块运行指令
 
 > 所有命令默认在项目根目录 (`LoGeR/`) 下执行，并使用 conda 环境 `loger`。
+inference_dynamic_cue_extractor.py ，run_geometry_backbone_inference.py，run_pipeline_abc.py，run_pipeline_abc.py，run_video_masklet_front_end.py
+---
+## 0. original LoGeR inference
+```bash
+CUDA_VISIBLE_DEVICES=0 conda run -n loger python demo_viser.py \
+    --input data/examples/taylor.mp4 \
+    --config ckpts/LoGeR/original_config.yaml \
+    --model_name  ckpts/LoGeR/latest.pt \
+    --start_frame 0 \
+    --end_frame 50 \
+    --stride 1 \
+    --window_size 32 \
+    --overlap_size 3 \
+    --subsample 2 \
+    --share
 
 ---
 
@@ -56,10 +71,11 @@ python run_geometry_backbone_inference.py \
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 conda run -n loger python inference_dynamic_cue_extractor.py \
-    --input data/examples/office \
+    --input data/examples/taylor.mp4 \
     --config ckpts/LoGeR/original_config.yaml \
     --checkpoint ckpts/LoGeR/latest.pt \
-    --output results/office_cues.pt
+    --output results/office_cues.pt \
+    --output_video results/taylor_cue.mp4
 ```
 
 **Stage B 特有参数：**

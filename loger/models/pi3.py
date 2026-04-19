@@ -612,6 +612,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         turn_off_swa = kwargs.pop('turn_off_swa', False)
         sim3_scale_mode = kwargs.pop('sim3_scale_mode', 'median')
         cache_ttt_primitives = kwargs.pop('cache_ttt_primitives', False)
+        return_ttt_state = kwargs.pop('return_ttt_state', False)
         ttt_state_input = kwargs.pop('ttt_state_input', None)
 
         if sim3 and se3:
@@ -876,7 +877,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         if all_attn_gate_scales:
             merged["attn_gate_scale"] = torch.stack(all_attn_gate_scales).mean()
 
-        if cache_ttt_primitives and ttt_output_info is not None:
+        if (cache_ttt_primitives or return_ttt_state) and ttt_output_info is not None:
             merged["ttt_output_info"] = ttt_output_info
 
         return merged

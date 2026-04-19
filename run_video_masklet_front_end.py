@@ -31,8 +31,8 @@ Usage examples::
 from __future__ import annotations
 
 import argparse
-import glob
 import os
+import shutil
 import sys
 import time
 from typing import Optional
@@ -40,7 +40,6 @@ from typing import Optional
 import cv2
 import numpy as np
 import torch
-from natsort import natsorted
 
 GSAM2_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Grounded-SAM-2")
 if GSAM2_ROOT not in sys.path:
@@ -51,6 +50,7 @@ from loger.pipeline.video_masklet_frontend import (
     VideoMaskletFrontend,
     SEMANTIC_GROUP_NAMES,
 )
+from run_geometry_backbone_inference import collect_image_paths as collect_image_paths_geo
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
-    p.add_argument("--input", required=True, help="Image folder.")
+    p.add_argument("--input", required=True, help="Image folder or video file.")
     p.add_argument("--output_video", default="results/masklet_tracking.mp4")
     p.add_argument("--output_pt", default=None, help="Save tensors.")
     p.add_argument("--save_frames", default=None, help="Save annotated frames.")
@@ -122,22 +122,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--mask_alpha", type=float, default=0.40)
 
     return p
-
-
-# ---------------------------------------------------------------------------
-# Image loading
-# ---------------------------------------------------------------------------
-def collect_image_paths(input_path: str, start: int, end: int, stride: int) -> list:
-    if os.path.isdir(input_path):
-        paths = natsorted(
-            glob.glob(os.path.join(input_path, "*.png"))
-            + glob.glob(os.path.join(input_path, "*.jpg"))
-            + glob.glob(os.path.join(input_path, "*.jpeg"))
-        )
-        paths = [p for p in paths if "depth" not in os.path.basename(p).lower()]
-        end_idx = None if end == -1 else end
-        return paths[start:end_idx:stride]
-    raise FileNotFoundError(f"Input not found: {input_path}")
 
 
 def load_images(paths: list) -> torch.Tensor:
@@ -278,82 +262,87 @@ def print_masklet_output(mo: MaskletOutput) -> None:
 def main() -> None:
     args = build_parser().parse_args()
 
-    image_paths = collect_image_paths(
-        args.input, args.start_frame, args.end_frame, args.stride,
-    )
-    if not image_paths:
-        sys.exit("No images found.")
-    print(f"Collected {len(image_paths)} images.")
+    temp_dir = None
+    try:
+        image_paths, temp_dir = collect_image_paths_geo(
+            args.input, args.start_frame, args.end_frame, args.stride,
+        )
+        if not image_paths:
+            sys.exit("No images found.")
+        print(f"Collected {len(image_paths)} images.")
 
-    images = load_images(image_paths)
-    print(f"Image tensor: {tuple(images.shape)}  (T, C, H, W)")
+        images = load_images(image_paths)
+        print(f"Image tensor: {tuple(images.shape)}  (T, C, H, W)")
 
-    # Build kwargs
-    frontend_kwargs: dict = dict(
-        box_threshold=args.box_threshold,
-        text_threshold=args.text_threshold,
-        ann_frame_idx=args.ann_frame_idx,
-        max_thing_objects=args.max_thing_objects,
-    )
-    if args.thing_prompts:
-        frontend_kwargs["thing_prompts"] = [s.strip() for s in args.thing_prompts.split(",")]
-    if args.stuff_prompts:
-        frontend_kwargs["stuff_prompts"] = [s.strip() for s in args.stuff_prompts.split(",")]
+        # Build kwargs
+        frontend_kwargs: dict = dict(
+            box_threshold=args.box_threshold,
+            text_threshold=args.text_threshold,
+            ann_frame_idx=args.ann_frame_idx,
+            max_thing_objects=args.max_thing_objects,
+        )
+        if args.thing_prompts:
+            frontend_kwargs["thing_prompts"] = [s.strip() for s in args.thing_prompts.split(",")]
+        if args.stuff_prompts:
+            frontend_kwargs["stuff_prompts"] = [s.strip() for s in args.stuff_prompts.split(",")]
 
-    # Build frontend
-    print(f"Loading models (detector={args.detector}) ...")
-    t0 = time.time()
+        # Build frontend
+        print(f"Loading models (detector={args.detector}) ...")
+        t0 = time.time()
 
-    build_kwargs: dict = dict(
-        sam2_checkpoint=args.sam2_checkpoint,
-        sam2_model_cfg=args.sam2_model_cfg,
-        device=args.device,
-        detector_type=args.detector,
-    )
-    if args.detector == "gdino":
-        build_kwargs["gdino_config"] = args.gdino_config
-        build_kwargs["gdino_checkpoint"] = args.gdino_checkpoint
-    elif args.detector == "yoloe":
-        build_kwargs["yoloe_model"] = args.yoloe_model
+        build_kwargs: dict = dict(
+            sam2_checkpoint=args.sam2_checkpoint,
+            sam2_model_cfg=args.sam2_model_cfg,
+            device=args.device,
+            detector_type=args.detector,
+        )
+        if args.detector == "gdino":
+            build_kwargs["gdino_config"] = args.gdino_config
+            build_kwargs["gdino_checkpoint"] = args.gdino_checkpoint
+        elif args.detector == "yoloe":
+            build_kwargs["yoloe_model"] = args.yoloe_model
 
-    frontend = VideoMaskletFrontend.from_config(**build_kwargs, **frontend_kwargs)
-    print(f"Models loaded in {time.time() - t0:.1f}s")
+        frontend = VideoMaskletFrontend.from_config(**build_kwargs, **frontend_kwargs)
+        print(f"Models loaded in {time.time() - t0:.1f}s")
 
-    # Run Stage C
-    print("Running Video Masklet Front-end (Stage C) ...")
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    t0 = time.time()
+        # Run Stage C
+        print("Running Video Masklet Front-end (Stage C) ...")
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        t0 = time.time()
 
-    masklet_output = frontend.run(images)
+        masklet_output = frontend.run(images)
 
-    if torch.cuda.is_available():
-        torch.cuda.synchronize()
-    print(f"Stage C done in {time.time() - t0:.2f}s")
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        print(f"Stage C done in {time.time() - t0:.2f}s")
 
-    print_masklet_output(masklet_output)
+        print_masklet_output(masklet_output)
 
-    create_tracking_video(
-        images, masklet_output, args.output_video,
-        fps=args.fps, mask_alpha=args.mask_alpha,
-        save_frames_dir=args.save_frames,
-    )
+        create_tracking_video(
+            images, masklet_output, args.output_video,
+            fps=args.fps, mask_alpha=args.mask_alpha,
+            save_frames_dir=args.save_frames,
+        )
 
-    if args.output_pt:
-        os.makedirs(os.path.dirname(args.output_pt) or ".", exist_ok=True)
-        torch.save({
-            "M_mask": masklet_output.M_mask,
-            "V_mask": masklet_output.V_mask,
-            "B_mask": masklet_output.B_mask,
-            "Q_mask": masklet_output.Q_mask,
-            "L_sem": masklet_output.L_sem,
-            "G_sem": masklet_output.G_sem,
-            "W_sem": masklet_output.W_sem,
-            "A_ratio": masklet_output.A_ratio,
-            "num_masklets": masklet_output.num_masklets,
-            "num_frames": masklet_output.num_frames,
-        }, args.output_pt)
-        print(f"Saved masklet tensors to {args.output_pt}")
+        if args.output_pt:
+            os.makedirs(os.path.dirname(args.output_pt) or ".", exist_ok=True)
+            torch.save({
+                "M_mask": masklet_output.M_mask,
+                "V_mask": masklet_output.V_mask,
+                "B_mask": masklet_output.B_mask,
+                "Q_mask": masklet_output.Q_mask,
+                "L_sem": masklet_output.L_sem,
+                "G_sem": masklet_output.G_sem,
+                "W_sem": masklet_output.W_sem,
+                "A_ratio": masklet_output.A_ratio,
+                "num_masklets": masklet_output.num_masklets,
+                "num_frames": masklet_output.num_frames,
+            }, args.output_pt)
+            print(f"Saved masklet tensors to {args.output_pt}")
+    finally:
+        if temp_dir and os.path.isdir(temp_dir):
+            shutil.rmtree(temp_dir)
 
 
 if __name__ == "__main__":

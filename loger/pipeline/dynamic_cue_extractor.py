@@ -107,7 +107,7 @@ class DynamicCueExtractor:
         self,
         *,
         # Support set
-        k_intra: int = 3,
+        k_intra: int = 10,
         # Point residual scale.  Same-pixel world-space comparison has
         # an inherent parallax baseline even on static surfaces (~0.03
         # median, ~0.08 mean for indoor).  sigma_pt must be well above
