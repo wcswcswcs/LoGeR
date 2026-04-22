@@ -13,3 +13,4 @@ outputs/*
 checkpoints/*.pt
 *.mp4
 mobileclip_blt.ts
+third_party/*

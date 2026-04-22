@@ -57,6 +57,12 @@ class CueOutput:
 
     E_cue: torch.Tensor
     G_write_geo: torch.Tensor
+    C_dyn_explicit: Optional[torch.Tensor] = None
+    C_dyn_implicit: Optional[torch.Tensor] = None
+    C_dyn_fusion_max: Optional[torch.Tensor] = None
+    C_dyn_fusion_soft_or: Optional[torch.Tensor] = None
+    C_dyn_fusion_avg: Optional[torch.Tensor] = None
+    C_dyn_fusion_addclip: Optional[torch.Tensor] = None
     E_cue_patch: Optional[torch.Tensor] = None
     G_write_geo_patch: Optional[torch.Tensor] = None
 
@@ -108,6 +114,11 @@ class DynamicCueExtractor:
         *,
         # Support set
         k_intra: int = 10,
+        use_attention_prior: bool = True,
+        support_time_decay: float = 2.0,
+        support_temporal_weight: float = 0.35,
+        support_affinity_weight: float = 0.45,
+        support_static_weight: float = 0.20,
         # Point residual scale.  Same-pixel world-space comparison has
         # an inherent parallax baseline even on static surfaces (~0.03
         # median, ~0.08 mean for indoor).  sigma_pt must be well above
@@ -122,6 +133,10 @@ class DynamicCueExtractor:
         alpha_1: float = 0.8,
         alpha_2: float = 0.0,
         alpha_3: float = 0.5,
+        attn_stat_fusion_weight: float = 0.35,
+        attn_dyn_weight: float = 0.30,
+        attn_gate_power: float = 1.0,
+        attn_debias_kernel: int = 7,
         # C_unc parameters
         conf_floor: float = 0.1,
         unc_conf_weight: float = 0.3,
@@ -137,12 +152,22 @@ class DynamicCueExtractor:
         compute_patch_cues: bool = True,
     ):
         self.k_intra = k_intra
+        self.max_support_views = 4
+        self.use_attention_prior = use_attention_prior
+        self.support_time_decay = support_time_decay
+        self.support_temporal_weight = support_temporal_weight
+        self.support_affinity_weight = support_affinity_weight
+        self.support_static_weight = support_static_weight
         self.sigma_pt = sigma_pt
         self.tau_occ = tau_occ
 
         self.alpha_1 = alpha_1
         self.alpha_2 = alpha_2
         self.alpha_3 = alpha_3
+        self.attn_stat_fusion_weight = attn_stat_fusion_weight
+        self.attn_dyn_weight = attn_dyn_weight  # kept for CLI/API compatibility
+        self.attn_gate_power = attn_gate_power
+        self.attn_debias_kernel = max(int(attn_debias_kernel), 1)
 
         self.conf_floor = conf_floor
         self.unc_conf_weight = unc_conf_weight
@@ -176,6 +201,8 @@ class DynamicCueExtractor:
         local_pts = geo.local_points   # [T, H, W, 3]
         cam_poses = geo.camera_poses   # [T, 4, 4]
         conf = geo.confidence          # [T, H, W]
+        frame_attention_prior = geo.frame_attention_prior  # [T, T] or None
+        attn_dynamic_patch = geo.attn_dynamic_patch        # [T, H_tok, W_tok] or None
 
         T, H, W = conf.shape
 
@@ -184,20 +211,72 @@ class DynamicCueExtractor:
             return self._single_frame_fallback(conf, geo.patch_grid)
 
         # -- multi-frame cue extraction --------------------------------------
-        support_idx, support_valid = self._build_support_tensor(T)
+        attn_dynamic = self._upsample_attn_dynamic(
+            attn_dynamic_patch, target_hw=(H, W),
+        )
+        support_idx, support_valid, support_score = self._build_support_tensor(
+            T,
+            frame_attention_prior=frame_attention_prior,
+            attn_dynamic_patch=attn_dynamic_patch,
+        )
         T_cw = torch.inverse(cam_poses)  # [T, 4, 4]
 
-        C_stat, C_occ, C_unc, debug_info = self._compute_pairwise_cues(
-            world_pts, local_pts, T_cw, conf, support_idx, support_valid,
+        C_stat, C_stat_geom, C_occ, C_unc, debug_info = self._compute_pairwise_cues(
+            world_pts,
+            local_pts,
+            T_cw,
+            conf,
+            support_idx,
+            support_valid,
+            support_score=support_score,
+            attn_dynamic=attn_dynamic,
         )
 
-        # C_dyn = clip(alpha_1*(1-C_stat) + alpha_2*C_bdry - alpha_3*C_occ, 0, 1)
-        C_dyn = torch.clamp(
-            self.alpha_1 * (1.0 - C_stat)
+        # Explicit geometry and implicit key-cosine evidence are fused as
+        # independent dynamic cues. We preserve the stronger branch at each
+        # location so the implicit cue can keep its own shape instead of only
+        # acting as a small correction on top of geometry.
+        D_exp = torch.clamp(
+            self.alpha_1 * (1.0 - C_stat_geom)
             + self.alpha_2 * 0.0  # boundary-break term reserved for Phase 2
             - self.alpha_3 * C_occ,
             0.0, 1.0,
         )
+        if attn_dynamic is not None and self.use_attention_prior:
+            # Keep the implicit cue close to the MUT3R-style Stage-A feature:
+            # selected frame-attention key-cosine maps are averaged in Stage A,
+            # then used directly before max-fusion. We intentionally do not
+            # apply local debiasing, extra geometric gating, or an additional
+            # scalar attenuation in this path.
+            attn_dyn_evidence = attn_dynamic.clamp(0, 1)
+            attn_dyn_support = attn_dyn_evidence
+            C_dyn_fusion_max = torch.maximum(D_exp, attn_dyn_support).clamp(0.0, 1.0)
+            C_dyn_fusion_soft_or = (
+                1.0 - (1.0 - D_exp) * (1.0 - attn_dyn_support)
+            ).clamp(0.0, 1.0)
+            C_dyn_fusion_avg = (0.5 * (D_exp + attn_dyn_support)).clamp(0.0, 1.0)
+            C_dyn_fusion_addclip = (D_exp + attn_dyn_support).clamp(0.0, 1.0)
+            C_dyn = C_dyn_fusion_max
+            debug_info["attention_dynamic_mean"] = attn_dynamic.mean().item()
+            debug_info["attention_dynamic_used_mean"] = attn_dyn_evidence.mean().item()
+            debug_info["attention_support_mean"] = attn_dyn_support.mean().item()
+            debug_info["attention_fusion_mode"] = "max_raw_average_no_scale"
+        else:
+            attn_dyn_support = torch.zeros_like(D_exp)
+            C_dyn_fusion_max = D_exp
+            C_dyn_fusion_soft_or = D_exp
+            C_dyn_fusion_avg = D_exp
+            C_dyn_fusion_addclip = D_exp
+            C_dyn = D_exp
+        debug_info["explicit_dynamic_mean"] = D_exp.mean().item()
+
+        debug_info["attention_prior_used"] = bool(
+            self.use_attention_prior
+            and (frame_attention_prior is not None or attn_dynamic is not None)
+        )
+        if frame_attention_prior is not None:
+            debug_info["frame_attention_mean"] = frame_attention_prior.mean().item()
+        debug_info["support_score_per_frame"] = support_score.sum(dim=1)
 
         # C_anchor = C_stat * (1 - C_dyn) * (1 - C_unc)
         C_anchor = C_stat * (1.0 - C_dyn) * (1.0 - C_unc)
@@ -226,6 +305,12 @@ class DynamicCueExtractor:
         return CueOutput(
             E_cue=E_cue,
             G_write_geo=G_write_geo,
+            C_dyn_explicit=D_exp,
+            C_dyn_implicit=attn_dyn_support,
+            C_dyn_fusion_max=C_dyn_fusion_max,
+            C_dyn_fusion_soft_or=C_dyn_fusion_soft_or,
+            C_dyn_fusion_avg=C_dyn_fusion_avg,
+            C_dyn_fusion_addclip=C_dyn_fusion_addclip,
             E_cue_patch=E_cue_patch,
             G_write_geo_patch=G_write_geo_patch,
             num_frames=T,
@@ -237,28 +322,138 @@ class DynamicCueExtractor:
     # ---- support set -------------------------------------------------------
 
     def _build_support_tensor(
-        self, T: int,
-    ) -> Tuple[torch.LongTensor, torch.BoolTensor]:
+        self,
+        T: int,
+        frame_attention_prior: Optional[torch.Tensor] = None,
+        attn_dynamic_patch: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.LongTensor, torch.BoolTensor, torch.Tensor]:
         """Build a ``[T, K]`` index tensor and matching validity mask.
 
-        For each frame *t*, selects up to *k_intra* temporally-nearest
-        frames as the intra-chunk support set.
+        For each frame *t*, first restrict candidates to the local temporal
+        window ``[t-k_intra//2, t+k_intra//2]`` (excluding ``t`` itself). It
+        then samples up to four support views uniformly across that window.
+        When attention priors are available, each temporal bin chooses the
+        highest-scoring view inside that bin.
         """
-        K = self.k_intra
+        K = self.max_support_views
         idx = torch.zeros(T, K, dtype=torch.long)
         valid = torch.zeros(T, K, dtype=torch.bool)
+        score = torch.zeros(T, K, dtype=torch.float32)
+
+        has_attention_prior = (
+            self.use_attention_prior
+            and (frame_attention_prior is not None or attn_dynamic_patch is not None)
+        )
+
+        if K <= 0:
+            return idx, valid, score
+
+        time_ids = torch.arange(T, dtype=torch.float32)
+        time_dist = (time_ids[:, None] - time_ids[None, :]).abs()
+        time_score = torch.exp(-time_dist / max(self.support_time_decay, 1e-6))
+
+        combined = self.support_temporal_weight * time_score
+
+        if frame_attention_prior is not None:
+            affinity = frame_attention_prior.float().clamp(0, 1)
+            affinity = 0.5 * (affinity + affinity.transpose(0, 1))
+            combined = combined + self.support_affinity_weight * affinity
+
+        if attn_dynamic_patch is not None:
+            static_patch = (1.0 - attn_dynamic_patch.float().clamp(0, 1)).reshape(T, -1)
+            static_overlap = torch.einsum("td,sd->ts", static_patch, static_patch)
+            static_overlap = static_overlap / max(static_patch.shape[1], 1)
+            combined = combined + self.support_static_weight * static_overlap
+
+        combined.fill_diagonal_(0.0)
+        combined = combined / combined.amax(dim=-1, keepdim=True).clamp_min(1e-6)
 
         for t in range(T):
-            filled = 0
-            for offset in range(1, T):
-                for s in (t - offset, t + offset):
-                    if 0 <= s < T and filled < K:
-                        idx[t, filled] = s
-                        valid[t, filled] = True
-                        filled += 1
-                if filled >= K:
-                    break
-        return idx, valid
+            window_radius = max(int(self.k_intra) // 2, 0)
+            left = max(0, t - window_radius)
+            right = min(T, t + window_radius + 1)
+            candidate_idx = torch.arange(left, right, dtype=torch.long)
+            candidate_idx = candidate_idx[candidate_idx != t]
+            num_candidates = int(candidate_idx.numel())
+            if num_candidates <= 0:
+                continue
+
+            num_take = min(K, num_candidates)
+            if num_candidates <= num_take:
+                selected = candidate_idx
+                if has_attention_prior:
+                    selected_scores = combined[t, selected]
+                else:
+                    selected_scores = torch.ones(num_take, dtype=torch.float32)
+            else:
+                selected_parts = []
+                selected_score_parts = []
+                row_scores = combined[t, candidate_idx] if has_attention_prior else None
+                for bin_idx in range(num_take):
+                    start = (bin_idx * num_candidates) // num_take
+                    end = ((bin_idx + 1) * num_candidates) // num_take
+                    if end <= start:
+                        end = start + 1
+                    bin_candidates = candidate_idx[start:end]
+                    if bin_candidates.numel() == 0:
+                        continue
+                    if has_attention_prior:
+                        bin_scores = row_scores[start:end]
+                        best_rel = torch.argmax(bin_scores)
+                        selected_parts.append(bin_candidates[best_rel:best_rel + 1])
+                        selected_score_parts.append(bin_scores[best_rel:best_rel + 1])
+                    else:
+                        center_rel = bin_candidates.numel() // 2
+                        selected_parts.append(bin_candidates[center_rel:center_rel + 1])
+                        selected_score_parts.append(torch.ones(1, dtype=torch.float32))
+
+                if not selected_parts:
+                    continue
+                selected = torch.cat(selected_parts, dim=0)
+                selected_scores = torch.cat(selected_score_parts, dim=0)
+
+            take = int(selected.numel())
+            idx[t, :take] = selected
+            valid[t, :take] = True
+            score[t, :take] = selected_scores
+
+        return idx, valid, score
+
+    @staticmethod
+    def _upsample_attn_dynamic(
+        attn_dynamic_patch: Optional[torch.Tensor],
+        target_hw: Tuple[int, int],
+    ) -> Optional[torch.Tensor]:
+        if attn_dynamic_patch is None:
+            return None
+        target_h, target_w = target_hw
+        return F.interpolate(
+            attn_dynamic_patch.unsqueeze(1),
+            size=(target_h, target_w),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(1).clamp(0, 1)
+
+    def _debias_attn_dynamic(self, attn_dynamic: torch.Tensor) -> torch.Tensor:
+        """Suppress large low-frequency scene-layout responses in attention features."""
+        _, h, w = attn_dynamic.shape
+        max_kernel = max(min(h, w), 1)
+        if max_kernel % 2 == 0:
+            max_kernel = max(max_kernel - 1, 1)
+        kernel = min(max(int(self.attn_debias_kernel), 1), max_kernel)
+        if kernel % 2 == 0:
+            kernel += 1
+        if kernel <= 1:
+            return attn_dynamic.clamp(0, 1)
+
+        pad = kernel // 2
+        x = attn_dynamic.unsqueeze(1)
+        pad_mode = "reflect" if h > pad and w > pad else "replicate"
+        x_pad = F.pad(x, (pad, pad, pad, pad), mode=pad_mode)
+        trend = F.avg_pool2d(x_pad, kernel_size=kernel, stride=1)
+        residual = torch.relu(x - trend)
+        scale = residual.amax(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+        return (residual / scale).squeeze(1).clamp(0, 1)
 
     # ---- pairwise evidence -------------------------------------------------
 
@@ -270,10 +465,12 @@ class DynamicCueExtractor:
         conf: torch.Tensor,         # [T, H, W]
         support_idx: torch.Tensor,  # [T, K]
         support_valid: torch.Tensor, # [T, K]
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
-        """Compute C_stat, C_occ, C_unc from pairwise residuals.
+        support_score: Optional[torch.Tensor] = None,  # [T, K]
+        attn_dynamic: Optional[torch.Tensor] = None,   # [T, H, W]
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
+        """Compute C_stat, C_stat_geom, C_occ, C_unc from pairwise residuals.
 
-        Returns (C_stat, C_occ, C_unc, debug_dict).
+        Returns (C_stat_fused, C_stat_geom, C_occ, C_unc, debug_dict).
         """
         T, H, W, _ = world_pts.shape
         K = support_idx.shape[1]
@@ -287,6 +484,8 @@ class DynamicCueExtractor:
         # Only pixels where both frames have conf > conf_floor participate.
         all_consistency = torch.zeros(K, T, H, W)
         all_consistency_valid = torch.zeros(K, T, H, W, dtype=torch.bool)
+        weighted_consistency_sum = torch.zeros(T, H, W)
+        weighted_consistency_weight = torch.zeros(T, H, W)
 
         # C_occ: confidence-weighted fraction of depth-ordering violations
         occ_weighted_sum = torch.zeros(T, H, W)
@@ -307,6 +506,10 @@ class DynamicCueExtractor:
 
             # Expand frame-level validity to spatial dims: [T, H, W]
             vk = valid_k.float()[:, None, None].expand(T, H, W)
+            support_w = valid_k.float()
+            if support_score is not None:
+                support_w = support_score[:, k].float()
+            support_w_map = support_w[:, None, None].expand(T, H, W)
 
             # ---- gather support-frame data ---------------------------------
             X_s = world_pts[s_idx]              # [T, H, W, 3]
@@ -328,6 +531,16 @@ class DynamicCueExtractor:
             pair_valid = valid_k[:, None, None].expand(T, H, W) & conf_ok
             all_consistency_valid[k] = pair_valid
 
+            pair_weight = support_w_map
+            if attn_dynamic is not None and self.use_attention_prior:
+                static_t = (1.0 - attn_dynamic).clamp(0, 1)
+                static_s = (1.0 - attn_dynamic[s_idx]).clamp(0, 1)
+                pair_weight = pair_weight * torch.sqrt((static_t * static_s).clamp_min(0.0))
+
+            weighted_valid = pair_weight * pair_valid.float()
+            weighted_consistency_sum += c * weighted_valid
+            weighted_consistency_weight += weighted_valid
+
             # Confidence weight (used only for C_occ / C_unc)
             w = conf * conf_s  # [T, H, W]
 
@@ -341,12 +554,12 @@ class DynamicCueExtractor:
             z_proj = X_in_s[..., 2]           # projected depth in frame s
 
             occ_flag = (z_proj - depth_s > self.tau_occ).float()
-            occ_weighted_sum += occ_flag * w * vk
-            weight_sum += w * vk
+            occ_weighted_sum += occ_flag * w * support_w_map * vk
+            weight_sum += w * support_w_map * vk
 
             # ---- validity (for C_unc) --------------------------------------
             proj_valid = ((z_proj > 0) & conf_ok).float()
-            valid_weighted_sum += w * proj_valid * vk
+            valid_weighted_sum += w * proj_valid * support_w_map * vk
 
             # ---- debug accumulator -----------------------------------------
             r_pt_sum += r_pt * vk
@@ -356,16 +569,34 @@ class DynamicCueExtractor:
 
         # C_stat: trimmed mean of *pure geometric* consistency.
         # Pixels with low confidence are excluded from the mean, not penalised.
-        C_stat = self._trimmed_mean(
+        C_stat_geom = self._trimmed_mean(
             all_consistency, all_consistency_valid, trim=self.trim_ratio,
         )
+        weighted_consistency = torch.where(
+            weighted_consistency_weight > 0,
+            weighted_consistency_sum / (weighted_consistency_weight + eps),
+            C_stat_geom,
+        )
+        if attn_dynamic is not None and self.use_attention_prior:
+            C_stat = torch.clamp(
+                (1.0 - self.attn_stat_fusion_weight) * C_stat_geom
+                + self.attn_stat_fusion_weight * weighted_consistency,
+                0.0,
+                1.0,
+            )
+        else:
+            C_stat = C_stat_geom
 
         # C_occ: confidence-weighted occlusion fraction
         C_occ = (occ_weighted_sum / (weight_sum + eps)).clamp(0, 1)
 
         # C_unc: two terms blended — support coverage and raw confidence.
         n_support = support_valid.sum(dim=1).float()  # [T]
-        unc_support = 1.0 - valid_weighted_sum / (n_support[:, None, None] + eps)
+        if support_score is not None:
+            support_mass = support_score.sum(dim=1).float().clamp_min(1e-6)
+        else:
+            support_mass = n_support.clamp_min(1.0)
+        unc_support = 1.0 - valid_weighted_sum / (support_mass[:, None, None] + eps)
         unc_conf = 1.0 - conf.clamp(0, 1)
         C_unc = (
             (1.0 - self.unc_conf_weight) * unc_support
@@ -376,11 +607,14 @@ class DynamicCueExtractor:
         mean_rpt = r_pt_sum / (r_pt_count + eps)
         debug = {
             "support_count_per_frame": n_support,
+            "support_mass_per_frame": support_mass,
             "mean_point_residual": mean_rpt.mean().item(),
             "mean_point_residual_map": mean_rpt,
+            "geometry_consistency_mean": C_stat_geom.mean().item(),
+            "weighted_consistency_mean": weighted_consistency.mean().item(),
         }
 
-        return C_stat, C_occ, C_unc, debug
+        return C_stat, C_stat_geom, C_occ, C_unc, debug
 
     # ---- trimmed mean ------------------------------------------------------
 
@@ -457,6 +691,12 @@ class DynamicCueExtractor:
         return CueOutput(
             E_cue=E_cue,
             G_write_geo=G_write_geo,
+            C_dyn_explicit=torch.zeros_like(C_dyn),
+            C_dyn_implicit=torch.zeros_like(C_dyn),
+            C_dyn_fusion_max=C_dyn,
+            C_dyn_fusion_soft_or=C_dyn,
+            C_dyn_fusion_avg=C_dyn,
+            C_dyn_fusion_addclip=C_dyn,
             E_cue_patch=E_cue_patch,
             G_write_geo_patch=G_write_geo_patch,
             num_frames=T,

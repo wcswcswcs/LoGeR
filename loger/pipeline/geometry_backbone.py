@@ -55,6 +55,37 @@ class GeometryOutput:
     # Token type ids: [L_tok] — 0 = register, 1 = role, 2 = patch
     token_type: torch.Tensor
 
+    # Symmetric frame affinity prior derived from decoder attention: [T, T]
+    frame_attention_prior: Optional[torch.Tensor] = None
+
+    # Patch-level Stage-A attention feature used downstream. By default this is
+    # the mean key-cosine map over frame-attention layers [0,2,4,6,8,10,12,14].
+    attn_dynamic_patch: Optional[torch.Tensor] = None
+
+    # VGGT4D-style global-attention dynamic saliency: [T, H_tok, W_tok]
+    dyn4d_patch: Optional[torch.Tensor] = None
+    dyn4d_qq_mean_patch: Optional[torch.Tensor] = None
+    dyn4d_qk_var_patch: Optional[torch.Tensor] = None
+    dyn4d_kk_mean_patch: Optional[torch.Tensor] = None
+    global_q_raw_patchvec: Optional[torch.Tensor] = None
+    global_k_raw_patchvec: Optional[torch.Tensor] = None
+    global_q_raw_patchvec_layers: Optional[torch.Tensor] = None
+    global_k_raw_patchvec_layers: Optional[torch.Tensor] = None
+    dyn4d_global_layer_ids: Optional[torch.Tensor] = None
+
+    # MUT3R-style frame-attention cosine response maps: [T, H_tok, W_tok]
+    frame_attn_cosine_shallow: Optional[torch.Tensor] = None
+    frame_attn_cosine_deep: Optional[torch.Tensor] = None
+    frame_attn_cosine_avg: Optional[torch.Tensor] = None
+    frame_attn_key_cosine_l0: Optional[torch.Tensor] = None
+    frame_attn_key_cosine_l4: Optional[torch.Tensor] = None
+    frame_attn_key_cosine_shallow: Optional[torch.Tensor] = None
+    frame_attn_key_cosine_deep: Optional[torch.Tensor] = None
+    frame_attn_key_cosine_avg: Optional[torch.Tensor] = None
+    frame_attn_cosine_query_layers: Optional[torch.Tensor] = None
+    frame_attn_cosine_key_layers: Optional[torch.Tensor] = None
+    frame_attn_cosine_layer_ids: Optional[torch.Tensor] = None
+
     # Number of frames in this chunk
     num_frames: int = 0
 
@@ -530,6 +561,32 @@ class LoGeRGeometryBackbone:
         local_pts = _sq(raw.get("local_points"))   # [T, H_p, W_p, 3]
         cam_poses = _sq(raw.get("camera_poses"))   # [T, 4, 4]
         conf_out = _sq(conf)                       # [T, H_p, W_p, 1]
+        frame_attn = _sq(raw.get("frame_attention_prior"))  # [T, T]
+        attn_dynamic_patch = _sq(raw.get("attn_dynamic_patch"))  # [T, H_tok, W_tok]
+        dyn4d_patch = _sq(raw.get("dyn4d_patch"))  # [T, H_tok, W_tok]
+        dyn4d_qq_mean_patch = _sq(raw.get("dyn4d_qq_mean_patch"))  # [T, H_tok, W_tok]
+        dyn4d_qk_var_patch = _sq(raw.get("dyn4d_qk_var_patch"))  # [T, H_tok, W_tok]
+        dyn4d_kk_mean_patch = _sq(raw.get("dyn4d_kk_mean_patch"))  # [T, H_tok, W_tok]
+        global_q_raw_patchvec = _sq(raw.get("global_q_raw_patchvec"))  # [T, H_tok, W_tok, D]
+        global_k_raw_patchvec = _sq(raw.get("global_k_raw_patchvec"))  # [T, H_tok, W_tok, D]
+        global_q_raw_patchvec_layers = _sq(raw.get("global_q_raw_patchvec_layers"))  # [T, L, H_tok, W_tok, D]
+        global_k_raw_patchvec_layers = _sq(raw.get("global_k_raw_patchvec_layers"))  # [T, L, H_tok, W_tok, D]
+        dyn4d_global_layer_ids = raw.get("dyn4d_global_layer_ids")
+        if dyn4d_global_layer_ids is not None:
+            dyn4d_global_layer_ids = dyn4d_global_layer_ids.squeeze(0).detach().cpu().long()
+        frame_attn_cosine_shallow = _sq(raw.get("frame_attn_cosine_shallow"))  # [T, H_tok, W_tok]
+        frame_attn_cosine_deep = _sq(raw.get("frame_attn_cosine_deep"))        # [T, H_tok, W_tok]
+        frame_attn_cosine_avg = _sq(raw.get("frame_attn_cosine_avg"))          # [T, H_tok, W_tok]
+        frame_attn_key_cosine_l0 = _sq(raw.get("frame_attn_key_cosine_l0"))    # [T, H_tok, W_tok]
+        frame_attn_key_cosine_l4 = _sq(raw.get("frame_attn_key_cosine_l4"))    # [T, H_tok, W_tok]
+        frame_attn_key_cosine_shallow = _sq(raw.get("frame_attn_key_cosine_shallow"))  # [T, H_tok, W_tok]
+        frame_attn_key_cosine_deep = _sq(raw.get("frame_attn_key_cosine_deep"))        # [T, H_tok, W_tok]
+        frame_attn_key_cosine_avg = _sq(raw.get("frame_attn_key_cosine_avg"))          # [T, H_tok, W_tok]
+        frame_attn_cosine_query_layers = _sq(raw.get("frame_attn_cosine_query_layers"))  # [T, L, H_tok, W_tok]
+        frame_attn_cosine_key_layers = _sq(raw.get("frame_attn_cosine_key_layers"))      # [T, L, H_tok, W_tok]
+        frame_attn_cosine_layer_ids = raw.get("frame_attn_cosine_layer_ids")
+        if frame_attn_cosine_layer_ids is not None:
+            frame_attn_cosine_layer_ids = frame_attn_cosine_layer_ids.squeeze(0).detach().cpu().long()
 
         if conf_out is not None and conf_out.dim() == 4:
             conf_out = conf_out.squeeze(-1)        # [T, H_p, W_p]
@@ -576,6 +633,28 @@ class LoGeRGeometryBackbone:
             world_points=world_pts,
             camera_poses=cam_poses,
             confidence=conf_out,
+            frame_attention_prior=frame_attn,
+            attn_dynamic_patch=attn_dynamic_patch,
+            dyn4d_patch=dyn4d_patch,
+            dyn4d_qq_mean_patch=dyn4d_qq_mean_patch,
+            dyn4d_qk_var_patch=dyn4d_qk_var_patch,
+            dyn4d_kk_mean_patch=dyn4d_kk_mean_patch,
+            global_q_raw_patchvec=global_q_raw_patchvec,
+            global_k_raw_patchvec=global_k_raw_patchvec,
+            global_q_raw_patchvec_layers=global_q_raw_patchvec_layers,
+            global_k_raw_patchvec_layers=global_k_raw_patchvec_layers,
+            dyn4d_global_layer_ids=dyn4d_global_layer_ids,
+            frame_attn_cosine_shallow=frame_attn_cosine_shallow,
+            frame_attn_cosine_deep=frame_attn_cosine_deep,
+            frame_attn_cosine_avg=frame_attn_cosine_avg,
+            frame_attn_key_cosine_l0=frame_attn_key_cosine_l0,
+            frame_attn_key_cosine_l4=frame_attn_key_cosine_l4,
+            frame_attn_key_cosine_shallow=frame_attn_key_cosine_shallow,
+            frame_attn_key_cosine_deep=frame_attn_key_cosine_deep,
+            frame_attn_key_cosine_avg=frame_attn_key_cosine_avg,
+            frame_attn_cosine_query_layers=frame_attn_cosine_query_layers,
+            frame_attn_cosine_key_layers=frame_attn_cosine_key_layers,
+            frame_attn_cosine_layer_ids=frame_attn_cosine_layer_ids,
             patch_meta=patch_meta,
             token_type=token_type,
             num_frames=T,

@@ -1,6 +1,6 @@
 # Dynamic Cue Extractor 设计文档（v2）
 
-> 本文档定义 **Dynamic Cue Extractor** 模块。模块以 **LoGeR 的 chunk 级几何输出** 为输入，输出一组直接服务于 **Semantic Prior Generator** 和 **TTT Write Controller** 的几何 cue。本文档聚焦：如何从 LoGeR 的 pointmap / pose / confidence 中构造 `C_stat / C_dyn / C_occ / C_unc / C_anchor`，并进一步生成几何驱动的 write-allow map。
+> 本文档定义 **Dynamic Cue Extractor** 模块。模块以 **LoGeR 的 chunk 级几何输出** 为输入，输出一组直接服务于 **Semantic Prior Generator** 和 **TTT Write Controller** 的几何 cue。本文档聚焦：如何从 LoGeR 的 pointmap / pose / confidence，以及可选的 decoder attention priors 中构造 `C_stat / C_dyn / C_occ / C_unc / C_anchor`，并进一步生成几何驱动的 write-allow map。
 
 ---
 
@@ -36,9 +36,19 @@
 
 ### 2.2 以当前 chunk 为主，但允许利用 overlap 和相邻 chunk 边界信息
 
-最核心的静态/动态判断来自当前 chunk 内多帧几何一致性；若有 overlap 或上一 chunk 边界缓存，则可额外利用跨 chunk 连续性提升稳健性。
+最核心的静态/动态判断来自当前 chunk 内多帧几何一致性；若有 overlap、上一 chunk 边界缓存，或 Stage A 导出的 attention priors，则可额外利用这些时序先验提升稳健性。
 
-### 2.3 明确区分动态违背、遮挡边界和几何不确定性
+### 2.3 attention prior 只作为先验，不直接替代几何证据
+
+来自 decoder 的 `frame_attention_prior / attn_dynamic_patch` 更适合做：
+
+- support 帧排序
+- pairwise consistency 的权重调节
+- `C_dyn` 的额外动态证据
+
+而不应直接替代 pointmap / pose / confidence 本身。
+
+### 2.4 明确区分动态违背、遮挡边界和几何不确定性
 
 `C_dyn`、`C_occ` 和 `C_unc` 必须分开：
 
@@ -46,11 +56,11 @@
 - `C_occ` 表示更像 visibility change；
 - `C_unc` 表示当前数据本身不适合做强判决。
 
-### 2.4 `C_anchor` 不是 `C_stat` 的简单拷贝
+### 2.5 `C_anchor` 不是 `C_stat` 的简单拷贝
 
 一个区域当前静态一致，不等于它就适合写进长期记忆。`C_anchor` 必须额外考虑动态风险和不确定性。
 
-### 2.5 面向写入控制的输出，应尽量稳定、连续、可 patch 化
+### 2.6 面向写入控制的输出，应尽量稳定、连续、可 patch 化
 
 因为下游最终需要的是 patch token prior，所以几何 cue 在空间上应平滑，在时间上应稳定，并且容易池化到 token 网格。
 
@@ -100,6 +110,8 @@ TTT Write Controller
 | camera-space pointmap | `P_cam` | `[T, H_p, W_p, 3]` | LoGeR 点图 |
 | world-from-camera pose | `T_w_c` | `[T, 4, 4]` | 当前帧位姿 |
 | geometry confidence | `Conf_geo` | `[T, H_p, W_p]` 或 `[T, H, W]` | 点图可信度 |
+| frame attention prior（可选） | `A_frame` | `[T, T]` | decoder attention 导出的 frame-level 亲和度 |
+| patch dynamic prior（可选） | `M_attn_patch` | `[T, H_tok, W_tok]` | decoder attention 导出的 patch-level dynamicness |
 | patch token meta | `PatchMeta` | `[L_patch, 3]` | 每个 patch token 对应 `(t, y_tok, x_tok)` |
 | 上一 chunk 边界缓存（可选） | `PrevOverlap` | 结构体 | 用于边界连续性检查 |
 | 重投影残差图（可选） | `R_geo` | `[T, H, W]` | LoGeR 内部辅助残差 |
@@ -189,13 +201,15 @@ CueDebug = {
 数据流如下：
 
 ```text
-P_cam / pose / confidence
+P_cam / pose / confidence / attention priors
       ↓
 world lifting + normal estimation
       ↓
-support set construction
+attention-aware support set construction
       ↓
 pairwise reprojection & residuals
+      ↓
+attention-aware consistency weighting
       ↓
 C_stat / C_dyn / C_occ / C_unc / C_anchor
       ↓
@@ -247,6 +261,20 @@ $$
 $$
 
 例如取前后若干帧，或仅取时间上邻近的 `k_intra` 帧。
+
+若 `A_frame / M_attn_patch` 可用，推荐把 support ranking 改成：
+
+$$
+S(t,s) = \lambda_t \cdot S_{time}(t,s) + \lambda_a \cdot A_{frame}(t,s) + \lambda_m \cdot O_{static}(t,s)
+$$
+
+其中：
+
+- `S_time(t,s)`：时间距离衰减项
+- `A_frame(t,s)`：frame attention prior
+- `O_static(t,s)`：由 `1 - M_attn_patch` 计算出的静态区域 overlap
+
+然后按 `S(t,s)` 选前 `k_intra` 个支持帧。
 
 #### B. 边界支持集（可选）
 

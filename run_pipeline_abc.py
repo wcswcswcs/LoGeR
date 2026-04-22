@@ -157,7 +157,7 @@ def build_parser() -> argparse.ArgumentParser:
     # -- Chunk scheduling ---------------------------------------------------
     p.add_argument("--chunk_size", type=int, default=0,
                     help="Frames per chunk (0 = all frames as one chunk).")
-    p.add_argument("--chunk_overlap", type=int, default=0)
+    p.add_argument("--chunk_overlap", type=int, default=2)
 
     # -- Stage A: LoGeR -----------------------------------------------------
     p.add_argument("--checkpoint", required=True)
@@ -170,7 +170,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--se3", action="store_true", default=None)
 
     # -- Stage B: Dynamic Cue Extractor ------------------------------------
-    p.add_argument("--k_intra", type=int, default=3)
+    p.add_argument("--k_intra", type=int, default=3,
+                   help="Temporal window-width parameter for Stage B; support candidates come from [t-k_intra//2, t+k_intra//2], and up to 4 views are sampled uniformly.")
     p.add_argument("--sigma_pt", type=float, default=0.25)
     p.add_argument("--tau_occ", type=float, default=0.05)
 

@@ -1,8 +1,9 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from functools import partial
 from copy import deepcopy
-from typing import Optional, Union, List
+from typing import Optional, Union, List, Tuple
 
 from .dinov2.layers import Mlp
 from ..utils.geometry import homogenize_points, robust_scale_estimation
@@ -29,6 +30,10 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             ttt_update_steps: int = 1,
             conf: bool = True,
             attn_insert_after: Union[int, List[int], None] = None,
+            feature_frame_attn_layers: Union[int, List[int], None] = None,
+            feature_global_attn_layers: Union[int, List[int], None] = None,
+            dyn4d_window_radius: int = 2,
+            export_attn_debug: bool = False,
             ttt_pre_norm: bool = False,
             pi3x: bool = False,
             pi3x_metric: bool = True,
@@ -47,12 +52,15 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
 
         parsed_ttt_insert_after = _normalize_insert_positions(ttt_insert_after)
         parsed_attn_insert_after = _normalize_insert_positions(attn_insert_after)
+        parsed_feature_frame_attn_layers = _normalize_insert_positions(feature_frame_attn_layers)
+        parsed_feature_global_attn_layers = _normalize_insert_positions(feature_global_attn_layers)
 
         if not parsed_attn_insert_after:
             parsed_attn_insert_after = parsed_ttt_insert_after.copy()
 
         self.ttt_insert_after = parsed_ttt_insert_after
         self.attn_insert_after = parsed_attn_insert_after
+        self.export_attn_debug = bool(export_attn_debug)
         self.detach_swa_history = False
         self.initialize_swa_from_global = True
         self.encoder = dinov2_vitl14_reg(pretrained=False)
@@ -120,6 +128,20 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 rope=self.rope
             ) for _ in range(dec_depth)])
         self.dec_embed_dim = dec_embed_dim
+        self.attn_prior_layers = self._resolve_attn_prior_layers(
+            len(self.decoder), self.attn_insert_after,
+        )
+        self.frame_attn_map_layers = self._resolve_frame_attention_map_layers(
+            len(self.decoder), self.attn_insert_after,
+        )
+        self.feature_frame_attn_layers = self._resolve_feature_frame_attention_layers(
+            len(self.decoder), parsed_feature_frame_attn_layers,
+        )
+        self.feature_global_attn_layers = self._resolve_feature_global_attention_layers(
+            len(self.decoder), parsed_feature_global_attn_layers,
+        )
+        self.dyn4d_window_radius = max(int(dyn4d_window_radius), 1)
+        self.all_frame_attn_layers = [idx for idx in range(len(self.decoder)) if idx % 2 == 0]
 
         # ----------------------
         #     Register_token
@@ -329,12 +351,491 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             return
         self._initialize_ttt_layers_from_global(self.swa_layers, "swa", self.attn_insert_after)
 
+    @staticmethod
+    def _resolve_attn_prior_layers(
+        num_decoder_layers: int,
+        insert_after: Optional[List[int]],
+    ) -> List[int]:
+        """Resolve decoder blocks used for attention-prior extraction.
+
+        The config stores adapter insertion points, which may target frame
+        attention blocks. For motion priors we prefer nearby global-attention
+        layers, so even indices are shifted to the subsequent odd layer.
+        """
+        resolved: List[int] = []
+        for insert_idx in insert_after or []:
+            layer_idx = int(insert_idx)
+            if layer_idx % 2 == 0:
+                layer_idx += 1
+            if 0 <= layer_idx < num_decoder_layers and layer_idx % 2 == 1:
+                resolved.append(layer_idx)
+
+        if resolved:
+            return sorted(set(resolved))
+
+        fallback = [idx for idx in range(num_decoder_layers) if idx % 2 == 1]
+        return fallback[-4:] if len(fallback) > 4 else fallback
+
+    @staticmethod
+    def _resolve_frame_attention_map_layers(
+        num_decoder_layers: int,
+        insert_after: Optional[List[int]],
+    ) -> List[int]:
+        """Resolve frame-attention layers for MUT3R-style visualization."""
+        resolved: List[int] = []
+        for insert_idx in insert_after or []:
+            layer_idx = int(insert_idx)
+            if layer_idx % 2 == 1:
+                layer_idx -= 1
+            if 0 <= layer_idx < num_decoder_layers and layer_idx % 2 == 0:
+                resolved.append(layer_idx)
+
+        if resolved:
+            return sorted(set(resolved))
+
+        even_layers = [idx for idx in range(num_decoder_layers) if idx % 2 == 0]
+        if len(even_layers) <= 4:
+            return even_layers
+
+        sample_ids = [
+            0,
+            len(even_layers) // 3,
+            (2 * len(even_layers)) // 3,
+            len(even_layers) - 1,
+        ]
+        return sorted({even_layers[idx] for idx in sample_ids})
+
+    @staticmethod
+    def _resolve_feature_frame_attention_layers(
+        num_decoder_layers: int,
+        layers: Optional[List[int]],
+    ) -> List[int]:
+        """Resolve default frame-attention layers used for Stage-A features."""
+        default_layers = [0, 2, 4, 6, 8, 10, 12, 14]
+        candidates = layers if layers else default_layers
+        resolved: List[int] = []
+        for layer_idx in candidates:
+            layer_idx = int(layer_idx)
+            if layer_idx % 2 == 1:
+                layer_idx -= 1
+            if 0 <= layer_idx < num_decoder_layers and layer_idx % 2 == 0:
+                resolved.append(layer_idx)
+        return sorted(set(resolved))
+
+    @staticmethod
+    def _resolve_feature_global_attention_layers(
+        num_decoder_layers: int,
+        layers: Optional[List[int]],
+    ) -> List[int]:
+        """Resolve global-attention layers used for VGGT4D-style 4D dynamic cues."""
+        if layers:
+            candidates = layers
+        else:
+            candidates = [idx for idx in range(num_decoder_layers) if idx % 2 == 1]
+
+        resolved: List[int] = []
+        for layer_idx in candidates:
+            layer_idx = int(layer_idx)
+            if layer_idx % 2 == 0:
+                layer_idx += 1
+            if 0 <= layer_idx < num_decoder_layers and layer_idx % 2 == 1:
+                resolved.append(layer_idx)
+        return sorted(set(resolved))
+
+    @staticmethod
+    def _split_dyn4d_global_layer_groups(
+        layers: List[int],
+    ) -> Tuple[List[int], List[int], List[int]]:
+        """Split selected global-attention layers into shallow/middle/deep groups."""
+        if not layers:
+            return [], [], []
+
+        layers = sorted(set(int(layer) for layer in layers))
+        num_layers = len(layers)
+        if num_layers == 1:
+            return layers[:], layers[:], layers[:]
+        if num_layers == 2:
+            return [layers[0]], [layers[0]], [layers[1]]
+
+        split_1 = max(1, num_layers // 3)
+        split_2 = max(split_1 + 1, (2 * num_layers) // 3)
+        split_2 = min(split_2, num_layers - 1)
+        shallow = layers[:split_1]
+        middle = layers[split_1:split_2]
+        deep = layers[split_2:]
+        if not middle:
+            middle = shallow[-1:]
+        if not deep:
+            deep = middle[-1:]
+        return shallow, middle, deep
+
+    def _extract_frame_attention_cosine_map(
+        self,
+        blk: nn.Module,
+        x: torch.Tensor,
+        xpos: Optional[torch.Tensor],
+        batch_size: int,
+        frame_num: int,
+        patch_h: int,
+        patch_w: int,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Extract a MUT3R-style patch response map from frame attention.
+
+        We only keep patch tokens and replace the expensive attention matrix
+        with the average q/k cosine similarity over keys:
+
+            mean_j cos(q_i, k_j) = q_i · mean_j(k_j)
+
+        and its key-side counterpart:
+
+            mean_j cos(q_j, k_i) = mean_j(q_j) · k_i
+
+        This keeps the patch-only frame-attention semantics while avoiding
+        materializing the full [P, P] score matrix.
+        """
+        if frame_num <= 0:
+            return None, None
+
+        batch_frames, total_tokens, dim = x.shape
+        if batch_frames != batch_size * frame_num:
+            return None, None
+
+        num_patch_tokens = total_tokens - self.patch_start_idx
+        if num_patch_tokens <= 0 or num_patch_tokens != patch_h * patch_w:
+            return None, None
+
+        x_patch = x[:, self.patch_start_idx:, :]
+        pos_patch = xpos[:, self.patch_start_idx:, :] if xpos is not None else None
+
+        x_norm = blk.norm1(x_patch)
+        qkv = blk.attn.qkv(x_norm).reshape(
+            batch_frames,
+            num_patch_tokens,
+            3,
+            blk.attn.num_heads,
+            dim // blk.attn.num_heads,
+        ).transpose(1, 3)
+        q, k, v = [qkv[:, :, i] for i in range(3)]
+        q = blk.attn.q_norm(q).to(v.dtype)
+        k = blk.attn.k_norm(k).to(v.dtype)
+
+        if blk.attn.rope is not None and pos_patch is not None:
+            q = blk.attn.rope(q, pos_patch)
+            k = blk.attn.rope(k, pos_patch)
+
+        q = F.normalize(q.float(), dim=-1)
+        k = F.normalize(k.float(), dim=-1)
+
+        query_centroid = q.mean(dim=2)
+        key_centroid = k.mean(dim=2)
+        query_response = (q * key_centroid.unsqueeze(2)).sum(dim=-1).mean(dim=1)
+        key_response = (k * query_centroid.unsqueeze(2)).sum(dim=-1).mean(dim=1)
+
+        def _normalize_response(response: torch.Tensor) -> torch.Tensor:
+            response_mean = response.mean(dim=-1, keepdim=True)
+            response_std = response.std(dim=-1, keepdim=True, unbiased=False).clamp_min(1e-6)
+            response = torch.sigmoid((response - response_mean) / (2.0 * response_std))
+            return response.reshape(batch_size, frame_num, patch_h, patch_w).clamp(0.0, 1.0)
+
+        return _normalize_response(query_response), _normalize_response(key_response)
+
+    def _extract_attention_prior_from_block(
+        self,
+        blk: nn.Module,
+        x: torch.Tensor,
+        xpos: Optional[torch.Tensor],
+        frame_num: int,
+        tokens_per_frame: int,
+        patch_h: int,
+        patch_w: int,
+    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Summarize one global-attention layer into frame/patch priors.
+
+        Returns
+        -------
+        frame_affinity : [B, T, T] or None
+            Symmetric chunk-internal frame affinity in [0, 1].
+        token_dynamic : [B, T, H_tok, W_tok] or None
+            Patch-level dynamicness prior in [0, 1], where larger means
+            less attention support from other frames.
+        """
+        if frame_num <= 1:
+            return None, None
+
+        batch_size, total_tokens, dim = x.shape
+        if frame_num * tokens_per_frame != total_tokens:
+            return None, None
+
+        num_patch_tokens = tokens_per_frame - self.patch_start_idx
+        if num_patch_tokens <= 0 or num_patch_tokens != patch_h * patch_w:
+            return None, None
+
+        x_patch = x.reshape(batch_size, frame_num, tokens_per_frame, dim)
+        x_patch = x_patch[:, :, self.patch_start_idx:, :].reshape(
+            batch_size, frame_num * num_patch_tokens, dim,
+        )
+
+        pos_patch = None
+        if xpos is not None:
+            pos_patch = xpos.reshape(batch_size, frame_num, tokens_per_frame, -1)
+            pos_patch = pos_patch[:, :, self.patch_start_idx:, :].reshape(
+                batch_size, frame_num * num_patch_tokens, -1,
+            )
+
+        x_norm = blk.norm1(x_patch)
+        qkv = blk.attn.qkv(x_norm).reshape(
+            batch_size,
+            frame_num * num_patch_tokens,
+            3,
+            blk.attn.num_heads,
+            dim // blk.attn.num_heads,
+        ).transpose(1, 3)
+        q, k, v = [qkv[:, :, i] for i in range(3)]
+        q = blk.attn.q_norm(q).to(v.dtype)
+        k = blk.attn.k_norm(k).to(v.dtype)
+
+        if blk.attn.rope is not None and pos_patch is not None:
+            q = blk.attn.rope(q, pos_patch)
+            k = blk.attn.rope(k, pos_patch)
+
+        q = q.reshape(
+            batch_size, blk.attn.num_heads, frame_num, num_patch_tokens, -1,
+        )
+        k = k.reshape(
+            batch_size, blk.attn.num_heads, frame_num, num_patch_tokens, -1,
+        )
+
+        scale = float(blk.attn.scale)
+        # Re-normalize frame centroids. Without this, patch-wise normalized
+        # vectors can cancel out during averaging, making centroid norms very
+        # small and collapsing the downstream cosine statistics toward 0.
+        q_frame = F.normalize(q.mean(dim=3), dim=-1)
+        k_frame = F.normalize(k.mean(dim=3), dim=-1)
+
+        frame_logits = scale * torch.einsum("bhtd,bhsd->bhts", q_frame, k_frame)
+        frame_probs = torch.softmax(frame_logits, dim=-1).mean(dim=1)
+        frame_affinity = 0.5 * (frame_probs + frame_probs.transpose(-1, -2))
+        eye = torch.eye(
+            frame_num, device=frame_affinity.device, dtype=torch.bool,
+        ).unsqueeze(0)
+        frame_affinity = frame_affinity.masked_fill(eye, 0.0)
+        frame_affinity = frame_affinity / frame_affinity.amax(
+            dim=-1, keepdim=True,
+        ).clamp_min(1e-6)
+
+        token_logits = scale * torch.einsum("bhtpd,bhsd->bhtps", q, k_frame)
+        token_similarity = torch.sigmoid(token_logits.mean(dim=1))
+        frame_weights = frame_affinity / frame_affinity.sum(
+            dim=-1, keepdim=True,
+        ).clamp_min(1e-6)
+        token_support = (token_similarity * frame_weights[:, :, None, :]).sum(dim=-1)
+
+        token_support_mean = token_support.mean(dim=(1, 2), keepdim=True)
+        token_support_std = token_support.std(
+            dim=(1, 2), keepdim=True, unbiased=False,
+        ).clamp_min(1e-6)
+        token_static = torch.sigmoid(
+            (token_support - token_support_mean) / (2.0 * token_support_std),
+        )
+        token_dynamic = 1.0 - token_static
+        token_dynamic = token_dynamic.reshape(batch_size, frame_num, patch_h, patch_w)
+
+        return frame_affinity.clamp(0.0, 1.0), token_dynamic.clamp(0.0, 1.0)
+
+    def _extract_dyn4d_global_stats_from_block(
+        self,
+        blk: nn.Module,
+        x: torch.Tensor,
+        xpos: Optional[torch.Tensor],
+        frame_num: int,
+        tokens_per_frame: int,
+        patch_h: int,
+        patch_w: int,
+        window_radius: int,
+    ) -> Optional[dict]:
+        """Export raw patch-level q/k vectors from one global-attention layer."""
+        if frame_num <= 1:
+            return None
+
+        batch_size, total_tokens, dim = x.shape
+        if frame_num * tokens_per_frame != total_tokens:
+            return None
+
+        num_patch_tokens = tokens_per_frame - self.patch_start_idx
+        if num_patch_tokens <= 0 or num_patch_tokens != patch_h * patch_w:
+            return None
+
+        x_patch = x.reshape(batch_size, frame_num, tokens_per_frame, dim)
+        x_patch = x_patch[:, :, self.patch_start_idx:, :].reshape(
+            batch_size, frame_num * num_patch_tokens, dim,
+        )
+
+        pos_patch = None
+        if xpos is not None:
+            pos_patch = xpos.reshape(batch_size, frame_num, tokens_per_frame, -1)
+            pos_patch = pos_patch[:, :, self.patch_start_idx:, :].reshape(
+                batch_size, frame_num * num_patch_tokens, -1,
+            )
+
+        x_norm = blk.norm1(x_patch)
+        qkv = blk.attn.qkv(x_norm).reshape(
+            batch_size,
+            frame_num * num_patch_tokens,
+            3,
+            blk.attn.num_heads,
+            dim // blk.attn.num_heads,
+        ).transpose(1, 3)
+        q, k, v = [qkv[:, :, i] for i in range(3)]
+        q = blk.attn.q_norm(q).to(v.dtype)
+        k = blk.attn.k_norm(k).to(v.dtype)
+
+        if blk.attn.rope is not None and pos_patch is not None:
+            q = blk.attn.rope(q, pos_patch)
+            k = blk.attn.rope(k, pos_patch)
+
+        q_raw = q.reshape(
+            batch_size, blk.attn.num_heads, frame_num, num_patch_tokens, -1,
+        ).float()
+        k_raw = k.reshape(
+            batch_size, blk.attn.num_heads, frame_num, num_patch_tokens, -1,
+        ).float()
+        return {
+            "q_raw_patchvec": q_raw.mean(dim=1).reshape(batch_size, frame_num, patch_h, patch_w, -1),
+            "k_raw_patchvec": k_raw.mean(dim=1).reshape(batch_size, frame_num, patch_h, patch_w, -1),
+        }
+
+    def _aggregate_dyn4d_from_global_stats(
+        self,
+        dyn4d_parts: List[Tuple[int, dict]],
+    ) -> Optional[dict]:
+        """Aggregate raw global q/k into token-level Gram statistics and 4D_dyn.
+
+        Important: Gram statistics are computed per global-attention layer first,
+        then averaged across layers. This keeps the computation path closer to
+        4DVGGT than averaging q/k vectors across layers before forming Gram stats.
+        """
+        if not dyn4d_parts:
+            return None
+
+        available_layers = sorted(layer_id for layer_id, _ in dyn4d_parts)
+        stats_by_layer = {layer_id: stats for layer_id, stats in dyn4d_parts}
+
+        def _collect_stack(layer_ids: List[int], key: str) -> Optional[torch.Tensor]:
+            parts = [
+                stats_by_layer[layer_id][key]
+                for layer_id in layer_ids
+                if layer_id in stats_by_layer and key in stats_by_layer[layer_id]
+            ]
+            if not parts:
+                return None
+            return torch.stack(parts, dim=1)
+
+        global_q_raw_layers = _collect_stack(available_layers, "q_raw_patchvec")
+        global_k_raw_layers = _collect_stack(available_layers, "k_raw_patchvec")
+        if global_q_raw_layers is None or global_k_raw_layers is None:
+            return None
+
+        batch_size, num_layers, frame_num, patch_h, patch_w, dim = global_q_raw_layers.shape
+        num_patches = patch_h * patch_w
+        q = F.normalize(
+            global_q_raw_layers.reshape(batch_size, num_layers, frame_num, num_patches, dim).float(),
+            dim=-1,
+        )
+        k = F.normalize(
+            global_k_raw_layers.reshape(batch_size, num_layers, frame_num, num_patches, dim).float(),
+            dim=-1,
+        )
+
+        qq_sum = torch.zeros(batch_size, num_layers, frame_num, num_patches, device=q.device, dtype=q.dtype)
+        kk_sum = torch.zeros_like(qq_sum)
+        qk_sum = torch.zeros_like(qq_sum)
+        qk_sumsq = torch.zeros_like(qq_sum)
+        counts = torch.zeros(1, 1, frame_num, 1, device=q.device, dtype=q.dtype)
+
+        for t in range(frame_num):
+            start = max(0, t - self.dyn4d_window_radius)
+            end = min(frame_num, t + self.dyn4d_window_radius + 1)
+            q_t = q[:, :, t]
+            k_t = k[:, :, t]
+            for s in range(start, end):
+                if s == t:
+                    continue
+                q_s = q[:, :, s]
+                k_s = k[:, :, s]
+
+                qq_scores = torch.matmul(q_t, q_s.transpose(-1, -2))
+                qk_scores = torch.matmul(q_t, k_s.transpose(-1, -2))
+                kk_scores = torch.matmul(k_t, k_s.transpose(-1, -2))
+
+                qq_sum[:, :, t] += qq_scores.sum(dim=-1)
+                kk_sum[:, :, t] += kk_scores.sum(dim=-1)
+                qk_sum[:, :, t] += qk_scores.sum(dim=-1)
+                qk_sumsq[:, :, t] += qk_scores.square().sum(dim=-1)
+                counts[:, :, t] += num_patches
+
+        counts = counts.clamp_min(1.0)
+        qq_mean = ((qq_sum / counts) + 1.0) * 0.5
+        kk_mean = ((kk_sum / counts) + 1.0) * 0.5
+        qk_mean = qk_sum / counts
+        qk_var = (qk_sumsq / counts) - qk_mean.square()
+        qk_var = qk_var.clamp_min(0.0)
+
+        qq_mean = qq_mean.reshape(batch_size, num_layers, frame_num, patch_h, patch_w).clamp(0.0, 1.0)
+        kk_mean = kk_mean.reshape(batch_size, num_layers, frame_num, patch_h, patch_w).clamp(0.0, 1.0)
+        qk_var = qk_var.reshape(batch_size, num_layers, frame_num, patch_h, patch_w)
+
+        qq_mean = qq_mean.mean(dim=1)
+        kk_mean = kk_mean.mean(dim=1)
+        qk_var = qk_var.mean(dim=1)
+
+        qk_var_flat = qk_var.reshape(batch_size, frame_num, -1)
+        qk_var_min = qk_var_flat.amin(dim=-1, keepdim=True)
+        qk_var_max = qk_var_flat.amax(dim=-1, keepdim=True)
+        qk_var_norm = (
+            (qk_var_flat - qk_var_min)
+            / (qk_var_max - qk_var_min).clamp_min(1e-6)
+        ).reshape_as(qk_var).clamp(0.0, 1.0)
+
+        dyn4d_raw = (
+            0.35 * (1.0 - qq_mean)
+            + 0.40 * qk_var_norm
+            + 0.25 * (1.0 - kk_mean)
+        ).clamp(0.0, 1.0)
+        dyn4d_flat = dyn4d_raw.reshape(batch_size, frame_num, -1)
+        dyn4d_min = dyn4d_flat.amin(dim=-1, keepdim=True)
+        dyn4d_max = dyn4d_flat.amax(dim=-1, keepdim=True)
+        dyn4d_norm = (dyn4d_flat - dyn4d_min) / (dyn4d_max - dyn4d_min).clamp_min(1e-6)
+        global_q_raw = global_q_raw_layers.mean(dim=1)
+        global_k_raw = global_k_raw_layers.mean(dim=1)
+        return {
+            "dyn4d_patch": dyn4d_norm.reshape_as(dyn4d_raw).clamp(0.0, 1.0),
+            "dyn4d_qq_mean_patch": qq_mean,
+            "dyn4d_qk_var_patch": qk_var_norm,
+            "dyn4d_kk_mean_patch": kk_mean,
+            "global_q_raw_patchvec": global_q_raw.float(),
+            "global_k_raw_patchvec": global_k_raw.float(),
+            "global_q_raw_patchvec_layers": global_q_raw_layers.permute(0, 2, 1, 3, 4, 5).contiguous().float(),
+            "global_k_raw_patchvec_layers": global_k_raw_layers.permute(0, 2, 1, 3, 4, 5).contiguous().float(),
+            "dyn4d_global_layer_ids": torch.tensor(
+                available_layers,
+                device=global_q_raw_layers.device,
+                dtype=torch.long,
+            ),
+        }
+
     def decode(self, hidden, N, H, W, ttt_dict: Optional[dict] = None, window_size: Optional[int] = None, overlap_size: Optional[int] = None, is_first_window: bool = False,
                turn_off_ttt=False, turn_off_swa=False, cache_ttt_primitives: bool = False) -> torch.Tensor:
         BN, hw, _ = hidden.shape
         B = BN // N
 
         final_output = []
+        attn_prior_frame_parts: List[torch.Tensor] = []
+        feature_key_parts: List[Tuple[int, torch.Tensor]] = []
+        dyn4d_global_parts: List[Tuple[int, dict]] = []
+        frame_attn_cosine_query_parts: List[Tuple[int, torch.Tensor]] = []
+        frame_attn_cosine_key_parts: List[Tuple[int, torch.Tensor]] = []
+        frame_attn_key_cosine_l0 = None
+        frame_attn_key_cosine_l4 = None
         
         hidden = hidden.reshape(B*N, hw, -1)
 
@@ -404,6 +905,58 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 hidden_before_block = hidden_for_block
             else:
                 hidden_before_block = hidden_for_block # dummy
+
+            need_feature_key = i in self.feature_frame_attn_layers and i % 2 == 0
+            need_layer0_key = i == 0
+            need_layer4_key = i == 4
+            need_debug_maps = self.export_attn_debug and i in self.all_frame_attn_layers and i % 2 == 0
+            if need_feature_key or need_layer0_key or need_layer4_key or need_debug_maps:
+                frame_attn_cosine_query, frame_attn_cosine_key = self._extract_frame_attention_cosine_map(
+                    blk,
+                    hidden_for_block,
+                    pos_for_block,
+                    B,
+                    N,
+                    H // self.patch_size,
+                    W // self.patch_size,
+                )
+                if need_debug_maps and frame_attn_cosine_query is not None:
+                    frame_attn_cosine_query_parts.append((i, frame_attn_cosine_query))
+                if need_debug_maps and frame_attn_cosine_key is not None:
+                    frame_attn_cosine_key_parts.append((i, frame_attn_cosine_key))
+                if need_layer0_key and frame_attn_cosine_key is not None:
+                    frame_attn_key_cosine_l0 = frame_attn_cosine_key
+                if need_layer4_key and frame_attn_cosine_key is not None:
+                    frame_attn_key_cosine_l4 = frame_attn_cosine_key
+                if need_feature_key and frame_attn_cosine_key is not None:
+                    feature_key_parts.append((i, frame_attn_cosine_key))
+
+            if i in self.attn_prior_layers and i % 2 == 1:
+                frame_prior, _dynamic_prior = self._extract_attention_prior_from_block(
+                    blk,
+                    hidden_for_block,
+                    pos_for_block,
+                    N,
+                    hw,
+                    H // self.patch_size,
+                    W // self.patch_size,
+                )
+                if frame_prior is not None:
+                    attn_prior_frame_parts.append(frame_prior)
+
+            if i in self.feature_global_attn_layers and i % 2 == 1:
+                dyn4d_stats = self._extract_dyn4d_global_stats_from_block(
+                    blk,
+                    hidden_for_block,
+                    pos_for_block,
+                    N,
+                    hw,
+                    H // self.patch_size,
+                    W // self.patch_size,
+                    self.dyn4d_window_radius,
+                )
+                if dyn4d_stats is not None:
+                    dyn4d_global_parts.append((i, dyn4d_stats))
 
             hidden = blk(hidden_for_block, xpos=pos_for_block)
 
@@ -590,6 +1143,87 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 f"Decoder expected to collect two final outputs but got {len(final_output)}."
             )
 
+        avg_frame_prior = None
+        if attn_prior_frame_parts:
+            avg_frame_prior = torch.stack(attn_prior_frame_parts, dim=0).mean(dim=0)
+            eye = torch.eye(
+                avg_frame_prior.shape[-1],
+                device=avg_frame_prior.device,
+                dtype=torch.bool,
+            ).unsqueeze(0)
+            avg_frame_prior = avg_frame_prior.masked_fill(eye, 0.0)
+
+        avg_dynamic_prior = None
+        if feature_key_parts:
+            avg_dynamic_prior = torch.stack(
+                [part for _, part in feature_key_parts], dim=0,
+            ).mean(dim=0)
+
+        dyn4d_outputs = self._aggregate_dyn4d_from_global_stats(dyn4d_global_parts)
+        dyn4d_patch = None
+        dyn4d_qq_mean_patch = None
+        dyn4d_qk_var_patch = None
+        dyn4d_kk_mean_patch = None
+        global_q_raw_patchvec = None
+        global_k_raw_patchvec = None
+        global_q_raw_patchvec_layers = None
+        global_k_raw_patchvec_layers = None
+        dyn4d_global_layer_ids = None
+        if dyn4d_outputs is not None:
+            dyn4d_patch = dyn4d_outputs.get("dyn4d_patch")
+            dyn4d_qq_mean_patch = dyn4d_outputs.get("dyn4d_qq_mean_patch")
+            dyn4d_qk_var_patch = dyn4d_outputs.get("dyn4d_qk_var_patch")
+            dyn4d_kk_mean_patch = dyn4d_outputs.get("dyn4d_kk_mean_patch")
+            global_q_raw_patchvec = dyn4d_outputs.get("global_q_raw_patchvec")
+            global_k_raw_patchvec = dyn4d_outputs.get("global_k_raw_patchvec")
+            global_q_raw_patchvec_layers = dyn4d_outputs.get("global_q_raw_patchvec_layers")
+            global_k_raw_patchvec_layers = dyn4d_outputs.get("global_k_raw_patchvec_layers")
+            dyn4d_global_layer_ids = dyn4d_outputs.get("dyn4d_global_layer_ids")
+
+        frame_attn_cosine_layer_ids = None
+        frame_attn_cosine_query_layers = None
+        frame_attn_cosine_key_layers = None
+        if self.export_attn_debug and frame_attn_cosine_query_parts and frame_attn_cosine_key_parts:
+            frame_attn_cosine_layer_ids = torch.tensor(
+                [layer_id for layer_id, _ in frame_attn_cosine_query_parts],
+                device=hidden.device,
+                dtype=torch.long,
+            )
+            frame_attn_cosine_query_layers = torch.stack(
+                [part for _, part in frame_attn_cosine_query_parts], dim=2,
+            )
+            frame_attn_cosine_key_layers = torch.stack(
+                [part for _, part in frame_attn_cosine_key_parts], dim=2,
+            )
+
+        frame_attn_cosine_shallow = None
+        frame_attn_cosine_deep = None
+        frame_attn_cosine_avg = None
+        frame_attn_key_cosine_shallow = None
+        frame_attn_key_cosine_deep = None
+        frame_attn_key_cosine_avg = None
+        if self.export_attn_debug and frame_attn_cosine_query_parts and frame_attn_cosine_key_parts:
+            query_by_layer = {layer_id: part for layer_id, part in frame_attn_cosine_query_parts}
+            key_by_layer = {layer_id: part for layer_id, part in frame_attn_cosine_key_parts}
+            selected_query_parts = [
+                query_by_layer[layer_id]
+                for layer_id in self.frame_attn_map_layers
+                if layer_id in query_by_layer
+            ]
+            selected_key_parts = [
+                key_by_layer[layer_id]
+                for layer_id in self.frame_attn_map_layers
+                if layer_id in key_by_layer
+            ]
+            if selected_query_parts:
+                frame_attn_cosine_shallow = selected_query_parts[0]
+                frame_attn_cosine_deep = selected_query_parts[-1]
+                frame_attn_cosine_avg = torch.stack(selected_query_parts, dim=0).mean(dim=0)
+            if selected_key_parts:
+                frame_attn_key_cosine_shallow = selected_key_parts[0]
+                frame_attn_key_cosine_deep = selected_key_parts[-1]
+                frame_attn_key_cosine_avg = torch.stack(selected_key_parts, dim=0).mean(dim=0)
+
         return (
             torch.cat([final_output[0], final_output[1]], dim=-1),
             (pos.reshape(B*N, hw, -1) if pos is not None else None),
@@ -597,6 +1231,28 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             avg_gate_scale,
             avg_attn_gate_scale,
             gate_scales,
+            avg_frame_prior,
+            avg_dynamic_prior,
+            dyn4d_patch,
+            dyn4d_qq_mean_patch,
+            dyn4d_qk_var_patch,
+            dyn4d_kk_mean_patch,
+            global_q_raw_patchvec,
+            global_k_raw_patchvec,
+            global_q_raw_patchvec_layers,
+            global_k_raw_patchvec_layers,
+            dyn4d_global_layer_ids,
+            frame_attn_cosine_shallow,
+            frame_attn_cosine_deep,
+            frame_attn_cosine_avg,
+            frame_attn_key_cosine_l0,
+            frame_attn_key_cosine_l4,
+            frame_attn_key_cosine_shallow,
+            frame_attn_key_cosine_deep,
+            frame_attn_key_cosine_avg,
+            frame_attn_cosine_query_layers,
+            frame_attn_cosine_key_layers,
+            frame_attn_cosine_layer_ids,
         )
     
     def forward(self, imgs, *args, **kwargs):
@@ -744,7 +1400,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                         "ttt": ttt_state,
                         "attn": attn_state,
                     }
-                hidden, pos, ttt_output_info, decode_avg_gate_scale, decode_avg_attn_gate_scale, _decode_gate_scales = self.decode(
+                hidden, pos, ttt_output_info, decode_avg_gate_scale, decode_avg_attn_gate_scale, _decode_gate_scales, frame_attention_prior, attn_dynamic_patch, dyn4d_patch, dyn4d_qq_mean_patch, dyn4d_qk_var_patch, dyn4d_kk_mean_patch, global_q_raw_patchvec, global_k_raw_patchvec, global_q_raw_patchvec_layers, global_k_raw_patchvec_layers, dyn4d_global_layer_ids, frame_attn_cosine_shallow, frame_attn_cosine_deep, frame_attn_cosine_avg, frame_attn_key_cosine_l0, frame_attn_key_cosine_l4, frame_attn_key_cosine_shallow, frame_attn_key_cosine_deep, frame_attn_key_cosine_avg, frame_attn_cosine_query_layers, frame_attn_cosine_key_layers, frame_attn_cosine_layer_ids = self.decode(
                     hidden_input, Nw, H, W,
                     ttt_dict=ttt_dict,
                     window_size=window_size,
@@ -850,6 +1506,30 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 camera_qvec=maybe_detach(camera_qvec, no_detach=no_detach),
                 local_camera_qvec=maybe_detach(local_camera_qvec, no_detach=no_detach),
                 metric=maybe_detach(metric, no_detach=no_detach),
+                frame_attention_prior=maybe_detach(frame_attention_prior, no_detach=no_detach),
+                attn_dynamic_patch=maybe_detach(attn_dynamic_patch, no_detach=no_detach),
+                dyn4d_patch=maybe_detach(dyn4d_patch, no_detach=no_detach),
+                dyn4d_qq_mean_patch=maybe_detach(dyn4d_qq_mean_patch, no_detach=no_detach),
+                dyn4d_qk_var_patch=maybe_detach(dyn4d_qk_var_patch, no_detach=no_detach),
+                dyn4d_kk_mean_patch=maybe_detach(dyn4d_kk_mean_patch, no_detach=no_detach),
+                global_q_raw_patchvec=maybe_detach(global_q_raw_patchvec, no_detach=no_detach),
+                global_k_raw_patchvec=maybe_detach(global_k_raw_patchvec, no_detach=no_detach),
+                global_q_raw_patchvec_layers=maybe_detach(global_q_raw_patchvec_layers, no_detach=no_detach),
+                global_k_raw_patchvec_layers=maybe_detach(global_k_raw_patchvec_layers, no_detach=no_detach),
+                dyn4d_global_layer_ids=maybe_detach(dyn4d_global_layer_ids, no_detach=no_detach),
+                frame_attn_cosine_shallow=maybe_detach(frame_attn_cosine_shallow, no_detach=no_detach),
+                frame_attn_cosine_deep=maybe_detach(frame_attn_cosine_deep, no_detach=no_detach),
+                frame_attn_cosine_avg=maybe_detach(frame_attn_cosine_avg, no_detach=no_detach),
+                frame_attn_key_cosine_l0=maybe_detach(frame_attn_key_cosine_l0, no_detach=no_detach),
+                frame_attn_key_cosine_l4=maybe_detach(frame_attn_key_cosine_l4, no_detach=no_detach),
+                frame_attn_key_cosine_shallow=maybe_detach(frame_attn_key_cosine_shallow, no_detach=no_detach),
+                frame_attn_key_cosine_deep=maybe_detach(frame_attn_key_cosine_deep, no_detach=no_detach),
+                frame_attn_key_cosine_avg=maybe_detach(frame_attn_key_cosine_avg, no_detach=no_detach),
+                frame_attn_cosine_query_layers=maybe_detach(frame_attn_cosine_query_layers, no_detach=no_detach),
+                frame_attn_cosine_key_layers=maybe_detach(frame_attn_cosine_key_layers, no_detach=no_detach),
+                frame_attn_cosine_layer_ids=maybe_detach(frame_attn_cosine_layer_ids, no_detach=no_detach),
+                _window_start=start_idx,
+                _window_end=end_idx,
             )
             all_predictions.append(pred_dict)
 
@@ -894,7 +1574,34 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
 
         merged_predictions = {}
         keys = list(all_predictions[0].keys())
-        sequence_keys = {"points", "local_points", "conf", "camera_poses", "local_camera_poses", "camera_qvec", "local_camera_qvec"}
+        sequence_keys = {
+            "points",
+            "local_points",
+            "conf",
+            "camera_poses",
+            "local_camera_poses",
+            "camera_qvec",
+            "local_camera_qvec",
+            "attn_dynamic_patch",
+            "dyn4d_patch",
+            "dyn4d_qq_mean_patch",
+            "dyn4d_qk_var_patch",
+            "dyn4d_kk_mean_patch",
+            "global_q_raw_patchvec",
+            "global_k_raw_patchvec",
+            "global_q_raw_patchvec_layers",
+            "global_k_raw_patchvec_layers",
+            "frame_attn_cosine_shallow",
+            "frame_attn_cosine_deep",
+            "frame_attn_cosine_avg",
+            "frame_attn_key_cosine_l0",
+            "frame_attn_key_cosine_l4",
+            "frame_attn_key_cosine_shallow",
+            "frame_attn_key_cosine_deep",
+            "frame_attn_key_cosine_avg",
+            "frame_attn_cosine_query_layers",
+            "frame_attn_cosine_key_layers",
+        }
         for key in keys:
             # Collect window tensors
             window_tensors = [pred.get(key, None) for pred in all_predictions]
@@ -904,7 +1611,11 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 continue
 
             # Only perform overlap-aware concatenation for known sequence-shaped tensors
-            if key in sequence_keys:
+            if key == "frame_attention_prior":
+                merged_prior = self._merge_windowed_frame_priors(all_predictions, key)
+                if merged_prior is not None:
+                    merged_predictions[key] = merged_prior
+            elif key in sequence_keys:
                 # Filter out None windows safely while preserving positions for slicing
                 result_parts = []
 
@@ -995,6 +1706,45 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                     merged_predictions["overlap_next_conf"] = torch.stack(next_conf_chunks, dim=1)  # (B, K, O, H, W)
 
         return merged_predictions
+
+    def _merge_windowed_frame_priors(self, all_predictions, key: str) -> Optional[torch.Tensor]:
+        """Merge per-window [B, T_w, T_w] frame priors into [B, T, T]."""
+        priors = []
+        starts = []
+        ends = []
+        for pred in all_predictions:
+            prior = pred.get(key, None)
+            start = pred.get("_window_start", None)
+            end = pred.get("_window_end", None)
+            if prior is None or start is None or end is None:
+                continue
+            priors.append(prior)
+            starts.append(int(start))
+            ends.append(int(end))
+
+        if not priors:
+            return None
+
+        batch_size = priors[0].shape[0]
+        total_frames = max(ends)
+        device = priors[0].device
+        dtype = priors[0].dtype
+
+        merged = torch.zeros(batch_size, total_frames, total_frames, device=device, dtype=dtype)
+        counts = torch.zeros(1, total_frames, total_frames, device=device, dtype=dtype)
+
+        for prior, start, end in zip(priors, starts, ends):
+            length = end - start
+            if prior.shape[-2:] != (length, length):
+                continue
+            merged[:, start:end, start:end] += prior
+            counts[:, start:end, start:end] += 1.0
+
+        valid = counts > 0
+        merged = torch.where(valid, merged / counts.clamp_min(1.0), merged)
+        eye = torch.eye(total_frames, device=device, dtype=torch.bool).unsqueeze(0)
+        merged = merged.masked_fill(eye, 0.0)
+        return merged
 
     def _merge_windowed_predictions_sim3(
         self,

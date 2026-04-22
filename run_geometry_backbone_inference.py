@@ -296,6 +296,24 @@ def print_geometry_output(geo: GeometryOutput) -> None:
     print(f"  world_points.shape   : {_shape(geo.world_points)}")
     print(f"  camera_poses.shape   : {_shape(geo.camera_poses)}")
     print(f"  confidence.shape     : {_shape(geo.confidence)}")
+    print(f"  frame_attn.shape     : {_shape(geo.frame_attention_prior)}")
+    print(f"  attn_feature.shape   : {_shape(geo.attn_dynamic_patch)}")
+    print(f"  dyn4d_patch.shape    : {_shape(geo.dyn4d_patch)}")
+    print(f"  dyn4d_qq_mean.shape  : {_shape(geo.dyn4d_qq_mean_patch)}")
+    print(f"  dyn4d_qk_var.shape   : {_shape(geo.dyn4d_qk_var_patch)}")
+    print(f"  dyn4d_kk_mean.shape  : {_shape(geo.dyn4d_kk_mean_patch)}")
+    print(f"  global_q_raw.shape   : {_shape(geo.global_q_raw_patchvec)}")
+    print(f"  global_k_raw.shape   : {_shape(geo.global_k_raw_patchvec)}")
+    print(f"  frame_cos_shallow    : {_shape(geo.frame_attn_cosine_shallow)}")
+    print(f"  frame_cos_deep       : {_shape(geo.frame_attn_cosine_deep)}")
+    print(f"  frame_cos_avg        : {_shape(geo.frame_attn_cosine_avg)}")
+    print(f"  key_cos_l0           : {_shape(geo.frame_attn_key_cosine_l0)}")
+    print(f"  key_cos_shallow      : {_shape(geo.frame_attn_key_cosine_shallow)}")
+    print(f"  key_cos_deep         : {_shape(geo.frame_attn_key_cosine_deep)}")
+    print(f"  key_cos_avg          : {_shape(geo.frame_attn_key_cosine_avg)}")
+    print(f"  query_layers.shape   : {_shape(geo.frame_attn_cosine_query_layers)}")
+    print(f"  key_layers.shape     : {_shape(geo.frame_attn_cosine_key_layers)}")
+    print(f"  layer_ids.shape      : {_shape(geo.frame_attn_cosine_layer_ids)}")
     print(f"  patch_meta.shape     : {_shape(geo.patch_meta)}")
     print(f"  token_type.shape     : {_shape(geo.token_type)}")
 
@@ -313,6 +331,64 @@ def print_geometry_output(geo: GeometryOutput) -> None:
     if geo.camera_poses is not None:
         t_norms = geo.camera_poses[:, :3, 3].norm(dim=-1)
         print(f"  camera translation ‖t‖: min={t_norms.min().item():.4f}  max={t_norms.max().item():.4f}")
+
+    if geo.frame_attention_prior is not None:
+        a = geo.frame_attention_prior
+        print(f"  frame_attn range     : [{a.min().item():.4f}, {a.max().item():.4f}]  mean={a.mean().item():.4f}")
+
+    if geo.attn_dynamic_patch is not None:
+        a = geo.attn_dynamic_patch
+        print(f"  attn_feature range   : [{a.min().item():.4f}, {a.max().item():.4f}]  mean={a.mean().item():.4f}")
+
+    if geo.dyn4d_patch is not None:
+        a = geo.dyn4d_patch
+        print(f"  dyn4d_patch range    : [{a.min().item():.4f}, {a.max().item():.4f}]  mean={a.mean().item():.4f}")
+    if geo.dyn4d_qq_mean_patch is not None:
+        a = geo.dyn4d_qq_mean_patch
+        print(f"  dyn4d_qq_mean range  : [{a.min().item():.4f}, {a.max().item():.4f}]  mean={a.mean().item():.4f}")
+    if geo.dyn4d_qk_var_patch is not None:
+        a = geo.dyn4d_qk_var_patch
+        print(f"  dyn4d_qk_var range   : [{a.min().item():.4f}, {a.max().item():.4f}]  mean={a.mean().item():.4f}")
+    if geo.dyn4d_kk_mean_patch is not None:
+        a = geo.dyn4d_kk_mean_patch
+        print(f"  dyn4d_kk_mean range  : [{a.min().item():.4f}, {a.max().item():.4f}]  mean={a.mean().item():.4f}")
+    if geo.global_q_raw_patchvec is not None:
+        a = geo.global_q_raw_patchvec
+        print(f"  global_q_raw range   : [{a.min().item():.4f}, {a.max().item():.4f}]  mean={a.mean().item():.4f}")
+    if geo.global_k_raw_patchvec is not None:
+        a = geo.global_k_raw_patchvec
+        print(f"  global_k_raw range   : [{a.min().item():.4f}, {a.max().item():.4f}]  mean={a.mean().item():.4f}")
+
+    if geo.frame_attn_cosine_shallow is not None:
+        a = geo.frame_attn_cosine_shallow
+        print(f"  frame_cos_shallow    : [{a.min().item():.4f}, {a.max().item():.4f}]  mean={a.mean().item():.4f}")
+
+    if geo.frame_attn_cosine_deep is not None:
+        a = geo.frame_attn_cosine_deep
+        print(f"  frame_cos_deep       : [{a.min().item():.4f}, {a.max().item():.4f}]  mean={a.mean().item():.4f}")
+
+    if geo.frame_attn_cosine_avg is not None:
+        a = geo.frame_attn_cosine_avg
+        print(f"  frame_cos_avg        : [{a.min().item():.4f}, {a.max().item():.4f}]  mean={a.mean().item():.4f}")
+
+    if geo.frame_attn_key_cosine_l0 is not None:
+        a = geo.frame_attn_key_cosine_l0
+        print(f"  key_cos_l0           : [{a.min().item():.4f}, {a.max().item():.4f}]  mean={a.mean().item():.4f}")
+
+    if geo.frame_attn_key_cosine_shallow is not None:
+        a = geo.frame_attn_key_cosine_shallow
+        print(f"  key_cos_shallow      : [{a.min().item():.4f}, {a.max().item():.4f}]  mean={a.mean().item():.4f}")
+
+    if geo.frame_attn_key_cosine_deep is not None:
+        a = geo.frame_attn_key_cosine_deep
+        print(f"  key_cos_deep         : [{a.min().item():.4f}, {a.max().item():.4f}]  mean={a.mean().item():.4f}")
+
+    if geo.frame_attn_key_cosine_avg is not None:
+        a = geo.frame_attn_key_cosine_avg
+        print(f"  key_cos_avg          : [{a.min().item():.4f}, {a.max().item():.4f}]  mean={a.mean().item():.4f}")
+
+    if geo.frame_attn_cosine_layer_ids is not None:
+        print(f"  frame-attn layer ids : {geo.frame_attn_cosine_layer_ids.tolist()}")
 
     print(f"  raw_predictions keys : {sorted(geo.raw_predictions.keys())}")
     print("=" * 60 + "\n")
@@ -408,6 +484,24 @@ def main() -> None:
             "world_points": geo_output.world_points,
             "camera_poses": geo_output.camera_poses,
             "confidence": geo_output.confidence,
+            "frame_attention_prior": geo_output.frame_attention_prior,
+            "attn_dynamic_patch": geo_output.attn_dynamic_patch,
+            "dyn4d_patch": geo_output.dyn4d_patch,
+            "dyn4d_qq_mean_patch": geo_output.dyn4d_qq_mean_patch,
+            "dyn4d_qk_var_patch": geo_output.dyn4d_qk_var_patch,
+            "dyn4d_kk_mean_patch": geo_output.dyn4d_kk_mean_patch,
+            "global_q_raw_patchvec": geo_output.global_q_raw_patchvec,
+            "global_k_raw_patchvec": geo_output.global_k_raw_patchvec,
+            "frame_attn_cosine_shallow": geo_output.frame_attn_cosine_shallow,
+            "frame_attn_cosine_deep": geo_output.frame_attn_cosine_deep,
+            "frame_attn_cosine_avg": geo_output.frame_attn_cosine_avg,
+            "frame_attn_key_cosine_l0": geo_output.frame_attn_key_cosine_l0,
+            "frame_attn_key_cosine_shallow": geo_output.frame_attn_key_cosine_shallow,
+            "frame_attn_key_cosine_deep": geo_output.frame_attn_key_cosine_deep,
+            "frame_attn_key_cosine_avg": geo_output.frame_attn_key_cosine_avg,
+            "frame_attn_cosine_query_layers": geo_output.frame_attn_cosine_query_layers,
+            "frame_attn_cosine_key_layers": geo_output.frame_attn_cosine_key_layers,
+            "frame_attn_cosine_layer_ids": geo_output.frame_attn_cosine_layer_ids,
             "patch_meta": geo_output.patch_meta,
             "token_type": geo_output.token_type,
             "num_frames": geo_output.num_frames,

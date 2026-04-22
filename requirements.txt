@@ -17,3 +17,10 @@ viser
 roma
 evo
 accelerate
+onnxruntime
+pycolmap==3.10.0
+pyceres
+scikit-image
+scikit-learn
+open3d
+git+https://github.com/jytime/LightGlue.git#egg=lightglue

@@ -9,9 +9,10 @@
 当前版本的 `DynamicCueExtractor` 是一个**基于 chunk 内多帧几何一致性**的简化实现：
 
 - 输入只使用 LoGeR Stage A 的 `world_points / local_points / camera_poses / confidence`
-- 在当前 chunk 内为每帧构造时间邻近支持集
+- 可选读取 Stage A 导出的 `frame_attention_prior / attn_dynamic_patch`
+- 在当前 chunk 内为每帧构造 attention-aware 支持集
 - 计算 `C_stat / C_occ / C_unc`
-- 再组合得到 `C_dyn / C_anchor / G_write_geo`
+- 再结合 attention 动态先验得到 `C_dyn / C_anchor / G_write_geo`
 - 可选输出 patch-level pooling 版本
 
 它已经覆盖了设计文档中的主输出接口，但仍然属于一个偏 **Phase 1 / 1.5** 的实现，而不是完整的设计稿版本。
@@ -35,6 +36,8 @@
 - `geo.local_points`：`[T, H_p, W_p, 3]`
 - `geo.camera_poses`：`[T, 4, 4]`
 - `geo.confidence`：`[T, H_p, W_p]`
+- `geo.frame_attention_prior`：`[T, T]`，可选
+- `geo.attn_dynamic_patch`：`[T, H_tok, W_tok]`，可选
 - `geo.patch_grid`：patch pooling 时使用
 
 当前实现**没有**直接使用：
@@ -70,15 +73,17 @@
 ```text
 GeometryOutput
     ↓
-提取 world/local points, pose, confidence
+提取 world/local points, pose, confidence, attention priors
     ↓
-构造 chunk 内支持集 N_intra(t)
+构造 attention-aware chunk 内支持集 N_intra(t)
     ↓
 计算 pairwise point residual / depth-order occlusion / valid coverage
     ↓
+attention-aware consistency weighting
+    ↓
 C_stat / C_occ / C_unc
     ↓
-C_dyn / C_anchor
+C_dyn(attn + geometry) / C_anchor
     ↓
 G_write_geo
     ↓
@@ -89,10 +94,13 @@ G_write_geo
 
 ## 4. 支持集构造
 
-当前实现使用 `_build_support_tensor(T)` 为每个时间帧 `t` 选择最多 `k_intra` 个支持帧：
+当前实现使用 `_build_support_tensor(T, frame_attention_prior, attn_dynamic_patch)` 为每个时间帧 `t` 选择最多 `k_intra` 个支持帧：
 
-- 按时间距离从近到远选取
-- 顺序是 `t-1, t+1, t-2, t+2, ...`
+- 如果没有 attention prior，按时间距离从近到远选取
+- 如果有 attention prior，则按一个混合分数排序：
+  - 时间接近性
+  - `frame_attention_prior[t, s]`
+  - `attn_dynamic_patch` 导出的静态区域 overlap
 - 只在**当前 chunk 内部**选择支持帧
 
 因此，当前实现中：
@@ -165,10 +173,12 @@ occ_flag = 1[z_proj - depth_s > tau_occ]
 c = exp(-r_pt / sigma_pt)
 ```
 
-然后对支持集做 trimmed mean：
+然后对支持集做 trimmed mean，并在存在 attention prior 时额外计算一个 attention-aware 的加权一致性：
 
 ```text
-C_stat = TrimMean_s c(t, s, u)
+C_stat_geom = TrimMean_s c(t, s, u)
+C_stat_attn = WeightedMean_s c(t, s, u)
+C_stat = (1-w_attn) * C_stat_geom + w_attn * C_stat_attn
 ```
 
 实现细节：
@@ -176,6 +186,7 @@ C_stat = TrimMean_s c(t, s, u)
 - 不乘 confidence 权重
 - 仅通过 `conf_floor` 排除低可信 pair
 - 使用 `_trimmed_mean(...)` 做鲁棒聚合
+- 若有 `attn_dynamic_patch`，则会把“当前帧和支持帧都更静态”的位置赋予更高的 consistency 权重
 
 ### 6.2 `C_occ`
 
@@ -205,24 +216,22 @@ C_unc = (1 - unc_conf_weight) * unc_support + unc_conf_weight * unc_conf
 
 ### 6.4 `C_dyn`
 
-当前实现与设计稿保持同一结构：
+当前实现与设计稿保持同一结构，但会额外融合 attention 动态证据：
 
 ```text
-C_dyn = clip(alpha_1 * (1 - C_stat) + alpha_2 * C_bdry - alpha_3 * C_occ, 0, 1)
+C_dyn_geom = clip(alpha_1 * (1 - C_stat) + alpha_2 * C_bdry - alpha_3 * C_occ, 0, 1)
+C_dyn = (1-w_dyn_attn) * C_dyn_geom + w_dyn_attn * (M_attn * (1-C_unc))
 ```
 
 但实际代码里：
 
 - `alpha_2` 对应的边界项还没有实现
-- 当前等价于：
-
-```text
-C_dyn = clip(alpha_1 * (1 - C_stat) - alpha_3 * C_occ, 0, 1)
-```
+- `M_attn` 来自 `attn_dynamic_patch` 双线性上采样到 pixel grid 后的动态先验
 
 因此它的含义更接近：
 
 - “几何静态一致性不足”
+- “并且 transformer attention 也觉得这里更像时序不稳定区域”
 - 但“又不完全能被遮挡解释”
 
 而不是一个纯粹的“运动物体显著图”。
@@ -363,4 +372,3 @@ G_write_geo = sigmoid(z_geo)
 若要看可视化如何渲染，再看：
 
 - `inference_dynamic_cue_extractor.py`
-

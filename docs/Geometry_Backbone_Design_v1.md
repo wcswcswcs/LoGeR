@@ -279,6 +279,8 @@ Geometry Backbone 的输出建议显式拆成四部分：
 | pose | `T_w_c_m` | `[T, 4, 4]` | world-from-camera 位姿 |
 | geometry confidence | `Conf_geo_m` | `[T, H_p, W_p]` 或 `[T, H, W]` | 每像素几何置信度 |
 | optional world pointmap | `P_world_m` | `[T, H_p, W_p, 3]` | 若方便，可直接给世界坐标点图 |
+| frame attention prior（可选） | `A_frame_m` | `[T, T]` | decoder attention 汇总得到的 frame-level 亲和度 |
+| patch dynamic prior（可选） | `M_attn_patch_m` | `[T, H_tok, W_tok]` | decoder attention 汇总得到的 patch-level dynamicness |
 | patch grid size | `PatchShape_m` | `[2]` | `H_tok, W_tok` |
 | geometry debug bundle | `Dbg_geo_m` | struct | 可选 debug 信息 |
 
@@ -308,6 +310,8 @@ $$
 - `PatchMeta`
 - `TokenType`
 - `TokenOrderId`
+
+如果启用了 attention-prior 导出，那么 `A_frame_m / M_attn_patch_m` 也会成为 Stage B 的额外输入，用来做 support ranking 和动态证据融合；它们不会改变 token 对齐顺序，但会影响后续写入先验的估计质量。
 
 这三项决定 `A_tok` 是否能和当前 chunk 的 token 序列严格对齐。
 
