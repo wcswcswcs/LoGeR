@@ -131,6 +131,7 @@ class WriteCacheOutput:
     w0_provisional: List[Optional[torch.Tensor]]
     w1_provisional: List[Optional[torch.Tensor]]
     w2_provisional: List[Optional[torch.Tensor]]
+    history_provisional: Optional[List[Optional[Dict[str, torch.Tensor]]]] = None
 
     # Token alignment info (duplicated from GeometryOutput for self-containment)
     num_frames: int = 0
@@ -347,34 +348,67 @@ class LoGeRGeometryBackbone:
     # -- Inference ---------------------------------------------------------
 
     def reset_ttt_state(self) -> None:
-        """Clear the internally tracked TTT fast weights."""
+        """Clear the internally tracked adaptive state (TTT + SWA)."""
         self._ttt_state = None
 
     def get_ttt_state(self) -> Optional[Dict[str, Any]]:
-        """Return a shallow copy of the internal TTT state, if any."""
+        """Return a shallow copy of the internal adaptive state, if any."""
         if self._ttt_state is None:
             return None
-        return {
+        state = {
             "w0": list(self._ttt_state["w0"]),
             "w1": list(self._ttt_state["w1"]),
             "w2": list(self._ttt_state["w2"]),
         }
+        if "history" in self._ttt_state:
+            state["history"] = self._copy_history_state(self._ttt_state["history"])
+        return state
+
+    def _copy_history_state(
+        self,
+        history: Optional[List[Optional[Dict[str, torch.Tensor]]]],
+    ) -> Optional[List[Optional[Dict[str, torch.Tensor]]]]:
+        if history is None:
+            return None
+        copied: List[Optional[Dict[str, torch.Tensor]]] = []
+        for entry in history:
+            if entry is None:
+                copied.append(None)
+            else:
+                copied.append({
+                    "k": entry["k"].clone(),
+                    "v": entry["v"].clone(),
+                })
+        return copied
 
     def _move_ttt_state_to_device(
         self,
         ttt_state: Optional[Dict[str, Any]],
     ) -> Optional[Dict[str, Any]]:
-        """Move a TTT state dict to the backbone device."""
+        """Move an adaptive state dict to the backbone device."""
         if ttt_state is None:
             return None
-        return {
-            "w0": [x.to(self.device, dtype=self.dtype) if x is not None else None for x in ttt_state["w0"]],
-            "w1": [x.to(self.device, dtype=self.dtype) if x is not None else None for x in ttt_state["w1"]],
-            "w2": [x.to(self.device, dtype=self.dtype) if x is not None else None for x in ttt_state["w2"]],
+        moved = {
+            "w0": [x.to(self.device) if x is not None else None for x in ttt_state["w0"]],
+            "w1": [x.to(self.device) if x is not None else None for x in ttt_state["w1"]],
+            "w2": [x.to(self.device) if x is not None else None for x in ttt_state["w2"]],
         }
+        history = ttt_state.get("history")
+        if history is not None:
+            moved_history: List[Optional[Dict[str, torch.Tensor]]] = []
+            for entry in history:
+                if entry is None:
+                    moved_history.append(None)
+                else:
+                    moved_history.append({
+                        "k": entry["k"].to(self.device),
+                        "v": entry["v"].to(self.device),
+                    })
+            moved["history"] = moved_history
+        return moved
 
     def _extract_ttt_state(self, raw: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Extract provisional fast weights from raw model output."""
+        """Extract provisional adaptive state from raw model output."""
         ttt_info = raw.get("ttt_output_info")
         if not ttt_info:
             return None
@@ -385,11 +419,24 @@ class LoGeRGeometryBackbone:
         if w0 is None or w1 is None or w2 is None:
             return None
 
-        return {
+        state = {
             "w0": [x.detach().cpu() if x is not None else None for x in w0],
             "w1": [x.detach().cpu() if x is not None else None for x in w1],
             "w2": [x.detach().cpu() if x is not None else None for x in w2],
         }
+        history = ttt_info.get("history")
+        if history is not None:
+            history_cpu: List[Optional[Dict[str, torch.Tensor]]] = []
+            for entry in history:
+                if entry is None:
+                    history_cpu.append(None)
+                else:
+                    history_cpu.append({
+                        "k": entry["k"].detach().cpu(),
+                        "v": entry["v"].detach().cpu(),
+                    })
+            state["history"] = history_cpu
+        return state
 
     @torch.no_grad()
     def run(
@@ -406,9 +453,9 @@ class LoGeRGeometryBackbone:
         images:
             ``[T, 3, H, W]`` float32 tensor (values in [0, 1]).
         ttt_state:
-            External TTT fast weights (W_m) to use.  Dict with keys
-            ``"w0"``, ``"w1"``, ``"w2"`` — lists of per-layer tensors.
-            When ``None`` the model's default initial weights are used.
+            External adaptive state to use. Dict with keys ``"w0"``,
+            ``"w1"``, ``"w2"`` and optional ``"history"`` for the SWA KV
+            cache. When ``None`` the model's default initial states are used.
         cache_ttt_primitives:
             If True, return a ``WriteCacheOutput`` alongside the
             ``GeometryOutput``.  The cache contains everything needed
@@ -429,7 +476,6 @@ class LoGeRGeometryBackbone:
         if images.dim() == 4:
             images = images.unsqueeze(0)
 
-        images = images.to(self.device)
         T = images.shape[1]
         H, W = images.shape[3], images.shape[4]
         patch_h, patch_w = H // PATCH_SIZE, W // PATCH_SIZE
@@ -447,6 +493,10 @@ class LoGeRGeometryBackbone:
         if ttt_state_input is not None:
             fwd_kwargs["ttt_state_input"] = self._move_ttt_state_to_device(ttt_state_input)
 
+        # Keep the full sequence on CPU by default. Pi3.forward() already
+        # slices by internal windows and moves each window to the model device,
+        # which dramatically lowers peak GPU memory while preserving the
+        # original window-loop semantics.
         with torch.cuda.amp.autocast(
             enabled=torch.cuda.is_available(), dtype=self.dtype
         ):
@@ -479,6 +529,7 @@ class LoGeRGeometryBackbone:
         w0_prov: List[Optional[torch.Tensor]] = []
         w1_prov: List[Optional[torch.Tensor]] = []
         w2_prov: List[Optional[torch.Tensor]] = []
+        history_prov: Optional[List[Optional[Dict[str, torch.Tensor]]]] = None
 
         if ttt_info is not None:
             write_caches = ttt_info.get("write_cache", [])
@@ -518,11 +569,24 @@ class LoGeRGeometryBackbone:
                     if ttt_info["w2"][li] is not None else None
                 )
 
+            history = ttt_info.get("history")
+            if history is not None:
+                history_prov = []
+                for entry in history:
+                    if entry is None:
+                        history_prov.append(None)
+                    else:
+                        history_prov.append({
+                            "k": entry["k"].detach().cpu(),
+                            "v": entry["v"].detach().cpu(),
+                        })
+
         return WriteCacheOutput(
             layer_caches=layer_caches,
             w0_provisional=w0_prov,
             w1_provisional=w1_prov,
             w2_provisional=w2_prov,
+            history_provisional=history_prov,
             num_frames=T,
             patch_grid=(patch_h, patch_w),
             num_ttt_layers=len(layer_caches),

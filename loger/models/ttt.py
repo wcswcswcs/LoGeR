@@ -1,6 +1,7 @@
 # LaCT
 
 import math
+import os
 from einops import rearrange
 import torch
 import torch.nn as nn
@@ -10,6 +11,11 @@ import collections
 
 
 TTTOperator = collections.namedtuple("TTTOperator", ["start", "end", "update", "apply"])
+
+
+def _compile_ttt_enabled() -> bool:
+    flag = os.getenv("LOGER_TTT_DISABLE_COMPILE", "").strip().lower()
+    return flag not in {"1", "true", "yes", "on"}
 
 
 def inv_softplus(x):
@@ -31,8 +37,7 @@ def silu_backprop(dy: torch.Tensor, x: torch.Tensor):
     return dx
 
 
-@torch.compile
-def zeropower_via_newtonschulz5(G, steps):
+def zeropower_via_newtonschulz5_impl(G, steps):
     """
     modified from https://github.com/MoonshotAI/Moonlight/blob/master/examples/toy_train.py#L49
     Major change: G is [b, d, d] rather than [d, d]
@@ -71,8 +76,7 @@ def zeropower_via_newtonschulz5(G, steps):
 
 
 
-@torch.compile
-def fast_weight_swish_glu_weight_norm_mini_batch_apply(
+def fast_weight_swish_glu_weight_norm_mini_batch_apply_impl(
     w0: torch.Tensor,
     w1: torch.Tensor,
     w2: torch.Tensor,
@@ -163,6 +167,18 @@ def fast_weight_swish_glu_weight_norm_mini_batch_apply(
     output = torch.cat(output, dim=1)
 
     return output, w0, w1, w2
+
+
+if _compile_ttt_enabled():
+    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5_impl)
+    fast_weight_swish_glu_weight_norm_mini_batch_apply = torch.compile(
+        fast_weight_swish_glu_weight_norm_mini_batch_apply_impl
+    )
+else:
+    zeropower_via_newtonschulz5 = zeropower_via_newtonschulz5_impl
+    fast_weight_swish_glu_weight_norm_mini_batch_apply = (
+        fast_weight_swish_glu_weight_norm_mini_batch_apply_impl
+    )
 
 
 def fast_weight_replay_update(

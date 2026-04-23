@@ -1269,7 +1269,11 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         sim3_scale_mode = kwargs.pop('sim3_scale_mode', 'median')
         cache_ttt_primitives = kwargs.pop('cache_ttt_primitives', False)
         return_ttt_state = kwargs.pop('return_ttt_state', False)
+        offload_adaptive_state_to_cpu = kwargs.pop('offload_adaptive_state_to_cpu', False)
         ttt_state_input = kwargs.pop('ttt_state_input', None)
+        swa_state_input = None
+        if isinstance(ttt_state_input, dict):
+            swa_state_input = ttt_state_input.get("history")
 
         if sim3 and se3:
             raise ValueError("'sim3' and 'se3' alignments are mutually exclusive; enable only one.")
@@ -1332,8 +1336,17 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         else:
             w0 = w1 = w2 = None
 
-        # Prepare SWA history states across windows
-        swa_history = [None] * len(self.attn_insert_after) if self.swa_layers is not None else None
+        # Prepare SWA history states across windows. When chunked inference is
+        # driven externally, we can resume the KV cache from the previous chunk
+        # through ``ttt_state_input['history']`` so the behavior matches the
+        # original single-call window loop more closely.
+        if self.swa_layers is not None:
+            if swa_state_input is not None:
+                swa_history = swa_state_input
+            else:
+                swa_history = [None] * len(self.attn_insert_after)
+        else:
+            swa_history = None
 
         def reset_adaptive_states():
             """Reset fast-weight TTT states only; SWA history is preserved across resets."""
@@ -1342,6 +1355,31 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 w0 = [None] * len(self.ttt_insert_after)
                 w1 = [None] * len(self.ttt_insert_after)
                 w2 = [None] * len(self.ttt_insert_after)
+
+        def _move_weight_state(state_list, device):
+            if state_list is None:
+                return None
+            moved = []
+            for item in state_list:
+                if item is None:
+                    moved.append(None)
+                else:
+                    moved.append(item.to(device))
+            return moved
+
+        def _move_history_state(history_list, device):
+            if history_list is None:
+                return None
+            moved = []
+            for entry in history_list:
+                if entry is None:
+                    moved.append(None)
+                else:
+                    moved.append({
+                        "k": entry["k"].to(device),
+                        "v": entry["v"].to(device),
+                    })
+            return moved
 
         all_predictions = []
         all_gate_scales: List[torch.Tensor] = []
@@ -1359,6 +1397,32 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             # Initialize to satisfy static analyzers; will be set inside decode loop
             hidden = None  # type: ignore[assignment]
             pos = None     # type: ignore[assignment]
+            ttt_output_info = None
+            decode_avg_gate_scale = None
+            decode_avg_attn_gate_scale = None
+            _decode_gate_scales = None
+            frame_attention_prior = None
+            attn_dynamic_patch = None
+            dyn4d_patch = None
+            dyn4d_qq_mean_patch = None
+            dyn4d_qk_var_patch = None
+            dyn4d_kk_mean_patch = None
+            global_q_raw_patchvec = None
+            global_k_raw_patchvec = None
+            global_q_raw_patchvec_layers = None
+            global_k_raw_patchvec_layers = None
+            dyn4d_global_layer_ids = None
+            frame_attn_cosine_shallow = None
+            frame_attn_cosine_deep = None
+            frame_attn_cosine_avg = None
+            frame_attn_key_cosine_l0 = None
+            frame_attn_key_cosine_l4 = None
+            frame_attn_key_cosine_shallow = None
+            frame_attn_key_cosine_deep = None
+            frame_attn_key_cosine_avg = None
+            frame_attn_cosine_query_layers = None
+            frame_attn_cosine_key_layers = None
+            frame_attn_cosine_layer_ids = None
 
             for _ in range(num_iterations):
                 if self.ttt_layers is not None and w0 is None:
@@ -1368,6 +1432,14 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
 
                 if self.swa_layers is not None and swa_history is None:
                     swa_history = [None] * len(self.attn_insert_after)
+
+                if offload_adaptive_state_to_cpu:
+                    if self.ttt_layers is not None:
+                        w0 = _move_weight_state(w0, self.image_mean.device)
+                        w1 = _move_weight_state(w1, self.image_mean.device)
+                        w2 = _move_weight_state(w2, self.image_mean.device)
+                    if self.swa_layers is not None:
+                        swa_history = _move_history_state(swa_history, self.image_mean.device)
 
                 imgs_flat = imgs_w.reshape(B * Nw, C, H, W)
                 hidden_input = self.encoder(imgs_flat, is_training=True)
@@ -1422,6 +1494,14 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 # TODO: get the updated history from the swa layer
                 if ttt_output_info is not None:
                     swa_history = ttt_output_info.get("history", swa_history)
+
+                if offload_adaptive_state_to_cpu:
+                    if self.ttt_layers is not None:
+                        w0 = _move_weight_state(w0, "cpu")
+                        w1 = _move_weight_state(w1, "cpu")
+                        w2 = _move_weight_state(w2, "cpu")
+                    if self.swa_layers is not None:
+                        swa_history = _move_history_state(swa_history, "cpu")
 
             # If for some reason decoding didn't produce hidden (e.g., empty window), skip this window
             if hidden is None:
@@ -1532,6 +1612,33 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 _window_end=end_idx,
             )
             all_predictions.append(pred_dict)
+
+            if not self.training:
+                del imgs_w, imgs_flat, hidden_input, hidden, pos
+                del point_hidden, conf_hidden, camera_hidden, global_camera_hidden
+                del local_points, conf, camera_poses, points
+                del decode_avg_gate_scale, decode_avg_attn_gate_scale, _decode_gate_scales
+                del frame_attention_prior, attn_dynamic_patch
+                del dyn4d_patch, dyn4d_qq_mean_patch, dyn4d_qk_var_patch, dyn4d_kk_mean_patch
+                del global_q_raw_patchvec, global_k_raw_patchvec
+                del global_q_raw_patchvec_layers, global_k_raw_patchvec_layers
+                del dyn4d_global_layer_ids
+                del frame_attn_cosine_shallow, frame_attn_cosine_deep, frame_attn_cosine_avg
+                del frame_attn_key_cosine_l0, frame_attn_key_cosine_l4
+                del frame_attn_key_cosine_shallow, frame_attn_key_cosine_deep, frame_attn_key_cosine_avg
+                del frame_attn_cosine_query_layers, frame_attn_cosine_key_layers, frame_attn_cosine_layer_ids
+                if metric_hidden is not None:
+                    del metric_hidden
+                if camera_qvec is not None:
+                    del camera_qvec
+                if local_camera_poses is not None:
+                    del local_camera_poses
+                if local_camera_qvec is not None:
+                    del local_camera_qvec
+                if metric is not None:
+                    del metric
+                if offload_adaptive_state_to_cpu:
+                    torch.cuda.empty_cache()
 
         # Merge windowed predictions
         # When reset is enabled but explicit Sim3/SE3 alignment is off, keep each reset block

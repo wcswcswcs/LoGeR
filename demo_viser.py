@@ -13,12 +13,13 @@ import cv2
 from PIL import Image
 from torchvision import transforms
 from natsort import natsorted
-from typing import List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from pathlib import Path
 from loger.utils.rotation import mat_to_quat
 from loger.utils.geometry import depth_edge
 from loger.models.pi3 import Pi3
+from loger.pipeline.geometry_backbone import LoGeRGeometryBackbone, GeometryOutput
 from loger.utils.viser_utils import viser_wrapper
 
 
@@ -125,6 +126,18 @@ parser.add_argument("--canonical_first_frame", action="store_true", default=True
 parser.add_argument("--no_canonical_first_frame", action="store_false", dest='canonical_first_frame', help="Do not use first frame as canonical frame.")
 parser.add_argument("--warmup", action="store_true", help="Run a warmup inference pass to trigger torch.compile before timing.")
 parser.add_argument("--benchmark", action="store_true", help="Run multiple inference passes and report timing statistics.")
+parser.add_argument(
+    "--preload_images_to_gpu",
+    action="store_true",
+    help="Preload the entire preprocessed image tensor to GPU before inference. "
+         "Disabled by default so Pi3 can stream each internal window from CPU to GPU and reduce peak memory.",
+)
+parser.add_argument(
+    "--external_exact_windows",
+    action="store_true",
+    help="Run the verified low-memory external-exact window orchestrator instead of Pi3's internal full-sequence loop. "
+         "Useful for long sequences such as KITTI-00 LoGeR* on 22GB GPUs.",
+)
 
 def load_pi3_model(model_name: str, config_path: Optional[str] = None, pi3x: bool = False, pi3x_metric: bool = True):
     """Initializes the Pi3 model and loads weights."""
@@ -221,6 +234,182 @@ def load_pi3_model(model_name: str, config_path: Optional[str] = None, pi3x: boo
     return model
 
 
+def _split_into_chunks(total_frames: int, chunk_size: int, overlap: int = 0) -> List[Tuple[int, int]]:
+    if chunk_size <= 0 or chunk_size >= total_frames:
+        return [(0, total_frames)]
+    chunks: List[Tuple[int, int]] = []
+    step = max(chunk_size - overlap, 1)
+    for start in range(0, total_frames, step):
+        end = min(start + chunk_size, total_frames)
+        chunks.append((start, end))
+        if end == total_frames:
+            break
+    return chunks
+
+
+def _rebuild_batched_raw_window_from_geo(
+    geo: GeometryOutput,
+    start: int,
+    end: int,
+) -> Dict[str, Any]:
+    raw: Dict[str, Any] = {}
+    keep_keys = {
+        "points",
+        "local_points",
+        "conf",
+        "camera_poses",
+        "local_camera_poses",
+        "camera_qvec",
+        "local_camera_qvec",
+        "metric",
+        "frame_attention_prior",
+        "attn_dynamic_patch",
+        "dyn4d_patch",
+        "dyn4d_qq_mean_patch",
+        "dyn4d_qk_var_patch",
+        "dyn4d_kk_mean_patch",
+        "global_q_raw_patchvec",
+        "global_k_raw_patchvec",
+        "global_q_raw_patchvec_layers",
+        "global_k_raw_patchvec_layers",
+        "frame_attn_cosine_shallow",
+        "frame_attn_cosine_deep",
+        "frame_attn_cosine_avg",
+        "frame_attn_key_cosine_l0",
+        "frame_attn_key_cosine_l4",
+        "frame_attn_key_cosine_shallow",
+        "frame_attn_key_cosine_deep",
+        "frame_attn_key_cosine_avg",
+        "frame_attn_cosine_query_layers",
+        "frame_attn_cosine_key_layers",
+    }
+    for key, value in geo.raw_predictions.items():
+        if key not in keep_keys or value is None or not torch.is_tensor(value):
+            continue
+        raw[key] = value.unsqueeze(0)
+    raw["_window_start"] = int(start)
+    raw["_window_end"] = int(end)
+    return raw
+
+
+def _merge_external_window_predictions_demo(
+    model: Pi3,
+    windows_raw: List[Dict[str, Any]],
+    *,
+    window_size: int,
+    overlap_size: int,
+    reset_every: int,
+    sim3: bool,
+    sim3_scale_mode: str,
+    se3: bool,
+) -> Dict[str, Any]:
+    model._last_window_size = window_size
+    model._last_overlap_size = overlap_size
+
+    align_on_resets_without_explicit_pose = reset_every > 0 and not sim3 and not se3
+    if sim3:
+        return model._merge_windowed_predictions_sim3(
+            windows_raw,
+            allow_scale=True,
+            scale_mode=sim3_scale_mode,
+        )
+    if se3 or align_on_resets_without_explicit_pose:
+        return model._merge_windowed_predictions_sim3(
+            windows_raw,
+            allow_scale=False,
+            reset_every=reset_every,
+            reuse_transform_within_reset_block=align_on_resets_without_explicit_pose,
+        )
+    return model._merge_windowed_predictions(
+        windows_raw,
+        window_size,
+        overlap_size,
+    )
+
+
+def run_external_exact_inference(
+    model_obj: Pi3,
+    images_tensor: torch.Tensor,
+    *,
+    device: str,
+    dtype: torch.dtype,
+    forward_kwargs: Dict[str, Any],
+) -> Dict[str, Any]:
+    window_size = int(forward_kwargs.get("window_size", -1))
+    overlap_size = int(forward_kwargs.get("overlap_size", 0))
+    reset_every = int(forward_kwargs.get("reset_every", 0))
+    sim3 = bool(forward_kwargs.get("sim3", False))
+    se3 = bool(forward_kwargs.get("se3", False))
+    sim3_scale_mode = forward_kwargs.get("sim3_scale_mode", "median")
+    num_iterations = int(forward_kwargs.get("num_iterations", 1))
+    turn_off_ttt = bool(forward_kwargs.get("turn_off_ttt", False))
+    turn_off_swa = bool(forward_kwargs.get("turn_off_swa", False))
+
+    if window_size <= 0:
+        raise ValueError("--external_exact_windows requires window_size > 0")
+
+    backbone = LoGeRGeometryBackbone(
+        model_obj,
+        device=device,
+        dtype=dtype,
+        window_size=window_size,
+        overlap_size=overlap_size,
+        reset_every=reset_every,
+        se3=se3,
+        sim3=sim3,
+        sim3_scale_mode=sim3_scale_mode,
+        turn_off_ttt=turn_off_ttt,
+        turn_off_swa=turn_off_swa,
+        edge_rtol=0.0,
+        update_ttt_weights=True,
+    )
+
+    chunks = _split_into_chunks(images_tensor.shape[0], window_size, overlap_size)
+    ttt_state: Optional[Dict[str, Any]] = None
+    windows_raw: List[Dict[str, Any]] = []
+
+    for ci, (start, end) in enumerate(chunks):
+        if reset_every > 0 and ci > 0 and ci % reset_every == 0 and ttt_state is not None:
+            preserved_history = ttt_state.get("history")
+            ttt_state = {
+                "w0": [None] * len(ttt_state.get("w0", [])),
+                "w1": [None] * len(ttt_state.get("w1", [])),
+                "w2": [None] * len(ttt_state.get("w2", [])),
+            }
+            if preserved_history is not None:
+                ttt_state["history"] = preserved_history
+
+        geo = backbone.run(
+            images_tensor[start:end],
+            ttt_state=ttt_state,
+            cache_ttt_primitives=False,
+            window_size=window_size,
+            overlap_size=overlap_size,
+            reset_every=0,
+            num_iterations=num_iterations,
+            sim3=False,
+            se3=False,
+            turn_off_ttt=turn_off_ttt,
+            turn_off_swa=turn_off_swa,
+        )
+        windows_raw.append(_rebuild_batched_raw_window_from_geo(geo, start, end))
+        ttt_state = backbone.get_ttt_state()
+        del geo
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    return _merge_external_window_predictions_demo(
+        model_obj,
+        windows_raw,
+        window_size=window_size,
+        overlap_size=overlap_size,
+        reset_every=reset_every,
+        sim3=sim3,
+        sim3_scale_mode=sim3_scale_mode,
+        se3=se3,
+    )
+
+
 def run_core_inference(
     model_obj: Pi3,
     input_paths: List[str],
@@ -229,6 +418,9 @@ def run_core_inference(
     stride: int = 1,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     target_resolution: List[int] = [504, 280],
+    preload_images_to_gpu: bool = False,
+    external_exact_windows: bool = False,
+    forward_kwargs: Optional[Dict[str, Any]] = None,
 ):
     """
     Handles data preparation and runs the core model inference for Pi3.
@@ -271,14 +463,28 @@ def run_core_inference(
         
     print(f"Loading images from combined inputs ({len(all_image_names)} images found)...")
     # Use load_images_from_paths to load exactly the images we collected
-    images_tensor = load_images_from_paths(all_image_names, Target_W=target_resolution[0], Target_H=target_resolution[1]).to(device)
+    images_tensor = load_images_from_paths(all_image_names, Target_W=target_resolution[0], Target_H=target_resolution[1])
+    inference_images = images_tensor.to(device) if preload_images_to_gpu else images_tensor
     print(f"Preprocessed images tensor shape: {images_tensor.shape}")
+    if preload_images_to_gpu:
+        print("Preloading all input images to GPU before inference.")
+    else:
+        print("Keeping input images on CPU; Pi3 will stream internal windows to GPU.")
 
     print("Running inference...")    
     dtype = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability(device)[0] >= 8 else torch.float16
 
-    with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available(), dtype=dtype):
-        raw_model_predictions = model_obj(images_tensor[None]) # Add batch dimension
+    if external_exact_windows:
+        raw_model_predictions = run_external_exact_inference(
+            model_obj,
+            images_tensor,
+            device=device,
+            dtype=dtype,
+            forward_kwargs=forward_kwargs or {},
+        )
+    else:
+        with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available(), dtype=dtype):
+            raw_model_predictions = model_obj(inference_images[None]) # Add batch dimension
     
     # Post-process predictions
     raw_model_predictions['images'] = images_tensor[None].permute(0, 1, 3, 4, 2) # B, S, H, W, C
@@ -501,9 +707,15 @@ def main():
             
         print(f"Found {len(all_image_names_collected)} images to process.")
         if target_resolution is not None:
-            images_tensor = load_images_from_paths(all_image_names_collected, Target_W=target_resolution[0], Target_H=target_resolution[1]).to(device)
+            images_tensor = load_images_from_paths(all_image_names_collected, Target_W=target_resolution[0], Target_H=target_resolution[1])
         else:
-            images_tensor = load_images_from_paths(all_image_names_collected).to(device)
+            images_tensor = load_images_from_paths(all_image_names_collected)
+
+        inference_images = images_tensor.to(device) if args.preload_images_to_gpu else images_tensor
+        if args.preload_images_to_gpu:
+            print("Preloading all input images to GPU before inference.")
+        else:
+            print("Keeping input images on CPU; Pi3 will stream internal windows to GPU.")
         
         image_folder_for_sky = os.path.dirname(all_image_names_collected[0]) if all_image_names_collected else None
 
@@ -535,6 +747,7 @@ def main():
                     'se3': se3_value,
                     'turn_off_ttt': args.no_ttt,
                     'turn_off_swa': args.no_swa,
+                    'offload_adaptive_state_to_cpu': True,
                 })
                 print(f"Forward pass kwargs from config: {forward_kwargs}")
 
@@ -551,14 +764,24 @@ def main():
                 'pi3x_metric': args.pi3x_metric,
                 'se3': bool(args.se3) if args.se3 is not None else False,
                 'sim3_scale_mode': args.sim3_scale_mode,
-                'reset_every': args.reset_every if args.reset_every is not None else 0
+                'reset_every': args.reset_every if args.reset_every is not None else 0,
+                'offload_adaptive_state_to_cpu': True,
             })
 
         # Warmup run to trigger torch.compile (first run has compilation overhead)
         if args.warmup or args.benchmark:
             print("Running warmup inference (to trigger torch.compile)...")
-            with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available(), dtype=dtype):
-                _ = model(images_tensor[None], **forward_kwargs)
+            if args.external_exact_windows:
+                _ = run_external_exact_inference(
+                    model,
+                    images_tensor,
+                    device=device,
+                    dtype=dtype,
+                    forward_kwargs=forward_kwargs,
+                )
+            else:
+                with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available(), dtype=dtype):
+                    _ = model(inference_images[None], **forward_kwargs)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             print("Warmup complete.")
@@ -572,8 +795,17 @@ def main():
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 t_start = time.time()
-                with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available(), dtype=dtype):
-                    raw_model_predictions = model(images_tensor[None], **forward_kwargs)
+                if args.external_exact_windows:
+                    raw_model_predictions = run_external_exact_inference(
+                        model,
+                        images_tensor,
+                        device=device,
+                        dtype=dtype,
+                        forward_kwargs=forward_kwargs,
+                    )
+                else:
+                    with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available(), dtype=dtype):
+                        raw_model_predictions = model(inference_images[None], **forward_kwargs)
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 t_end = time.time()
@@ -600,8 +832,17 @@ def main():
                 torch.cuda.synchronize()
             inference_start_time = time.time()
             
-            with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available(), dtype=dtype):
-                raw_model_predictions = model(images_tensor[None], **forward_kwargs) # Add batch dimension
+            if args.external_exact_windows:
+                raw_model_predictions = run_external_exact_inference(
+                    model,
+                    images_tensor,
+                    device=device,
+                    dtype=dtype,
+                    forward_kwargs=forward_kwargs,
+                )
+            else:
+                with torch.no_grad(), torch.cuda.amp.autocast(enabled=torch.cuda.is_available(), dtype=dtype):
+                    raw_model_predictions = model(inference_images[None], **forward_kwargs) # Add batch dimension
 
             if torch.cuda.is_available():
                 torch.cuda.synchronize()

@@ -150,6 +150,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Run detector every N frames inside each chunk so late-appearing objects can be seeded.")
     p.add_argument("--max_thing_objects", type=int, default=15,
                    help="Max thing objects to track per chunk.")
+    p.add_argument("--sam31_max_movable_objects", type=int, default=2,
+                   help="For sam31_multiplex, max movable thing prompts tracked per chunk.")
+    p.add_argument("--sam31_max_static_objects", type=int, default=1,
+                   help="For sam31_multiplex, max static thing prompts tracked per chunk.")
+    p.add_argument("--sam31_max_structure_objects", type=int, default=1,
+                   help="For sam31_multiplex, max structure prompts tracked per chunk.")
 
     # Video
     p.add_argument("--fps", type=int, default=10)
@@ -326,9 +332,32 @@ def _build_chunk_seed_detections(
             "raw_label": label,
             "sem_group": sem_group,
             "area_ratio": area_ratio,
+            "is_seed_track": True,
         })
 
     return seed_dets
+
+
+def build_chunk_discovery_indices(
+    chunk_len: int,
+    ann_frame_idx: int,
+    discovery_frame_stride: int,
+    overlap: int,
+    chunk_idx: int,
+) -> Optional[List[int]]:
+    if chunk_len <= 0:
+        return None
+    if chunk_idx == 0 or overlap <= 0:
+        return None
+
+    start_idx = max(int(overlap), int(ann_frame_idx))
+    if start_idx >= chunk_len:
+        return [chunk_len - 1]
+
+    indices = list(range(start_idx, chunk_len, max(int(discovery_frame_stride), 1)))
+    if not indices:
+        return [start_idx]
+    return indices
 
 
 def _compute_track_match_score(
@@ -868,6 +897,9 @@ def main() -> None:
             ann_frame_idx=args.ann_frame_idx,
             discovery_frame_stride=args.discovery_frame_stride,
             max_thing_objects=args.max_thing_objects,
+            sam31_max_movable_objects=args.sam31_max_movable_objects,
+            sam31_max_static_objects=args.sam31_max_static_objects,
+            sam31_max_structure_objects=args.sam31_max_structure_objects,
         )
         if args.thing_prompts:
             frontend_kwargs["thing_prompts"] = [s.strip() for s in args.thing_prompts.split(",")]
@@ -911,8 +943,14 @@ def main() -> None:
         prev_chunk_output: Optional[MaskletOutput] = None
         prev_chunk_start: Optional[int] = None
         for ci, (start, end) in enumerate(chunks):
-            chunk_images = load_images(image_paths[start:end])
             seed_detections_by_frame = None
+            discovery_frame_indices = build_chunk_discovery_indices(
+                chunk_len=end - start,
+                ann_frame_idx=args.ann_frame_idx,
+                discovery_frame_stride=args.discovery_frame_stride,
+                overlap=args.chunk_overlap,
+                chunk_idx=ci,
+            )
             if (
                 prev_chunk_output is not None
                 and prev_chunk_start is not None
@@ -928,8 +966,9 @@ def main() -> None:
             print(f"# Chunk {ci}/{len(chunks) - 1}  frames [{start}, {end})")
             print(f"{'#' * 72}")
             chunk_t0 = time.time()
-            chunk_output = frontend.run(
-                chunk_images,
+            chunk_output = frontend.run_from_paths(
+                image_paths[start:end],
+                discovery_frame_indices=discovery_frame_indices,
                 seed_detections_by_frame=seed_detections_by_frame,
             )
             print(f"  Stage C chunk done in {time.time() - chunk_t0:.2f}s")
@@ -949,7 +988,6 @@ def main() -> None:
             )
             prev_chunk_output = chunk_output
             prev_chunk_start = start
-            del chunk_images
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 

@@ -35,6 +35,7 @@ import argparse
 import os
 import sys
 import time
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
@@ -68,6 +69,7 @@ from loger.pipeline.ttt_write_controller import (
     WriteResult,
     TTTWriteController,
 )
+from loger.utils.rotation import mat_to_quat, quat_to_mat
 
 from run_geometry_backbone_inference import (
     collect_image_paths as collect_image_paths_geo,
@@ -137,6 +139,377 @@ def split_into_chunks(
     return chunks
 
 
+def merge_chunk_tensor_tail_trim(
+    tensors: List[torch.Tensor], overlap: int,
+) -> Optional[torch.Tensor]:
+    """Merge external chunks by trimming the tail-overlap of every non-final
+    chunk. This is the closest match to the original long-context LoGeR
+    scheduling when ``chunk_overlap`` is aligned with ``overlap_size``."""
+    if not tensors:
+        return None
+
+    merged_parts: List[torch.Tensor] = []
+    num_chunks = len(tensors)
+    for i, tensor in enumerate(tensors):
+        trim = overlap if i < num_chunks - 1 else 0
+        if trim > 0:
+            if tensor.shape[0] <= trim:
+                continue
+            merged_parts.append(tensor[:-trim])
+        else:
+            merged_parts.append(tensor)
+
+    if not merged_parts:
+        return None
+    return torch.cat(merged_parts, dim=0)
+
+
+def _rebuild_batched_raw_window(
+    geo: GeometryOutput,
+    start: int,
+    end: int,
+) -> Dict[str, Any]:
+    """Rebuild a batched raw-prediction dict from ``GeometryOutput.raw_predictions``.
+
+    ``Pi3`` merge utilities expect tensors with a leading batch dimension.
+    ``GeometryOutput.raw_predictions`` stores the same tensors already moved to
+    CPU and squeezed along batch.  This helper restores ``[B=1, ...]`` layout
+    and injects the global window range so we can reuse the original merge code.
+    """
+    raw = {}
+    keep_keys = {
+        "points",
+        "local_points",
+        "conf",
+        "camera_poses",
+        "local_camera_poses",
+        "camera_qvec",
+        "local_camera_qvec",
+        "metric",
+        "frame_attention_prior",
+        "attn_dynamic_patch",
+        "dyn4d_patch",
+        "dyn4d_qq_mean_patch",
+        "dyn4d_qk_var_patch",
+        "dyn4d_kk_mean_patch",
+        "global_q_raw_patchvec",
+        "global_k_raw_patchvec",
+        "global_q_raw_patchvec_layers",
+        "global_k_raw_patchvec_layers",
+        "frame_attn_cosine_shallow",
+        "frame_attn_cosine_deep",
+        "frame_attn_cosine_avg",
+        "frame_attn_key_cosine_l0",
+        "frame_attn_key_cosine_l4",
+        "frame_attn_key_cosine_shallow",
+        "frame_attn_key_cosine_deep",
+        "frame_attn_key_cosine_avg",
+        "frame_attn_cosine_query_layers",
+        "frame_attn_cosine_key_layers",
+    }
+
+    for key, value in geo.raw_predictions.items():
+        if key not in keep_keys or value is None or not torch.is_tensor(value):
+            continue
+        raw[key] = value.unsqueeze(0)
+
+    raw["_window_start"] = int(start)
+    raw["_window_end"] = int(end)
+    return raw
+
+
+def _merge_external_window_predictions(
+    backbone: LoGeRGeometryBackbone,
+    windows_raw: List[Dict[str, Any]],
+    *,
+    window_size: int,
+    overlap_size: int,
+    reset_every: int,
+    se3: bool,
+) -> Dict[str, Any]:
+    """Merge externally scheduled windows using the original Pi3 helpers."""
+    model = backbone.model
+    model._last_window_size = window_size
+    model._last_overlap_size = overlap_size
+
+    align_on_resets_without_explicit_pose = reset_every > 0 and not se3
+    if se3 or align_on_resets_without_explicit_pose:
+        return model._merge_windowed_predictions_sim3(
+            windows_raw,
+            allow_scale=False,
+            reset_every=reset_every,
+            reuse_transform_within_reset_block=align_on_resets_without_explicit_pose,
+        )
+    return model._merge_windowed_predictions(
+        windows_raw,
+        window_size,
+        overlap_size,
+    )
+
+
+def run_geometry_eval_external_exact(
+    *,
+    backbone: LoGeRGeometryBackbone,
+    controller: TTTWriteController,
+    images_loger: torch.Tensor,
+    chunks: List[Tuple[int, int]],
+    args: argparse.Namespace,
+) -> GeometryOutput:
+    """Exact external window orchestrator for geometry-only parity checks.
+
+    Each external chunk is treated as one LoGeR window.  We keep the original
+    model math but move the sequence scheduling / reset logic out of
+    ``Pi3.forward`` and reuse Pi3's own merge utilities at the end.
+    """
+    if args.chunk_size <= 0:
+        raise ValueError("external exact geometry orchestrator requires chunk_size > 0")
+    if args.chunk_size != args.window_size or args.chunk_overlap != args.overlap_size:
+        raise ValueError(
+            "For exact parity, external chunking must match internal windowing: "
+            "chunk_size == window_size and chunk_overlap == overlap_size"
+        )
+
+    ttt_state: Optional[Dict[str, Any]] = None
+    window_raw_predictions: List[Dict[str, Any]] = []
+
+    for ci, (start, end) in enumerate(chunks):
+        print(f"\n{'#'*72}")
+        print(f"# Exact Geometry Window {ci}/{len(chunks)-1}  frames [{start}, {end})")
+        print(f"{'#'*72}")
+
+        if args.reset_every > 0 and ci > 0 and ci % args.reset_every == 0 and ttt_state is not None:
+            preserved_history = ttt_state.get("history")
+            ttt_state = {
+                "w0": [None] * len(ttt_state.get("w0", [])),
+                "w1": [None] * len(ttt_state.get("w1", [])),
+                "w2": [None] * len(ttt_state.get("w2", [])),
+            }
+            if preserved_history is not None:
+                ttt_state["history"] = preserved_history
+            print(f"  External reset_every triggered at window {ci}: cleared TTT fast weights, preserved SWA history")
+
+        chunk_loger = images_loger[start:end]
+
+        print("  Stage A: Geometry Backbone ...")
+        t0 = time.time()
+        use_controller_write_through = (
+            args.ttt_write_mode == "native" and args.native_write_through_controller
+        )
+        stage_a_result = backbone.run(
+            chunk_loger,
+            ttt_state=ttt_state,
+            cache_ttt_primitives=use_controller_write_through,
+            window_size=args.window_size,
+            overlap_size=args.overlap_size,
+            reset_every=0,
+            se3=False,
+        )
+        if use_controller_write_through:
+            geo, write_cache = stage_a_result
+        else:
+            geo = stage_a_result
+            write_cache = None
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        print(f"    done in {time.time() - t0:.2f}s")
+        print_geometry_output(geo)
+
+        window_raw_predictions.append(_rebuild_batched_raw_window(geo, start, end))
+
+        if use_controller_write_through:
+            print("  Stage E: TTT Write Controller (native write-through) ...")
+            t0 = time.time()
+            assert write_cache is not None
+            wr = controller.run(
+                write_cache,
+                A_tok=None,
+                B_chunk_geo=None,
+                device=args.device,
+            )
+            print(f"    done in {time.time() - t0:.2f}s")
+            print_write_result(wr)
+
+            ttt_state = {"w0": wr.w0, "w1": wr.w1, "w2": wr.w2}
+            if wr.history is not None:
+                ttt_state["history"] = wr.history
+        else:
+            ttt_state = backbone.get_ttt_state()
+            print("  Stage E: skipped (native write-through from Stage A state)")
+
+        del geo, write_cache
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    merged_raw = _merge_external_window_predictions(
+        backbone,
+        window_raw_predictions,
+        window_size=args.window_size,
+        overlap_size=args.overlap_size,
+        reset_every=args.reset_every,
+        se3=bool(args.se3),
+    )
+
+    T = images_loger.shape[0]
+    H = images_loger.shape[2]
+    W = images_loger.shape[3]
+    patch_h, patch_w = H // 14, W // 14
+    return backbone._postprocess(
+        merged_raw,
+        images_loger.unsqueeze(0),
+        T,
+        H,
+        W,
+        patch_h,
+        patch_w,
+    )
+
+
+def build_timestamps_for_output(image_paths: List[str], input_path: str) -> List[float]:
+    """Best-effort timestamp loader, matching demo_viser.py behavior."""
+    input_rgb_dir = Path(input_path)
+    if input_rgb_dir.is_file():
+        return [float(i) for i in range(len(image_paths))]
+
+    rgb_txt_path = input_rgb_dir.parent / "rgb.txt"
+    if rgb_txt_path.exists():
+        name_to_ts: Dict[str, float] = {}
+        with open(rgb_txt_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split()
+                if len(parts) < 2:
+                    continue
+                try:
+                    ts = float(parts[0])
+                except ValueError:
+                    continue
+                name_to_ts[Path(parts[1]).name] = ts
+        ts_list = [name_to_ts.get(Path(p).name, None) for p in image_paths]
+        if all(t is not None for t in ts_list):
+            return [float(t) for t in ts_list]
+
+    timestamps_txt = input_rgb_dir / "timestamps.txt"
+    if timestamps_txt.exists():
+        with open(timestamps_txt, "r") as f:
+            raw_lines = [l.strip() for l in f.readlines()
+                         if l.strip() and not l.strip().startswith("#")]
+        ts_list: List[float] = []
+        for i in range(min(len(raw_lines), len(image_paths))):
+            try:
+                ts_list.append(float(raw_lines[i]))
+            except ValueError:
+                ts_list.append(float(i))
+        for i in range(len(ts_list), len(image_paths)):
+            ts_list.append(float(i))
+        return ts_list
+
+    return [float(i) for i in range(len(image_paths))]
+
+
+def write_trajectory_txt(
+    output_path: Path,
+    timestamps: List[float],
+    translations: List[List[float]],
+    quaternions: List[List[float]],
+) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        f.write("# timestamp tx ty tz qx qy qz qw\n")
+        for ts, t, q in zip(timestamps, translations, quaternions):
+            f.write(
+                f"{ts:.6f} {t[0]:.6f} {t[1]:.6f} {t[2]:.6f} "
+                f"{q[0]:.6f} {q[1]:.6f} {q[2]:.6f} {q[3]:.6f}\n"
+            )
+
+
+def _average_pose_transforms(transforms: torch.Tensor) -> torch.Tensor:
+    """Average SE(3) transforms from a small set of candidates."""
+    if transforms.shape[0] == 1:
+        return transforms[0]
+
+    rotations = transforms[:, :3, :3]
+    translations = transforms[:, :3, 3]
+    quats = mat_to_quat(rotations)
+    ref = quats[0:1]
+    sign = torch.sign((quats * ref).sum(dim=-1, keepdim=True))
+    sign[sign == 0] = 1
+    quats = quats * sign
+    quat_mean = quats.mean(dim=0)
+    quat_mean = quat_mean / quat_mean.norm().clamp_min(1e-8)
+
+    out = torch.eye(4, dtype=transforms.dtype)
+    out[:3, :3] = quat_to_mat(quat_mean)
+    out[:3, 3] = translations.mean(dim=0)
+    return out
+
+
+def align_chunk_geometry_outputs(
+    chunks: List[GeometryOutput], overlap: int,
+) -> List[GeometryOutput]:
+    """Align each later chunk to the previous chunk using shared overlap poses."""
+    if len(chunks) <= 1 or overlap <= 0:
+        return chunks
+
+    aligned: List[GeometryOutput] = [chunks[0]]
+    for curr in chunks[1:]:
+        prev = aligned[-1]
+        ov = min(overlap, prev.camera_poses.shape[0], curr.camera_poses.shape[0])
+        if ov <= 0:
+            aligned.append(curr)
+            continue
+
+        prev_poses = prev.camera_poses[-ov:]
+        curr_poses = curr.camera_poses[:ov]
+        correction_candidates = torch.matmul(prev_poses, torch.linalg.inv(curr_poses))
+        correction = _average_pose_transforms(correction_candidates)
+
+        new_cam = torch.matmul(correction.unsqueeze(0), curr.camera_poses)
+
+        world = curr.world_points
+        flat = world.reshape(-1, 3)
+        ones = torch.ones(flat.shape[0], 1, dtype=flat.dtype)
+        homog = torch.cat([flat, ones], dim=-1)
+        transformed = (homog @ correction.T)[..., :3].reshape_as(world)
+
+        aligned.append(GeometryOutput(
+            local_points=curr.local_points,
+            world_points=transformed,
+            camera_poses=new_cam,
+            confidence=curr.confidence,
+            patch_meta=curr.patch_meta,
+            token_type=curr.token_type,
+            frame_attention_prior=curr.frame_attention_prior,
+            attn_dynamic_patch=curr.attn_dynamic_patch,
+            dyn4d_patch=curr.dyn4d_patch,
+            dyn4d_qq_mean_patch=curr.dyn4d_qq_mean_patch,
+            dyn4d_qk_var_patch=curr.dyn4d_qk_var_patch,
+            dyn4d_kk_mean_patch=curr.dyn4d_kk_mean_patch,
+            global_q_raw_patchvec=curr.global_q_raw_patchvec,
+            global_k_raw_patchvec=curr.global_k_raw_patchvec,
+            global_q_raw_patchvec_layers=curr.global_q_raw_patchvec_layers,
+            global_k_raw_patchvec_layers=curr.global_k_raw_patchvec_layers,
+            dyn4d_global_layer_ids=curr.dyn4d_global_layer_ids,
+            frame_attn_cosine_shallow=curr.frame_attn_cosine_shallow,
+            frame_attn_cosine_deep=curr.frame_attn_cosine_deep,
+            frame_attn_cosine_avg=curr.frame_attn_cosine_avg,
+            frame_attn_key_cosine_l0=curr.frame_attn_key_cosine_l0,
+            frame_attn_key_cosine_l4=curr.frame_attn_key_cosine_l4,
+            frame_attn_key_cosine_shallow=curr.frame_attn_key_cosine_shallow,
+            frame_attn_key_cosine_deep=curr.frame_attn_key_cosine_deep,
+            frame_attn_key_cosine_avg=curr.frame_attn_key_cosine_avg,
+            frame_attn_cosine_query_layers=curr.frame_attn_cosine_query_layers,
+            frame_attn_cosine_key_layers=curr.frame_attn_cosine_key_layers,
+            frame_attn_cosine_layer_ids=curr.frame_attn_cosine_layer_ids,
+            num_frames=curr.num_frames,
+            pointmap_resolution=curr.pointmap_resolution,
+            patch_grid=curr.patch_grid,
+            raw_predictions=curr.raw_predictions,
+        ))
+    return aligned
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -149,10 +522,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--input", required=True, help="Image folder or video file.")
     p.add_argument("--output_video", default="results/pipeline_full.mp4")
     p.add_argument("--output_pt", default=None, help="Save outputs as .pt file.")
+    p.add_argument("--output_txt", default=None, help="Save merged camera trajectory in TUM format.")
     p.add_argument("--save_frames", default=None)
     p.add_argument("--start_frame", type=int, default=0)
     p.add_argument("--end_frame", type=int, default=-1)
     p.add_argument("--stride", type=int, default=1)
+    p.add_argument("--geometry_eval_mode", action="store_true",
+                   help="Geometry-only evaluation mode: skip Stages B/C/D and export merged Stage-A trajectory/results.")
 
     # -- Chunk scheduling ---------------------------------------------------
     p.add_argument("--chunk_size", type=int, default=0,
@@ -168,6 +544,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--overlap_size", type=int, default=3)
     p.add_argument("--reset_every", type=int, default=0)
     p.add_argument("--se3", action="store_true", default=None)
+    p.add_argument("--geometry_edge_rtol", type=float, default=0.03,
+                   help="Depth-edge confidence suppression used by Stage A. Set to 0.0 for demo_viser parity.")
 
     # -- Stage B: Dynamic Cue Extractor ------------------------------------
     p.add_argument("--k_intra", type=int, default=3,
@@ -176,8 +554,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tau_occ", type=float, default=0.05)
 
     # -- Stage C: Video Masklet Front-end ----------------------------------
-    p.add_argument("--sam2_checkpoint", required=True)
-    p.add_argument("--sam2_model_cfg", required=True)
+    p.add_argument("--sam2_checkpoint", default=None)
+    p.add_argument("--sam2_model_cfg", default=None)
     p.add_argument("--detector", choices=["gdino", "yoloe"], default="gdino")
     p.add_argument("--gdino_config", default=None)
     p.add_argument("--gdino_checkpoint", default=None)
@@ -192,6 +570,10 @@ def build_parser() -> argparse.ArgumentParser:
     # -- Stage E: TTT Write Controller -------------------------------------
     p.add_argument("--lambda_min", type=float, default=0.0)
     p.add_argument("--lambda_max", type=float, default=1.0)
+    p.add_argument("--ttt_write_mode", choices=["semantic", "unity_replay", "native"], default="semantic",
+                   help="Stage E mode: semantic=use Stage D prior, unity_replay=all-one prior replay, native=use model provisional W directly.")
+    p.add_argument("--native_write_through_controller", action="store_true",
+                   help="In exact external geometry mode, force native mode to route through TTTWriteController write-through. Higher memory than the default direct Stage-A state path.")
 
     # -- Video output -------------------------------------------------------
     p.add_argument("--fps", type=int, default=10)
@@ -373,9 +755,12 @@ def print_prior_output(prior: PriorOutput) -> None:
     print("PriorOutput summary  (Stage D)")
     print(f"{'='*72}")
     print(f"  A_mask shape   : {tuple(prior.A_mask.shape)}")
+    print(f"  Elig_pix shape : {tuple(prior.Elig_pix.shape)}")
+    print(f"  r_mask shape   : {tuple(prior.r_mask.shape)}")
     print(f"  A_pix shape    : {tuple(prior.A_pix.shape)}")
     print(f"  A_tok shape    : {tuple(prior.A_tok.shape)}")
     print(f"  A_special      : {prior.A_special:.3f}")
+    print(f"  B_chunk_geo    : {prior.B_chunk_geo:.4f}")
     print(f"  A_tok  mean    : {prior.A_tok.mean().item():.4f}")
     print(f"  A_tok  min     : {prior.A_tok.min().item():.4f}")
     print(f"  A_tok  max     : {prior.A_tok.max().item():.4f}")
@@ -389,12 +774,15 @@ def print_write_result(wr: WriteResult) -> None:
     print("WriteResult summary  (Stage E)")
     print(f"{'='*72}")
     n = len(wr.w0)
+    mode = wr.debug.get("mode", "?")
+    print(f"  mode               : {mode}")
     print(f"  TTT layers committed: {n}")
     for li in range(n):
         d = wr.debug.get(f"layer_{li}", {})
         lam = d.get("lambda_write", "?")
         mp = d.get("mean_prior", "?")
-        print(f"    layer {li}: lambda={lam}, mean_prior={mp}")
+        bg = d.get("budget_geo", "?")
+        print(f"    layer {li}: lambda={lam}, mean_prior={mp}, budget_geo={bg}")
     print(f"{'='*72}\n")
 
 
@@ -408,6 +796,18 @@ def main() -> None:
         sys.exit(f"Config not found: {args.config}")
     if not os.path.isfile(args.checkpoint):
         sys.exit(f"Checkpoint not found: {args.checkpoint}")
+    if args.geometry_eval_mode and args.ttt_write_mode == "semantic":
+        sys.exit("geometry_eval_mode cannot be used with ttt_write_mode=semantic; use native or unity_replay.")
+    if not args.geometry_eval_mode:
+        if not args.sam2_checkpoint or not os.path.isfile(args.sam2_checkpoint):
+            sys.exit(f"SAM2 checkpoint not found: {args.sam2_checkpoint}")
+        if not args.sam2_model_cfg:
+            sys.exit("sam2_model_cfg is required unless --geometry_eval_mode is enabled.")
+    if args.geometry_eval_mode and args.ttt_write_mode == "native":
+        if args.chunk_size > 0 and args.chunk_size != args.window_size:
+            print(f"[warn] native LoGeR parity is best when chunk_size ({args.chunk_size}) == window_size ({args.window_size}).")
+        if args.chunk_overlap != args.overlap_size:
+            print(f"[warn] native LoGeR parity is best when chunk_overlap ({args.chunk_overlap}) == overlap_size ({args.overlap_size}).")
 
     # ===================================================================
     # Collect all images
@@ -420,10 +820,15 @@ def main() -> None:
     total_frames = len(image_paths)
     print(f"Collected {total_frames} images.")
 
-    # Full-resolution images for Stage C
-    images_full = load_images_tensor(image_paths)
-    _, _, H_full, W_full = images_full.shape
-    print(f"Full-res images: {tuple(images_full.shape)}")
+    images_full: Optional[torch.Tensor]
+    if args.geometry_eval_mode:
+        images_full = None
+        H_full = W_full = 0
+        print("Full-res images: skipped (--geometry_eval_mode)")
+    else:
+        images_full = load_images_tensor(image_paths)
+        _, _, H_full, W_full = images_full.shape
+        print(f"Full-res images: {tuple(images_full.shape)}")
 
     # LoGeR-resolution images for Stage A
     target_w, target_h = args.resolution if args.resolution else (None, None)
@@ -448,6 +853,15 @@ def main() -> None:
         window_size=args.window_size,
         overlap_size=args.overlap_size,
         reset_every=args.reset_every,
+        edge_rtol=args.geometry_edge_rtol,
+        update_ttt_weights=(
+            args.ttt_write_mode == "native"
+            and not (
+                args.geometry_eval_mode
+                and args.chunk_size > 0
+                and args.native_write_through_controller
+            )
+        ),
     )
     if args.se3 is not None:
         backbone_kwargs["se3"] = args.se3
@@ -462,71 +876,139 @@ def main() -> None:
     print(f"Model loaded in {time.time() - t0:.1f}s")
 
     # Stage B
-    extractor = DynamicCueExtractor(
-        k_intra=args.k_intra,
-        sigma_pt=args.sigma_pt,
-        tau_occ=args.tau_occ,
-    )
+    extractor: Optional[DynamicCueExtractor]
+    if args.geometry_eval_mode:
+        extractor = None
+    else:
+        extractor = DynamicCueExtractor(
+            k_intra=args.k_intra,
+            sigma_pt=args.sigma_pt,
+            tau_occ=args.tau_occ,
+        )
 
     # Stage C
-    frontend_kwargs: dict = dict(
-        box_threshold=args.box_threshold,
-        text_threshold=args.text_threshold,
-        ann_frame_idx=args.ann_frame_idx,
-        max_thing_objects=args.max_thing_objects,
-    )
-    if args.thing_prompts:
-        frontend_kwargs["thing_prompts"] = [s.strip() for s in args.thing_prompts.split(",")]
-    if args.stuff_prompts:
-        frontend_kwargs["stuff_prompts"] = [s.strip() for s in args.stuff_prompts.split(",")]
+    frontend_kwargs: dict = {}
+    build_kwargs: dict = {}
+    if not args.geometry_eval_mode:
+        frontend_kwargs = dict(
+            box_threshold=args.box_threshold,
+            text_threshold=args.text_threshold,
+            ann_frame_idx=args.ann_frame_idx,
+            max_thing_objects=args.max_thing_objects,
+        )
+        if args.thing_prompts:
+            frontend_kwargs["thing_prompts"] = [s.strip() for s in args.thing_prompts.split(",")]
+        if args.stuff_prompts:
+            frontend_kwargs["stuff_prompts"] = [s.strip() for s in args.stuff_prompts.split(",")]
 
-    build_kwargs: dict = dict(
-        sam2_checkpoint=args.sam2_checkpoint,
-        sam2_model_cfg=args.sam2_model_cfg,
-        device=args.device,
-        detector_type=args.detector,
-    )
-    if args.detector == "gdino":
-        build_kwargs["gdino_config"] = args.gdino_config
-        build_kwargs["gdino_checkpoint"] = args.gdino_checkpoint
-    elif args.detector == "yoloe":
-        build_kwargs["yoloe_model"] = args.yoloe_model
+        build_kwargs = dict(
+            sam2_checkpoint=args.sam2_checkpoint,
+            sam2_model_cfg=args.sam2_model_cfg,
+            device=args.device,
+            detector_type=args.detector,
+        )
+        if args.detector == "gdino":
+            build_kwargs["gdino_config"] = args.gdino_config
+            build_kwargs["gdino_checkpoint"] = args.gdino_checkpoint
+        elif args.detector == "yoloe":
+            build_kwargs["yoloe_model"] = args.yoloe_model
 
-    # Stage D
-    prior_gen = SemanticPriorGenerator()
+    need_semantic_prior = (args.ttt_write_mode == "semantic") and (not args.geometry_eval_mode)
+    prior_gen = SemanticPriorGenerator() if need_semantic_prior else None
 
     # Stage E
     controller = TTTWriteController(
         lambda_min=args.lambda_min,
         lambda_max=args.lambda_max,
         device=args.device,
+        write_mode=args.ttt_write_mode,
     )
+
+    if args.geometry_eval_mode and args.chunk_size > 0:
+        print("\nUsing exact external geometry orchestrator.")
+        merged_geo = run_geometry_eval_external_exact(
+            backbone=backbone,
+            controller=controller,
+            images_loger=images_loger,
+            chunks=chunks,
+            args=args,
+        )
+
+        merged_camera_poses = merged_geo.camera_poses
+        merged_local_points = merged_geo.local_points
+        merged_world_points = merged_geo.world_points
+        merged_confidence = merged_geo.confidence
+
+        if args.output_txt and merged_camera_poses is not None:
+            timestamps = build_timestamps_for_output(image_paths, args.input)
+            twc = merged_camera_poses[:, :3, 3]
+            qwc = mat_to_quat(merged_camera_poses[:, :3, :3])
+            S = min(len(timestamps), twc.shape[0], qwc.shape[0])
+            write_trajectory_txt(
+                Path(args.output_txt),
+                timestamps[:S],
+                twc[:S].tolist(),
+                qwc[:S].tolist(),
+            )
+            print(f"Saved trajectory to {args.output_txt}")
+
+        if args.output_pt:
+            os.makedirs(os.path.dirname(args.output_pt) or ".", exist_ok=True)
+            save_dict: Dict[str, torch.Tensor] = {}
+            if merged_local_points is not None:
+                save_dict["local_points"] = merged_local_points
+            if merged_world_points is not None:
+                save_dict["points"] = merged_world_points
+            if merged_camera_poses is not None:
+                save_dict["camera_poses"] = merged_camera_poses
+            if merged_confidence is not None:
+                save_dict["conf"] = merged_confidence
+            torch.save(save_dict, args.output_pt)
+            print(f"Saved output to {args.output_pt}")
+        return
 
     # ===================================================================
     # Chunk-by-chunk processing loop
     # ===================================================================
     ttt_state: Optional[Dict] = None
     all_geo: List[GeometryOutput] = []
-    all_cue: List[CueOutput] = []
-    all_masklet: List[MaskletOutput] = []
-    all_prior: List[PriorOutput] = []
+    all_cue: List[Optional[CueOutput]] = []
+    all_masklet: List[Optional[MaskletOutput]] = []
+    all_prior: List[Optional[PriorOutput]] = []
 
     for ci, (start, end) in enumerate(chunks):
         print(f"\n{'#'*72}")
         print(f"# Chunk {ci}/{len(chunks)-1}  frames [{start}, {end})")
         print(f"{'#'*72}")
 
+        if args.reset_every > 0 and ci > 0 and ci % args.reset_every == 0 and ttt_state is not None:
+            preserved_history = ttt_state.get("history")
+            ttt_state = {
+                "w0": [None] * len(ttt_state.get("w0", [])),
+                "w1": [None] * len(ttt_state.get("w1", [])),
+                "w2": [None] * len(ttt_state.get("w2", [])),
+            }
+            if preserved_history is not None:
+                ttt_state["history"] = preserved_history
+            print(f"  External reset_every triggered at chunk {ci}: cleared TTT fast weights, preserved SWA history")
+
         chunk_loger = images_loger[start:end]
-        chunk_full = images_full[start:end]
+        chunk_full = images_full[start:end] if images_full is not None else None
 
         # ---- Stage A ----
         print(f"\n  Stage A: Geometry Backbone ...")
         t0 = time.time()
-        geo, write_cache = backbone.run(
+        cache_ttt_primitives = args.ttt_write_mode != "native"
+        stage_a_result = backbone.run(
             chunk_loger,
             ttt_state=ttt_state,
-            cache_ttt_primitives=True,
+            cache_ttt_primitives=cache_ttt_primitives,
         )
+        if cache_ttt_primitives:
+            geo, write_cache = stage_a_result
+        else:
+            geo = stage_a_result
+            write_cache = None
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         print(f"    done in {time.time() - t0:.2f}s")
@@ -534,40 +1016,65 @@ def main() -> None:
         all_geo.append(geo)
 
         # ---- Stage B ----
-        print(f"  Stage B: Dynamic Cue Extractor ...")
-        t0 = time.time()
-        cue = extractor.run(geo)
-        print(f"    done in {time.time() - t0:.2f}s")
-        print_cue_output(cue)
+        cue: Optional[CueOutput] = None
+        if not args.geometry_eval_mode:
+            print(f"  Stage B: Dynamic Cue Extractor ...")
+            t0 = time.time()
+            assert extractor is not None
+            cue = extractor.run(geo)
+            print(f"    done in {time.time() - t0:.2f}s")
+            print_cue_output(cue)
+        else:
+            print("  Stage B: skipped (--geometry_eval_mode)")
         all_cue.append(cue)
 
         # ---- Stage C ----
-        print(f"  Stage C: Video Masklet Front-end ...")
-        t0 = time.time()
-        mo = _run_stage_c_lazy(build_kwargs, frontend_kwargs, chunk_full, ci)
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
-        print(f"    done in {time.time() - t0:.2f}s")
-        print_masklet_output(mo)
+        mo: Optional[MaskletOutput] = None
+        if not args.geometry_eval_mode:
+            print(f"  Stage C: Video Masklet Front-end ...")
+            t0 = time.time()
+            assert chunk_full is not None
+            mo = _run_stage_c_lazy(build_kwargs, frontend_kwargs, chunk_full, ci)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            print(f"    done in {time.time() - t0:.2f}s")
+            print_masklet_output(mo)
+        else:
+            print("  Stage C: skipped (--geometry_eval_mode)")
         all_masklet.append(mo)
 
         # ---- Stage D ----
-        print(f"  Stage D: Semantic Prior Generator ...")
-        t0 = time.time()
-        prior = prior_gen.run(cue, mo, geo)
-        print(f"    done in {time.time() - t0:.2f}s")
-        print_prior_output(prior)
+        prior: Optional[PriorOutput] = None
+        if need_semantic_prior:
+            print(f"  Stage D: Semantic Prior Generator ...")
+            t0 = time.time()
+            assert prior_gen is not None
+            prior = prior_gen.run(cue, mo, geo)
+            print(f"    done in {time.time() - t0:.2f}s")
+            print_prior_output(prior)
+        else:
+            print(f"  Stage D: skipped (ttt_write_mode={args.ttt_write_mode})")
         all_prior.append(prior)
 
         # ---- Stage E ----
-        if write_cache.num_ttt_layers > 0:
+        if args.ttt_write_mode == "native":
+            ttt_state = backbone.get_ttt_state()
+            print("  Stage E: skipped (native write-through from Stage A state)")
+        elif write_cache is not None and write_cache.num_ttt_layers > 0:
             print(f"  Stage E: TTT Write Controller ...")
             t0 = time.time()
-            wr = controller.run(write_cache, prior.A_tok, device=args.device)
+            wr = controller.run(
+                write_cache,
+                prior.A_tok if prior is not None else None,
+                B_chunk_geo=prior.B_chunk_geo if prior is not None else None,
+                device=args.device,
+            )
             print(f"    done in {time.time() - t0:.2f}s")
             print_write_result(wr)
 
             ttt_state = {"w0": wr.w0, "w1": wr.w1, "w2": wr.w2}
+            if wr.history is not None:
+                ttt_state["history"] = wr.history
         else:
             print("  Stage E: skipped (no TTT layers cached)")
 
@@ -575,10 +1082,42 @@ def main() -> None:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
+    all_geo_for_merge = align_chunk_geometry_outputs(all_geo, args.chunk_overlap)
+
+    merged_local_points = merge_chunk_tensor_tail_trim(
+        [g.local_points for g in all_geo_for_merge], args.chunk_overlap,
+    )
+    merged_world_points = merge_chunk_tensor_tail_trim(
+        [g.world_points for g in all_geo_for_merge], args.chunk_overlap,
+    )
+    merged_camera_poses = merge_chunk_tensor_tail_trim(
+        [g.camera_poses for g in all_geo_for_merge], args.chunk_overlap,
+    )
+    merged_confidence = merge_chunk_tensor_tail_trim(
+        [g.confidence for g in all_geo_for_merge], args.chunk_overlap,
+    )
+
+    if args.output_txt and merged_camera_poses is not None:
+        timestamps = build_timestamps_for_output(image_paths, args.input)
+        twc = merged_camera_poses[:, :3, 3]
+        qwc = mat_to_quat(merged_camera_poses[:, :3, :3])
+        S = min(len(timestamps), twc.shape[0], qwc.shape[0])
+        write_trajectory_txt(
+            Path(args.output_txt),
+            timestamps[:S],
+            twc[:S].tolist(),
+            qwc[:S].tolist(),
+        )
+        print(f"Saved trajectory to {args.output_txt}")
+
     # ===================================================================
     # Visualisation: use first chunk results for now (single-chunk mode)
     # ===================================================================
-    if all_masklet and all_cue:
+    if (
+        all_masklet and all_cue
+        and all_masklet[0] is not None
+        and all_cue[0] is not None
+    ):
         mo = all_masklet[0]
         cue = all_cue[0]
         prior = all_prior[0] if all_prior else None
@@ -601,7 +1140,21 @@ def main() -> None:
             save_frames_dir=args.save_frames,
         )
 
-    if args.output_pt and all_masklet:
+    if args.output_pt and args.geometry_eval_mode:
+        os.makedirs(os.path.dirname(args.output_pt) or ".", exist_ok=True)
+        save_dict: Dict[str, torch.Tensor] = {}
+        if merged_local_points is not None:
+            save_dict["local_points"] = merged_local_points
+        if merged_world_points is not None:
+            save_dict["points"] = merged_world_points
+        if merged_camera_poses is not None:
+            save_dict["camera_poses"] = merged_camera_poses
+        if merged_confidence is not None:
+            save_dict["conf"] = merged_confidence
+        torch.save(save_dict, args.output_pt)
+        print(f"Saved output to {args.output_pt}")
+
+    elif args.output_pt and all_masklet and all_masklet[0] is not None:
         os.makedirs(os.path.dirname(args.output_pt) or ".", exist_ok=True)
         mo = all_masklet[0]
         save_dict = {
@@ -611,9 +1164,13 @@ def main() -> None:
             "G_sem": mo.G_sem,
             "W_sem": mo.W_sem,
         }
-        if all_prior:
+        if all_prior and all_prior[0] is not None:
             save_dict["A_tok"] = all_prior[0].A_tok
             save_dict["A_pix"] = all_prior[0].A_pix
+            save_dict["Elig_pix"] = all_prior[0].Elig_pix
+            save_dict["A_mask"] = all_prior[0].A_mask
+            save_dict["r_mask"] = all_prior[0].r_mask
+            save_dict["B_chunk_geo"] = torch.tensor(all_prior[0].B_chunk_geo)
         torch.save(save_dict, args.output_pt)
         print(f"Saved output to {args.output_pt}")
 

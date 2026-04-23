@@ -1,115 +1,91 @@
 """
 Stage D: Semantic Prior Generator
 
-Fuses geometric cues (Stage B) and semantic masklets (Stage C) into a
-unified token-level write prior ``A_tok`` that the TTT Write Controller
-(Stage E) uses to modulate per-token contributions during fast-weight
-update.
+v2 redesign: decoupled write policy
 
-Three representation layers are produced:
-  1. masklet-level  ``A_mask``  [J, T]
-  2. pixel-level    ``A_pix``   [T, H_p, W_p]
-  3. token-level    ``A_tok``   [L_tok]
+  - Geometry Eligibility Branch -> ``Elig_pix``
+  - Semantic Value Branch       -> ``v_sem``
+  - Mask Trust Branch           -> ``r_mask``
 
-Phase 1 uses a **rule-based** (no trainable parameters) formulation.
+The final absolute write gate is produced via:
+
+  ``A_mask`` -> ``A_pix`` -> ``A_patch_flat`` / ``A_special`` -> ``A_tok``
+
+Chunk-level write budget is carried separately as ``B_chunk_geo`` and is
+consumed by Stage E.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Tuple
 
 import torch
 import torch.nn.functional as F
 
-from .geometry_backbone import (
-    GeometryOutput,
-    PATCH_SIZE,
-    TOKEN_TYPE_PATCH,
-    TOKEN_TYPE_REGISTER,
-    TOKEN_TYPE_ROLE,
-)
+from .geometry_backbone import GeometryOutput, TOKEN_TYPE_PATCH
 from .dynamic_cue_extractor import CueOutput
-from .video_masklet_frontend import MaskletOutput, DEFAULT_SEMANTIC_WEIGHTS
+from .video_masklet_frontend import (
+    MaskletOutput,
+    SEMANTIC_GROUP_LOW_VALUE_STUFF,
+    SEMANTIC_GROUP_MOVABLE_THING,
+    SEMANTIC_GROUP_STATIC_THING,
+    SEMANTIC_GROUP_STRUCTURE_ANCHOR,
+    SEMANTIC_GROUP_UNCERTAIN_REGION,
+)
 
 
-# ---------------------------------------------------------------------------
-# Output container
-# ---------------------------------------------------------------------------
 @dataclass
 class PriorOutput:
     """Structured output of the Semantic Prior Generator."""
 
-    A_mask: torch.Tensor          # [J, T]   masklet-level write allow
-    A_pix: torch.Tensor           # [T, H_p, W_p]  pixel-level write allow
-    A_tok: torch.Tensor           # [L_tok]  token-level write prior
-    A_patch_flat: torch.Tensor    # [L_patch]
+    A_mask: torch.Tensor
+    A_pix: torch.Tensor
+    A_tok: torch.Tensor
+    A_patch_flat: torch.Tensor
 
-    A_special: float = 1.0        # scalar for special tokens
+    Elig_pix: torch.Tensor
+    r_mask: torch.Tensor
+    E_patch_flat: torch.Tensor
+
+    B_chunk_geo: float = 0.0
+    A_special: float = 1.0
 
     debug: Dict[str, Any] = field(default_factory=dict)
 
 
-# ---------------------------------------------------------------------------
-# Core generator
-# ---------------------------------------------------------------------------
 class SemanticPriorGenerator:
-    """Stage D — rule-based semantic prior (Phase 1, no trainable params).
-
-    Usage::
-
-        gen = SemanticPriorGenerator()
-        prior = gen.run(cue, masklet, geo)
-    """
+    """Stage D — v2 decoupled semantic prior (rule-based, no trainable params)."""
 
     def __init__(
         self,
         *,
-        # A_mask linear combination (§7.2 of design doc)
-        b_stat: float = 1.0,
-        b_anchor: float = 0.8,
-        b_dyn: float = 1.0,
-        b_occ: float = 0.5,
-        b_unc: float = 0.5,
-        b_quality: float = 0.3,
-        b_sem: float = 0.5,
-        b_bias: float = 0.0,
-        # Cue-only prior (§8.1)
-        c_stat: float = 1.0,
-        c_anchor: float = 0.5,
-        c_dyn: float = 1.0,
-        c_occ: float = 0.3,
-        c_unc: float = 0.5,
-        c_bias: float = 0.0,
-        # Special token prior (§9.2)
-        kappa_special: float = 0.5,
+        use_g_write_geo: bool = True,
+        k_pos: float = 1.5,
+        k_risk: float = 3.0,
+        b_elig: float = 0.0,
+        rho_sem: float = 0.6,
         a_min_special: float = 0.3,
-        # Layer schedule
-        omega_layer: float = 1.0,
-        a_min_token: float = 0.05,
+        value_structure: float = 1.0,
+        value_background: float = 0.7,
+        value_distractor: float = 0.4,
+        value_movable: float = 0.1,
+        value_uncertain: float = 0.4,
     ):
-        self.b_stat = b_stat
-        self.b_anchor = b_anchor
-        self.b_dyn = b_dyn
-        self.b_occ = b_occ
-        self.b_unc = b_unc
-        self.b_quality = b_quality
-        self.b_sem = b_sem
-        self.b_bias = b_bias
+        self.use_g_write_geo = use_g_write_geo
+        self.k_pos = float(k_pos)
+        self.k_risk = float(k_risk)
+        self.b_elig = float(b_elig)
+        self.rho_sem = float(rho_sem)
+        self.a_min_special = float(a_min_special)
 
-        self.c_stat = c_stat
-        self.c_anchor = c_anchor
-        self.c_dyn = c_dyn
-        self.c_occ = c_occ
-        self.c_unc = c_unc
-        self.c_bias = c_bias
+        self.value_structure = float(value_structure)
+        self.value_background = float(value_background)
+        self.value_distractor = float(value_distractor)
+        self.value_movable = float(value_movable)
+        self.value_uncertain = float(value_uncertain)
 
-        self.kappa_special = kappa_special
-        self.a_min_special = a_min_special
-        self.omega_layer = omega_layer
-        self.a_min_token = a_min_token
-
-    # -- public API --------------------------------------------------------
+    # -- public API ----------------------------------------------------
 
     def run(
         self,
@@ -121,21 +97,33 @@ class SemanticPriorGenerator:
         H_p, W_p = cue.spatial_resolution
         H_tok, W_tok = geo.patch_grid
 
-        # =================================================================
-        # 1. masklet-level prior  A_mask [J, T]
-        # =================================================================
-        A_mask = self._compute_masklet_prior(cue, masklet, T, H_p, W_p)
-
-        # =================================================================
-        # 2. pixel-level prior  A_pix [T, H_p, W_p]
-        # =================================================================
-        A_pix = self._compute_pixel_prior(cue, masklet, A_mask, T, H_p, W_p)
-
-        # =================================================================
-        # 3. token-level prior  A_tok [L_tok]
-        # =================================================================
-        A_patch_flat, A_special_val, A_tok = self._compute_token_prior(
-            A_pix, geo, T, H_tok, W_tok,
+        Elig_pix = self._compute_geometry_eligibility(cue)
+        v_sem = self._compute_semantic_value(masklet)
+        r_mask = self._compute_mask_trust(masklet, T)
+        A_mask = self._compute_masklet_gate(
+            Elig_pix=Elig_pix,
+            mo=masklet,
+            v_sem=v_sem,
+            T=T,
+            H_p=H_p,
+            W_p=W_p,
+        )
+        A_pix = self._compute_pixel_prior(
+            Elig_pix=Elig_pix,
+            mo=masklet,
+            A_mask=A_mask,
+            r_mask=r_mask,
+            T=T,
+            H_p=H_p,
+            W_p=W_p,
+        )
+        A_patch_flat, E_patch_flat, A_special, B_chunk_geo, A_tok = self._compute_token_prior(
+            A_pix=A_pix,
+            Elig_pix=Elig_pix,
+            cue=cue,
+            geo=geo,
+            H_tok=H_tok,
+            W_tok=W_tok,
         )
 
         return PriorOutput(
@@ -143,167 +131,233 @@ class SemanticPriorGenerator:
             A_pix=A_pix,
             A_tok=A_tok,
             A_patch_flat=A_patch_flat,
-            A_special=A_special_val,
+            Elig_pix=Elig_pix,
+            r_mask=r_mask,
+            E_patch_flat=E_patch_flat,
+            B_chunk_geo=B_chunk_geo,
+            A_special=A_special,
             debug={
-                "rho_suppr_chunk": (1 - A_patch_flat).mean().item(),
+                "v_sem": v_sem,
+                "rho_sem": self.rho_sem,
+                "rho_suppr_chunk": float(1.0 - A_patch_flat.mean().item()) if A_patch_flat.numel() > 0 else 0.0,
+                "mean_elig": float(Elig_pix.mean().item()) if Elig_pix.numel() > 0 else 0.0,
+                "mean_a_pix": float(A_pix.mean().item()) if A_pix.numel() > 0 else 0.0,
+                "mean_r_mask": float(r_mask.mean().item()) if r_mask.numel() > 0 else 0.0,
             },
         )
 
-    # -- masklet-level prior -----------------------------------------------
+    # -- branch 1: geometry eligibility --------------------------------
 
-    def _compute_masklet_prior(
-        self, cue: CueOutput, mo: MaskletOutput,
-        T: int, H_p: int, W_p: int,
+    def _compute_geometry_eligibility(self, cue: CueOutput) -> torch.Tensor:
+        if self.use_g_write_geo and cue.G_write_geo is not None:
+            return cue.G_write_geo.float().clamp(0.0, 1.0)
+
+        c_stat = cue.E_cue[..., 0]
+        c_dyn = cue.E_cue[..., 1]
+        c_occ = cue.E_cue[..., 2]
+        c_unc = cue.E_cue[..., 3]
+        c_anchor = cue.E_cue[..., 4]
+
+        p_pos = 0.5 * c_stat + 0.5 * c_anchor
+        p_risk = 0.5 * c_dyn + 0.25 * c_occ + 0.25 * c_unc
+        return torch.sigmoid(self.k_pos * p_pos - self.k_risk * p_risk + self.b_elig)
+
+    # -- branch 2: semantic value --------------------------------------
+
+    def _compute_semantic_value(self, mo: MaskletOutput) -> torch.Tensor:
+        J = mo.num_masklets
+        if J == 0:
+            return torch.zeros(0, dtype=torch.float32)
+
+        v_sem = torch.full((J,), self.value_uncertain, dtype=torch.float32)
+        groups = mo.G_sem.to(dtype=torch.long)
+        v_sem[groups == SEMANTIC_GROUP_STRUCTURE_ANCHOR] = self.value_structure
+        v_sem[groups == SEMANTIC_GROUP_STATIC_THING] = self.value_background
+        v_sem[groups == SEMANTIC_GROUP_LOW_VALUE_STUFF] = self.value_distractor
+        v_sem[groups == SEMANTIC_GROUP_MOVABLE_THING] = self.value_movable
+        v_sem[groups == SEMANTIC_GROUP_UNCERTAIN_REGION] = self.value_uncertain
+        return v_sem
+
+    # -- branch 3: mask trust ------------------------------------------
+
+    def _compute_mask_trust(self, mo: MaskletOutput, T: int) -> torch.Tensor:
+        J = mo.num_masklets
+        if J == 0:
+            return torch.zeros(0, T, dtype=torch.float32)
+
+        T_use = min(T, mo.num_frames)
+        r_mask = torch.zeros(J, T, dtype=torch.float32)
+        r_mask[:, :T_use] = mo.V_mask[:, :T_use].float() * mo.Q_mask[:, :T_use].float()
+        return r_mask.clamp(0.0, 1.0)
+
+    # -- masklet gate ---------------------------------------------------
+
+    def _compute_masklet_gate(
+        self,
+        *,
+        Elig_pix: torch.Tensor,
+        mo: MaskletOutput,
+        v_sem: torch.Tensor,
+        T: int,
+        H_p: int,
+        W_p: int,
     ) -> torch.Tensor:
         J = mo.num_masklets
         if J == 0:
-            return torch.zeros(0, T)
-
-        C_stat = cue.E_cue[..., 0]   # [T, H_p, W_p]
-        C_dyn = cue.E_cue[..., 1]
-        C_occ = cue.E_cue[..., 2]
-        C_unc = cue.E_cue[..., 3]
-        C_anchor = cue.E_cue[..., 4]
-        cue_maps = [C_stat, C_dyn, C_occ, C_unc, C_anchor]
+            return torch.zeros(0, T, dtype=torch.float32)
 
         H_mask, W_mask = mo.frame_height, mo.frame_width
+        elig_for_mean = Elig_pix
         if (H_p, W_p) != (H_mask, W_mask):
-            cue_maps = [
-                F.interpolate(
-                    c.unsqueeze(1), size=(H_mask, W_mask),
-                    mode="bilinear", align_corners=False,
-                ).squeeze(1)
-                for c in cue_maps
-            ]
-        C_stat, C_dyn, C_occ, C_unc, C_anchor = cue_maps
+            elig_for_mean = F.interpolate(
+                Elig_pix.unsqueeze(1),
+                size=(H_mask, W_mask),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(1)
 
-        T_min = min(T, mo.num_frames)
-        A_mask = torch.zeros(J, T)
+        T_use = min(T, mo.num_frames)
+        A_mask = torch.zeros(J, T, dtype=torch.float32)
+        sem_mod = ((1.0 - self.rho_sem) + self.rho_sem * v_sem).clamp(0.0, 1.0)
 
         for j in range(J):
-            for t in range(T_min):
-                if not mo.V_mask[j, t]:
+            for t in range(T_use):
+                if not bool(mo.V_mask[j, t]):
                     continue
                 mask_t = mo.M_mask[j, t].bool()
-                n = mask_t.sum().item()
-                if n == 0:
+                if not bool(mask_t.any()):
                     continue
-                bar_stat = C_stat[t][mask_t].mean().item()
-                bar_dyn = C_dyn[t][mask_t].mean().item()
-                bar_occ = C_occ[t][mask_t].mean().item()
-                bar_unc = C_unc[t][mask_t].mean().item()
-                bar_anchor = C_anchor[t][mask_t].mean().item()
-
-                g = mo.G_sem[j].item()
-                w_sem = DEFAULT_SEMANTIC_WEIGHTS.get(g, 0.15)
-                q = mo.Q_mask[j, t].item()
-
-                z = (
-                    self.b_bias
-                    + self.b_stat * bar_stat
-                    + self.b_anchor * bar_anchor
-                    - self.b_dyn * bar_dyn
-                    - self.b_occ * bar_occ
-                    - self.b_unc * bar_unc
-                    + self.b_quality * q
-                    + self.b_sem * w_sem
+                e_bar = float(elig_for_mean[t][mask_t].mean().item())
+                A_mask[j, t] = torch.clamp(
+                    torch.tensor(e_bar * float(sem_mod[j].item()), dtype=torch.float32),
+                    0.0,
+                    1.0,
                 )
-                A_mask[j, t] = torch.sigmoid(torch.tensor(z)).item()
 
         return A_mask
 
-    # -- pixel-level prior -------------------------------------------------
+    # -- pixel fusion ---------------------------------------------------
 
     def _compute_pixel_prior(
-        self, cue: CueOutput, mo: MaskletOutput,
-        A_mask: torch.Tensor, T: int, H_p: int, W_p: int,
+        self,
+        *,
+        Elig_pix: torch.Tensor,
+        mo: MaskletOutput,
+        A_mask: torch.Tensor,
+        r_mask: torch.Tensor,
+        T: int,
+        H_p: int,
+        W_p: int,
     ) -> torch.Tensor:
-        C_stat = cue.E_cue[..., 0]
-        C_dyn = cue.E_cue[..., 1]
-        C_occ = cue.E_cue[..., 2]
-        C_unc = cue.E_cue[..., 3]
-        C_anchor = cue.E_cue[..., 4]
-
-        z_cue = (
-            self.c_bias
-            + self.c_stat * C_stat
-            + self.c_anchor * C_anchor
-            - self.c_dyn * C_dyn
-            - self.c_occ * C_occ
-            - self.c_unc * C_unc
-        )
-        A_pix_cue = torch.sigmoid(z_cue)   # [T, H_p, W_p]
-
         J = mo.num_masklets
         if J == 0:
-            return A_pix_cue
+            return Elig_pix.clone()
 
+        T_use = min(T, mo.num_frames)
         H_mask, W_mask = mo.frame_height, mo.frame_width
-        T_min = min(T, mo.num_frames)
 
-        A_pix_mask = torch.zeros(T, H_p, W_p)
-        m_cov = torch.zeros(T, H_p, W_p)
+        best_score = torch.zeros(T, H_p, W_p, dtype=torch.float32)
+        A_sem_pix = torch.zeros(T, H_p, W_p, dtype=torch.float32)
+        R_mask_pix = torch.zeros(T, H_p, W_p, dtype=torch.float32)
 
         for j in range(J):
-            for t in range(T_min):
-                if not mo.V_mask[j, t]:
+            for t in range(T_use):
+                if not bool(mo.V_mask[j, t]):
                     continue
-                mask_full = mo.M_mask[j, t]   # [H_mask, W_mask]
+                mask_t = mo.M_mask[j, t].float()
+                if not bool(mask_t.bool().any()):
+                    continue
                 if (H_p, W_p) != (H_mask, W_mask):
                     mask_r = F.interpolate(
-                        mask_full.unsqueeze(0).unsqueeze(0),
-                        size=(H_p, W_p), mode="bilinear", align_corners=False,
+                        mask_t.unsqueeze(0).unsqueeze(0),
+                        size=(H_p, W_p),
+                        mode="bilinear",
+                        align_corners=False,
                     ).squeeze(0).squeeze(0)
                 else:
-                    mask_r = mask_full
+                    mask_r = mask_t
 
-                a = A_mask[j, t].item()
-                contribution = mask_r * a
-                A_pix_mask[t] = torch.max(A_pix_mask[t], contribution)
-                m_cov[t] = torch.max(m_cov[t], mask_r)
+                score = mask_r * float(r_mask[j, t].item()) * float(A_mask[j, t].item())
+                update = score > best_score[t]
+                best_score[t] = torch.where(update, score, best_score[t])
+                A_sem_pix[t] = torch.where(
+                    update,
+                    torch.full_like(A_sem_pix[t], float(A_mask[j, t].item())),
+                    A_sem_pix[t],
+                )
+                R_mask_pix[t] = torch.where(
+                    update,
+                    torch.full_like(R_mask_pix[t], float(r_mask[j, t].item())),
+                    R_mask_pix[t],
+                )
 
-        A_pix = m_cov * A_pix_mask + (1 - m_cov) * A_pix_cue
-        return A_pix.clamp(0, 1)
+        A_pix = R_mask_pix * A_sem_pix + (1.0 - R_mask_pix) * Elig_pix
+        return A_pix.clamp(0.0, 1.0)
 
-    # -- token-level prior -------------------------------------------------
+    # -- token projection ------------------------------------------------
 
     def _compute_token_prior(
         self,
+        *,
         A_pix: torch.Tensor,
+        Elig_pix: torch.Tensor,
+        cue: CueOutput,
         geo: GeometryOutput,
-        T: int,
         H_tok: int,
         W_tok: int,
-    ) -> Tuple[torch.Tensor, float, torch.Tensor]:
-        pH = A_pix.shape[1] // H_tok
-        pW = A_pix.shape[2] // W_tok
+    ) -> Tuple[torch.Tensor, torch.Tensor, float, float, torch.Tensor]:
+        A_patch = self._pool_to_patch(A_pix, H_tok, W_tok)
+        A_patch_flat = A_patch.reshape(-1).float().clamp(0.0, 1.0)
 
-        A_patch = A_pix[
-            :, :H_tok * pH, :W_tok * pW
-        ].reshape(T, H_tok, pH, W_tok, pW).mean(dim=(2, 4))  # [T, H_tok, W_tok]
+        if cue.G_write_geo_patch is not None and tuple(cue.patch_grid) == (H_tok, W_tok):
+            E_patch = cue.G_write_geo_patch.float()
+        else:
+            E_patch = self._pool_to_patch(Elig_pix, H_tok, W_tok)
+        E_patch_flat = E_patch.reshape(-1).float().clamp(0.0, 1.0)
 
-        A_patch_flat = A_patch.reshape(-1)   # [L_patch]
+        B_chunk_geo = float(E_patch_flat.mean().item()) if E_patch_flat.numel() > 0 else 0.0
+        A_special = float(
+            torch.clamp(
+                torch.tensor(
+                    self.a_min_special + (1.0 - self.a_min_special) * B_chunk_geo,
+                    dtype=torch.float32,
+                ),
+                self.a_min_special,
+                1.0,
+            ).item()
+        )
 
-        # Apply layer schedule + floor
-        A_patch_flat = (
-            self.omega_layer * A_patch_flat + (1 - self.omega_layer)
-        ).clamp(self.a_min_token, 1.0)
-
-        # Special token prior
-        rho_suppr = (1 - A_patch_flat).mean().item()
-        A_special_val = max(1 - self.kappa_special * rho_suppr, self.a_min_special)
-
-        # Build full A_tok: iterate token_type to assign patch or special prior
-        token_type = geo.token_type   # [L_tok]
-        L_tok = token_type.shape[0]
-        A_tok = torch.full((L_tok,), A_special_val)
+        token_type = geo.token_type
+        L_tok = int(token_type.shape[0])
+        A_tok = torch.full((L_tok,), A_special, dtype=torch.float32)
 
         patch_idx = 0
         for i in range(L_tok):
-            tt = token_type[i].item()
-            if tt == TOKEN_TYPE_PATCH:
-                if patch_idx < A_patch_flat.shape[0]:
+            if int(token_type[i].item()) == TOKEN_TYPE_PATCH:
+                if patch_idx < A_patch_flat.numel():
                     A_tok[i] = A_patch_flat[patch_idx]
                 patch_idx += 1
 
-        return A_patch_flat, A_special_val, A_tok
+        return A_patch_flat, E_patch_flat, A_special, B_chunk_geo, A_tok
+
+    # -- utilities ------------------------------------------------------
+
+    def _pool_to_patch(
+        self,
+        pix_map: torch.Tensor,
+        H_tok: int,
+        W_tok: int,
+    ) -> torch.Tensor:
+        T, H_p, W_p = pix_map.shape
+        if H_tok <= 0 or W_tok <= 0:
+            raise ValueError(f"Invalid patch grid: {(H_tok, W_tok)}")
+
+        pH = max(H_p // H_tok, 1)
+        pW = max(W_p // W_tok, 1)
+        H_trim = H_tok * pH
+        W_trim = W_tok * pW
+
+        pooled = pix_map[:, :H_trim, :W_trim].reshape(
+            T, H_tok, pH, W_tok, pW,
+        ).mean(dim=(2, 4))
+        return pooled

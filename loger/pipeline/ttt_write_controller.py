@@ -37,6 +37,7 @@ class WriteResult:
     w0: List[Optional[torch.Tensor]]    # per-layer branch-0 weights
     w1: List[Optional[torch.Tensor]]    # per-layer branch-1 weights
     w2: List[Optional[torch.Tensor]]    # per-layer branch-2 weights
+    history: Optional[List[Optional[Dict[str, torch.Tensor]]]] = None
 
     debug: Dict[str, Any] = field(default_factory=dict)
 
@@ -60,17 +61,20 @@ class TTTWriteController:
         lambda_min: float = 0.0,
         lambda_max: float = 1.0,
         device: str = "cuda",
+        write_mode: str = "semantic",
     ):
         self.lambda_min = lambda_min
         self.lambda_max = lambda_max
         self.device = device
+        self.write_mode = write_mode
 
     # -- public API --------------------------------------------------------
 
     def run(
         self,
         write_cache: WriteCacheOutput,
-        A_tok: torch.Tensor,
+        A_tok: Optional[torch.Tensor],
+        B_chunk_geo: Optional[float] = None,
         device: Optional[str] = None,
     ) -> WriteResult:
         """Perform delayed write-back: W_m → W_{m+1}.
@@ -92,18 +96,43 @@ class TTTWriteController:
             ``w0``, ``w1``, ``w2`` lists ready to be fed as
             ``ttt_state_input`` to the next chunk's Geometry Backbone.
         """
+        mode = self.write_mode
         dev = device or self.device
         n_layers = write_cache.num_ttt_layers
+
+        history = write_cache.history_provisional
+
+        if mode == "native":
+            debug_info = {
+                "mode": mode,
+                "native_write_through": True,
+            }
+            return WriteResult(
+                w0=list(write_cache.w0_provisional),
+                w1=list(write_cache.w1_provisional),
+                w2=list(write_cache.w2_provisional),
+                history=history,
+                debug=debug_info,
+            )
+
+        if mode not in {"semantic", "unity_replay"}:
+            raise ValueError(f"Unsupported write_mode: {mode}")
 
         w0_new: List[Optional[torch.Tensor]] = [None] * n_layers
         w1_new: List[Optional[torch.Tensor]] = [None] * n_layers
         w2_new: List[Optional[torch.Tensor]] = [None] * n_layers
 
-        debug_info: Dict[str, Any] = {}
+        debug_info: Dict[str, Any] = {"mode": mode}
 
         for li, lc in enumerate(write_cache.layer_caches):
+            if mode == "unity_replay":
+                effective_prior = None
+                effective_budget = 1.0
+            else:
+                effective_prior = A_tok
+                effective_budget = B_chunk_geo
             w0_li, w1_li, w2_li, layer_debug = self._replay_layer(
-                lc, A_tok, dev,
+                lc, effective_prior, effective_budget, dev,
             )
             w0_new[li] = w0_li
             w1_new[li] = w1_li
@@ -114,6 +143,7 @@ class TTTWriteController:
             w0=w0_new,
             w1=w1_new,
             w2=w2_new,
+            history=history,
             debug=debug_info,
         )
 
@@ -122,7 +152,8 @@ class TTTWriteController:
     def _replay_layer(
         self,
         lc: TTTLayerCache,
-        A_tok: torch.Tensor,
+        A_tok: Optional[torch.Tensor],
+        B_chunk_geo: Optional[float],
         device: str,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
         """Replay one TTT layer's update with prior-weighted lr."""
@@ -147,16 +178,18 @@ class TTTWriteController:
         # tokens that went through this TTT layer (patch tokens from the
         # window processed by decode).  We need to align.
         l = k.shape[1]
-        if A_tok.shape[0] >= l:
+        if A_tok is None:
+            prior_flat = torch.ones(l)
+        elif A_tok.shape[0] >= l:
             prior_flat = A_tok[:l]
         else:
             prior_flat = torch.ones(l)
             prior_flat[:A_tok.shape[0]] = A_tok
         token_prior = prior_flat.to(device).unsqueeze(0).unsqueeze(-1)  # [1, l, 1]
 
-        # Optional block-level write gain
         mean_prior = prior_flat.mean().item()
-        lam = self.lambda_min + (self.lambda_max - self.lambda_min) * mean_prior
+        budget_geo = float(B_chunk_geo) if B_chunk_geo is not None else mean_prior
+        lam = self.lambda_min + (self.lambda_max - self.lambda_min) * budget_geo
 
         with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
             w0_new, w1_new, w2_new = fast_weight_replay_update(
@@ -172,6 +205,7 @@ class TTTWriteController:
 
         debug = {
             "mean_prior": mean_prior,
+            "budget_geo": budget_geo,
             "lambda_write": lam,
         }
 

@@ -14,3 +14,8 @@ checkpoints/*.pt
 *.mp4
 mobileclip_blt.ts
 third_party/*
+sam31_repro_m4dsqspa/
+tmp/
+# local debug artifacts
+sam31_repro_*/
+tmp/sam3_probe/

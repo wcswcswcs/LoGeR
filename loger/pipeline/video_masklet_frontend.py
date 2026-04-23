@@ -24,11 +24,12 @@ import shutil
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from functools import lru_cache
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import cv2
 import numpy as np
 import torch
+from PIL import Image
 from torchvision.ops import box_convert
 
 # ---------------------------------------------------------------------------
@@ -410,6 +411,10 @@ class VideoMaskletFrontend:
         max_thing_objects: int = 15,
         prompt_type: str = "mask",
         sam31_offload_video_to_cpu: bool = True,
+        sam31_offload_state_to_cpu: bool = True,
+        sam31_max_movable_objects: int = 2,
+        sam31_max_static_objects: int = 1,
+        sam31_max_structure_objects: int = 1,
     ):
         self.video_predictor = video_predictor
         self.detector = detector
@@ -430,6 +435,10 @@ class VideoMaskletFrontend:
         self.max_thing_objects = max_thing_objects
         self.prompt_type = prompt_type
         self.sam31_offload_video_to_cpu = sam31_offload_video_to_cpu
+        self.sam31_offload_state_to_cpu = sam31_offload_state_to_cpu
+        self.sam31_max_movable_objects = max(int(sam31_max_movable_objects), 0)
+        self.sam31_max_static_objects = max(int(sam31_max_static_objects), 0)
+        self.sam31_max_structure_objects = max(int(sam31_max_structure_objects), 0)
 
     # -- Factory -----------------------------------------------------------
 
@@ -478,12 +487,12 @@ class VideoMaskletFrontend:
             try:
                 video_predictor = build_sam3_multiplex_video_predictor(
                     checkpoint_path=sam31_checkpoint,
-                    async_loading_frames=False,
+                    use_fa3=False,
+                    use_rope_real=False,
+                    multiplex_count=max(int(kwargs.get("max_thing_objects", 15)), 16),
                     compile=False,
                     warm_up=False,
-                    use_fa3=False,
-                    max_num_objects=max(int(kwargs.get("max_thing_objects", 15)), 16),
-                    multiplex_count=max(int(kwargs.get("max_thing_objects", 15)), 16),
+                    async_loading_frames=False,
                 )
                 if hasattr(video_predictor, "model"):
                     if hasattr(video_predictor.model, "postprocess_batch_size"):
@@ -492,14 +501,12 @@ class VideoMaskletFrontend:
                         video_predictor.model.batched_grounding_batch_size = (
                             sam31_batched_grounding_batch_size
                         )
+                    detector = getattr(video_predictor.model, "detector", None)
                     if (
-                        hasattr(video_predictor.model, "detector")
-                        and hasattr(
-                            video_predictor.model.detector,
-                            "offload_outputs_to_cpu_for_eval",
-                        )
+                        detector is not None
+                        and hasattr(detector, "offload_outputs_to_cpu_for_eval")
                     ):
-                        video_predictor.model.detector.offload_outputs_to_cpu_for_eval = (
+                        detector.offload_outputs_to_cpu_for_eval = (
                             sam31_offload_outputs_to_cpu
                         )
             except Exception as exc:
@@ -537,6 +544,7 @@ class VideoMaskletFrontend:
                    sam_backend=sam_backend,
                    device=device,
                    sam31_offload_video_to_cpu=sam31_offload_video_to_cpu,
+                   sam31_offload_state_to_cpu=sam31_offload_outputs_to_cpu,
                    **kwargs)
 
     # -- Public API --------------------------------------------------------
@@ -580,6 +588,48 @@ class VideoMaskletFrontend:
         finally:
             shutil.rmtree(frame_dir, ignore_errors=True)
 
+    def run_from_paths(
+        self,
+        image_paths: List[str],
+        ann_frame_idx: Optional[int] = None,
+        discovery_frame_indices: Optional[List[int]] = None,
+        seed_detections_by_frame: Optional[Dict[int, List[Dict[str, Any]]]] = None,
+    ) -> MaskletOutput:
+        """Run Stage C directly from existing frame files.
+
+        This avoids decoding the chunk into a tensor and then re-encoding it
+        back to temporary jpg files before detector / SAM3.1 consume it.
+        """
+        if not image_paths:
+            raise ValueError("image_paths must be non-empty")
+
+        sample = cv2.imread(image_paths[0], cv2.IMREAD_COLOR)
+        if sample is None:
+            raise FileNotFoundError(f"Failed to read frame: {image_paths[0]}")
+
+        T = len(image_paths)
+        H, W = sample.shape[:2]
+        ann_idx = ann_frame_idx if ann_frame_idx is not None else self.ann_frame_idx
+        discovery_indices = self._build_discovery_frame_indices(
+            T, ann_idx, discovery_frame_indices,
+        )
+
+        self.detector.to_device()
+
+        frame_dir = tempfile.mkdtemp(prefix="masklet_links_")
+        try:
+            self._link_frames(image_paths, frame_dir)
+            return self._run_pipeline(
+                frame_dir,
+                T,
+                H,
+                W,
+                discovery_indices,
+                seed_detections_by_frame=seed_detections_by_frame,
+            )
+        finally:
+            shutil.rmtree(frame_dir, ignore_errors=True)
+
     # -- Pipeline ----------------------------------------------------------
 
     def _build_discovery_frame_indices(
@@ -601,17 +651,17 @@ class VideoMaskletFrontend:
             indices.insert(0, 0)
         return sorted({i for i in indices if 0 <= i < T})
 
-    def _start_sam31_session(self, frame_dir: str) -> str:
+    def _start_sam31_session(self, frame_resource: Any) -> str:
         request = dict(
             type="start_session",
-            resource_path=frame_dir,
+            resource_path=frame_resource,
             offload_video_to_cpu=self.sam31_offload_video_to_cpu,
         )
         return self.video_predictor.handle_request(request)["session_id"]
 
     def _select_multiframe_things(
         self,
-        frame_dir: str,
+        frame_resource: Any,
         thing_dets_by_frame: Dict[int, List[Dict[str, Any]]],
         discovery_indices: List[int],
         T: int,
@@ -621,11 +671,11 @@ class VideoMaskletFrontend:
     ) -> Tuple[List[Dict[str, Any]], Dict[int, Dict[int, np.ndarray]], Dict[int, Dict]]:
         if self.sam_backend == "sam3":
             return self._select_multiframe_things_sam3(
-                frame_dir, thing_dets_by_frame, discovery_indices, T, H, W, area,
+                frame_resource, thing_dets_by_frame, discovery_indices, T, H, W, area,
             )
         if self.sam_backend == "sam31_multiplex":
             return self._select_multiframe_things_sam31_multiplex(
-                frame_dir, thing_dets_by_frame, discovery_indices, T, H, W, area,
+                frame_resource, thing_dets_by_frame, discovery_indices, T, H, W, area,
             )
 
         selected: List[Dict[str, Any]] = []
@@ -653,7 +703,7 @@ class VideoMaskletFrontend:
 
             if added:
                 thing_segments, thing_oid_map = self._propagate_things(
-                    frame_dir, selected, T, H, W,
+                    frame_resource, selected, T, H, W,
                 )
 
             if len(selected) >= self.max_thing_objects:
@@ -663,7 +713,7 @@ class VideoMaskletFrontend:
 
     def _select_multiframe_things_sam31_multiplex(
         self,
-        frame_dir: str,
+        frame_resource: Any,
         thing_dets_by_frame: Dict[int, List[Dict[str, Any]]],
         discovery_indices: List[int],
         T: int,
@@ -691,7 +741,7 @@ class VideoMaskletFrontend:
         if not label_to_dets:
             return selected, thing_segments, thing_oid_map
 
-        session_id = self._start_sam31_session(frame_dir)
+        session_id = self._start_sam31_session(frame_resource)
 
         try:
             label_order = sorted(
@@ -750,7 +800,7 @@ class VideoMaskletFrontend:
                         )
                     except Exception:
                         pass
-                    session_id = self._start_sam31_session(frame_dir)
+                    session_id = self._start_sam31_session(frame_resource)
                     try:
                         obj_segments, obj_scores = self._track_label_with_sam31_multiplex_session(
                             session_id=session_id,
@@ -806,7 +856,7 @@ class VideoMaskletFrontend:
 
     def _select_multiframe_structure_sam31_multiplex(
         self,
-        frame_dir: str,
+        frame_resource: Any,
         structure_dets_by_frame: Dict[int, List[Dict[str, Any]]],
         discovery_indices: List[int],
         T: int,
@@ -834,7 +884,7 @@ class VideoMaskletFrontend:
         if not label_to_dets:
             return selected, structure_segments, structure_oid_map
 
-        session_id = self._start_sam31_session(frame_dir)
+        session_id = self._start_sam31_session(frame_resource)
 
         try:
             label_order = sorted(
@@ -886,7 +936,7 @@ class VideoMaskletFrontend:
                         )
                     except Exception:
                         pass
-                    session_id = self._start_sam31_session(frame_dir)
+                    session_id = self._start_sam31_session(frame_resource)
                     try:
                         obj_segments, obj_scores = self._track_label_with_sam31_multiplex_session(
                             session_id=session_id,
@@ -943,9 +993,395 @@ class VideoMaskletFrontend:
 
         return selected, structure_segments, structure_oid_map
 
+    def _cluster_sam31_track_candidates(
+        self,
+        dets_by_frame: Dict[int, List[Dict[str, Any]]],
+        discovery_indices: List[int],
+        area: int,
+    ) -> List[Dict[str, Any]]:
+        clusters: List[Dict[str, Any]] = []
+        for frame_idx in discovery_indices:
+            candidates = list(dets_by_frame.get(frame_idx, []))
+            if not candidates:
+                continue
+            candidates.sort(
+                key=lambda d: (
+                    int(d.get("frame_idx", frame_idx)),
+                    -(d["mask"].astype(bool).sum() / max(area, 1)),
+                    -float(d["confidence"]),
+                ),
+            )
+            for det in candidates:
+                det_frame = int(det.get("frame_idx", frame_idx))
+                best_cluster = None
+                best_score = -1.0
+                det_group = int(det["sem_group"])
+                det_mask = det["mask"].astype(bool)
+                det_box = np.asarray(det["box"], dtype=np.float32)
+                det_area = max(float(det_mask.sum()), 1.0)
+
+                for cluster in clusters:
+                    ref_det = cluster["detections"][-1]
+                    if int(ref_det["sem_group"]) != det_group:
+                        continue
+                    if not _labels_compatible(str(ref_det["label"]), str(det["label"])):
+                        continue
+
+                    ref_mask = ref_det["mask"].astype(bool)
+                    ref_box = np.asarray(ref_det["box"], dtype=np.float32)
+                    ref_area = max(float(ref_mask.sum()), 1.0)
+                    mask_iou = _mask_iou(det_mask, ref_mask)
+                    box_iou = _box_iou_xyxy(det_box, ref_box)
+                    area_sim = min(det_area, ref_area) / max(det_area, ref_area)
+                    frame_gap = abs(det_frame - int(ref_det.get("frame_idx", det_frame)))
+                    gap_bonus = 0.10 if frame_gap <= max(self.discovery_frame_stride, 1) else 0.0
+
+                    if det_group == SEMANTIC_GROUP_STRUCTURE_ANCHOR:
+                        score = 0.45 * mask_iou + 0.25 * box_iou + 0.20 * area_sim + gap_bonus
+                        threshold = 0.18
+                    elif det_group == SEMANTIC_GROUP_STATIC_THING:
+                        score = 0.25 * mask_iou + 0.45 * box_iou + 0.20 * area_sim + gap_bonus
+                        threshold = 0.18
+                    else:
+                        score = 0.15 * mask_iou + 0.55 * box_iou + 0.20 * area_sim + gap_bonus
+                        threshold = 0.16
+
+                    if score >= threshold and score > best_score:
+                        best_score = score
+                        best_cluster = cluster
+
+                if best_cluster is None:
+                    clusters.append({
+                        "label": str(det["label"]),
+                        "sem_group": det_group,
+                        "detections": [dict(det)],
+                    })
+                else:
+                    best_cluster["detections"].append(dict(det))
+
+        candidates: List[Dict[str, Any]] = []
+        for cluster in clusters:
+            dets = sorted(
+                cluster["detections"],
+                key=lambda d: (
+                    -int(bool(d.get("is_seed_track", False))),
+                    int(d.get("frame_idx", 0)),
+                    -float(d["confidence"]),
+                    -(d["mask"].astype(bool).sum() / max(area, 1)),
+                ),
+            )
+            seed_count = sum(1 for d in dets if bool(d.get("is_seed_track", False)))
+            prompt_det = dict(dets[0])
+            prompt_det["cluster_size"] = len(dets)
+            prompt_det["seed_count"] = int(seed_count)
+            prompt_det["support_frames"] = sorted({int(d.get("frame_idx", 0)) for d in dets})
+            prompt_det["cluster_confidence"] = max(float(d["confidence"]) for d in dets)
+            candidates.append(prompt_det)
+
+        candidates.sort(
+            key=lambda d: (
+                -int(d.get("seed_count", 0)),
+                -int(d.get("cluster_size", 1)),
+                -float(d.get("cluster_confidence", d["confidence"])),
+                -(d["mask"].astype(bool).sum() / max(area, 1)),
+                int(d.get("frame_idx", 0)),
+            )
+        )
+        return candidates
+
+    def _filter_sam31_track_candidates(
+        self,
+        candidates: List[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        filtered: List[Dict[str, Any]] = []
+        for det in candidates:
+            seed_count = int(det.get("seed_count", 0))
+            cluster_size = int(det.get("cluster_size", 1))
+            confidence = float(det.get("cluster_confidence", det.get("confidence", 0.0)))
+            area_ratio = float(det.get("area_ratio", 0.0))
+            sem_group = int(det.get("sem_group", SEMANTIC_GROUP_UNCERTAIN_REGION))
+
+            if seed_count > 0:
+                filtered.append(det)
+                continue
+
+            if sem_group == SEMANTIC_GROUP_STRUCTURE_ANCHOR:
+                keep = cluster_size >= 2 or confidence >= 0.60 or area_ratio >= 0.12
+            elif sem_group == SEMANTIC_GROUP_STATIC_THING:
+                keep = cluster_size >= 2 or confidence >= 0.58 or area_ratio >= 0.03
+            elif sem_group == SEMANTIC_GROUP_MOVABLE_THING:
+                keep = cluster_size >= 2 or confidence >= 0.68
+            else:
+                keep = cluster_size >= 2 or confidence >= 0.72
+
+            if keep:
+                filtered.append(det)
+        return filtered
+
+    def _take_sam31_track_candidates(
+        self,
+        candidates: List[Dict[str, Any]],
+        *,
+        budget: int,
+        allowed_groups: Optional[Set[int]] = None,
+        per_label_limit: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        if budget <= 0:
+            return []
+
+        selected: List[Dict[str, Any]] = []
+        label_counts: Dict[str, int] = {}
+        for det in candidates:
+            sem_group = int(det.get("sem_group", SEMANTIC_GROUP_UNCERTAIN_REGION))
+            if allowed_groups is not None and sem_group not in allowed_groups:
+                continue
+            label = str(det.get("label", "unknown"))
+            if per_label_limit is not None and label_counts.get(label, 0) >= per_label_limit:
+                continue
+            selected.append(dict(det))
+            label_counts[label] = label_counts.get(label, 0) + 1
+            if len(selected) >= budget:
+                break
+        return selected
+
+    def _build_sam31_object_prompt(
+        self,
+        det: Dict[str, Any],
+        H: int,
+        W: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        mask = det["mask"].astype(bool)
+        ys, xs = np.where(mask)
+        if len(xs) > 0:
+            cx = float(xs.mean())
+            cy = float(ys.mean())
+        else:
+            x1, y1, x2, y2 = [float(v) for v in np.asarray(det["box"], dtype=np.float32)]
+            cx = 0.5 * (x1 + x2)
+            cy = 0.5 * (y1 + y2)
+
+        x1, y1, x2, y2 = [float(v) for v in np.asarray(det["box"], dtype=np.float32)]
+        x1 = np.clip(x1, 0.0, max(W - 1, 0))
+        x2 = np.clip(x2, 0.0, max(W - 1, 0))
+        y1 = np.clip(y1, 0.0, max(H - 1, 0))
+        y2 = np.clip(y2, 0.0, max(H - 1, 0))
+        cx = np.clip(cx, 0.0, max(W - 1, 0))
+        cy = np.clip(cy, 0.0, max(H - 1, 0))
+
+        points = np.array(
+            [
+                [x1 / max(W, 1), y1 / max(H, 1)],
+                [x2 / max(W, 1), y2 / max(H, 1)],
+                [cx / max(W, 1), cy / max(H, 1)],
+            ],
+            dtype=np.float32,
+        )
+        labels = np.array([2, 3, 1], dtype=np.int32)
+        return points, labels
+
+    @torch.inference_mode()
+    def _track_objects_once_sam31_multiplex_session(
+        self,
+        session_id: str,
+        detections: List[Dict[str, Any]],
+        H: int,
+        W: int,
+    ) -> Tuple[Dict[int, Dict[int, np.ndarray]], Dict[int, float], Dict[int, Dict[str, Any]]]:
+        if not detections:
+            return {}, {}, {}
+
+        obj_to_det: Dict[int, Dict[str, Any]] = {}
+        obj_segments: Dict[int, Dict[int, np.ndarray]] = {}
+        obj_scores: Dict[int, float] = {}
+        start_frame_idx = min(int(det.get("frame_idx", 0)) for det in detections)
+
+        dets_by_prompt_frame: Dict[int, List[Tuple[int, Dict[str, Any]]]] = {}
+        for obj_id, det in enumerate(detections, start=1):
+            obj_id = int(obj_id)
+            prompt_frame = int(det.get("frame_idx", 0))
+            obj_to_det[obj_id] = det
+            obj_segments[obj_id] = {}
+            obj_scores[obj_id] = max(obj_scores.get(obj_id, 0.0), float(det.get("confidence", 0.0)))
+            dets_by_prompt_frame.setdefault(prompt_frame, []).append((obj_id, det))
+
+        for prompt_frame in sorted(dets_by_prompt_frame.keys()):
+            frame_entries = dets_by_prompt_frame[prompt_frame]
+            for obj_id, det in frame_entries:
+                points, labels = self._build_sam31_object_prompt(det, H=H, W=W)
+                response = self.video_predictor.handle_request(
+                    dict(
+                        type="add_prompt",
+                        session_id=session_id,
+                        frame_index=int(prompt_frame),
+                        points=points,
+                        point_labels=labels,
+                        obj_id=int(obj_id),
+                    )
+                )
+                outputs = response["outputs"]
+                out_obj_ids = outputs.get("out_obj_ids", [])
+                out_masks = outputs.get("out_binary_masks", [])
+                out_probs = outputs.get("out_probs", [])
+                for idx, out_obj_id in enumerate(out_obj_ids):
+                    out_obj_id = int(out_obj_id)
+                    if out_obj_id not in obj_to_det:
+                        continue
+                    if idx < len(out_masks):
+                        obj_segments.setdefault(out_obj_id, {})[int(prompt_frame)] = (
+                            out_masks[idx].astype(np.uint8)
+                        )
+                    if idx < len(out_probs):
+                        obj_scores[out_obj_id] = max(obj_scores.get(out_obj_id, 0.0), float(out_probs[idx]))
+
+        for prop_response in self.video_predictor.handle_stream_request(
+            dict(
+                type="propagate_in_video",
+                session_id=session_id,
+                propagation_direction="forward",
+                start_frame_index=int(start_frame_idx),
+            )
+        ):
+            out_frame_idx = int(prop_response["frame_index"])
+            outputs = prop_response["outputs"]
+            out_obj_ids = outputs.get("out_obj_ids", [])
+            out_masks = outputs.get("out_binary_masks", [])
+            out_probs = outputs.get("out_probs", [])
+            for idx, out_obj_id in enumerate(out_obj_ids):
+                out_obj_id = int(out_obj_id)
+                if out_obj_id not in obj_to_det:
+                    continue
+                if idx < len(out_masks):
+                    obj_segments.setdefault(out_obj_id, {})[out_frame_idx] = (
+                        out_masks[idx].astype(np.uint8)
+                    )
+                if idx < len(out_probs):
+                    obj_scores[out_obj_id] = max(obj_scores.get(out_obj_id, 0.0), float(out_probs[idx]))
+
+        obj_segments = {
+            obj_id: frame_to_mask
+            for obj_id, frame_to_mask in obj_segments.items()
+            if frame_to_mask
+        }
+        return obj_segments, obj_scores, obj_to_det
+
+    def _track_all_objects_sam31_multiplex(
+        self,
+        frame_resource: Any,
+        thing_dets_by_frame: Dict[int, List[Dict[str, Any]]],
+        structure_dets_by_frame: Dict[int, List[Dict[str, Any]]],
+        discovery_indices: List[int],
+        T: int,
+        H: int,
+        W: int,
+        area: int,
+    ) -> Tuple[
+        List[Dict[str, Any]],
+        Dict[int, Dict[int, np.ndarray]],
+        Dict[int, Dict],
+        List[Dict[str, Any]],
+        Dict[int, Dict[int, np.ndarray]],
+        Dict[int, Dict],
+    ]:
+        selected_thing_dets: List[Dict[str, Any]] = []
+        thing_segments: Dict[int, Dict[int, np.ndarray]] = {}
+        thing_oid_map: Dict[int, Dict] = {}
+        selected_structure_dets: List[Dict[str, Any]] = []
+        structure_segments: Dict[int, Dict[int, np.ndarray]] = {}
+        structure_oid_map: Dict[int, Dict] = {}
+
+        thing_candidates = self._cluster_sam31_track_candidates(
+            thing_dets_by_frame, discovery_indices, area,
+        )
+        structure_candidates = self._cluster_sam31_track_candidates(
+            structure_dets_by_frame, discovery_indices, area,
+        )
+        thing_candidates = self._filter_sam31_track_candidates(thing_candidates)
+        structure_candidates = self._filter_sam31_track_candidates(structure_candidates)
+
+        thing_budget = max(int(self.max_thing_objects), 0)
+        selected_movable = self._take_sam31_track_candidates(
+            thing_candidates,
+            budget=min(thing_budget, self.sam31_max_movable_objects),
+            allowed_groups={SEMANTIC_GROUP_MOVABLE_THING},
+        )
+        remaining_thing_budget = max(0, thing_budget - len(selected_movable))
+        selected_static = self._take_sam31_track_candidates(
+            thing_candidates,
+            budget=min(remaining_thing_budget, self.sam31_max_static_objects),
+            allowed_groups={SEMANTIC_GROUP_STATIC_THING},
+            per_label_limit=1,
+        )
+        selected_structure_dets = self._take_sam31_track_candidates(
+            structure_candidates,
+            budget=self.sam31_max_structure_objects,
+            allowed_groups={SEMANTIC_GROUP_STRUCTURE_ANCHOR},
+            per_label_limit=1,
+        )
+        selected_thing_dets = selected_movable + selected_static
+
+        all_candidates = selected_thing_dets + selected_structure_dets
+        if not all_candidates:
+            return (
+                selected_thing_dets,
+                thing_segments,
+                thing_oid_map,
+                selected_structure_dets,
+                structure_segments,
+                structure_oid_map,
+            )
+
+        session_id = self._start_sam31_session(frame_resource)
+        try:
+            obj_segments, obj_scores, obj_to_det = self._track_objects_once_sam31_multiplex_session(
+                session_id=session_id,
+                detections=all_candidates,
+                H=H,
+                W=W,
+            )
+        finally:
+            self.video_predictor.handle_request(
+                dict(type="close_session", session_id=session_id)
+            )
+
+        next_thing_oid = 1
+        next_structure_oid = 1
+        selected_thing_final: List[Dict[str, Any]] = []
+        selected_structure_final: List[Dict[str, Any]] = []
+        thing_set = {id(det) for det in selected_thing_dets}
+
+        for obj_id in sorted(obj_segments.keys()):
+            det = dict(obj_to_det[obj_id])
+            det["confidence"] = max(
+                float(det["confidence"]),
+                float(obj_scores.get(obj_id, 0.0)),
+            )
+            if id(obj_to_det[obj_id]) in thing_set:
+                oid = next_thing_oid
+                next_thing_oid += 1
+                thing_oid_map[oid] = det
+                selected_thing_final.append(det)
+                for t, mask in obj_segments[obj_id].items():
+                    thing_segments.setdefault(int(t), {})[oid] = mask
+            else:
+                oid = next_structure_oid
+                next_structure_oid += 1
+                structure_oid_map[oid] = det
+                selected_structure_final.append(det)
+                for t, mask in obj_segments[obj_id].items():
+                    structure_segments.setdefault(int(t), {})[oid] = mask
+
+        return (
+            selected_thing_final,
+            thing_segments,
+            thing_oid_map,
+            selected_structure_final,
+            structure_segments,
+            structure_oid_map,
+        )
+
     def _select_multiframe_things_sam3(
         self,
-        frame_dir: str,
+        frame_resource: Any,
         thing_dets_by_frame: Dict[int, List[Dict[str, Any]]],
         discovery_indices: List[int],
         T: int,
@@ -957,7 +1393,7 @@ class VideoMaskletFrontend:
         thing_segments: Dict[int, Dict[int, np.ndarray]] = {}
         thing_oid_map: Dict[int, Dict] = {}
         next_oid = 1
-        request = dict(type="start_session", resource_path=frame_dir)
+        request = dict(type="start_session", resource_path=frame_resource)
         session_id = self.video_predictor.handle_request(request)["session_id"]
 
         try:
@@ -1064,19 +1500,22 @@ class VideoMaskletFrontend:
 
     def _run_pipeline(
         self,
-        frame_dir: str,
+        frame_resource: Any,
         T: int,
         H: int,
         W: int,
         discovery_indices: List[int],
         seed_detections_by_frame: Optional[Dict[int, List[Dict[str, Any]]]] = None,
+        detector_image_paths: Optional[List[str]] = None,
     ) -> MaskletOutput:
         area = H * W
 
         # ======== Step 1: detect on discovery frames ========
         detections_by_frame: Dict[int, List[Dict[str, Any]]] = {}
         for frame_idx in discovery_indices:
-            frame_dets = self._detect_and_filter(frame_dir, frame_idx, H, W)
+            frame_dets = self._detect_and_filter(
+                frame_resource, frame_idx, H, W, detector_image_paths=detector_image_paths
+            )
             for det in frame_dets:
                 det["frame_idx"] = frame_idx
             detections_by_frame[frame_idx] = frame_dets
@@ -1119,26 +1558,21 @@ class VideoMaskletFrontend:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        # ======== Step 3: SAM2 Video Predictor — track thing objects ========
+        # ======== Step 3: track thing / structure objects ========
         thing_segments, thing_oid_map = {}, {}
-        selected_thing_dets, thing_segments, thing_oid_map = \
-            self._select_multiframe_things(
-                frame_dir, thing_dets_by_frame, discovery_indices, T, H, W, area,
-            )
-        if not thing_segments and selected_thing_dets:
-            thing_segments, thing_oid_map = self._propagate_things(
-                frame_dir, selected_thing_dets, T, H, W,
-            )
-
         structure_segments, structure_oid_map = {}, {}
         selected_structure_dets: List[Dict[str, Any]] = []
         if self.sam_backend == "sam31_multiplex":
             (
+                selected_thing_dets,
+                thing_segments,
+                thing_oid_map,
                 selected_structure_dets,
                 structure_segments,
                 structure_oid_map,
-            ) = self._select_multiframe_structure_sam31_multiplex(
-                frame_dir,
+            ) = self._track_all_objects_sam31_multiplex(
+                frame_resource,
+                thing_dets_by_frame,
                 structure_dets_by_frame,
                 discovery_indices,
                 T,
@@ -1146,6 +1580,15 @@ class VideoMaskletFrontend:
                 W,
                 area,
             )
+        else:
+            selected_thing_dets, thing_segments, thing_oid_map = \
+                self._select_multiframe_things(
+                    frame_resource, thing_dets_by_frame, discovery_indices, T, H, W, area,
+                )
+            if not thing_segments and selected_thing_dets:
+                thing_segments, thing_oid_map = self._propagate_things(
+                    frame_resource, selected_thing_dets, T, H, W,
+                )
 
         tracked_structure_labels = {str(det["label"]) for det in selected_structure_dets}
         if tracked_structure_labels:
@@ -1164,7 +1607,7 @@ class VideoMaskletFrontend:
 
         # ======== Step 4: stuff — per-keyframe static masks ========
         stuff_entries = self._build_stuff_entries(
-            stuff_dets, frame_dir, T, H, W,
+            stuff_dets, frame_resource, T, H, W,
         )
 
         # ======== Step 5: assemble ========
@@ -1187,9 +1630,18 @@ class VideoMaskletFrontend:
 
     # -- Detection & filtering --------------------------------------------
 
-    def _detect_and_filter(self, frame_dir: str, frame_idx: int,
-                           H: int, W: int) -> List[Dict]:
-        img_path = os.path.join(frame_dir, f"{frame_idx:05d}.jpg")
+    def _detect_and_filter(
+        self,
+        frame_resource: Any,
+        frame_idx: int,
+        H: int,
+        W: int,
+        detector_image_paths: Optional[List[str]] = None,
+    ) -> List[Dict]:
+        if detector_image_paths is not None:
+            img_path = detector_image_paths[frame_idx]
+        else:
+            img_path = os.path.join(frame_resource, f"{frame_idx:05d}.jpg")
         raw = self.detector.detect(
             img_path, self.thing_prompts, self.stuff_prompts,
             self.box_threshold, self.text_threshold,
@@ -1452,14 +1904,14 @@ class VideoMaskletFrontend:
 
     @torch.inference_mode()
     def _propagate_things(
-        self, frame_dir: str, thing_dets: List[Dict], T: int, H: int, W: int,
+        self, frame_resource: Any, thing_dets: List[Dict], T: int, H: int, W: int,
     ) -> Tuple[Dict[int, Dict[int, np.ndarray]], Dict[int, Dict]]:
         if self.sam_backend == "sam3":
             dets_by_frame: Dict[int, List[Dict[str, Any]]] = {}
             for det in thing_dets:
                 dets_by_frame.setdefault(int(det.get("frame_idx", 0)), []).append(det)
             selected, segments, oid_map = self._select_multiframe_things_sam3(
-                frame_dir,
+                frame_resource,
                 dets_by_frame,
                 sorted(dets_by_frame.keys()),
                 T,
@@ -1473,7 +1925,7 @@ class VideoMaskletFrontend:
             for det in thing_dets:
                 dets_by_frame.setdefault(int(det.get("frame_idx", 0)), []).append(det)
             selected, segments, oid_map = self._select_multiframe_things_sam31_multiplex(
-                frame_dir,
+                frame_resource,
                 dets_by_frame,
                 sorted(dets_by_frame.keys()),
                 T,
@@ -1483,7 +1935,7 @@ class VideoMaskletFrontend:
             )
             return segments, oid_map
 
-        inference_state = self.video_predictor.init_state(video_path=frame_dir)
+        inference_state = self.video_predictor.init_state(video_path=frame_resource)
         oid_map: Dict[int, Dict] = {}
 
         with torch.autocast(device_type=self.device, dtype=torch.bfloat16):
@@ -1525,7 +1977,7 @@ class VideoMaskletFrontend:
 
     def _build_stuff_entries(
         self, stuff_dets: List[Dict],
-        frame_dir: str, T: int, H: int, W: int,
+        frame_resource: Any, T: int, H: int, W: int,
     ) -> List[Dict]:
         """Build stable stuff masklet entries for the whole chunk.
 
@@ -1815,6 +2267,32 @@ class VideoMaskletFrontend:
             img_np = (images[t].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
             img_bgr = cv2.cvtColor(img_np, cv2.COLOR_RGB2BGR)
             cv2.imwrite(os.path.join(out_dir, f"{t:05d}.jpg"), img_bgr)
+
+    def _tensor_to_pil_images(self, images: torch.Tensor) -> List[Image.Image]:
+        out: List[Image.Image] = []
+        for t in range(images.shape[0]):
+            img_np = (images[t].permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+            out.append(Image.fromarray(img_np, mode="RGB"))
+        return out
+
+    def _load_pil_images(self, image_paths: List[str]) -> List[Image.Image]:
+        images: List[Image.Image] = []
+        for path in image_paths:
+            with Image.open(path) as img:
+                images.append(img.convert("RGB").copy())
+        return images
+
+    def _link_frames(self, image_paths: List[str], out_dir: str) -> None:
+        for t, src_path in enumerate(image_paths):
+            dst_path = os.path.join(out_dir, f"{t:05d}.jpg")
+            abs_src = os.path.abspath(src_path)
+            try:
+                os.symlink(abs_src, dst_path)
+            except OSError:
+                try:
+                    os.link(abs_src, dst_path)
+                except OSError:
+                    shutil.copy2(abs_src, dst_path)
 
     def _empty_output(self, T: int, H: int, W: int) -> MaskletOutput:
         return MaskletOutput(
