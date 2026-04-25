@@ -177,6 +177,67 @@ def _mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
     return inter / union if union > 0 else 0.0
 
 
+def _clean_instance_mask_components(
+    mask: np.ndarray,
+    sem_group: int,
+    label: str,
+    *,
+    image_area: int,
+) -> np.ndarray:
+    """Keep instance masks from carrying far-away SAM fragments.
+
+    SAM video propagation can occasionally attach small disconnected islands
+    from other people/objects. Those islands make boxes jump across the frame
+    and weaken cross-chunk matching, so tracked instance masks are reduced to
+    their dominant connected support. Stuff masks are intentionally not passed
+    through this helper.
+    """
+    binary = mask.astype(bool)
+    if int(sem_group) not in {
+        SEMANTIC_GROUP_MOVABLE_THING,
+        SEMANTIC_GROUP_STATIC_THING,
+    }:
+        return binary
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        binary.astype(np.uint8), connectivity=8,
+    )
+    if num_labels <= 2:
+        return binary
+
+    comp_areas = stats[1:, cv2.CC_STAT_AREA].astype(np.float32)
+    if comp_areas.size == 0:
+        return binary
+
+    order = np.argsort(comp_areas)[::-1]
+    largest = float(comp_areas[order[0]])
+    if largest <= 0.0:
+        return binary
+
+    label_l = str(label).strip().lower()
+    single_instance = int(sem_group) == SEMANTIC_GROUP_MOVABLE_THING
+    if _labels_compatible(label_l, "person") or _labels_compatible(label_l, "people"):
+        single_instance = True
+
+    keep = np.zeros_like(binary, dtype=bool)
+    max_components = 1 if single_instance else 3
+    min_component_area = max(12.0, 0.00002 * float(max(image_area, 1)))
+    if not single_instance:
+        min_component_area = max(min_component_area, 0.08 * largest)
+
+    kept = 0
+    for comp_rank in order:
+        comp_area = float(comp_areas[comp_rank])
+        if kept > 0 and comp_area < min_component_area:
+            continue
+        keep |= labels == int(comp_rank + 1)
+        kept += 1
+        if kept >= max_components:
+            break
+
+    return keep if keep.any() else binary
+
+
 def _box_iou_xyxy(box_a: np.ndarray, box_b: np.ndarray) -> float:
     ax1, ay1, ax2, ay2 = [float(v) for v in box_a]
     bx1, by1, bx2, by2 = [float(v) for v in box_b]
@@ -316,7 +377,10 @@ class YOLOEDetector(BaseDetector):
             self.model.set_classes(all_prompts)
             self._prompts_set = key
 
-        results = self.model.predict(image_path, conf=box_threshold, verbose=False)
+        # Use YOLOE primarily as a high-recall seed generator; SAM3 does the
+        # temporally-consistent filtering/tracking afterwards.
+        yolo_conf = min(float(box_threshold), 0.18)
+        results = self.model.predict(image_path, conf=yolo_conf, verbose=False)
         if not results or results[0].boxes is None or len(results[0].boxes) == 0:
             return []
         r = results[0]
@@ -376,6 +440,7 @@ class MaskletOutput:
 
     source_type: List[str] = field(default_factory=list)  # "thing_tracked" | "structure_tracked" | "stuff_static"
     birth_frame: List[int] = field(default_factory=list)
+    seed_global_track_idx: List[Optional[int]] = field(default_factory=list)
     debug: Dict[str, Any] = field(default_factory=dict)
 
 
@@ -402,19 +467,20 @@ class VideoMaskletFrontend:
         box_threshold: float = 0.30,
         text_threshold: float = 0.25,
         ann_frame_idx: int = 0,
-        discovery_frame_stride: int = 8,
+        discovery_frame_stride: int = 4,
         stuff_keyframe_stride: int = 10,
         min_mask_area_ratio: float = 0.001,
         max_mask_area_ratio: float = 0.95,
         nms_iou_threshold: float = 0.70,
         discovery_match_iou_threshold: float = 0.50,
-        max_thing_objects: int = 15,
+        max_thing_objects: int = 18,
         prompt_type: str = "mask",
         sam31_offload_video_to_cpu: bool = True,
         sam31_offload_state_to_cpu: bool = True,
+        sam31_offload_sam_during_detection: bool = False,
         sam31_max_movable_objects: int = 2,
         sam31_max_static_objects: int = 1,
-        sam31_max_structure_objects: int = 1,
+        sam31_max_structure_objects: int = 0,
     ):
         self.video_predictor = video_predictor
         self.detector = detector
@@ -436,9 +502,38 @@ class VideoMaskletFrontend:
         self.prompt_type = prompt_type
         self.sam31_offload_video_to_cpu = sam31_offload_video_to_cpu
         self.sam31_offload_state_to_cpu = sam31_offload_state_to_cpu
+        self.sam31_offload_sam_during_detection = bool(sam31_offload_sam_during_detection)
         self.sam31_max_movable_objects = max(int(sam31_max_movable_objects), 0)
         self.sam31_max_static_objects = max(int(sam31_max_static_objects), 0)
         self.sam31_max_structure_objects = max(int(sam31_max_structure_objects), 0)
+
+    def _sam31_prompt_only_budget(self, label: str, sem_group: int) -> int:
+        """Allow SAM3.1 text-prompt instances that YOLOE failed to seed.
+
+        YOLOE detections are still used as high-confidence anchors, but for
+        categories like person the SAM3.1 text prompt can discover additional
+        instances in the same query. Keep this narrow and capped to avoid the
+        noisy prompt-only explosion seen when every label is admitted.
+        """
+        if sem_group != SEMANTIC_GROUP_MOVABLE_THING:
+            return 0
+        if _labels_compatible(label, "person") or _labels_compatible(label, "people"):
+            return min(8, max(int(self.max_thing_objects), 0))
+        return min(1, max(int(self.max_thing_objects), 0))
+
+    def _sam31_prompt_only_filters(
+        self,
+        label: str,
+        sem_group: int,
+        T: int,
+    ) -> Tuple[int, float, float, float]:
+        if sem_group == SEMANTIC_GROUP_MOVABLE_THING and (
+            _labels_compatible(label, "person") or _labels_compatible(label, "people")
+        ):
+            return max(6, min(int(T), int(round(T * 0.18)))), 0.22, 0.0005, 0.60
+        if sem_group == SEMANTIC_GROUP_MOVABLE_THING:
+            return max(6, min(int(T), int(round(T * 0.25)))), 0.45, 0.0010, 0.35
+        return max(6, min(int(T), int(round(T * 0.25)))), 0.50, 0.0020, 0.50
 
     # -- Factory -----------------------------------------------------------
 
@@ -460,6 +555,9 @@ class VideoMaskletFrontend:
     ) -> "VideoMaskletFrontend":
         sam31_offload_video_to_cpu = bool(kwargs.pop("sam31_offload_video_to_cpu", True))
         sam31_offload_outputs_to_cpu = bool(kwargs.pop("sam31_offload_outputs_to_cpu", True))
+        sam31_offload_sam_during_detection = bool(
+            kwargs.pop("sam31_offload_sam_during_detection", False)
+        )
         sam31_postprocess_batch_size = max(int(kwargs.pop("sam31_postprocess_batch_size", 1)), 1)
         sam31_batched_grounding_batch_size = max(
             int(kwargs.pop("sam31_batched_grounding_batch_size", 1)), 1
@@ -489,7 +587,11 @@ class VideoMaskletFrontend:
                     checkpoint_path=sam31_checkpoint,
                     use_fa3=False,
                     use_rope_real=False,
-                    multiplex_count=max(int(kwargs.get("max_thing_objects", 15)), 16),
+                    # The public SAM3.1 multiplex checkpoint is trained with
+                    # 16 object slots. Keep the model slot count checkpoint-
+                    # compatible; the frontend may still aggregate more than
+                    # 16 final tracks across multiple text-prompt refreshes.
+                    multiplex_count=16,
                     compile=False,
                     warm_up=False,
                     async_loading_frames=False,
@@ -545,6 +647,7 @@ class VideoMaskletFrontend:
                    device=device,
                    sam31_offload_video_to_cpu=sam31_offload_video_to_cpu,
                    sam31_offload_state_to_cpu=sam31_offload_outputs_to_cpu,
+                   sam31_offload_sam_during_detection=sam31_offload_sam_during_detection,
                    **kwargs)
 
     # -- Public API --------------------------------------------------------
@@ -659,6 +762,62 @@ class VideoMaskletFrontend:
         )
         return self.video_predictor.handle_request(request)["session_id"]
 
+    def _move_sam31_predictor_model(self, device: str) -> None:
+        predictor_model = getattr(self.video_predictor, "model", None)
+        if predictor_model is not None and hasattr(predictor_model, "to"):
+            predictor_model.to(device)
+
+    def _query_sam31_label_tracks(
+        self,
+        frame_resource: Any,
+        session_id: str,
+        label: str,
+        prompt_frame: int,
+        *,
+        log_prefix: str = "",
+    ) -> Tuple[str, Dict[int, Dict[int, np.ndarray]], Dict[int, float]]:
+        # SAM3.1 multiplex long runs can leave tracker-side state behind even
+        # after reset_session. We still try the cheap reset first, but on the
+        # specific "No points are provided" failure we reopen a fresh session.
+        self.video_predictor.handle_request(
+            dict(type="reset_session", session_id=session_id)
+        )
+        try:
+            obj_segments, obj_scores = self._track_label_with_sam31_multiplex_session(
+                session_id=session_id,
+                label=label,
+                frame_idx=prompt_frame,
+            )
+            return session_id, obj_segments, obj_scores
+        except RuntimeError as exc:
+            if "No points are provided; please add points first" not in str(exc):
+                raise
+
+        try:
+            self.video_predictor.handle_request(
+                dict(type="close_session", session_id=session_id)
+            )
+        except Exception:
+            pass
+
+        session_id = self._start_sam31_session(frame_resource)
+        try:
+            obj_segments, obj_scores = self._track_label_with_sam31_multiplex_session(
+                session_id=session_id,
+                label=label,
+                frame_idx=prompt_frame,
+            )
+            return session_id, obj_segments, obj_scores
+        except RuntimeError as retry_exc:
+            if "No points are provided; please add points first" not in str(retry_exc):
+                raise
+            print(
+                f"[sam31_multiplex] skipping {log_prefix}label={label!r} "
+                f"prompt_frame={prompt_frame} after repeated "
+                "'No points are provided' failures"
+            )
+            return session_id, {}, {}
+
     def _select_multiframe_things(
         self,
         frame_resource: Any,
@@ -682,7 +841,10 @@ class VideoMaskletFrontend:
         thing_segments: Dict[int, Dict[int, np.ndarray]] = {}
         thing_oid_map: Dict[int, Dict] = {}
 
-        for frame_idx in discovery_indices:
+        candidate_frame_indices = sorted(
+            {int(k) for k in discovery_indices}.union(int(k) for k in thing_dets_by_frame.keys())
+        )
+        for frame_idx in candidate_frame_indices:
             candidates = list(thing_dets_by_frame.get(frame_idx, []))
             if not candidates:
                 continue
@@ -727,7 +889,10 @@ class VideoMaskletFrontend:
         next_oid = 1
 
         label_to_dets: Dict[str, List[Dict[str, Any]]] = {}
-        for frame_idx in discovery_indices:
+        candidate_frame_indices = sorted(
+            {int(k) for k in discovery_indices}.union(int(k) for k in thing_dets_by_frame.keys())
+        )
+        for frame_idx in candidate_frame_indices:
             candidates = list(thing_dets_by_frame.get(frame_idx, []))
             if not candidates:
                 continue
@@ -752,24 +917,27 @@ class VideoMaskletFrontend:
                 if len(selected) >= self.max_thing_objects:
                     break
 
-                # SAM3.1 multiplex long runs can leave tracker-side state behind even
-                # after reset_session. We still try the cheap reset first, but on the
-                # specific "No points are provided" failure we reopen a fresh session.
-                self.video_predictor.handle_request(
-                    dict(type="reset_session", session_id=session_id)
-                )
-
                 raw_dets = sorted(
                     label_to_dets[label],
                     key=lambda d: (
+                        -int(bool(d.get("is_seed_track", False))),
                         int(d.get("frame_idx", 0)),
                         -(d["mask"].astype(bool).sum() / max(area, 1)),
                         -float(d["confidence"]),
                     ),
                 )
                 candidate_dets: List[Dict[str, Any]] = []
+                remaining_track_budget = max(int(self.max_thing_objects) - len(selected), 1)
+                # Keep a wider temporal candidate pool than the final object
+                # budget. Otherwise early-frame duplicates can consume the
+                # pre-SAM quota and late-entering objects never reach the
+                # clustering / refresh logic at all.
+                candidate_pool_limit = max(
+                    remaining_track_budget * max(4, min(len(discovery_indices), 8)),
+                    remaining_track_budget + 8,
+                )
                 for det in raw_dets:
-                    if len(selected) + len(candidate_dets) >= self.max_thing_objects:
+                    if len(candidate_dets) >= candidate_pool_limit:
                         break
                     if self._is_duplicate_thing_detection(
                         det, int(det.get("frame_idx", 0)), thing_segments, thing_oid_map
@@ -779,49 +947,23 @@ class VideoMaskletFrontend:
 
                 if not candidate_dets:
                     continue
+                candidate_dets = self._assign_sam31_detection_cluster_ids(
+                    candidate_dets,
+                    area=area,
+                )
 
                 prompt_frame = min(int(det.get("frame_idx", 0)) for det in candidate_dets)
-                obj_segments: Dict[int, Dict[int, np.ndarray]] = {}
-                obj_scores: Dict[int, float] = {}
-                try:
-                    obj_segments, obj_scores = self._track_label_with_sam31_multiplex_session(
-                        session_id=session_id,
-                        label=label,
-                        frame_idx=prompt_frame,
-                    )
-                except RuntimeError as exc:
-                    if "No points are provided; please add points first" not in str(exc):
-                        raise
-                    # Retry from a brand-new session; in long videos reset_session is not
-                    # always enough to clear the multiplex tracker state.
-                    try:
-                        self.video_predictor.handle_request(
-                            dict(type="close_session", session_id=session_id)
-                        )
-                    except Exception:
-                        pass
-                    session_id = self._start_sam31_session(frame_resource)
-                    try:
-                        obj_segments, obj_scores = self._track_label_with_sam31_multiplex_session(
-                            session_id=session_id,
-                            label=label,
-                            frame_idx=prompt_frame,
-                        )
-                    except RuntimeError as retry_exc:
-                        if "No points are provided; please add points first" not in str(retry_exc):
-                            raise
-                        print(
-                            f"[sam31_multiplex] skipping label={label!r} prompt_frame={prompt_frame} "
-                            "after repeated 'No points are provided' failures"
-                        )
-                        continue
+                session_id, obj_segments, obj_scores = self._query_sam31_label_tracks(
+                    frame_resource,
+                    session_id,
+                    label,
+                    int(prompt_frame),
+                )
                 if not obj_segments:
                     continue
 
-                used_prompt_obj_ids = set()
+                matched_by_prompt_obj_id: Dict[int, List[Tuple[Dict[str, Any], float]]] = {}
                 for det in candidate_dets:
-                    if len(selected) >= self.max_thing_objects:
-                        break
                     match = self._match_detection_to_object_track(
                         det=det,
                         obj_segments=obj_segments,
@@ -829,21 +971,283 @@ class VideoMaskletFrontend:
                     if match is None:
                         continue
                     prompt_obj_id, match_score = match
-                    if prompt_obj_id in used_prompt_obj_ids:
-                        continue
-                    used_prompt_obj_ids.add(prompt_obj_id)
+                    matched_by_prompt_obj_id.setdefault(int(prompt_obj_id), []).append(
+                        (det, float(match_score))
+                    )
 
-                    det_copy = dict(det)
+                sem_group = int(
+                    candidate_dets[0].get(
+                        "sem_group",
+                        SEMANTIC_GROUP_UNCERTAIN_REGION,
+                    )
+                )
+                prompt_only_budget = self._sam31_prompt_only_budget(label, sem_group)
+                (
+                    prompt_only_min_track_length,
+                    prompt_only_min_obj_score,
+                    prompt_only_min_area_ratio,
+                    prompt_only_max_area_ratio,
+                ) = self._sam31_prompt_only_filters(label, sem_group, T)
+
+                prompt_candidates = self._build_sam31_prompt_track_candidates(
+                    label=label,
+                    matched_by_prompt_obj_id=matched_by_prompt_obj_id,
+                    obj_segments=obj_segments,
+                    obj_scores=obj_scores,
+                    prompt_frame_idx=int(prompt_frame),
+                    include_unmatched_prompt_tracks=prompt_only_budget > 0,
+                    area=area,
+                    duplicate_threshold=0.78,
+                    min_support_frames=2,
+                    min_track_length=max(6, self.discovery_frame_stride + 2),
+                    min_obj_score=0.45,
+                    max_prompt_only_tracks=prompt_only_budget,
+                    prompt_only_min_track_length=prompt_only_min_track_length,
+                    prompt_only_min_obj_score=prompt_only_min_obj_score,
+                    prompt_only_min_area_ratio=prompt_only_min_area_ratio,
+                    prompt_only_max_area_ratio=prompt_only_max_area_ratio,
+                )
+                remaining_budget = max(
+                    0,
+                    int(self.max_thing_objects) - len(selected) - len(prompt_candidates),
+                )
+                if (
+                    sem_group == SEMANTIC_GROUP_MOVABLE_THING
+                    and remaining_budget > 0
+                ):
+                    used_cluster_ids = {
+                        int(cluster_id)
+                        for candidate in prompt_candidates
+                        for cluster_id in candidate.get("cluster_ids", [])
+                    }
+                    used_seed_ids = {
+                        int(seed_idx)
+                        for candidate in prompt_candidates
+                        for seed_idx in candidate.get("seed_global_ids", [])
+                    }
+                    late_unmatched_dets: List[Dict[str, Any]] = []
+                    for det in candidate_dets:
+                        det_frame = int(det.get("frame_idx", 0))
+                        if det_frame <= prompt_frame:
+                            continue
+                        det_seed_idx = det.get("seed_global_track_idx", None)
+                        if det_seed_idx is not None and int(det_seed_idx) in used_seed_ids:
+                            continue
+                        det_cluster_id = det.get("_cluster_id", None)
+                        if det_cluster_id is not None and int(det_cluster_id) in used_cluster_ids:
+                            continue
+                        late_unmatched_dets.append(det)
+
+                    if late_unmatched_dets:
+                        is_person_label = (
+                            _labels_compatible(label, "person")
+                            or _labels_compatible(label, "people")
+                        )
+                        max_refresh_frames = 2 if is_person_label and remaining_budget >= 2 else 1
+                        fallback_frames = self._select_sam31_label_prompt_frames(
+                            late_unmatched_dets,
+                            max_prompt_frames=max_refresh_frames,
+                        )
+                        queried_refresh_frames: Set[int] = set()
+                        for fallback_frame in fallback_frames:
+                            if len(prompt_candidates) >= int(self.max_thing_objects) - len(selected):
+                                break
+                            fallback_frame = int(fallback_frame)
+                            if fallback_frame in queried_refresh_frames:
+                                continue
+                            queried_refresh_frames.add(fallback_frame)
+                            min_late_gap = max(self.discovery_frame_stride, 3)
+                            if fallback_frame < prompt_frame + min_late_gap:
+                                continue
+
+                            used_cluster_ids = {
+                                int(cluster_id)
+                                for candidate in prompt_candidates
+                                for cluster_id in candidate.get("cluster_ids", [])
+                            }
+                            used_seed_ids = {
+                                int(seed_idx)
+                                for candidate in prompt_candidates
+                                for seed_idx in candidate.get("seed_global_ids", [])
+                            }
+                            refresh_unmatched_dets: List[Dict[str, Any]] = []
+                            for det in late_unmatched_dets:
+                                det_seed_idx = det.get("seed_global_track_idx", None)
+                                if det_seed_idx is not None and int(det_seed_idx) in used_seed_ids:
+                                    continue
+                                det_cluster_id = det.get("_cluster_id", None)
+                                if det_cluster_id is not None and int(det_cluster_id) in used_cluster_ids:
+                                    continue
+                                refresh_unmatched_dets.append(det)
+                            if not refresh_unmatched_dets:
+                                break
+
+                            session_id, fallback_segments, fallback_scores = (
+                                self._query_sam31_label_tracks(
+                                    frame_resource,
+                                    session_id,
+                                    label,
+                                    fallback_frame,
+                                )
+                            )
+                            if not fallback_segments:
+                                continue
+
+                            fallback_matched: Dict[
+                                int,
+                                List[Tuple[Dict[str, Any], float]],
+                            ] = {}
+                            for det in refresh_unmatched_dets:
+                                match = self._match_detection_to_object_track(
+                                    det=det,
+                                    obj_segments=fallback_segments,
+                                )
+                                if match is None:
+                                    continue
+                                prompt_obj_id, match_score = match
+                                fallback_matched.setdefault(
+                                    int(prompt_obj_id),
+                                    [],
+                                ).append((det, float(match_score)))
+
+                            if fallback_matched:
+                                fallback_candidates = (
+                                    self._build_sam31_prompt_track_candidates(
+                                        label=label,
+                                        matched_by_prompt_obj_id=fallback_matched,
+                                        obj_segments=fallback_segments,
+                                        obj_scores=fallback_scores,
+                                        duplicate_threshold=0.78,
+                                        min_support_frames=2,
+                                        min_track_length=max(
+                                            6,
+                                            self.discovery_frame_stride + 2,
+                                        ),
+                                        min_obj_score=0.50,
+                                        max_prompt_only_tracks=0,
+                                    )
+                                )
+                                if fallback_candidates:
+                                    prompt_candidates = (
+                                        self._select_sam31_prompt_track_candidates(
+                                            prompt_candidates + fallback_candidates,
+                                            duplicate_threshold=0.76,
+                                            min_support_frames=2,
+                                            min_track_length=max(
+                                                6,
+                                                self.discovery_frame_stride + 2,
+                                            ),
+                                            min_obj_score=0.50,
+                                            max_prompt_only_tracks=prompt_only_budget,
+                                            prompt_only_min_track_length=prompt_only_min_track_length,
+                                            prompt_only_min_obj_score=prompt_only_min_obj_score,
+                                            prompt_only_min_area_ratio=prompt_only_min_area_ratio,
+                                            prompt_only_max_area_ratio=prompt_only_max_area_ratio,
+                                        )
+                                    )
+
+                object_fallback_budget = 0
+                # Object-prompt fallback is much slower than the text-track
+                # branch and often duplicates prompt-only person tracks. Keep it
+                # disabled by default; YOLOE detections still feed late text
+                # refresh above, which is cheaper and easier to deduplicate.
+
+                remaining_object_budget = max(
+                    0,
+                    min(
+                        int(object_fallback_budget),
+                        int(self.max_thing_objects) - len(selected) - len(prompt_candidates),
+                    ),
+                )
+                if remaining_object_budget > 0:
+                    used_cluster_ids = {
+                        int(cluster_id)
+                        for candidate in prompt_candidates
+                        for cluster_id in candidate.get("cluster_ids", [])
+                    }
+                    used_seed_ids = {
+                        int(seed_idx)
+                        for candidate in prompt_candidates
+                        for seed_idx in candidate.get("seed_global_ids", [])
+                    }
+                    object_prompt_dets: List[Dict[str, Any]] = []
+                    for det in sorted(
+                        candidate_dets,
+                        key=lambda d: (
+                            -int(bool(d.get("is_seed_track", False))),
+                            -float(d.get("confidence", 0.0)),
+                            -(d["mask"].astype(bool).sum() / max(area, 1)),
+                            int(d.get("frame_idx", 0)),
+                        ),
+                    ):
+                        det_seed_idx = det.get("seed_global_track_idx", None)
+                        if det_seed_idx is not None and int(det_seed_idx) in used_seed_ids:
+                            continue
+                        det_cluster_id = det.get("_cluster_id", None)
+                        if det_cluster_id is not None and int(det_cluster_id) in used_cluster_ids:
+                            continue
+                        object_prompt_dets.append(dict(det))
+                        if len(object_prompt_dets) >= remaining_object_budget:
+                            break
+
+                    if object_prompt_dets:
+                        self.video_predictor.handle_request(
+                            dict(type="reset_session", session_id=session_id)
+                        )
+                        object_segments, object_scores, object_to_det = (
+                            self._track_objects_once_sam31_multiplex_session(
+                                session_id=session_id,
+                                detections=object_prompt_dets,
+                                H=H,
+                                W=W,
+                            )
+                        )
+                        object_candidates = self._build_sam31_object_prompt_track_candidates(
+                            label=label,
+                            detections=object_prompt_dets,
+                            obj_segments=object_segments,
+                            obj_scores=object_scores,
+                            obj_to_det=object_to_det,
+                        )
+                        if object_candidates:
+                            prompt_candidates = (
+                                self._select_sam31_prompt_track_candidates(
+                                    prompt_candidates + object_candidates,
+                                    duplicate_threshold=0.76,
+                                    min_support_frames=1,
+                                    min_track_length=max(5, self.discovery_frame_stride + 1),
+                                    min_obj_score=0.35,
+                                    max_prompt_only_tracks=prompt_only_budget,
+                                    prompt_only_min_track_length=prompt_only_min_track_length,
+                                    prompt_only_min_obj_score=prompt_only_min_obj_score,
+                                    prompt_only_min_area_ratio=prompt_only_min_area_ratio,
+                                    prompt_only_max_area_ratio=prompt_only_max_area_ratio,
+                                )
+                            )
+
+                for candidate in prompt_candidates:
+                    if len(selected) >= self.max_thing_objects:
+                        break
+                    segment_frames = sorted(int(t) for t in candidate["segments"].keys())
+                    if not segment_frames:
+                        continue
+                    support_start = int(segment_frames[0])
+                    det_copy = dict(candidate["best_det"])
+                    det_copy["frame_idx"] = support_start
                     det_copy["confidence"] = max(
                         float(det_copy["confidence"]),
-                        float(obj_scores.get(prompt_obj_id, 0.0)),
+                        float(candidate.get("obj_score", 0.0)),
                     )
+                    if candidate["primary_seed_global_idx"] is not None:
+                        det_copy["seed_global_track_idx"] = int(
+                            candidate["primary_seed_global_idx"]
+                        )
                     oid = next_oid
                     next_oid += 1
                     thing_oid_map[oid] = det_copy
                     selected.append(det_copy)
 
-                    segments = obj_segments[prompt_obj_id]
+                    segments = candidate["segments"]
                     for t, mask in segments.items():
                         thing_segments.setdefault(int(t), {})[oid] = mask
 
@@ -869,8 +1273,14 @@ class VideoMaskletFrontend:
         structure_oid_map: Dict[int, Dict] = {}
         next_oid = 1
 
+        if self.sam31_max_structure_objects <= 0:
+            return selected, structure_segments, structure_oid_map
+
         label_to_dets: Dict[str, List[Dict[str, Any]]] = {}
-        for frame_idx in discovery_indices:
+        candidate_frame_indices = sorted(
+            {int(k) for k in discovery_indices}.union(int(k) for k in structure_dets_by_frame.keys())
+        )
+        for frame_idx in candidate_frame_indices:
             candidates = list(structure_dets_by_frame.get(frame_idx, []))
             if not candidates:
                 continue
@@ -892,13 +1302,13 @@ class VideoMaskletFrontend:
                 key=lambda lbl: min(int(det.get("frame_idx", 0)) for det in label_to_dets[lbl]),
             )
             for label in label_order:
-                self.video_predictor.handle_request(
-                    dict(type="reset_session", session_id=session_id)
-                )
+                if len(selected) >= self.sam31_max_structure_objects:
+                    break
 
                 raw_dets = sorted(
                     label_to_dets[label],
                     key=lambda d: (
+                        -int(bool(d.get("is_seed_track", False))),
                         int(d.get("frame_idx", 0)),
                         -(d["mask"].astype(bool).sum() / max(area, 1)),
                         -float(d["confidence"]),
@@ -917,46 +1327,23 @@ class VideoMaskletFrontend:
 
                 if not candidate_dets:
                     continue
+                candidate_dets = self._assign_sam31_detection_cluster_ids(
+                    candidate_dets,
+                    area=area,
+                )
 
                 prompt_frame = min(int(det.get("frame_idx", 0)) for det in candidate_dets)
-                obj_segments: Dict[int, Dict[int, np.ndarray]] = {}
-                obj_scores: Dict[int, float] = {}
-                try:
-                    obj_segments, obj_scores = self._track_label_with_sam31_multiplex_session(
-                        session_id=session_id,
-                        label=label,
-                        frame_idx=prompt_frame,
-                    )
-                except RuntimeError as exc:
-                    if "No points are provided; please add points first" not in str(exc):
-                        raise
-                    try:
-                        self.video_predictor.handle_request(
-                            dict(type="close_session", session_id=session_id)
-                        )
-                    except Exception:
-                        pass
-                    session_id = self._start_sam31_session(frame_resource)
-                    try:
-                        obj_segments, obj_scores = self._track_label_with_sam31_multiplex_session(
-                            session_id=session_id,
-                            label=label,
-                            frame_idx=prompt_frame,
-                        )
-                    except RuntimeError as retry_exc:
-                        if "No points are provided; please add points first" not in str(retry_exc):
-                            raise
-                        print(
-                            f"[sam31_multiplex] skipping structure label={label!r} prompt_frame={prompt_frame} "
-                            "after repeated 'No points are provided' failures"
-                        )
-                        continue
+                session_id, obj_segments, obj_scores = self._query_sam31_label_tracks(
+                    frame_resource,
+                    session_id,
+                    label,
+                    int(prompt_frame),
+                    log_prefix="structure ",
+                )
                 if not obj_segments:
                     continue
 
-                best_obj_id = None
-                best_obj_score = -1.0
-                best_det = None
+                matched_by_prompt_obj_id: Dict[int, List[Tuple[Dict[str, Any], float]]] = {}
                 for det in candidate_dets:
                     match = self._match_detection_to_object_track(
                         det=det,
@@ -965,26 +1352,47 @@ class VideoMaskletFrontend:
                     if match is None:
                         continue
                     prompt_obj_id, match_score = match
-                    score = float(match_score) + 0.10 * float(obj_scores.get(prompt_obj_id, 0.0))
-                    if score > best_obj_score:
-                        best_obj_id = int(prompt_obj_id)
-                        best_obj_score = score
-                        best_det = det
+                    matched_by_prompt_obj_id.setdefault(int(prompt_obj_id), []).append(
+                        (det, float(match_score))
+                    )
 
-                if best_obj_id is None or best_det is None:
+                if not matched_by_prompt_obj_id:
                     continue
 
-                det_copy = dict(best_det)
+                prompt_candidates = self._build_sam31_prompt_track_candidates(
+                    label=label,
+                    matched_by_prompt_obj_id=matched_by_prompt_obj_id,
+                    obj_segments=obj_segments,
+                    obj_scores=obj_scores,
+                    duplicate_threshold=0.74,
+                    min_support_frames=1,
+                    min_track_length=max(4, self.discovery_frame_stride + 1),
+                    min_obj_score=0.35,
+                )
+                if not prompt_candidates:
+                    continue
+
+                best_candidate = prompt_candidates[0]
+                segment_frames = sorted(int(t) for t in best_candidate["segments"].keys())
+                if not segment_frames:
+                    continue
+                support_start = int(segment_frames[0])
+                det_copy = dict(best_candidate["best_det"])
+                det_copy["frame_idx"] = support_start
                 det_copy["confidence"] = max(
                     float(det_copy["confidence"]),
-                    float(obj_scores.get(best_obj_id, 0.0)),
+                    float(best_candidate.get("obj_score", 0.0)),
                 )
+                if best_candidate["primary_seed_global_idx"] is not None:
+                    det_copy["seed_global_track_idx"] = int(
+                        best_candidate["primary_seed_global_idx"]
+                    )
                 oid = next_oid
                 next_oid += 1
                 structure_oid_map[oid] = det_copy
                 selected.append(det_copy)
 
-                for t, mask in obj_segments[best_obj_id].items():
+                for t, mask in best_candidate["segments"].items():
                     structure_segments.setdefault(int(t), {})[oid] = mask
         finally:
             self.video_predictor.handle_request(
@@ -1045,6 +1453,17 @@ class VideoMaskletFrontend:
                     else:
                         score = 0.15 * mask_iou + 0.55 * box_iou + 0.20 * area_sim + gap_bonus
                         threshold = 0.16
+
+                    if frame_gap == 0:
+                        if det_group == SEMANTIC_GROUP_STRUCTURE_ANCHOR:
+                            score = 0.60 * mask_iou + 0.40 * box_iou
+                            threshold = 0.30
+                        elif det_group == SEMANTIC_GROUP_STATIC_THING:
+                            score = 0.45 * mask_iou + 0.55 * box_iou
+                            threshold = 0.35
+                        else:
+                            score = 0.40 * mask_iou + 0.60 * box_iou
+                            threshold = 0.35
 
                     if score >= threshold and score > best_score:
                         best_score = score
@@ -1194,6 +1613,7 @@ class VideoMaskletFrontend:
         obj_segments: Dict[int, Dict[int, np.ndarray]] = {}
         obj_scores: Dict[int, float] = {}
         start_frame_idx = min(int(det.get("frame_idx", 0)) for det in detections)
+        last_prompt_frame_idx = max(int(det.get("frame_idx", 0)) for det in detections)
 
         dets_by_prompt_frame: Dict[int, List[Tuple[int, Dict[str, Any]]]] = {}
         for obj_id, det in enumerate(detections, start=1):
@@ -1233,29 +1653,41 @@ class VideoMaskletFrontend:
                     if idx < len(out_probs):
                         obj_scores[out_obj_id] = max(obj_scores.get(out_obj_id, 0.0), float(out_probs[idx]))
 
-        for prop_response in self.video_predictor.handle_stream_request(
-            dict(
-                type="propagate_in_video",
-                session_id=session_id,
-                propagation_direction="forward",
-                start_frame_index=int(start_frame_idx),
-            )
-        ):
-            out_frame_idx = int(prop_response["frame_index"])
-            outputs = prop_response["outputs"]
-            out_obj_ids = outputs.get("out_obj_ids", [])
-            out_masks = outputs.get("out_binary_masks", [])
-            out_probs = outputs.get("out_probs", [])
-            for idx, out_obj_id in enumerate(out_obj_ids):
-                out_obj_id = int(out_obj_id)
-                if out_obj_id not in obj_to_det:
-                    continue
-                if idx < len(out_masks):
-                    obj_segments.setdefault(out_obj_id, {})[out_frame_idx] = (
-                        out_masks[idx].astype(np.uint8)
-                    )
-                if idx < len(out_probs):
-                    obj_scores[out_obj_id] = max(obj_scores.get(out_obj_id, 0.0), float(out_probs[idx]))
+        def _consume(direction: str, start_frame: int) -> None:
+            for prop_response in self.video_predictor.handle_stream_request(
+                dict(
+                    type="propagate_in_video",
+                    session_id=session_id,
+                    propagation_direction=direction,
+                    start_frame_index=int(start_frame),
+                )
+            ):
+                out_frame_idx = int(prop_response["frame_index"])
+                outputs = prop_response["outputs"]
+                out_obj_ids = outputs.get("out_obj_ids", [])
+                out_masks = outputs.get("out_binary_masks", [])
+                out_probs = outputs.get("out_probs", [])
+                for idx, out_obj_id in enumerate(out_obj_ids):
+                    out_obj_id = int(out_obj_id)
+                    if out_obj_id not in obj_to_det:
+                        continue
+                    if idx < len(out_masks):
+                        obj_segments.setdefault(out_obj_id, {})[out_frame_idx] = (
+                            out_masks[idx].astype(np.uint8)
+                        )
+                    if idx < len(out_probs):
+                        obj_scores[out_obj_id] = max(obj_scores.get(out_obj_id, 0.0), float(out_probs[idx]))
+
+        _consume("forward", int(start_frame_idx))
+        if int(last_prompt_frame_idx) > 0:
+            try:
+                _consume("backward", int(last_prompt_frame_idx))
+            except KeyError as exc:
+                print(
+                    f"[sam31_multiplex] warning: object reverse propagation failed "
+                    f"at frame_idx={last_prompt_frame_idx} with {exc!r}; "
+                    "keeping forward-only result"
+                )
 
         obj_segments = {
             obj_id: frame_to_mask
@@ -1511,6 +1943,21 @@ class VideoMaskletFrontend:
         area = H * W
 
         # ======== Step 1: detect on discovery frames ========
+        sam31_model_offloaded_for_detection = False
+        if (
+            self.sam_backend == "sam31_multiplex"
+            and self.sam31_offload_sam_during_detection
+            and str(self.device).startswith("cuda")
+        ):
+            # YOLOE and SAM3.1 are not needed simultaneously. Keeping SAM on
+            # CPU during discovery avoids detector+tracker VRAM stacking in
+            # the full A/B/C/D/E pipeline.
+            self._move_sam31_predictor_model("cpu")
+            sam31_model_offloaded_for_detection = True
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        self.detector.to_device()
         detections_by_frame: Dict[int, List[Dict[str, Any]]] = {}
         for frame_idx in discovery_indices:
             frame_dets = self._detect_and_filter(
@@ -1557,22 +2004,33 @@ class VideoMaskletFrontend:
         self.detector.release_gpu()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+        if sam31_model_offloaded_for_detection:
+            self._move_sam31_predictor_model(self.device)
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
         # ======== Step 3: track thing / structure objects ========
         thing_segments, thing_oid_map = {}, {}
         structure_segments, structure_oid_map = {}, {}
         selected_structure_dets: List[Dict[str, Any]] = []
         if self.sam_backend == "sam31_multiplex":
+            selected_thing_dets, thing_segments, thing_oid_map = (
+                self._select_multiframe_things_sam31_multiplex(
+                    frame_resource,
+                    thing_dets_by_frame,
+                    discovery_indices,
+                    T,
+                    H,
+                    W,
+                    area,
+                )
+            )
             (
-                selected_thing_dets,
-                thing_segments,
-                thing_oid_map,
                 selected_structure_dets,
                 structure_segments,
                 structure_oid_map,
-            ) = self._track_all_objects_sam31_multiplex(
+            ) = self._select_multiframe_structure_sam31_multiplex(
                 frame_resource,
-                thing_dets_by_frame,
                 structure_dets_by_frame,
                 discovery_indices,
                 T,
@@ -1605,7 +2063,7 @@ class VideoMaskletFrontend:
                 for d in structure_dets_by_frame.get(frame_idx, [])
             )
 
-        # ======== Step 4: stuff — per-keyframe static masks ========
+        # ======== Step 4: stuff — sparse support masks only ========
         stuff_entries = self._build_stuff_entries(
             stuff_dets, frame_resource, T, H, W,
         )
@@ -1659,15 +2117,25 @@ class VideoMaskletFrontend:
                 mask_f = cv2.resize(mask_f, (W, H), interpolation=cv2.INTER_LINEAR)
                 mask_bool = mask_f > 0.5
 
+            raw_label = str(det.get("label", "unknown"))
+            label = canonicalize_label(raw_label)
+            sem_group = label_to_group(label)
+            confidence = float(det.get("confidence", 0.0))
+            if sem_group != SEMANTIC_GROUP_MOVABLE_THING and confidence < self.box_threshold:
+                continue
             ratio = mask_bool.sum() / area
-            if ratio < self.min_mask_area_ratio or ratio > self.max_mask_area_ratio:
+            min_area_ratio = self.min_mask_area_ratio
+            if sem_group == SEMANTIC_GROUP_MOVABLE_THING:
+                min_area_ratio = min(min_area_ratio, 0.0004)
+            elif sem_group == SEMANTIC_GROUP_STATIC_THING:
+                min_area_ratio = min(min_area_ratio, 0.0007)
+            if ratio < min_area_ratio or ratio > self.max_mask_area_ratio:
                 continue
 
-            raw_label = str(det.get("label", "unknown"))
             det["raw_label"] = raw_label
-            det["label"] = canonicalize_label(raw_label)
+            det["label"] = label
             det["mask"] = mask_bool.astype(np.uint8)
-            det["sem_group"] = label_to_group(det["label"])
+            det["sem_group"] = sem_group
             det["area_ratio"] = ratio
             filtered.append(det)
 
@@ -1794,6 +2262,612 @@ class VideoMaskletFrontend:
             return None
         return best_obj_id, float(best_score)
 
+    def _mask_to_box_xyxy(self, mask: np.ndarray) -> np.ndarray:
+        mask_bool = mask.astype(bool)
+        ys, xs = np.where(mask_bool)
+        if len(xs) == 0 or len(ys) == 0:
+            return np.zeros(4, dtype=np.float32)
+        return np.array(
+            [xs.min(), ys.min(), xs.max(), ys.max()],
+            dtype=np.float32,
+        )
+
+    def _compute_sam31_prompt_track_similarity(
+        self,
+        frame_to_mask_a: Dict[int, np.ndarray],
+        frame_to_mask_b: Dict[int, np.ndarray],
+    ) -> float:
+        shared_frames = sorted(set(frame_to_mask_a).intersection(frame_to_mask_b))
+        if not shared_frames:
+            return -1.0
+
+        frame_ious: List[float] = []
+        frame_covers: List[float] = []
+        frame_box_ious: List[float] = []
+
+        for frame_idx in shared_frames:
+            mask_a = frame_to_mask_a[frame_idx].astype(bool)
+            mask_b = frame_to_mask_b[frame_idx].astype(bool)
+            area_a = float(mask_a.sum())
+            area_b = float(mask_b.sum())
+            if area_a <= 0.0 or area_b <= 0.0:
+                continue
+            inter = float((mask_a & mask_b).sum())
+            union = area_a + area_b - inter
+            frame_ious.append(inter / union if union > 0.0 else 0.0)
+            frame_covers.append(max(inter / area_a, inter / area_b))
+            frame_box_ious.append(
+                _box_iou_xyxy(
+                    self._mask_to_box_xyxy(mask_a),
+                    self._mask_to_box_xyxy(mask_b),
+                )
+            )
+
+        if not frame_ious:
+            return -1.0
+
+        mean_iou = sum(frame_ious) / len(frame_ious)
+        mean_cover = sum(frame_covers) / len(frame_covers)
+        mean_box_iou = sum(frame_box_ious) / len(frame_box_ious)
+        return 0.35 * mean_iou + 0.45 * mean_cover + 0.20 * mean_box_iou
+
+    def _select_sam31_label_prompt_frames(
+        self,
+        detections: List[Dict[str, Any]],
+        *,
+        max_prompt_frames: int,
+    ) -> List[int]:
+        if not detections or max_prompt_frames <= 0:
+            return []
+
+        frame_priorities: Dict[int, float] = {}
+        for det in detections:
+            frame_idx = int(det.get("frame_idx", 0))
+            priority = float(det.get("confidence", 0.0))
+            priority += min(float(det.get("area_ratio", 0.0)) * 6.0, 1.0)
+            if bool(det.get("is_seed_track", False)):
+                priority += 2.0
+            if det.get("seed_global_track_idx", None) is not None:
+                priority += 1.5
+            prev = frame_priorities.get(frame_idx, None)
+            if prev is None or priority > prev:
+                frame_priorities[frame_idx] = priority
+
+        if not frame_priorities:
+            return []
+
+        chosen = [min(frame_priorities.keys())]
+        remaining = {frame_idx for frame_idx in frame_priorities if frame_idx not in chosen}
+        min_gap = max(self.discovery_frame_stride // 2, 1)
+
+        while remaining and len(chosen) < max_prompt_frames:
+            best_frame = None
+            best_score = -1e9
+            for frame_idx in sorted(remaining):
+                gap = min(abs(frame_idx - ref_frame) for ref_frame in chosen)
+                score = frame_priorities[frame_idx] + 0.20 * float(gap)
+                if frame_idx > max(chosen):
+                    score += 0.35
+                if gap < min_gap:
+                    score -= 0.60
+                if score > best_score:
+                    best_score = score
+                    best_frame = frame_idx
+            if best_frame is None:
+                break
+            chosen.append(int(best_frame))
+            remaining.remove(best_frame)
+
+        return sorted({int(frame_idx) for frame_idx in chosen})
+
+    def _assign_sam31_detection_cluster_ids(
+        self,
+        detections: List[Dict[str, Any]],
+        area: int,
+    ) -> List[Dict[str, Any]]:
+        if not detections:
+            return []
+
+        clusters: List[List[Dict[str, Any]]] = []
+        dets_sorted = sorted(
+            detections,
+            key=lambda d: (
+                -int(bool(d.get("is_seed_track", False))),
+                int(d.get("frame_idx", 0)),
+                -(d["mask"].astype(bool).sum() / max(area, 1)),
+                -float(d.get("confidence", 0.0)),
+            ),
+        )
+
+        clustered_dets: List[Dict[str, Any]] = []
+        for det in dets_sorted:
+            det_copy = dict(det)
+            det_mask = det_copy["mask"].astype(bool)
+            det_box = np.asarray(det_copy["box"], dtype=np.float32)
+            det_area = max(float(det_mask.sum()), 1.0)
+            det_group = int(det_copy.get("sem_group", SEMANTIC_GROUP_UNCERTAIN_REGION))
+            det_seed = det_copy.get("seed_global_track_idx", None)
+
+            best_cluster_idx = None
+            best_score = -1.0
+            best_threshold = 1.0
+
+            for cluster_idx, cluster_dets in enumerate(clusters):
+                ref_det = cluster_dets[-1]
+                ref_mask = ref_det["mask"].astype(bool)
+                ref_box = np.asarray(ref_det["box"], dtype=np.float32)
+                ref_area = max(float(ref_mask.sum()), 1.0)
+                mask_iou = _mask_iou(det_mask, ref_mask)
+                box_iou = _box_iou_xyxy(det_box, ref_box)
+                area_sim = min(det_area, ref_area) / max(det_area, ref_area)
+                frame_gap = abs(
+                    int(det_copy.get("frame_idx", 0)) - int(ref_det.get("frame_idx", 0))
+                )
+                gap_bonus = 0.10 if frame_gap <= max(self.discovery_frame_stride, 1) else 0.0
+
+                if det_group == SEMANTIC_GROUP_STRUCTURE_ANCHOR:
+                    score = 0.45 * mask_iou + 0.25 * box_iou + 0.20 * area_sim + gap_bonus
+                    threshold = 0.18
+                elif det_group == SEMANTIC_GROUP_STATIC_THING:
+                    score = 0.25 * mask_iou + 0.45 * box_iou + 0.20 * area_sim + gap_bonus
+                    threshold = 0.18
+                else:
+                    score = 0.15 * mask_iou + 0.55 * box_iou + 0.20 * area_sim + gap_bonus
+                    threshold = 0.16
+
+                ref_seed = ref_det.get("seed_global_track_idx", None)
+                if det_seed is not None and ref_seed is not None and int(det_seed) == int(ref_seed):
+                    score += 0.50
+                    threshold = min(threshold, 0.05)
+                elif frame_gap == 0:
+                    # Same-frame detections are different object hypotheses.
+                    # Do not merge separate people/objects just because their
+                    # areas are similar; require real spatial overlap.
+                    if det_group == SEMANTIC_GROUP_STRUCTURE_ANCHOR:
+                        score = 0.60 * mask_iou + 0.40 * box_iou
+                        threshold = 0.30
+                    elif det_group == SEMANTIC_GROUP_STATIC_THING:
+                        score = 0.45 * mask_iou + 0.55 * box_iou
+                        threshold = 0.35
+                    else:
+                        score = 0.40 * mask_iou + 0.60 * box_iou
+                        threshold = 0.35
+
+                if score >= threshold and score > best_score:
+                    best_score = score
+                    best_threshold = threshold
+                    best_cluster_idx = cluster_idx
+
+            if best_cluster_idx is None:
+                det_copy["_cluster_id"] = len(clusters)
+                clusters.append([det_copy])
+            else:
+                det_copy["_cluster_id"] = int(best_cluster_idx)
+                clusters[best_cluster_idx].append(det_copy)
+
+            clustered_dets.append(det_copy)
+
+        return clustered_dets
+
+    def _build_sam31_prompt_only_detection(
+        self,
+        label: str,
+        prompt_obj_id: int,
+        prompt_frame_idx: int,
+        obj_segments: Dict[int, Dict[int, np.ndarray]],
+        obj_scores: Dict[int, float],
+        *,
+        area: int,
+    ) -> Optional[Dict[str, Any]]:
+        frame_to_mask = obj_segments.get(int(prompt_obj_id), {})
+        if not frame_to_mask:
+            return None
+
+        use_frame_idx = (
+            int(prompt_frame_idx)
+            if int(prompt_frame_idx) in frame_to_mask
+            else int(min(frame_to_mask.keys()))
+        )
+        mask = frame_to_mask.get(use_frame_idx)
+        if mask is None:
+            return None
+
+        mask_bool = mask.astype(bool)
+        mask_area = int(mask_bool.sum())
+        if mask_area <= 0:
+            return None
+
+        area_ratio = float(mask_area) / max(area, 1)
+        if area_ratio < self.min_mask_area_ratio or area_ratio > self.max_mask_area_ratio:
+            return None
+
+        box = self._mask_to_box_xyxy(mask_bool)
+        if float(box[2] - box[0]) <= 1.0 or float(box[3] - box[1]) <= 1.0:
+            return None
+
+        return {
+            "mask": mask_bool.astype(np.uint8),
+            "box": box.astype(np.float32),
+            "confidence": float(obj_scores.get(int(prompt_obj_id), 0.0)),
+            "label": str(label),
+            "raw_label": str(label),
+            "sem_group": label_to_group(label),
+            "area_ratio": area_ratio,
+            "frame_idx": int(use_frame_idx),
+            "detector_source": "sam31_prompt",
+            "is_prompt_only": True,
+        }
+
+    def _build_sam31_prompt_track_candidate_records(
+        self,
+        label: str,
+        matched_by_prompt_obj_id: Dict[int, List[Tuple[Dict[str, Any], float]]],
+        obj_segments: Dict[int, Dict[int, np.ndarray]],
+        obj_scores: Dict[int, float],
+        *,
+        prompt_frame_idx: Optional[int] = None,
+        include_unmatched_prompt_tracks: bool = False,
+        area: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        all_prompt_obj_ids = (
+            sorted(int(obj_id) for obj_id in obj_segments.keys())
+            if include_unmatched_prompt_tracks
+            else sorted(int(obj_id) for obj_id in matched_by_prompt_obj_id.keys())
+        )
+
+        candidates: List[Dict[str, Any]] = []
+        for prompt_obj_id in all_prompt_obj_ids:
+            matched_dets = list(matched_by_prompt_obj_id.get(int(prompt_obj_id), []))
+            prompt_only = len(matched_dets) == 0
+            if matched_dets:
+                matched_dets.sort(
+                    key=lambda item: (
+                        -int(bool(item[0].get("seed_global_track_idx") is not None)),
+                        -float(item[1]),
+                        int(item[0].get("frame_idx", 0)),
+                        -float(item[0].get("confidence", 0.0)),
+                    ),
+                )
+                best_det = dict(matched_dets[0][0])
+                support_frames = sorted(
+                    {int(det.get("frame_idx", 0)) for det, _ in matched_dets}
+                )
+                cluster_ids = sorted(
+                    {
+                        int(det["_cluster_id"])
+                        for det, _ in matched_dets
+                        if det.get("_cluster_id") is not None
+                    }
+                )
+                seed_global_ids = sorted(
+                    {
+                        int(det.get("seed_global_track_idx"))
+                        for det, _ in matched_dets
+                        if det.get("seed_global_track_idx") is not None
+                    }
+                )
+                best_match_score = float(max(score for _, score in matched_dets))
+            else:
+                if prompt_frame_idx is None or area is None:
+                    continue
+                best_det = self._build_sam31_prompt_only_detection(
+                    label=label,
+                    prompt_obj_id=int(prompt_obj_id),
+                    prompt_frame_idx=int(prompt_frame_idx),
+                    obj_segments=obj_segments,
+                    obj_scores=obj_scores,
+                    area=int(area),
+                )
+                if best_det is None:
+                    continue
+                support_frames = [int(best_det.get("frame_idx", prompt_frame_idx))]
+                cluster_ids = []
+                seed_global_ids = []
+                best_match_score = float(best_det.get("confidence", 0.0))
+
+            frame_to_mask = {
+                int(frame_idx): mask
+                for frame_idx, mask in obj_segments.get(int(prompt_obj_id), {}).items()
+            }
+            if not frame_to_mask:
+                continue
+
+            mask_areas = [
+                float(mask.astype(bool).sum()) for mask in frame_to_mask.values()
+            ]
+            area_denom = None
+            if area is not None:
+                area_denom = max(float(area), 1.0)
+            elif best_det.get("area_ratio", None) is not None:
+                best_area = float(best_det.get("area_ratio", 0.0))
+                best_mask_area = float(best_det["mask"].astype(bool).sum())
+                if best_area > 0.0 and best_mask_area > 0.0:
+                    area_denom = best_mask_area / best_area
+            mean_mask_area = float(sum(mask_areas) / len(mask_areas)) if mask_areas else 0.0
+            mean_mask_area_ratio = (
+                float(mean_mask_area / area_denom)
+                if area_denom is not None and area_denom > 0.0
+                else float(best_det.get("area_ratio", 0.0))
+            )
+            support_start = int(best_det.get("frame_idx", support_frames[0]))
+            candidate_prompt_obj_id = (
+                int(prompt_frame_idx) * 10000 + int(prompt_obj_id)
+                if prompt_frame_idx is not None
+                else int(prompt_obj_id)
+            )
+            candidates.append(
+                {
+                    "label": str(label),
+                    "prompt_obj_id": int(candidate_prompt_obj_id),
+                    "best_det": best_det,
+                    "segments": frame_to_mask,
+                    "support_frames": support_frames,
+                    "support_start": support_start,
+                    "track_length": int(len(frame_to_mask)),
+                    "obj_score": float(obj_scores.get(prompt_obj_id, 0.0)),
+                    "best_match_score": float(best_match_score),
+                    "seed_global_ids": seed_global_ids,
+                    "cluster_ids": cluster_ids,
+                    "primary_cluster_id": (
+                        int(cluster_ids[0]) if cluster_ids else None
+                    ),
+                    "primary_seed_global_idx": (
+                        int(seed_global_ids[0]) if seed_global_ids else None
+                    ),
+                    "mean_mask_area": mean_mask_area,
+                    "mean_mask_area_ratio": mean_mask_area_ratio,
+                    "prompt_only": bool(prompt_only),
+                    "prompt_frame_idx": (
+                        int(prompt_frame_idx)
+                        if prompt_frame_idx is not None
+                        else support_start
+                    ),
+                }
+            )
+
+        return candidates
+
+    def _build_sam31_object_prompt_track_candidates(
+        self,
+        label: str,
+        detections: List[Dict[str, Any]],
+        obj_segments: Dict[int, Dict[int, np.ndarray]],
+        obj_scores: Dict[int, float],
+        obj_to_det: Dict[int, Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        candidates: List[Dict[str, Any]] = []
+        for obj_id, frame_to_mask_raw in obj_segments.items():
+            obj_id = int(obj_id)
+            det_src = obj_to_det.get(obj_id)
+            if det_src is None:
+                continue
+            best_det = dict(det_src)
+            frame_to_mask = {
+                int(frame_idx): mask
+                for frame_idx, mask in frame_to_mask_raw.items()
+                if mask is not None
+            }
+            if not frame_to_mask:
+                continue
+
+            support_frame = int(best_det.get("frame_idx", min(frame_to_mask.keys())))
+            support_frames = [support_frame]
+            cluster_ids = (
+                [int(best_det["_cluster_id"])]
+                if best_det.get("_cluster_id", None) is not None
+                else []
+            )
+            seed_global_ids = (
+                [int(best_det.get("seed_global_track_idx"))]
+                if best_det.get("seed_global_track_idx", None) is not None
+                else []
+            )
+            mask_areas = [
+                float(mask.astype(bool).sum()) for mask in frame_to_mask.values()
+            ]
+            mean_mask_area = float(sum(mask_areas) / len(mask_areas)) if mask_areas else 0.0
+            best_area_ratio = float(best_det.get("area_ratio", 0.0))
+            best_mask_area = float(best_det["mask"].astype(bool).sum())
+            area_denom = (
+                best_mask_area / best_area_ratio
+                if best_area_ratio > 0.0 and best_mask_area > 0.0
+                else None
+            )
+            mean_mask_area_ratio = (
+                float(mean_mask_area / area_denom)
+                if area_denom is not None and area_denom > 0.0
+                else best_area_ratio
+            )
+            track_length = int(len(frame_to_mask))
+            obj_score = float(obj_scores.get(obj_id, best_det.get("confidence", 0.0)))
+            min_track_length = max(5, self.discovery_frame_stride + 1)
+            if track_length < min_track_length or obj_score < 0.35:
+                continue
+
+            if _labels_compatible(label, "person") or _labels_compatible(label, "people"):
+                min_area_ratio = 0.0008
+                max_area_ratio = 0.45
+            else:
+                min_area_ratio = 0.0010
+                max_area_ratio = 0.35
+            if mean_mask_area_ratio < min_area_ratio or mean_mask_area_ratio > max_area_ratio:
+                continue
+
+            candidates.append(
+                {
+                    "label": str(label),
+                    "prompt_obj_id": int(900000000 + obj_id),
+                    "best_det": best_det,
+                    "segments": frame_to_mask,
+                    "support_frames": support_frames,
+                    "support_start": int(min(frame_to_mask.keys())),
+                    "track_length": track_length,
+                    "obj_score": obj_score,
+                    "best_match_score": 1.0,
+                    "seed_global_ids": seed_global_ids,
+                    "cluster_ids": cluster_ids,
+                    "primary_cluster_id": int(cluster_ids[0]) if cluster_ids else None,
+                    "primary_seed_global_idx": int(seed_global_ids[0]) if seed_global_ids else None,
+                    "mean_mask_area": mean_mask_area,
+                    "mean_mask_area_ratio": mean_mask_area_ratio,
+                    "prompt_only": False,
+                    "prompt_frame_idx": support_frame,
+                }
+            )
+
+        return candidates
+
+    def _select_sam31_prompt_track_candidates(
+        self,
+        candidates: List[Dict[str, Any]],
+        *,
+        duplicate_threshold: float,
+        min_support_frames: int,
+        min_track_length: int,
+        min_obj_score: float,
+        max_prompt_only_tracks: Optional[int] = None,
+        prompt_only_min_track_length: Optional[int] = None,
+        prompt_only_min_obj_score: Optional[float] = None,
+        prompt_only_min_area_ratio: float = 0.0,
+        prompt_only_max_area_ratio: float = 1.0,
+    ) -> List[Dict[str, Any]]:
+        if not candidates:
+            return []
+
+        candidates.sort(
+            key=lambda item: (
+                int(item["primary_seed_global_idx"] is not None),
+                int(not item.get("prompt_only", False)),
+                int(len(item["seed_global_ids"])),
+                int(len(item["support_frames"])),
+                float(item["best_match_score"]),
+                float(item["obj_score"]),
+                int(item["track_length"]),
+                float(item["mean_mask_area"]),
+                -int(item["support_start"]),
+            ),
+            reverse=True,
+        )
+
+        selected: List[Dict[str, Any]] = []
+        used_seed_ids: Set[int] = set()
+        used_cluster_ids: Set[int] = set()
+        selected_prompt_only = 0
+        for candidate in candidates:
+            is_prompt_only = bool(candidate.get("prompt_only", False))
+            if is_prompt_only:
+                if max_prompt_only_tracks is not None and selected_prompt_only >= max_prompt_only_tracks:
+                    continue
+                if (
+                    prompt_only_min_track_length is not None
+                    and int(candidate["track_length"]) < int(prompt_only_min_track_length)
+                ):
+                    continue
+                if (
+                    prompt_only_min_obj_score is not None
+                    and float(candidate["obj_score"]) < float(prompt_only_min_obj_score)
+                ):
+                    continue
+                mean_area_ratio = float(candidate.get("mean_mask_area_ratio", 0.0))
+                if mean_area_ratio < prompt_only_min_area_ratio:
+                    continue
+                if mean_area_ratio > prompt_only_max_area_ratio:
+                    continue
+
+            candidate_seed_ids = {
+                int(seed_idx) for seed_idx in candidate["seed_global_ids"]
+            }
+            if candidate_seed_ids & used_seed_ids:
+                # A handoff seed should continue as only one local track.
+                continue
+            candidate_cluster_ids = {
+                int(cluster_idx) for cluster_idx in candidate["cluster_ids"]
+            }
+            candidate_group = int(
+                candidate["best_det"].get(
+                    "sem_group",
+                    SEMANTIC_GROUP_UNCERTAIN_REGION,
+                )
+            )
+            if (
+                candidate["primary_seed_global_idx"] is None
+                and candidate_group != SEMANTIC_GROUP_MOVABLE_THING
+                and candidate_cluster_ids & used_cluster_ids
+            ):
+                continue
+
+            is_duplicate = False
+            for chosen in selected:
+                if not _labels_compatible(chosen["label"], candidate["label"]):
+                    continue
+                similarity = self._compute_sam31_prompt_track_similarity(
+                    chosen["segments"],
+                    candidate["segments"],
+                )
+                if similarity >= duplicate_threshold:
+                    is_duplicate = True
+                    break
+            if is_duplicate:
+                continue
+
+            if candidate["primary_seed_global_idx"] is None:
+                if (
+                    len(candidate["support_frames"]) < min_support_frames
+                    and int(candidate["track_length"]) < min_track_length
+                    and float(candidate["obj_score"]) < min_obj_score
+                ):
+                    continue
+
+            selected.append(candidate)
+            used_seed_ids.update(candidate_seed_ids)
+            used_cluster_ids.update(candidate_cluster_ids)
+            if is_prompt_only:
+                selected_prompt_only += 1
+
+        return selected
+
+    def _build_sam31_prompt_track_candidates(
+        self,
+        label: str,
+        matched_by_prompt_obj_id: Dict[int, List[Tuple[Dict[str, Any], float]]],
+        obj_segments: Dict[int, Dict[int, np.ndarray]],
+        obj_scores: Dict[int, float],
+        *,
+        prompt_frame_idx: Optional[int] = None,
+        include_unmatched_prompt_tracks: bool = False,
+        area: Optional[int] = None,
+        duplicate_threshold: float,
+        min_support_frames: int,
+        min_track_length: int,
+        min_obj_score: float,
+        max_prompt_only_tracks: Optional[int] = None,
+        prompt_only_min_track_length: Optional[int] = None,
+        prompt_only_min_obj_score: Optional[float] = None,
+        prompt_only_min_area_ratio: float = 0.0,
+        prompt_only_max_area_ratio: float = 1.0,
+    ) -> List[Dict[str, Any]]:
+        candidates = self._build_sam31_prompt_track_candidate_records(
+            label=label,
+            matched_by_prompt_obj_id=matched_by_prompt_obj_id,
+            obj_segments=obj_segments,
+            obj_scores=obj_scores,
+            prompt_frame_idx=prompt_frame_idx,
+            include_unmatched_prompt_tracks=include_unmatched_prompt_tracks,
+            area=area,
+        )
+        return self._select_sam31_prompt_track_candidates(
+            candidates,
+            duplicate_threshold=duplicate_threshold,
+            min_support_frames=min_support_frames,
+            min_track_length=min_track_length,
+            min_obj_score=min_obj_score,
+            max_prompt_only_tracks=max_prompt_only_tracks,
+            prompt_only_min_track_length=prompt_only_min_track_length,
+            prompt_only_min_obj_score=prompt_only_min_obj_score,
+            prompt_only_min_area_ratio=prompt_only_min_area_ratio,
+            prompt_only_max_area_ratio=prompt_only_max_area_ratio,
+        )
+
     @torch.inference_mode()
     def _track_single_thing_with_sam3_session(
         self,
@@ -1875,25 +2949,39 @@ class VideoMaskletFrontend:
             if idx < len(prompt_masks):
                 obj_segments[obj_id][int(frame_idx)] = prompt_masks[idx].astype(np.uint8)
 
-        for prop_response in self.video_predictor.handle_stream_request(
-            dict(
-                type="propagate_in_video",
-                session_id=session_id,
-                propagation_direction="forward",
-                start_frame_index=int(frame_idx),
-            )
-        ):
-            out_frame_idx = int(prop_response["frame_index"])
-            outputs = prop_response["outputs"]
-            out_obj_ids = outputs.get("out_obj_ids", [])
-            out_masks = outputs.get("out_binary_masks", [])
-            out_probs = outputs.get("out_probs", [])
-            for idx, obj_id in enumerate(out_obj_ids):
-                obj_id = int(obj_id)
-                if idx < len(out_masks):
-                    obj_segments.setdefault(obj_id, {})[out_frame_idx] = out_masks[idx].astype(np.uint8)
-                if idx < len(out_probs):
-                    obj_scores[obj_id] = max(obj_scores.get(obj_id, 0.0), float(out_probs[idx]))
+        def _consume(direction: str) -> None:
+            for prop_response in self.video_predictor.handle_stream_request(
+                dict(
+                    type="propagate_in_video",
+                    session_id=session_id,
+                    propagation_direction=direction,
+                    start_frame_index=int(frame_idx),
+                )
+            ):
+                out_frame_idx = int(prop_response["frame_index"])
+                outputs = prop_response["outputs"]
+                out_obj_ids = outputs.get("out_obj_ids", [])
+                out_masks = outputs.get("out_binary_masks", [])
+                out_probs = outputs.get("out_probs", [])
+                for idx, obj_id in enumerate(out_obj_ids):
+                    obj_id = int(obj_id)
+                    if idx < len(out_masks):
+                        obj_segments.setdefault(obj_id, {})[out_frame_idx] = out_masks[idx].astype(np.uint8)
+                    if idx < len(out_probs):
+                        obj_scores[obj_id] = max(obj_scores.get(obj_id, 0.0), float(out_probs[idx]))
+
+        _consume("forward")
+        if int(frame_idx) > 0:
+            try:
+                _consume("backward")
+            except KeyError as exc:
+                # SAM3.1 multiplex occasionally misses reverse-cache entries on long runs.
+                # Keep the forward chunk result rather than crashing the whole video.
+                print(
+                    f"[sam31_multiplex] warning: reverse propagation failed for "
+                    f"label={label!r} frame_idx={frame_idx} with {exc!r}; "
+                    "keeping forward-only result"
+                )
 
         obj_segments = {
             obj_id: frame_to_mask
@@ -1979,13 +3067,12 @@ class VideoMaskletFrontend:
         self, stuff_dets: List[Dict],
         frame_resource: Any, T: int, H: int, W: int,
     ) -> List[Dict]:
-        """Build stable stuff masklet entries for the whole chunk.
+        """Build sparse stuff entries from detector support frames.
 
-        We first collapse repeated structure/stuff detections across discovery
-        frames into a small set of chunk-level tracks. Then each track is made
-        visible on every frame in the chunk by copying the nearest discovered
-        mask. This greatly reduces per-frame flicker and gives cross-chunk ID
-        matching actual overlap to work with.
+        Copying a single stuff mask to all later frames caused severe temporal
+        artifacts, so we only keep masks on the frames where the detector
+        actually supported them. Structure-style stuff is handled separately by
+        the tracked SAM3.1 path when possible.
         """
         if not stuff_dets:
             return []
@@ -2038,11 +3125,10 @@ class VideoMaskletFrontend:
 
             frame_to_mask: Dict[int, np.ndarray] = {}
             frame_to_confidence: Dict[int, float] = {}
-            for t in range(T):
-                nearest_frame = min(detected_frames, key=lambda k: abs(k - t))
-                chosen = frame_to_det[nearest_frame]
-                frame_to_mask[t] = chosen["mask"].astype(np.uint8)
-                frame_to_confidence[t] = float(chosen["confidence"])
+            for t in detected_frames:
+                chosen = frame_to_det[t]
+                frame_to_mask[int(t)] = chosen["mask"].astype(np.uint8)
+                frame_to_confidence[int(t)] = float(chosen["confidence"])
 
             entries.append({
                 "label": cluster["label"],
@@ -2128,7 +3214,7 @@ class VideoMaskletFrontend:
         B_mask = torch.zeros(J, T, 4, dtype=torch.float32)
         A_ratio = torch.zeros(J, T, dtype=torch.float32)
 
-        L_sem, source_type, birth_frame = [], [], []
+        L_sem, source_type, birth_frame, seed_global_track_idx = [], [], [], []
         G_sem = torch.zeros(J, dtype=torch.long)
         W_sem = torch.zeros(J, dtype=torch.float32)
 
@@ -2141,6 +3227,7 @@ class VideoMaskletFrontend:
             W_sem[j] = DEFAULT_SEMANTIC_WEIGHTS.get(g, 0.15)
             source_type.append("thing_tracked")
             birth_frame.append(det.get("frame_idx", 0))
+            seed_global_track_idx.append(det.get("seed_global_track_idx", None))
 
             for t in range(T):
                 if t not in thing_segments or oid not in thing_segments[t]:
@@ -2152,7 +3239,12 @@ class VideoMaskletFrontend:
                     prob = cv2.resize(prob.astype(np.float32), (W, H),
                                       interpolation=cv2.INTER_NEAREST)
 
-                binary = prob.astype(bool)
+                binary = _clean_instance_mask_components(
+                    prob,
+                    int(g),
+                    str(det["label"]),
+                    image_area=area,
+                )
                 mask_area = binary.sum()
                 if mask_area < 1:
                     continue
@@ -2177,6 +3269,7 @@ class VideoMaskletFrontend:
             W_sem[j] = DEFAULT_SEMANTIC_WEIGHTS.get(g, 0.15)
             source_type.append("structure_tracked")
             birth_frame.append(det.get("frame_idx", 0))
+            seed_global_track_idx.append(det.get("seed_global_track_idx", None))
 
             for t in range(T):
                 if t not in structure_segments or oid not in structure_segments[t]:
@@ -2191,7 +3284,12 @@ class VideoMaskletFrontend:
                         interpolation=cv2.INTER_NEAREST,
                     )
 
-                binary = prob.astype(bool)
+                binary = _clean_instance_mask_components(
+                    prob,
+                    int(g),
+                    str(det["label"]),
+                    image_area=area,
+                )
                 mask_area = binary.sum()
                 if mask_area < 1:
                     continue
@@ -2215,6 +3313,7 @@ class VideoMaskletFrontend:
             W_sem[j] = DEFAULT_SEMANTIC_WEIGHTS.get(g, 0.15)
             source_type.append("stuff_static")
             birth_frame.append(entry["birth_frame"])
+            seed_global_track_idx.append(entry.get("seed_global_track_idx", None))
 
             frame_to_mask = entry.get("frame_to_mask")
             if frame_to_mask is None:
@@ -2257,6 +3356,7 @@ class VideoMaskletFrontend:
             L_sem=L_sem, G_sem=G_sem, W_sem=W_sem, A_ratio=A_ratio,
             num_masklets=J, num_frames=T, frame_height=H, frame_width=W,
             source_type=source_type, birth_frame=birth_frame,
+            seed_global_track_idx=seed_global_track_idx,
             debug={"J_thing": J_thing, "J_structure": J_structure, "J_stuff": J_stuff},
         )
 

@@ -65,6 +65,8 @@ from loger.pipeline.video_masklet_frontend import (
     MaskletOutput,
     VideoMaskletFrontend,
     SEMANTIC_GROUP_NAMES,
+    SEMANTIC_GROUP_MOVABLE_THING,
+    SEMANTIC_GROUP_STATIC_THING,
 )
 from run_geometry_backbone_inference import collect_image_paths as collect_image_paths_geo
 
@@ -124,6 +126,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="SAM3.1 multiplex: keep decoded video frames on CPU during session inference (1/0).")
     p.add_argument("--sam31_offload_outputs_to_cpu", type=int, default=1,
                    help="SAM3.1 multiplex: offload detector outputs to CPU during eval to save GPU memory (1/0).")
+    p.add_argument("--sam31_offload_sam_during_detection", type=int, default=0,
+                   help="SAM3.1 multiplex: move SAM to CPU while detector discovery runs to avoid stacked model VRAM (1/0).")
 
     # Detector selection
     p.add_argument("--detector", choices=["gdino", "yoloe"], default="gdino")
@@ -146,15 +150,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--text_threshold", type=float, default=0.25)
     p.add_argument("--ann_frame_idx", type=int, default=0,
                    help="Base discovery frame index inside each chunk.")
-    p.add_argument("--discovery_frame_stride", type=int, default=8,
+    p.add_argument("--discovery_frame_stride", type=int, default=4,
                    help="Run detector every N frames inside each chunk so late-appearing objects can be seeded.")
-    p.add_argument("--max_thing_objects", type=int, default=15,
+    p.add_argument("--max_thing_objects", type=int, default=18,
                    help="Max thing objects to track per chunk.")
     p.add_argument("--sam31_max_movable_objects", type=int, default=2,
                    help="For sam31_multiplex, max movable thing prompts tracked per chunk.")
     p.add_argument("--sam31_max_static_objects", type=int, default=1,
                    help="For sam31_multiplex, max static thing prompts tracked per chunk.")
-    p.add_argument("--sam31_max_structure_objects", type=int, default=1,
+    p.add_argument("--sam31_max_structure_objects", type=int, default=0,
                    help="For sam31_multiplex, max structure prompts tracked per chunk.")
 
     # Video
@@ -237,6 +241,56 @@ def _unpack_mask_np(packed: np.ndarray, H: int, W: int) -> np.ndarray:
     return flat.reshape(H, W).astype(bool)
 
 
+def _clean_instance_mask_components(
+    mask: np.ndarray,
+    sem_group: int,
+    label: str,
+    *,
+    image_area: int,
+) -> np.ndarray:
+    binary = mask.astype(bool)
+    if int(sem_group) not in {SEMANTIC_GROUP_MOVABLE_THING, SEMANTIC_GROUP_STATIC_THING}:
+        return binary
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        binary.astype(np.uint8), connectivity=8,
+    )
+    if num_labels <= 2:
+        return binary
+
+    comp_areas = stats[1:, cv2.CC_STAT_AREA].astype(np.float32)
+    if comp_areas.size == 0:
+        return binary
+
+    order = np.argsort(comp_areas)[::-1]
+    largest = float(comp_areas[order[0]])
+    if largest <= 0.0:
+        return binary
+
+    label_l = str(label).strip().lower()
+    single_instance = int(sem_group) == SEMANTIC_GROUP_MOVABLE_THING
+    if _labels_compatible(label_l, "person") or _labels_compatible(label_l, "people"):
+        single_instance = True
+
+    keep = np.zeros_like(binary, dtype=bool)
+    max_components = 1 if single_instance else 3
+    min_component_area = max(12.0, 0.00002 * float(max(image_area, 1)))
+    if not single_instance:
+        min_component_area = max(min_component_area, 0.08 * largest)
+
+    kept = 0
+    for comp_rank in order:
+        comp_area = float(comp_areas[comp_rank])
+        if kept > 0 and comp_area < min_component_area:
+            continue
+        keep |= labels == int(comp_rank + 1)
+        kept += 1
+        if kept >= max_components:
+            break
+
+    return keep if keep.any() else binary
+
+
 @dataclass
 class SparseMaskletOutput:
     tracks: List[Dict]
@@ -287,8 +341,7 @@ def _write_local_track_into_global(
 
 
 def _build_chunk_seed_detections(
-    prev_mo: MaskletOutput,
-    prev_start: int,
+    global_tracks: List[Dict],
     curr_start: int,
     overlap: int,
 ) -> Dict[int, List[Dict]]:
@@ -296,44 +349,40 @@ def _build_chunk_seed_detections(
         return {}
 
     seed_dets: Dict[int, List[Dict]] = {}
-    for j in range(prev_mo.num_masklets):
-        source_type = prev_mo.source_type[j] if j < len(prev_mo.source_type) else "?"
+    for global_idx, track in enumerate(global_tracks):
+        source_type = track.get("source_type", "?")
         if source_type not in {"thing_tracked", "structure_tracked"}:
             continue
 
-        chosen_local_t = None
         for local_curr_t in range(overlap):
             global_t = curr_start + local_curr_t
-            prev_local_t = global_t - prev_start
-            if not (0 <= prev_local_t < prev_mo.num_frames):
+            if global_t not in track["mask_by_frame"]:
                 continue
-            if bool(prev_mo.V_mask[j, prev_local_t]):
-                chosen_local_t = (local_curr_t, prev_local_t)
-                break
 
-        if chosen_local_t is None:
-            continue
+            mask = _unpack_mask_np(
+                track["mask_by_frame"][global_t],
+                int(track["frame_height"]),
+                int(track["frame_width"]),
+            )
+            if mask.sum() <= 0:
+                continue
+            box = track["box_by_frame"][global_t].numpy().astype(np.float32)
+            label = str(track.get("L_sem", "unknown"))
+            sem_group = int(track.get("G_sem", -1))
+            conf = float(track["q_by_frame"][global_t])
+            area_ratio = float(track["area_by_frame"][global_t])
 
-        local_curr_t, prev_local_t = chosen_local_t
-        mask = prev_mo.M_mask[j, prev_local_t].numpy() > 0.5
-        if mask.sum() <= 0:
-            continue
-        box = prev_mo.B_mask[j, prev_local_t].numpy().astype(np.float32)
-        label = prev_mo.L_sem[j] if j < len(prev_mo.L_sem) else "unknown"
-        sem_group = int(prev_mo.G_sem[j].item())
-        conf = float(prev_mo.Q_mask[j, prev_local_t].item())
-        area_ratio = float(prev_mo.A_ratio[j, prev_local_t].item())
-
-        seed_dets.setdefault(local_curr_t, []).append({
-            "mask": mask.astype(np.uint8),
-            "box": box,
-            "confidence": conf,
-            "label": label,
-            "raw_label": label,
-            "sem_group": sem_group,
-            "area_ratio": area_ratio,
-            "is_seed_track": True,
-        })
+            seed_dets.setdefault(local_curr_t, []).append({
+                "mask": mask.astype(np.uint8),
+                "box": box,
+                "confidence": conf,
+                "label": label,
+                "raw_label": label,
+                "sem_group": sem_group,
+                "area_ratio": area_ratio,
+                "is_seed_track": True,
+                "seed_global_track_idx": int(global_idx),
+            })
 
     return seed_dets
 
@@ -358,6 +407,31 @@ def build_chunk_discovery_indices(
     if not indices:
         return [start_idx]
     return indices
+
+
+def _compute_local_track_seed_priority(
+    mo: MaskletOutput,
+    local_idx: int,
+    overlap: int,
+) -> Tuple[int, int, float, float, int]:
+    overlap_vis = 0
+    overlap_mean_area = 0.0
+    overlap_len = min(max(int(overlap), 0), mo.num_frames)
+    if overlap_len > 0:
+        overlap_visible = mo.V_mask[local_idx, :overlap_len]
+        overlap_vis = int(overlap_visible.sum().item())
+        if overlap_vis > 0:
+            overlap_mean_area = float(
+                mo.A_ratio[local_idx, :overlap_len][overlap_visible].mean().item()
+            )
+
+    total_vis = int(mo.V_mask[local_idx].sum().item())
+    mean_area = (
+        float(mo.A_ratio[local_idx, mo.V_mask[local_idx]].mean().item())
+        if total_vis > 0 else 0.0
+    )
+    birth_frame = int(mo.birth_frame[local_idx]) if local_idx < len(mo.birth_frame) else 0
+    return overlap_vis, total_vis, overlap_mean_area, mean_area, -birth_frame
 
 
 def _compute_track_match_score(
@@ -447,6 +521,14 @@ def _compute_track_match_score(
             + 0.10 * mean_box_iou
             + 0.10 * mean_area_sim
         )
+    if global_track["source_type"] == "thing_tracked":
+        return (
+            0.40 * mean_iou
+            + 0.25 * mean_cover
+            + 0.15 * union_iou
+            + 0.15 * mean_box_iou
+            + 0.05 * mean_area_sim
+        )
     if frame_ious:
         return 0.7 * mean_iou + 0.3 * union_iou
     return union_iou
@@ -455,7 +537,7 @@ def _compute_track_match_score(
 def _compute_structure_track_similarity(track_a: Dict, track_b: Dict, total_frames: int) -> float:
     if track_a["source_type"] != "stuff_static" or track_b["source_type"] != "stuff_static":
         return -1.0
-    if track_a["G_sem"] != 0 or track_b["G_sem"] != 0:
+    if int(track_a["G_sem"]) != int(track_b["G_sem"]):
         return -1.0
     if not _labels_compatible(track_a["L_sem"], track_b["L_sem"]):
         return -1.0
@@ -485,7 +567,10 @@ def _compute_structure_track_similarity(track_a: Dict, track_b: Dict, total_fram
             frame_area_sims.append(min(area_a, area_b) / max(area_a, area_b))
 
     if overlap_frames == 0:
-        return -1.0
+        # Stuff is semantic region support, not instance identity. If the same
+        # stuff label appears in different chunks, merge it into one sparse
+        # timeline instead of minting a new ID for every chunk.
+        return 0.56
 
     mean_iou = sum(frame_ious) / len(frame_ious) if frame_ious else 0.0
     mean_cover = sum(frame_covers) / len(frame_covers) if frame_covers else 0.0
@@ -494,6 +579,168 @@ def _compute_structure_track_similarity(track_a: Dict, track_b: Dict, total_fram
     return (
         0.20 * mean_iou
         + 0.45 * mean_cover
+        + 0.20 * mean_box_iou
+        + 0.15 * mean_area_sim
+    )
+
+
+def _track_visible_frames(track: Dict) -> List[int]:
+    return sorted(int(t) for t in track["mask_by_frame"].keys())
+
+
+def _mean_box_and_area(track: Dict, frames: List[int]) -> Tuple[torch.Tensor, float]:
+    boxes = torch.stack([track["box_by_frame"][int(t)].float() for t in frames], dim=0)
+    mean_box = boxes.mean(dim=0)
+    mean_area = float(
+        sum(float(track["area_by_frame"][int(t)]) for t in frames) / max(len(frames), 1)
+    )
+    return mean_box, mean_area
+
+
+def _box_center_size(box: torch.Tensor) -> Tuple[float, float, float, float]:
+    x1, y1, x2, y2 = [float(v) for v in box.tolist()]
+    w = max(1.0, x2 - x1)
+    h = max(1.0, y2 - y1)
+    return 0.5 * (x1 + x2), 0.5 * (y1 + y2), w, h
+
+
+def _compute_temporal_gap_track_similarity(track_a: Dict, track_b: Dict) -> float:
+    if track_a["source_type"] != track_b["source_type"]:
+        return -1.0
+    if track_a["source_type"] != "thing_tracked":
+        return -1.0
+    if int(track_a["G_sem"]) != int(track_b["G_sem"]):
+        return -1.0
+    if not _labels_compatible(track_a["L_sem"], track_b["L_sem"]):
+        return -1.0
+
+    frames_a = _track_visible_frames(track_a)
+    frames_b = _track_visible_frames(track_b)
+    if not frames_a or not frames_b:
+        return -1.0
+
+    if frames_a[-1] < frames_b[0]:
+        early, late = track_a, track_b
+        early_frames, late_frames = frames_a, frames_b
+    elif frames_b[-1] < frames_a[0]:
+        early, late = track_b, track_a
+        early_frames, late_frames = frames_b, frames_a
+    else:
+        return -1.0
+
+    gap = int(late_frames[0] - early_frames[-1] - 1)
+    label = str(track_a.get("L_sem", "")).strip().lower()
+    is_person = _labels_compatible(label, "person") or _labels_compatible(label, "people")
+    max_gap = 36 if is_person else 10
+    if gap < 0 or gap > max_gap:
+        return -1.0
+    if min(len(early_frames), len(late_frames)) < 2 and gap > 3:
+        return -1.0
+
+    edge = 3
+    early_edge = early_frames[-edge:]
+    late_edge = late_frames[:edge]
+    early_box, early_area = _mean_box_and_area(early, early_edge)
+    late_box, late_area = _mean_box_and_area(late, late_edge)
+    if early_area <= 0.0 or late_area <= 0.0:
+        return -1.0
+
+    e_cx, e_cy, e_w, e_h = _box_center_size(early_box)
+    l_cx, l_cy, l_w, l_h = _box_center_size(late_box)
+    center_dist = float(np.hypot(l_cx - e_cx, l_cy - e_cy))
+    avg_diag = 0.5 * (float(np.hypot(e_w, e_h)) + float(np.hypot(l_w, l_h)))
+    center_norm = center_dist / max(avg_diag, 1.0)
+
+    area_sim = min(early_area, late_area) / max(early_area, late_area)
+    width_sim = min(e_w, l_w) / max(e_w, l_w)
+    height_sim = min(e_h, l_h) / max(e_h, l_h)
+    size_sim = 0.5 * (width_sim + height_sim)
+
+    allowed_center = 1.25 + 0.04 * float(gap) if is_person else 0.95 + 0.03 * float(gap)
+    allowed_center = min(allowed_center, 2.35 if is_person else 1.40)
+    min_area_sim = 0.25 if is_person else 0.40
+    min_size_sim = 0.25 if is_person else 0.40
+    if center_norm > allowed_center or area_sim < min_area_sim or size_sim < min_size_sim:
+        return -1.0
+
+    center_score = 1.0 - min(center_norm / max(allowed_center, 1e-6), 1.0)
+    gap_score = 1.0 - min(float(gap) / max(float(max_gap), 1.0), 1.0)
+    return (
+        0.42 * center_score
+        + 0.32 * area_sim
+        + 0.18 * size_sim
+        + 0.08 * gap_score
+    )
+
+
+def _compute_global_track_similarity(track_a: Dict, track_b: Dict) -> float:
+    if track_a["source_type"] != track_b["source_type"]:
+        return -1.0
+    if int(track_a["G_sem"]) != int(track_b["G_sem"]):
+        return -1.0
+    if not _labels_compatible(track_a["L_sem"], track_b["L_sem"]):
+        return -1.0
+
+    source_type = track_a["source_type"]
+    if source_type not in {"thing_tracked", "structure_tracked"}:
+        return -1.0
+
+    shared_frames = sorted(set(track_a["mask_by_frame"]).intersection(track_b["mask_by_frame"]))
+    if len(shared_frames) < 1:
+        return -1.0
+
+    frame_ious: List[float] = []
+    frame_covers: List[float] = []
+    frame_box_ious: List[float] = []
+    frame_area_sims: List[float] = []
+
+    for t in shared_frames:
+        mask_a = torch.from_numpy(
+            _unpack_mask_np(track_a["mask_by_frame"][t], track_a["frame_height"], track_a["frame_width"])
+        )
+        mask_b = torch.from_numpy(
+            _unpack_mask_np(track_b["mask_by_frame"][t], track_b["frame_height"], track_b["frame_width"])
+        )
+        iou, cover_a, cover_b = _mask_alignment_stats(mask_a, mask_b)
+        frame_ious.append(iou)
+        frame_covers.append(max(cover_a, cover_b))
+        frame_box_ious.append(_box_iou_xyxy_torch(track_a["box_by_frame"][t], track_b["box_by_frame"][t]))
+        area_a = float(track_a["area_by_frame"][t])
+        area_b = float(track_b["area_by_frame"][t])
+        if area_a > 0.0 and area_b > 0.0:
+            frame_area_sims.append(min(area_a, area_b) / max(area_a, area_b))
+
+    mean_iou = sum(frame_ious) / len(frame_ious) if frame_ious else 0.0
+    mean_cover = sum(frame_covers) / len(frame_covers) if frame_covers else 0.0
+    mean_box_iou = sum(frame_box_ious) / len(frame_box_ious) if frame_box_ious else 0.0
+    mean_area_sim = sum(frame_area_sims) / len(frame_area_sims) if frame_area_sims else 0.0
+
+    if len(shared_frames) == 1:
+        if source_type == "thing_tracked":
+            if mean_cover < 0.84 or mean_box_iou < 0.72:
+                return -1.0
+            return 0.55 * mean_cover + 0.30 * mean_box_iou + 0.15 * mean_area_sim
+        if mean_cover < 0.80 or mean_box_iou < 0.65:
+            return -1.0
+        return 0.45 * mean_cover + 0.35 * mean_box_iou + 0.20 * mean_area_sim
+
+    if source_type == "thing_tracked":
+        if mean_cover < 0.65 and mean_iou < 0.50:
+            return -1.0
+        if mean_box_iou < 0.45 and mean_cover < 0.80:
+            return -1.0
+        return (
+            0.35 * mean_iou
+            + 0.30 * mean_cover
+            + 0.20 * mean_box_iou
+            + 0.15 * mean_area_sim
+        )
+
+    if mean_cover < 0.70 and mean_iou < 0.55:
+        return -1.0
+    return (
+        0.30 * mean_iou
+        + 0.35 * mean_cover
         + 0.20 * mean_box_iou
         + 0.15 * mean_area_sim
     )
@@ -582,6 +829,686 @@ def _deduplicate_structure_stuff_tracks(
     return deduped, merge_debug
 
 
+def _deduplicate_thing_structure_tracks(
+    global_tracks: List[Dict],
+    total_frames: int,
+) -> Tuple[List[Dict], List[Dict[str, float]]]:
+    removed = set()
+    merge_debug: List[Dict[str, float]] = []
+
+    while True:
+        candidates: List[Tuple[float, int, int, str]] = []
+        for i in range(len(global_tracks)):
+            if i in removed:
+                continue
+            for j in range(i + 1, len(global_tracks)):
+                if j in removed:
+                    continue
+                match_kind = "overlap"
+                score = _compute_global_track_similarity(global_tracks[i], global_tracks[j])
+                if score < 0.0:
+                    score = _compute_temporal_gap_track_similarity(global_tracks[i], global_tracks[j])
+                    match_kind = "gap"
+                    if score < 0.0:
+                        continue
+                source_type = global_tracks[i]["source_type"]
+                if match_kind == "gap":
+                    threshold = 0.50 if source_type == "thing_tracked" else 0.78
+                else:
+                    threshold = 0.64 if source_type == "thing_tracked" else 0.78
+                if score < threshold:
+                    continue
+
+                vis_i = len(global_tracks[i]["mask_by_frame"])
+                vis_j = len(global_tracks[j]["mask_by_frame"])
+                mean_q_i = (
+                    float(sum(global_tracks[i]["q_by_frame"].values()) / max(vis_i, 1))
+                    if vis_i > 0 else 0.0
+                )
+                mean_q_j = (
+                    float(sum(global_tracks[j]["q_by_frame"].values()) / max(vis_j, 1))
+                    if vis_j > 0 else 0.0
+                )
+                if (vis_i, mean_q_i, -int(global_tracks[i]["birth_frame"])) >= (
+                    vis_j, mean_q_j, -int(global_tracks[j]["birth_frame"])
+                ):
+                    primary, secondary = i, j
+                else:
+                    primary, secondary = j, i
+                candidates.append((score, primary, secondary, match_kind))
+
+        if not candidates:
+            break
+
+        candidates.sort(key=lambda x: x[0], reverse=True)
+        merged_this_round = False
+        used_this_round = set()
+        for score, primary, secondary, match_kind in candidates:
+            if primary in removed or secondary in removed:
+                continue
+            if primary in used_this_round or secondary in used_this_round:
+                continue
+            _merge_global_track_payload(global_tracks[primary], global_tracks[secondary], total_frames)
+            removed.add(secondary)
+            used_this_round.add(primary)
+            used_this_round.add(secondary)
+            merge_debug.append({
+                "score": float(score),
+                "primary": int(primary),
+                "secondary": int(secondary),
+                "kind": match_kind,
+            })
+            merged_this_round = True
+
+        if not merged_this_round:
+            break
+
+    deduped = [track for idx, track in enumerate(global_tracks) if idx not in removed]
+    return deduped, merge_debug
+
+
+def _prune_weak_global_tracks(
+    global_tracks: List[Dict],
+) -> Tuple[List[Dict], List[Dict[str, float]]]:
+    kept: List[Dict] = []
+    prune_debug: List[Dict[str, float]] = []
+
+    for idx, track in enumerate(global_tracks):
+        visible_frames = len(track["mask_by_frame"])
+        mean_area = (
+            float(sum(track["area_by_frame"].values()) / max(visible_frames, 1))
+            if visible_frames > 0 else 0.0
+        )
+        source_type = str(track.get("source_type", "?"))
+        label = str(track.get("L_sem", "")).strip().lower()
+
+        drop = False
+        if visible_frames <= 0:
+            drop = True
+        elif source_type == "thing_tracked":
+            drop = visible_frames <= 1 or (
+                visible_frames <= 3 and mean_area < 0.0015
+            )
+            if (
+                not drop
+                and any(_labels_compatible(label, key) for key in {"door", "window"})
+                and mean_area > 0.10
+            ):
+                drop = True
+            if not drop and _labels_compatible(label, "person"):
+                drop = (
+                    (visible_frames <= 4 and mean_area < 0.0020)
+                    or (visible_frames <= 10 and mean_area < 0.0012)
+                    or (visible_frames <= 16 and mean_area < 0.0020)
+                    or (visible_frames <= 32 and mean_area < 0.0010)
+                    or (visible_frames <= 48 and mean_area < 0.0008)
+                )
+            if (
+                not drop
+                and any(
+                    _labels_compatible(label, key)
+                    for key in {
+                        "chair",
+                        "monitor",
+                        "laptop",
+                        "book",
+                        "bottle",
+                        "mouse",
+                        "keyboard",
+                        "cup",
+                        "phone",
+                        "bicycle",
+                    }
+                )
+            ):
+                drop = (
+                    (visible_frames <= 15 and mean_area < 0.0045)
+                    or (visible_frames <= 35 and mean_area < 0.0025)
+                )
+        elif source_type == "structure_tracked":
+            drop = visible_frames <= 1 and mean_area < 0.01
+        elif source_type == "stuff_static":
+            drop = visible_frames <= 1 and mean_area < 0.01
+
+        if drop:
+            prune_debug.append(
+                {
+                    "track_index": int(idx),
+                    "visible_frames": int(visible_frames),
+                    "mean_area": float(mean_area),
+                    "label": str(label),
+                }
+            )
+            continue
+
+        kept.append(track)
+
+    return kept, prune_debug
+
+
+def _clean_sparse_track_masks(
+    global_tracks: List[Dict],
+) -> Tuple[List[Dict], List[Dict[str, float]]]:
+    clean_debug: List[Dict[str, float]] = []
+
+    for idx, track in enumerate(global_tracks):
+        if track.get("source_type") not in {"thing_tracked", "structure_tracked"}:
+            continue
+        H = int(track["frame_height"])
+        W = int(track["frame_width"])
+        image_area = max(H * W, 1)
+        sem_group = int(track.get("G_sem", -1))
+        label = str(track.get("L_sem", ""))
+
+        for frame_idx in list(track["mask_by_frame"].keys()):
+            mask = _unpack_mask_np(track["mask_by_frame"][frame_idx], H, W)
+            before_area = int(mask.sum())
+            cleaned = _clean_instance_mask_components(
+                mask,
+                sem_group,
+                label,
+                image_area=image_area,
+            )
+            after_area = int(cleaned.sum())
+            if after_area <= 0:
+                track["mask_by_frame"].pop(frame_idx, None)
+                track["box_by_frame"].pop(frame_idx, None)
+                track["q_by_frame"].pop(frame_idx, None)
+                track["area_by_frame"].pop(frame_idx, None)
+                continue
+            if after_area != before_area:
+                ys, xs = np.where(cleaned)
+                track["mask_by_frame"][frame_idx] = _pack_mask_np(cleaned)
+                track["box_by_frame"][frame_idx] = torch.tensor(
+                    [xs.min(), ys.min(), xs.max(), ys.max()],
+                    dtype=torch.float32,
+                )
+                track["area_by_frame"][frame_idx] = float(after_area / image_area)
+                if len(clean_debug) < 200:
+                    clean_debug.append(
+                        {
+                            "track_index": int(idx),
+                            "frame_idx": int(frame_idx),
+                            "before_area": float(before_area / image_area),
+                            "after_area": float(after_area / image_area),
+                        }
+                    )
+
+        if track["mask_by_frame"]:
+            track["birth_frame"] = min(int(t) for t in track["mask_by_frame"].keys())
+
+    return global_tracks, clean_debug
+
+
+def _bridge_short_track_gaps(
+    global_tracks: List[Dict],
+    total_frames: int,
+) -> Tuple[List[Dict], List[Dict[str, float]]]:
+    """Fill very short thing-track flicker gaps using the nearest trusted mask.
+
+    This is a lightweight analogue of SAM2Long's confidence-gated memory reuse:
+    we only reuse an existing instance memory when the gap is tiny and the two
+    endpoint boxes still look compatible. Stuff masks are never bridged.
+    """
+    bridge_debug: List[Dict[str, float]] = []
+
+    for idx, track in enumerate(global_tracks):
+        if track.get("source_type") != "thing_tracked":
+            continue
+        frames = sorted(int(t) for t in track["mask_by_frame"].keys())
+        if len(frames) < 2:
+            continue
+
+        label = str(track.get("L_sem", "")).strip().lower()
+        is_person = _labels_compatible(label, "person") or _labels_compatible(label, "people")
+        max_gap = 4 if is_person else 3
+
+        for left, right in zip(frames[:-1], frames[1:]):
+            gap = int(right - left - 1)
+            if gap <= 0 or gap > max_gap:
+                continue
+            if left < 0 or right >= total_frames:
+                continue
+
+            left_area = float(track["area_by_frame"].get(left, 0.0))
+            right_area = float(track["area_by_frame"].get(right, 0.0))
+            if left_area <= 0.0 or right_area <= 0.0:
+                continue
+            area_sim = min(left_area, right_area) / max(left_area, right_area)
+            center_norm = _boxes_center_norm(
+                track["box_by_frame"][left],
+                track["box_by_frame"][right],
+            )
+            if is_person:
+                if area_sim < 0.30 or center_norm > 1.35:
+                    continue
+            else:
+                if area_sim < 0.45 or center_norm > 0.95:
+                    continue
+
+            for frame_idx in range(left + 1, right):
+                if frame_idx in track["mask_by_frame"]:
+                    continue
+                src = left if (frame_idx - left) <= (right - frame_idx) else right
+                track["mask_by_frame"][frame_idx] = track["mask_by_frame"][src].copy()
+                track["box_by_frame"][frame_idx] = track["box_by_frame"][src].clone()
+                track["area_by_frame"][frame_idx] = float(track["area_by_frame"][src])
+                track["q_by_frame"][frame_idx] = 0.75 * min(
+                    float(track["q_by_frame"].get(left, 1.0)),
+                    float(track["q_by_frame"].get(right, 1.0)),
+                )
+                if len(bridge_debug) < 200:
+                    bridge_debug.append(
+                        {
+                            "track_index": int(idx),
+                            "frame_idx": int(frame_idx),
+                            "left": int(left),
+                            "right": int(right),
+                            "gap": int(gap),
+                            "area_sim": float(area_sim),
+                            "center_norm": float(center_norm),
+                        }
+                    )
+
+        if track["mask_by_frame"]:
+            track["birth_frame"] = min(int(t) for t in track["mask_by_frame"].keys())
+
+    return global_tracks, bridge_debug
+
+
+def _track_frame_priority(track: Dict, track_index: int, frame_idx: int) -> Tuple[int, float, float, int, int]:
+    visible_frames = len(track["mask_by_frame"])
+    mean_q = (
+        float(sum(track["q_by_frame"].values()) / max(visible_frames, 1))
+        if visible_frames > 0 else 0.0
+    )
+    area_at_frame = float(track["area_by_frame"].get(frame_idx, 0.0))
+    # Prefer longer, higher-confidence tracks. Earlier births win ties so
+    # chunk handoffs do not get displaced by late duplicate fragments.
+    return (
+        int(visible_frames),
+        float(mean_q),
+        float(area_at_frame),
+        -int(track.get("birth_frame", 0)),
+        -int(track_index),
+    )
+
+
+def _boxes_center_norm(box_a: torch.Tensor, box_b: torch.Tensor) -> float:
+    ax, ay, aw, ah = _box_center_size(box_a)
+    bx, by, bw, bh = _box_center_size(box_b)
+    dist = float(np.hypot(ax - bx, ay - by))
+    avg_diag = 0.5 * (float(np.hypot(aw, ah)) + float(np.hypot(bw, bh)))
+    return dist / max(avg_diag, 1.0)
+
+
+def _box_candidate_cover_xyxy_torch(box_candidate: torch.Tensor, box_reference: torch.Tensor) -> float:
+    cx1, cy1, cx2, cy2 = [float(v) for v in box_candidate.tolist()]
+    rx1, ry1, rx2, ry2 = [float(v) for v in box_reference.tolist()]
+    inter_x1 = max(cx1, rx1)
+    inter_y1 = max(cy1, ry1)
+    inter_x2 = min(cx2, rx2)
+    inter_y2 = min(cy2, ry2)
+    inter_w = max(0.0, inter_x2 - inter_x1)
+    inter_h = max(0.0, inter_y2 - inter_y1)
+    inter = inter_w * inter_h
+    cand_area = max(0.0, cx2 - cx1) * max(0.0, cy2 - cy1)
+    return inter / cand_area if cand_area > 0.0 else 0.0
+
+
+def _box_center_inside_expanded_reference(
+    box_candidate: torch.Tensor,
+    box_reference: torch.Tensor,
+    *,
+    expand: float = 0.08,
+) -> bool:
+    cx1, cy1, cx2, cy2 = [float(v) for v in box_candidate.tolist()]
+    rx1, ry1, rx2, ry2 = [float(v) for v in box_reference.tolist()]
+    rcx, rcy, rw, rh = _box_center_size(box_reference)
+    ccx = 0.5 * (cx1 + cx2)
+    ccy = 0.5 * (cy1 + cy2)
+    return (
+        rx1 - expand * rw <= ccx <= rx2 + expand * rw
+        and ry1 - expand * rh <= ccy <= ry2 + expand * rh
+    )
+
+
+def _person_spatial_fragment_duplicate(
+    cand_box: torch.Tensor,
+    ref_box: torch.Tensor,
+    *,
+    cand_area_ratio: float,
+    ref_area_ratio: float,
+) -> bool:
+    """Detect small person fragments nested inside a stronger person track.
+
+    SAM2Long-style multi-branch recovery improves recall, but it can also leave
+    small partial-person branches around a stable full-body branch. This helper
+    only marks very small candidates as duplicates when box geometry agrees
+    that the candidate is spatial support of the stronger track.
+    """
+    if cand_area_ratio <= 0.0 or ref_area_ratio <= 0.0:
+        return False
+    if cand_area_ratio > 0.014:
+        return False
+    if cand_area_ratio > 0.38 * ref_area_ratio:
+        return False
+
+    box_cover = _box_candidate_cover_xyxy_torch(cand_box, ref_box)
+    box_iou = _box_iou_xyxy_torch(cand_box, ref_box)
+    center_norm = _boxes_center_norm(cand_box, ref_box)
+    center_inside = _box_center_inside_expanded_reference(cand_box, ref_box)
+
+    return (
+        (box_cover >= 0.50 and center_norm <= 1.15)
+        or (box_iou >= 0.08 and center_norm <= 1.10)
+        or (center_inside and box_cover >= 0.12 and center_norm <= 0.90)
+        or (box_cover >= 0.22 and center_norm <= 0.70)
+    )
+
+
+def _suppress_duplicate_track_frames(
+    global_tracks: List[Dict],
+    total_frames: int,
+) -> Tuple[List[Dict], List[Dict[str, float]]]:
+    """Remove frame-level duplicate masks while keeping complementary spans.
+
+    Global merging is intentionally conservative to avoid collapsing two nearby
+    people. This pass is a safer cleanup: if two tracks of the same semantic
+    label are visible on the same frame and one mask is mostly covered by a
+    stronger/stabler track, only that duplicated frame is suppressed.
+    """
+    suppress_debug: List[Dict[str, float]] = []
+    suppressed_by_track: Dict[int, int] = {}
+
+    track_priorities = {
+        idx: _track_frame_priority(track, idx, -1)
+        for idx, track in enumerate(global_tracks)
+    }
+
+    for frame_idx in range(total_frames):
+        label_to_indices: Dict[Tuple[str, int, str], List[int]] = {}
+        for idx, track in enumerate(global_tracks):
+            if track.get("source_type") != "thing_tracked":
+                continue
+            if frame_idx not in track["mask_by_frame"]:
+                continue
+            label = str(track.get("L_sem", "")).strip().lower()
+            key = (label, int(track.get("G_sem", -1)), str(track.get("source_type", "?")))
+            label_to_indices.setdefault(key, []).append(idx)
+
+        for (_, sem_group, _), indices in label_to_indices.items():
+            if len(indices) <= 1:
+                continue
+
+            ordered = sorted(
+                indices,
+                key=lambda idx: (
+                    track_priorities[idx][0],
+                    track_priorities[idx][1],
+                    float(global_tracks[idx]["area_by_frame"].get(frame_idx, 0.0)),
+                    track_priorities[idx][3],
+                    track_priorities[idx][4],
+                ),
+                reverse=True,
+            )
+            kept: List[Tuple[int, np.ndarray, torch.Tensor]] = []
+            for idx in ordered:
+                track = global_tracks[idx]
+                cand_mask = _unpack_mask_np(
+                    track["mask_by_frame"][frame_idx],
+                    int(track["frame_height"]),
+                    int(track["frame_width"]),
+                )
+                cand_area = float(cand_mask.sum())
+                if cand_area <= 0.0:
+                    continue
+                cand_box = track["box_by_frame"][frame_idx]
+                cand_label = str(track.get("L_sem", "")).strip().lower()
+                is_person = _labels_compatible(cand_label, "person") or _labels_compatible(cand_label, "people")
+                image_area = max(int(track["frame_height"]) * int(track["frame_width"]), 1)
+                cand_area_ratio = cand_area / float(image_area)
+
+                suppress = False
+                suppress_against = None
+                suppress_stats = (0.0, 0.0, 0.0, 0.0)
+                for kept_idx, kept_mask, kept_box in kept:
+                    kept_area = float(kept_mask.sum())
+                    if kept_area <= 0.0:
+                        continue
+                    kept_area_ratio = kept_area / float(image_area)
+                    inter = float((cand_mask & kept_mask).sum())
+                    union = cand_area + kept_area - inter
+                    iou = inter / union if union > 0.0 else 0.0
+                    cand_cover = inter / max(cand_area, 1.0)
+                    kept_cover = inter / max(kept_area, 1.0)
+                    box_iou = _box_iou_xyxy_torch(cand_box, kept_box)
+                    center_norm = _boxes_center_norm(cand_box, kept_box)
+
+                    if is_person:
+                        duplicate = (
+                            iou >= 0.45
+                            or (
+                                cand_cover >= 0.72
+                                and (box_iou >= 0.12 or center_norm <= 1.00)
+                            )
+                            or (
+                                cand_cover >= 0.58
+                                and kept_cover >= 0.58
+                                and box_iou >= 0.25
+                            )
+                        )
+                        duplicate = duplicate or (
+                            cand_cover >= 0.05
+                            and _person_spatial_fragment_duplicate(
+                                cand_box,
+                                kept_box,
+                                cand_area_ratio=float(cand_area_ratio),
+                                ref_area_ratio=float(kept_area_ratio),
+                            )
+                        )
+                    elif sem_group == 1:
+                        duplicate = (
+                            iou >= 0.48
+                            or cand_cover >= 0.78
+                            or (cand_cover >= 0.62 and box_iou >= 0.36)
+                        )
+                    else:
+                        duplicate = (
+                            iou >= 0.52
+                            or (
+                                cand_cover >= 0.80
+                                and (box_iou >= 0.24 or center_norm <= 0.68)
+                            )
+                        )
+
+                    if duplicate:
+                        suppress = True
+                        suppress_against = int(kept_idx)
+                        suppress_stats = (iou, cand_cover, kept_cover, box_iou)
+                        break
+
+                if suppress:
+                    track["mask_by_frame"].pop(frame_idx, None)
+                    track["box_by_frame"].pop(frame_idx, None)
+                    track["q_by_frame"].pop(frame_idx, None)
+                    track["area_by_frame"].pop(frame_idx, None)
+                    suppressed_by_track[idx] = suppressed_by_track.get(idx, 0) + 1
+                    if len(suppress_debug) < 200:
+                        iou, cand_cover, kept_cover, box_iou = suppress_stats
+                        suppress_debug.append(
+                            {
+                                "track_index": int(idx),
+                                "frame_idx": int(frame_idx),
+                                "against": int(suppress_against) if suppress_against is not None else -1,
+                                "iou": float(iou),
+                                "candidate_cover": float(cand_cover),
+                                "kept_cover": float(kept_cover),
+                                "box_iou": float(box_iou),
+                            }
+                        )
+                    continue
+
+                kept.append((idx, cand_mask, cand_box))
+
+    for idx, track in enumerate(global_tracks):
+        if not track["mask_by_frame"]:
+            continue
+        track["birth_frame"] = min(int(t) for t in track["mask_by_frame"].keys())
+
+    if suppressed_by_track:
+        suppress_debug.append(
+            {
+                "num_tracks_suppressed": int(len(suppressed_by_track)),
+                "num_frames_suppressed": int(sum(suppressed_by_track.values())),
+            }
+        )
+
+    return global_tracks, suppress_debug
+
+
+def _drop_redundant_global_tracks(
+    global_tracks: List[Dict],
+) -> Tuple[List[Dict], List[Dict[str, float]]]:
+    """Drop tracks whose support is mostly explained by stronger same-label tracks."""
+    drop_debug: List[Dict[str, float]] = []
+    removed = set()
+    priorities = {
+        idx: _track_frame_priority(track, idx, -1)
+        for idx, track in enumerate(global_tracks)
+    }
+
+    def _is_stronger(a: int, b: int) -> bool:
+        return priorities[a] > priorities[b]
+
+    for idx, track in enumerate(global_tracks):
+        if track.get("source_type") != "thing_tracked":
+            continue
+        frames = sorted(int(t) for t in track["mask_by_frame"].keys())
+        if not frames:
+            removed.add(idx)
+            continue
+        label = str(track.get("L_sem", "")).strip().lower()
+        sem_group = int(track.get("G_sem", -1))
+        is_person = _labels_compatible(label, "person") or _labels_compatible(label, "people")
+        same_label_stronger = [
+            other_idx
+            for other_idx, other in enumerate(global_tracks)
+            if other_idx != idx
+            and other_idx not in removed
+            and other.get("source_type") == "thing_tracked"
+            and int(other.get("G_sem", -2)) == sem_group
+            and _labels_compatible(str(other.get("L_sem", "")), label)
+            and _is_stronger(other_idx, idx)
+        ]
+        if not same_label_stronger:
+            continue
+
+        duplicate_frames = 0
+        checked_frames = 0
+        for frame_idx in frames:
+            cand_mask = _unpack_mask_np(
+                track["mask_by_frame"][frame_idx],
+                int(track["frame_height"]),
+                int(track["frame_width"]),
+            )
+            cand_area = float(cand_mask.sum())
+            if cand_area <= 0.0:
+                continue
+            cand_box = track["box_by_frame"][frame_idx]
+            image_area = max(int(track["frame_height"]) * int(track["frame_width"]), 1)
+            cand_area_ratio = cand_area / float(image_area)
+            checked_frames += 1
+            frame_duplicate = False
+
+            for other_idx in same_label_stronger:
+                other = global_tracks[other_idx]
+                if frame_idx not in other["mask_by_frame"]:
+                    continue
+                other_mask = _unpack_mask_np(
+                    other["mask_by_frame"][frame_idx],
+                    int(other["frame_height"]),
+                    int(other["frame_width"]),
+                )
+                other_area = float(other_mask.sum())
+                if other_area <= 0.0:
+                    continue
+                other_area_ratio = other_area / float(image_area)
+                inter = float((cand_mask & other_mask).sum())
+                union = cand_area + other_area - inter
+                iou = inter / union if union > 0.0 else 0.0
+                cand_cover = inter / max(cand_area, 1.0)
+                other_cover = inter / max(other_area, 1.0)
+                box_iou = _box_iou_xyxy_torch(cand_box, other["box_by_frame"][frame_idx])
+                center_norm = _boxes_center_norm(cand_box, other["box_by_frame"][frame_idx])
+
+                if is_person:
+                    frame_duplicate = (
+                        iou >= 0.42
+                        or (
+                            cand_cover >= 0.68
+                            and (box_iou >= 0.10 or center_norm <= 1.10)
+                        )
+                        or (
+                            cand_cover >= 0.55
+                            and other_cover >= 0.55
+                            and box_iou >= 0.20
+                        )
+                    )
+                    frame_duplicate = frame_duplicate or (
+                        cand_cover >= 0.05
+                        and _person_spatial_fragment_duplicate(
+                            cand_box,
+                            other["box_by_frame"][frame_idx],
+                            cand_area_ratio=float(cand_area_ratio),
+                            ref_area_ratio=float(other_area_ratio),
+                        )
+                    )
+                else:
+                    frame_duplicate = (
+                        iou >= 0.50
+                        or cand_cover >= 0.78
+                        or (cand_cover >= 0.62 and box_iou >= 0.28)
+                    )
+                if frame_duplicate:
+                    break
+
+            if frame_duplicate:
+                duplicate_frames += 1
+
+        if checked_frames <= 0:
+            removed.add(idx)
+            continue
+
+        duplicate_ratio = duplicate_frames / max(checked_frames, 1)
+        visible_frames = len(frames)
+        mean_area = (
+            float(sum(track["area_by_frame"].values()) / max(visible_frames, 1))
+            if visible_frames > 0 else 0.0
+        )
+        drop = duplicate_frames >= max(4, int(np.ceil(0.70 * checked_frames)))
+        if is_person and visible_frames <= 48:
+            drop = drop or duplicate_ratio >= 0.50
+        if is_person and visible_frames <= 96 and mean_area < 0.004:
+            drop = drop or duplicate_ratio >= 0.45
+
+        if drop:
+            removed.add(idx)
+            if len(drop_debug) < 200:
+                drop_debug.append(
+                    {
+                        "track_index": int(idx),
+                        "visible_frames": int(visible_frames),
+                        "duplicate_frames": int(duplicate_frames),
+                        "checked_frames": int(checked_frames),
+                        "duplicate_ratio": float(duplicate_ratio),
+                        "mean_area": float(mean_area),
+                    }
+                )
+
+    return [track for idx, track in enumerate(global_tracks) if idx not in removed], drop_debug
+
+
 def merge_chunk_masklet_into_global(
     global_tracks: List[Dict],
     mo: MaskletOutput,
@@ -596,13 +1523,56 @@ def merge_chunk_masklet_into_global(
     overlap = 0 if chunk_idx == 0 else min(int(chunk_overlap), mo.num_frames)
     local_to_global: Dict[int, int] = {}
 
+    seeded_locals = set()
+    rejected_seeded_locals = set()
+    if getattr(mo, "seed_global_track_idx", None):
+        best_seeded_local: Dict[int, int] = {}
+        best_seeded_priority: Dict[int, Tuple[int, int, float, float, int]] = {}
+        for j, seeded_global_idx in enumerate(mo.seed_global_track_idx):
+            if seeded_global_idx is None:
+                continue
+            seeded_global_idx = int(seeded_global_idx)
+            if not (0 <= seeded_global_idx < len(global_tracks)):
+                continue
+            local_type = mo.source_type[j] if j < len(mo.source_type) else "?"
+            local_group = int(mo.G_sem[j].item())
+            local_label = mo.L_sem[j] if j < len(mo.L_sem) else "?"
+            track = global_tracks[seeded_global_idx]
+            if track["source_type"] != local_type:
+                continue
+            if int(track["G_sem"]) != local_group:
+                continue
+            if not _labels_compatible(track["L_sem"], local_label):
+                continue
+            priority = _compute_local_track_seed_priority(mo, j, overlap)
+            prev_local = best_seeded_local.get(seeded_global_idx)
+            if (
+                prev_local is None
+                or priority > best_seeded_priority[seeded_global_idx]
+            ):
+                if prev_local is not None:
+                    rejected_seeded_locals.add(int(prev_local))
+                best_seeded_local[seeded_global_idx] = int(j)
+                best_seeded_priority[seeded_global_idx] = priority
+                rejected_seeded_locals.discard(int(j))
+            else:
+                rejected_seeded_locals.add(int(j))
+
+        for seeded_global_idx, j in best_seeded_local.items():
+            local_to_global[int(j)] = int(seeded_global_idx)
+            seeded_locals.add(int(j))
+
     if chunk_idx > 0 and overlap > 0 and global_tracks:
         candidates: List[Tuple[float, int, int]] = []
         for j in range(mo.num_masklets):
+            if j in seeded_locals or j in rejected_seeded_locals:
+                continue
             for g, track in enumerate(global_tracks):
+                if g in local_to_global.values():
+                    continue
                 score = _compute_track_match_score(mo, j, track, start, overlap)
                 if track["source_type"] == "thing_tracked":
-                    threshold = 0.35
+                    threshold = 0.28
                 elif track["source_type"] == "structure_tracked":
                     threshold = 0.16
                 elif track["G_sem"] == 0:
@@ -612,8 +1582,8 @@ def merge_chunk_masklet_into_global(
                 if score >= threshold:
                     candidates.append((score, j, g))
         candidates.sort(key=lambda x: x[0], reverse=True)
-        used_local = set()
-        used_global = set()
+        used_local = set(seeded_locals)
+        used_global = set(local_to_global.values())
         for score, j, g in candidates:
             if j in used_local or g in used_global:
                 continue
@@ -623,6 +1593,8 @@ def merge_chunk_masklet_into_global(
 
     preserve_overlap_until = start + overlap
     for j in range(mo.num_masklets):
+        if j in rejected_seeded_locals and j not in local_to_global:
+            continue
         global_idx = local_to_global.get(j)
         if global_idx is None:
             birth_frame = start + (mo.birth_frame[j] if j < len(mo.birth_frame) else 0)
@@ -670,9 +1642,21 @@ def finalize_global_tracks(
             debug={"chunk_match_debug": chunk_match_debug, "num_chunks": len(chunk_match_debug)},
         )
 
+    global_tracks, thing_structure_dedup_debug = _deduplicate_thing_structure_tracks(
+        global_tracks, total_frames,
+    )
     global_tracks, structure_dedup_debug = _deduplicate_structure_stuff_tracks(
         global_tracks, total_frames,
     )
+    global_tracks, mask_clean_debug = _clean_sparse_track_masks(global_tracks)
+    global_tracks, short_gap_bridge_debug = _bridge_short_track_gaps(
+        global_tracks, total_frames,
+    )
+    global_tracks, frame_suppress_debug = _suppress_duplicate_track_frames(
+        global_tracks, total_frames,
+    )
+    global_tracks, redundant_drop_debug = _drop_redundant_global_tracks(global_tracks)
+    global_tracks, prune_debug = _prune_weak_global_tracks(global_tracks)
     return SparseMaskletOutput(
         tracks=global_tracks,
         num_masklets=len(global_tracks),
@@ -681,7 +1665,13 @@ def finalize_global_tracks(
         frame_width=W,
         debug={
             "chunk_match_debug": chunk_match_debug,
+            "thing_structure_dedup_debug": thing_structure_dedup_debug,
             "structure_dedup_debug": structure_dedup_debug,
+            "mask_clean_debug": mask_clean_debug,
+            "short_gap_bridge_debug": short_gap_bridge_debug,
+            "frame_suppress_debug": frame_suppress_debug,
+            "redundant_drop_debug": redundant_drop_debug,
+            "prune_debug": prune_debug,
             "num_chunks": len(chunk_match_debug),
             "J_thing": sum(1 for track in global_tracks if track["source_type"] == "thing_tracked"),
             "J_structure": sum(1 for track in global_tracks if track["source_type"] == "structure_tracked"),
@@ -745,7 +1735,7 @@ def render_annotated_frame(
         x1, y1, x2, y2 = box
         cv2.rectangle(overlay, (x1, y1), (x2, y2), colour, 2)
 
-        text = f"{label} [{group_name}] w={w_sem:.2f} q={q:.2f}"
+        text = f"#{j} {label} [{group_name}] w={w_sem:.2f} q={q:.2f}"
 
         (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
         cv2.rectangle(overlay, (x1, max(0, y1 - th - 6)), (x1 + tw + 4, y1), colour, -1)
@@ -920,6 +1910,7 @@ def main() -> None:
             sam31_batched_grounding_batch_size=args.sam31_batched_grounding_batch_size,
             sam31_offload_video_to_cpu=args.sam31_offload_video_to_cpu,
             sam31_offload_outputs_to_cpu=args.sam31_offload_outputs_to_cpu,
+            sam31_offload_sam_during_detection=args.sam31_offload_sam_during_detection,
             device=args.device,
             detector_type=args.detector,
         )
@@ -940,8 +1931,6 @@ def main() -> None:
 
         global_tracks: List[Dict] = []
         chunk_match_debug: List[Dict[str, object]] = []
-        prev_chunk_output: Optional[MaskletOutput] = None
-        prev_chunk_start: Optional[int] = None
         for ci, (start, end) in enumerate(chunks):
             seed_detections_by_frame = None
             discovery_frame_indices = build_chunk_discovery_indices(
@@ -952,13 +1941,11 @@ def main() -> None:
                 chunk_idx=ci,
             )
             if (
-                prev_chunk_output is not None
-                and prev_chunk_start is not None
+                global_tracks
                 and args.chunk_overlap > 0
             ):
                 seed_detections_by_frame = _build_chunk_seed_detections(
-                    prev_chunk_output,
-                    prev_chunk_start,
+                    global_tracks,
                     start,
                     args.chunk_overlap,
                 )
@@ -986,8 +1973,6 @@ def main() -> None:
                     chunk_overlap=args.chunk_overlap,
                 )
             )
-            prev_chunk_output = chunk_output
-            prev_chunk_start = start
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 

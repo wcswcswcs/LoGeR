@@ -546,6 +546,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--se3", action="store_true", default=None)
     p.add_argument("--geometry_edge_rtol", type=float, default=0.03,
                    help="Depth-edge confidence suppression used by Stage A. Set to 0.0 for demo_viser parity.")
+    p.add_argument("--stage_memory_swap", type=int, default=1,
+                   help="Move inactive Stage-A/Stage-C models to CPU between stages to keep pipeline GPU memory low (1/0).")
 
     # -- Stage B: Dynamic Cue Extractor ------------------------------------
     p.add_argument("--k_intra", type=int, default=3,
@@ -554,14 +556,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--tau_occ", type=float, default=0.05)
 
     # -- Stage C: Video Masklet Front-end ----------------------------------
+    p.add_argument("--sam_backend", choices=["sam2", "sam3", "sam31_multiplex"], default="sam2")
     p.add_argument("--sam2_checkpoint", default=None)
     p.add_argument("--sam2_model_cfg", default=None)
+    p.add_argument("--sam3_checkpoint", default=None)
+    p.add_argument("--sam31_checkpoint", default=None,
+                   help="Optional local SAM 3.1 multiplex checkpoint.")
+    p.add_argument("--sam31_postprocess_batch_size", type=int, default=1,
+                   help="SAM3.1 multiplex postprocess batch size. Smaller uses less GPU memory.")
+    p.add_argument("--sam31_batched_grounding_batch_size", type=int, default=1,
+                   help="SAM3.1 multiplex internal grounding batch size. Smaller uses less GPU memory.")
+    p.add_argument("--sam31_offload_video_to_cpu", type=int, default=1,
+                   help="SAM3.1 multiplex: keep decoded video frames on CPU during session inference (1/0).")
+    p.add_argument("--sam31_offload_outputs_to_cpu", type=int, default=1,
+                   help="SAM3.1 multiplex: offload detector outputs to CPU during eval to save GPU memory (1/0).")
+    p.add_argument("--sam31_offload_sam_during_detection", type=int, default=0,
+                   help="SAM3.1 multiplex: move SAM to CPU while detector discovery runs to avoid stacked model VRAM (1/0).")
     p.add_argument("--detector", choices=["gdino", "yoloe"], default="gdino")
     p.add_argument("--gdino_config", default=None)
     p.add_argument("--gdino_checkpoint", default=None)
     p.add_argument("--yoloe_model", default="yoloe-11l-seg.pt")
     p.add_argument("--ann_frame_idx", type=int, default=0)
-    p.add_argument("--max_thing_objects", type=int, default=15)
+    p.add_argument("--max_thing_objects", type=int, default=18)
     p.add_argument("--box_threshold", type=float, default=0.30)
     p.add_argument("--text_threshold", type=float, default=0.25)
     p.add_argument("--thing_prompts", default=None)
@@ -799,10 +815,17 @@ def main() -> None:
     if args.geometry_eval_mode and args.ttt_write_mode == "semantic":
         sys.exit("geometry_eval_mode cannot be used with ttt_write_mode=semantic; use native or unity_replay.")
     if not args.geometry_eval_mode:
-        if not args.sam2_checkpoint or not os.path.isfile(args.sam2_checkpoint):
-            sys.exit(f"SAM2 checkpoint not found: {args.sam2_checkpoint}")
-        if not args.sam2_model_cfg:
-            sys.exit("sam2_model_cfg is required unless --geometry_eval_mode is enabled.")
+        if args.sam_backend == "sam2":
+            if not args.sam2_checkpoint or not os.path.isfile(args.sam2_checkpoint):
+                sys.exit(f"SAM2 checkpoint not found: {args.sam2_checkpoint}")
+            if not args.sam2_model_cfg:
+                sys.exit("sam2_model_cfg is required when --sam_backend=sam2.")
+        elif args.sam_backend == "sam3":
+            if not args.sam3_checkpoint or not os.path.isfile(args.sam3_checkpoint):
+                sys.exit(f"SAM3 checkpoint not found: {args.sam3_checkpoint}")
+        elif args.sam_backend == "sam31_multiplex":
+            if args.sam31_checkpoint and not os.path.isfile(args.sam31_checkpoint):
+                sys.exit(f"SAM3.1 checkpoint not found: {args.sam31_checkpoint}")
     if args.geometry_eval_mode and args.ttt_write_mode == "native":
         if args.chunk_size > 0 and args.chunk_size != args.window_size:
             print(f"[warn] native LoGeR parity is best when chunk_size ({args.chunk_size}) == window_size ({args.window_size}).")
@@ -904,6 +927,14 @@ def main() -> None:
         build_kwargs = dict(
             sam2_checkpoint=args.sam2_checkpoint,
             sam2_model_cfg=args.sam2_model_cfg,
+            sam_backend=args.sam_backend,
+            sam3_checkpoint=args.sam3_checkpoint,
+            sam31_checkpoint=args.sam31_checkpoint,
+            sam31_postprocess_batch_size=args.sam31_postprocess_batch_size,
+            sam31_batched_grounding_batch_size=args.sam31_batched_grounding_batch_size,
+            sam31_offload_video_to_cpu=args.sam31_offload_video_to_cpu,
+            sam31_offload_outputs_to_cpu=args.sam31_offload_outputs_to_cpu,
+            sam31_offload_sam_during_detection=args.sam31_offload_sam_during_detection,
             device=args.device,
             detector_type=args.detector,
         )
@@ -981,6 +1012,10 @@ def main() -> None:
         print(f"# Chunk {ci}/{len(chunks)-1}  frames [{start}, {end})")
         print(f"{'#'*72}")
 
+        if args.stage_memory_swap and str(args.device).startswith("cuda"):
+            _offload_stage_c_frontend_to_cpu()
+            _ensure_backbone_on_device(backbone, args.device)
+
         if args.reset_every > 0 and ci > 0 and ci % args.reset_every == 0 and ttt_state is not None:
             preserved_history = ttt_state.get("history")
             ttt_state = {
@@ -1034,11 +1069,15 @@ def main() -> None:
             print(f"  Stage C: Video Masklet Front-end ...")
             t0 = time.time()
             assert chunk_full is not None
+            if args.stage_memory_swap and str(args.device).startswith("cuda"):
+                _offload_backbone_to_cpu(backbone)
             mo = _run_stage_c_lazy(build_kwargs, frontend_kwargs, chunk_full, ci)
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             print(f"    done in {time.time() - t0:.2f}s")
             print_masklet_output(mo)
+            if args.stage_memory_swap and str(args.device).startswith("cuda"):
+                _offload_stage_c_frontend_to_cpu()
         else:
             print("  Stage C: skipped (--geometry_eval_mode)")
         all_masklet.append(mo)
@@ -1059,6 +1098,8 @@ def main() -> None:
         # ---- Stage E ----
         if args.ttt_write_mode == "native":
             ttt_state = backbone.get_ttt_state()
+            if args.stage_memory_swap and str(args.device).startswith("cuda") and ttt_state is not None:
+                ttt_state = _move_tensor_tree_to_device(ttt_state, "cpu")
             print("  Stage E: skipped (native write-through from Stage A state)")
         elif write_cache is not None and write_cache.num_ttt_layers > 0:
             print(f"  Stage E: TTT Write Controller ...")
@@ -1075,6 +1116,8 @@ def main() -> None:
             ttt_state = {"w0": wr.w0, "w1": wr.w1, "w2": wr.w2}
             if wr.history is not None:
                 ttt_state["history"] = wr.history
+            if args.stage_memory_swap and str(args.device).startswith("cuda"):
+                ttt_state = _move_tensor_tree_to_device(ttt_state, "cpu")
         else:
             print("  Stage E: skipped (no TTT layers cached)")
 
@@ -1185,6 +1228,52 @@ def main() -> None:
 _frontend_instance: Optional[VideoMaskletFrontend] = None
 
 
+def _move_module_to_device(module: Any, device: str) -> None:
+    if module is not None and hasattr(module, "to"):
+        module.to(device)
+
+
+def _move_tensor_tree_to_device(obj: Any, device: str) -> Any:
+    if torch.is_tensor(obj):
+        return obj.to(device)
+    if isinstance(obj, list):
+        return [_move_tensor_tree_to_device(v, device) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_move_tensor_tree_to_device(v, device) for v in obj)
+    if isinstance(obj, dict):
+        return {k: _move_tensor_tree_to_device(v, device) for k, v in obj.items()}
+    return obj
+
+
+def _ensure_backbone_on_device(backbone: LoGeRGeometryBackbone, device: str) -> None:
+    _move_module_to_device(getattr(backbone, "model", None), device)
+
+
+def _offload_backbone_to_cpu(backbone: LoGeRGeometryBackbone) -> None:
+    _move_module_to_device(getattr(backbone, "model", None), "cpu")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _ensure_stage_c_frontend_on_device(device: str) -> None:
+    if _frontend_instance is None:
+        return
+    predictor = getattr(_frontend_instance, "video_predictor", None)
+    _move_module_to_device(getattr(predictor, "model", None), device)
+
+
+def _offload_stage_c_frontend_to_cpu() -> None:
+    if _frontend_instance is None:
+        return
+    detector = getattr(_frontend_instance, "detector", None)
+    if detector is not None and hasattr(detector, "release_gpu"):
+        detector.release_gpu()
+    predictor = getattr(_frontend_instance, "video_predictor", None)
+    _move_module_to_device(getattr(predictor, "model", None), "cpu")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def _run_stage_c_lazy(
     build_kwargs: dict, frontend_kwargs: dict,
     chunk_images: torch.Tensor, chunk_idx: int,
@@ -1195,6 +1284,8 @@ def _run_stage_c_lazy(
         _frontend_instance = VideoMaskletFrontend.from_config(
             **build_kwargs, **frontend_kwargs,
         )
+    else:
+        _ensure_stage_c_frontend_on_device(str(build_kwargs.get("device", "cuda")))
     return _frontend_instance.run(chunk_images)
 
 
