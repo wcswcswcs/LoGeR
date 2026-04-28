@@ -10,7 +10,7 @@ the new fast weights W_{m+1} that the next chunk's Geometry Backbone
 Stages:
   A  LoGeR Geometry Backbone  → GeometryOutput + WriteCacheOutput
   B  Dynamic Cue Extractor    → CueOutput
-  C  Efficient Video Masklet Front-end  → MaskletOutput
+  C  Video Masklet Front-end  → MaskletOutput
   D  Semantic Prior Generator  → PriorOutput (A_tok)
   E  TTT Write Controller      → WriteResult (W_{m+1})
 
@@ -20,8 +20,8 @@ Usage::
         --input data/examples/office \\
         --config ckpts/LoGeR/original_config.yaml \\
         --checkpoint ckpts/LoGeR/latest.pt \\
-        --tracker_backend sam2 \\
-        --sam3_checkpoint ckpts/SAM3/sam3.pt \\
+        --sam_backend sam31_multiplex \\
+        --sam31_checkpoint ckpts/SAM3/sam3.1_multiplex.pt \\
         --sam2_checkpoint /home/tmp_datasets/weights/sam/sam2.1_hiera_large.pt \\
         --sam2_model_cfg configs/sam2.1/sam2.1_hiera_l.yaml \\
         --detector yoloe \\
@@ -77,15 +77,8 @@ from loger.pipeline.geometry_backbone import (
     load_images as loger_load_images,
 )
 from loger.pipeline.dynamic_cue_extractor import CueOutput, DynamicCueExtractor
-from loger.pipeline.efficient_video_masklet_frontend import (
-    DEFAULT_EFFICIENTSAM3_FILENAME,
-    DEFAULT_EFFICIENTSAM3_REPO_ID,
-    DEFAULT_EDGETAM_CHECKPOINT,
-    DEFAULT_EDGETAM_MODEL_CFG,
-    DEFAULT_SAM2_CHECKPOINT,
-    DEFAULT_SAM2_MODEL_CFG,
-    DEFAULT_SAM3_CHECKPOINT,
-    EfficientVideoMaskletFrontend,
+from loger.pipeline.video_masklet_frontend import (
+    VideoMaskletFrontend,
     MaskletOutput,
     SEMANTIC_GROUP_NAMES,
 )
@@ -106,8 +99,15 @@ from run_geometry_backbone_inference import (
 from inference_dynamic_cue_extractor import print_cue_output
 
 
-DEFAULT_EFFICIENT_THING_PROMPTS = "person,door,desk,table,window,monitor"
-DEFAULT_EFFICIENT_STUFF_PROMPTS = "floor,wall,ceiling"
+DEFAULT_SAM3_CHECKPOINT = "ckpts/SAM3/sam3.pt"
+DEFAULT_SAM31_CHECKPOINT = "ckpts/SAM3/sam3.1_multiplex.pt"
+DEFAULT_SAM2_CHECKPOINT = "/home/tmp_datasets/weights/sam/sam2.1_hiera_large.pt"
+DEFAULT_SAM2_MODEL_CFG = "configs/sam2.1/sam2.1_hiera_l.yaml"
+DEFAULT_VIDEO_THING_PROMPTS = (
+    "person,people,singer,dancer,performer,guitar,microphone,"
+    "microphone stand,door,desk,table,window,monitor,chair"
+)
+DEFAULT_VIDEO_STUFF_PROMPTS = "floor,wall,ceiling"
 
 
 # ---------------------------------------------------------------------------
@@ -330,17 +330,14 @@ def run_geometry_eval_external_exact(
         stage_a_result = backbone.run(
             chunk_loger,
             ttt_state=ttt_state,
-            cache_ttt_primitives=use_controller_write_through,
+            cache_ttt_primitives=False,
             window_size=args.window_size,
             overlap_size=args.overlap_size,
             reset_every=0,
             se3=False,
         )
-        if use_controller_write_through:
-            geo, write_cache = stage_a_result
-        else:
-            geo = stage_a_result
-            write_cache = None
+        geo = stage_a_result
+        write_cache = None
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         print(f"    done in {time.time() - t0:.2f}s")
@@ -351,7 +348,12 @@ def run_geometry_eval_external_exact(
         if use_controller_write_through:
             print("  Stage E: TTT Write Controller (native write-through) ...")
             t0 = time.time()
-            assert write_cache is not None
+            native_state = backbone.get_ttt_state()
+            write_cache = _build_native_write_cache_from_state(
+                native_state,
+                num_frames=geo.num_frames,
+                patch_grid=geo.patch_grid,
+            )
             wr = controller.run(
                 write_cache,
                 A_tok=None,
@@ -393,6 +395,60 @@ def run_geometry_eval_external_exact(
         W,
         patch_h,
         patch_w,
+    )
+
+
+def _clone_ttt_tensor_list(xs: List[Optional[torch.Tensor]]) -> List[Optional[torch.Tensor]]:
+    return [x.detach().cpu().clone() if x is not None else None for x in xs]
+
+
+def _clone_ttt_history(
+    history: Optional[List[Optional[Dict[str, torch.Tensor]]]],
+) -> Optional[List[Optional[Dict[str, torch.Tensor]]]]:
+    if history is None:
+        return None
+    cloned: List[Optional[Dict[str, torch.Tensor]]] = []
+    for entry in history:
+        if entry is None:
+            cloned.append(None)
+        else:
+            cloned.append({
+                "k": entry["k"].detach().cpu().clone(),
+                "v": entry["v"].detach().cpu().clone(),
+            })
+    return cloned
+
+
+def _build_native_write_cache_from_state(
+    ttt_state: Optional[Dict[str, Any]],
+    *,
+    num_frames: int,
+    patch_grid: Tuple[int, int],
+) -> WriteCacheOutput:
+    """Build a lightweight native WriteCache from provisional fast weights.
+
+    Native write-through does not need replay primitives (q/k/v/lr).  Stage A
+    has already computed the updated fast weights, so Stage E only needs a
+    small cache carrying those provisional weights through TTTWriteController.
+    """
+    if ttt_state is None:
+        raise RuntimeError("native TTT write-through requested but Stage A produced no TTT state")
+
+    w0 = _clone_ttt_tensor_list(ttt_state.get("w0", []))
+    w1 = _clone_ttt_tensor_list(ttt_state.get("w1", []))
+    w2 = _clone_ttt_tensor_list(ttt_state.get("w2", []))
+    if not (len(w0) == len(w1) == len(w2)):
+        raise RuntimeError("invalid native TTT state: w0/w1/w2 layer counts differ")
+
+    return WriteCacheOutput(
+        layer_caches=[],
+        w0_provisional=w0,
+        w1_provisional=w1,
+        w2_provisional=w2,
+        history_provisional=_clone_ttt_history(ttt_state.get("history")),
+        num_frames=num_frames,
+        patch_grid=patch_grid,
+        num_ttt_layers=len(w0),
     )
 
 
@@ -587,47 +643,49 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sigma_pt", type=float, default=0.25)
     p.add_argument("--tau_occ", type=float, default=0.05)
 
-    # -- Stage C: Efficient Video Masklet Front-end -------------------------
+    # -- Stage C: Video Masklet Front-end -----------------------------------
     p.add_argument("--sam_backend", choices=["sam2", "sam3", "sam31_multiplex"], default="sam31_multiplex",
-                   help="Legacy Stage-C selector kept for old scripts. run_pipeline_abc now uses the efficient frontend.")
+                   help="Stage-C SAM backend. The quality path uses sam31_multiplex.")
     p.add_argument("--tracker_backend", default="sam2",
                    choices=["sam2", "edgetam", "cutie", "efficientsam3", "efficient"],
-                   help="Efficient Stage C tracker backend. Default: SAM3+YOLOE discovery + SAM2.1 propagation.")
+                   help="Compatibility argument from the old efficient frontend; ignored by VideoMaskletFrontend.")
     p.add_argument("--sam2_checkpoint", default=DEFAULT_SAM2_CHECKPOINT)
     p.add_argument("--sam2_model_cfg", default=DEFAULT_SAM2_MODEL_CFG)
-    p.add_argument("--edgetam_checkpoint", default=DEFAULT_EDGETAM_CHECKPOINT)
-    p.add_argument("--edgetam_model_cfg", default=DEFAULT_EDGETAM_MODEL_CFG)
+    p.add_argument("--edgetam_checkpoint", default=None,
+                   help="Compatibility argument from the old efficient frontend; ignored.")
+    p.add_argument("--edgetam_model_cfg", default=None,
+                   help="Compatibility argument from the old efficient frontend; ignored.")
     p.add_argument("--sam3_checkpoint", default=DEFAULT_SAM3_CHECKPOINT,
-                   help="SAM3 checkpoint used by the efficient Cutie backend for keyframe prompt segmentation.")
-    p.add_argument("--sam31_checkpoint", default=None,
-                   help="Legacy SAM3.1 multiplex checkpoint argument; accepted for compatibility but not used by the efficient frontend.")
+                   help="SAM3 checkpoint used when --sam_backend=sam3.")
+    p.add_argument("--sam31_checkpoint", default=DEFAULT_SAM31_CHECKPOINT,
+                   help="SAM3.1 multiplex checkpoint used when --sam_backend=sam31_multiplex.")
     p.add_argument("--efficientsam3_checkpoint", default=None,
-                   help="Local merged EfficientSAM3 checkpoint for --tracker_backend efficientsam3/efficient.")
-    p.add_argument("--efficientsam3_repo_id", default=DEFAULT_EFFICIENTSAM3_REPO_ID,
-                   help="Hugging Face repo used when auto-downloading EfficientSAM3.")
-    p.add_argument("--efficientsam3_filename", default=DEFAULT_EFFICIENTSAM3_FILENAME,
-                   help="Filename inside the HF repo used when auto-downloading EfficientSAM3.")
+                   help="Compatibility argument from the old efficient frontend; ignored.")
+    p.add_argument("--efficientsam3_repo_id", default=None,
+                   help="Compatibility argument from the old efficient frontend; ignored.")
+    p.add_argument("--efficientsam3_filename", default=None,
+                   help="Compatibility argument from the old efficient frontend; ignored.")
     p.add_argument("--efficientsam3_cache_dir", default="ckpts/EfficientSAM3",
-                   help="Local cache dir for EfficientSAM3 downloads.")
+                   help="Compatibility argument from the old efficient frontend; ignored.")
     p.add_argument("--efficientsam3_backbone_type", default="efficientvit",
                    choices=["repvit", "tinyvit", "efficientvit"],
-                   help="EfficientSAM3 student vision backbone family.")
+                   help="Compatibility argument from the old efficient frontend; ignored.")
     p.add_argument("--efficientsam3_model_name", default="b0",
-                   help="Model variant inside the chosen EfficientSAM3 backbone family.")
+                   help="Compatibility argument from the old efficient frontend; ignored.")
     p.add_argument("--efficientsam3_text_encoder_type", default=None,
-                   help="Optional EfficientSAM3 student text encoder type, e.g. MobileCLIP-S0.")
+                   help="Compatibility argument from the old efficient frontend; ignored.")
     p.add_argument("--efficientsam3_text_context_length", type=int, default=77,
-                   help="Context length when using an EfficientSAM3 student text encoder.")
+                   help="Compatibility argument from the old efficient frontend; ignored.")
     p.add_argument("--cutie_max_internal_size", type=int, default=480,
-                   help="Cutie internal short-edge size. Lower is faster; -1 keeps original size.")
+                   help="Compatibility argument from the old efficient frontend; ignored.")
     p.add_argument("--sam3_cutie_sam_confidence_threshold", type=float, default=0.10,
-                   help="SAM3 image-prompt confidence threshold before local filtering.")
+                   help="Compatibility argument from the old efficient frontend; ignored.")
     p.add_argument("--sam3_cutie_detection_frame_count", type=int, default=6,
-                   help="Number of SAM3 prompt-discovery frames per chunk for the Cutie backend.")
+                   help="Compatibility argument from the old efficient frontend; ignored.")
     p.add_argument("--sam3_cutie_max_prompt_dets_per_label", type=int, default=4,
-                   help="Max SAM3 masks kept per label per discovery frame.")
+                   help="Compatibility argument from the old efficient frontend; ignored.")
     p.add_argument("--sam3_cutie_use_yoloe", type=int, default=1,
-                   help="Also add YOLOE detections as seeds for the SAM3+Cutie backend (1/0).")
+                   help="Compatibility argument from the old efficient frontend; ignored.")
     p.add_argument("--sam31_postprocess_batch_size", type=int, default=1,
                    help="SAM3.1 multiplex postprocess batch size. Smaller uses less GPU memory.")
     p.add_argument("--sam31_batched_grounding_batch_size", type=int, default=1,
@@ -638,10 +696,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="SAM3.1 multiplex: offload detector outputs to CPU during eval to save GPU memory (1/0).")
     p.add_argument("--sam31_offload_sam_during_detection", type=int, default=0,
                    help="SAM3.1 multiplex: move SAM to CPU while detector discovery runs to avoid stacked model VRAM (1/0).")
-    p.add_argument("--sam31_text_track_labels", default="",
-                   help="Comma-separated labels that use text-prompt tracking. Empty keeps the efficient YOLOE/SAM3 seed path focused.")
+    p.add_argument("--sam31_text_track_labels", default="person",
+                   help="Comma-separated labels that use SAM3.1 text-prompt tracking; use 'all' for every detected label.")
+    p.add_argument("--sam31_direct_text_prompt_labels", default="person",
+                   help="Comma-separated THING labels directly queried with SAM3.1 text prompts independent of detector hits.")
+    p.add_argument("--sam31_direct_text_prompt_frame_count", type=int, default=1,
+                   help="Number of direct SAM3.1 text-prompt frames per chunk.")
     p.add_argument("--sam31_structure_prompt_labels", default="wall,floor,ceiling",
-                   help="Comma-separated structure labels directly queried by the efficient Stage C frontend.")
+                   help="Comma-separated structure labels directly queried by Stage C.")
     p.add_argument("--sam31_structure_prompt_frame_count", type=int, default=1,
                    help="Number of discovery frames per chunk used for direct SAM3.1 structure prompt detection.")
     p.add_argument("--sam31_structure_prompt_chunk_stride", type=int, default=1,
@@ -652,10 +714,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Stage C max non-text YOLOE candidates propagated with SAM3.1 object prompts per chunk; 0 keeps the default path fast.")
     p.add_argument("--sam31_nontext_object_prompt_min_support", type=int, default=2,
                    help="Stage C minimum detector support for non-seed non-text object prompts.")
+    p.add_argument("--sam31_text_object_prompt_budget", type=int, default=0,
+                   help="Max unmatched YOLOE candidates for text-tracked labels to force through SAM3.1 object prompts per label/chunk.")
     p.add_argument("--sam31_nontext_sparse_support", type=int, default=1,
                    help="Stage C keeps non-text YOLOE thing masks as sparse support without SAM3.1 propagation (1/0).")
     p.add_argument("--sam31_max_text_prompt_objects", type=int, default=0,
                    help="Stage C caps text-prompt objects propagated per SAM3.1 query; 0 keeps all.")
+    p.add_argument("--sam31_max_internal_objects", type=int, default=16,
+                   help="SAM3.1 multiplex runtime object slots per query.")
     p.add_argument("--sam31_max_movable_objects", type=int, default=8,
                    help="Max movable thing prompt tracks per chunk.")
     p.add_argument("--sam31_max_static_objects", type=int, default=2,
@@ -663,18 +729,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sam31_max_structure_objects", type=int, default=3,
                    help="Max tracked structure prompt objects per chunk.")
     p.add_argument("--detector", choices=["gdino", "yoloe"], default="yoloe",
-                   help="Legacy detector selector. Efficient Stage C uses YOLOE; gdino is accepted only for old scripts.")
+                   help="Detector used by Video Masklet Front-end.")
     p.add_argument("--gdino_config", default=None)
     p.add_argument("--gdino_checkpoint", default=None)
     p.add_argument("--yoloe_model", default="yoloe-11l-seg.pt")
+    p.add_argument("--yoloe_batch_size", type=int, default=4)
+    p.add_argument("--yoloe_imgsz", type=int, default=0)
     p.add_argument("--ann_frame_idx", type=int, default=0)
     p.add_argument("--discovery_frame_stride", type=int, default=4,
                    help="Run semantic discovery every N frames inside each chunk.")
     p.add_argument("--max_thing_objects", type=int, default=24)
     p.add_argument("--box_threshold", type=float, default=0.30)
     p.add_argument("--text_threshold", type=float, default=0.25)
-    p.add_argument("--thing_prompts", default=DEFAULT_EFFICIENT_THING_PROMPTS)
-    p.add_argument("--stuff_prompts", default=DEFAULT_EFFICIENT_STUFF_PROMPTS)
+    p.add_argument("--thing_prompts", default=DEFAULT_VIDEO_THING_PROMPTS)
+    p.add_argument("--stuff_prompts", default=DEFAULT_VIDEO_STUFF_PROMPTS)
 
     # -- Stage E: TTT Write Controller -------------------------------------
     p.add_argument("--lambda_min", type=float, default=0.0)
@@ -682,7 +750,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ttt_write_mode", choices=["semantic", "unity_replay", "native"], default="semantic",
                    help="Stage E mode: semantic=use Stage D prior, unity_replay=all-one prior replay, native=use model provisional W directly.")
     p.add_argument("--native_write_through_controller", action="store_true",
-                   help="In exact external geometry mode, force native mode to route through TTTWriteController write-through. Higher memory than the default direct Stage-A state path.")
+                   help="In exact external geometry mode, route native fast-weight state through TTTWriteController write-through.")
 
     # -- Video output -------------------------------------------------------
     p.add_argument("--fps", type=int, default=10)
@@ -919,22 +987,6 @@ def main() -> None:
         elif args.sam_backend == "sam31_multiplex":
             if args.sam31_checkpoint and not os.path.isfile(args.sam31_checkpoint):
                 sys.exit(f"SAM3.1 checkpoint not found: {args.sam31_checkpoint}")
-        if args.tracker_backend == "sam2":
-            if not args.sam2_checkpoint or not (
-                os.path.isfile(args.sam2_checkpoint)
-                or os.path.isfile(os.path.join(REPO_ROOT, args.sam2_checkpoint))
-            ):
-                sys.exit(f"SAM2 checkpoint not found: {args.sam2_checkpoint}")
-            if not args.sam2_model_cfg:
-                sys.exit("sam2_model_cfg is required when --tracker_backend=sam2.")
-        elif args.tracker_backend == "edgetam":
-            if not args.edgetam_checkpoint or not (
-                os.path.isfile(args.edgetam_checkpoint)
-                or os.path.isfile(os.path.join(REPO_ROOT, args.edgetam_checkpoint))
-            ):
-                sys.exit(f"EdgeTAM checkpoint not found: {args.edgetam_checkpoint}")
-            if not args.edgetam_model_cfg:
-                sys.exit("edgetam_model_cfg is required when --tracker_backend=edgetam.")
     if args.geometry_eval_mode and args.ttt_write_mode == "native":
         if args.chunk_size > 0 and args.chunk_size != args.window_size:
             print(f"[warn] native LoGeR parity is best when chunk_size ({args.chunk_size}) == window_size ({args.window_size}).")
@@ -986,14 +1038,7 @@ def main() -> None:
         overlap_size=args.overlap_size,
         reset_every=args.reset_every,
         edge_rtol=args.geometry_edge_rtol,
-        update_ttt_weights=(
-            args.ttt_write_mode == "native"
-            and not (
-                args.geometry_eval_mode
-                and args.chunk_size > 0
-                and args.native_write_through_controller
-            )
-        ),
+        update_ttt_weights=(args.ttt_write_mode == "native"),
     )
     if args.se3 is not None:
         backbone_kwargs["se3"] = args.se3
@@ -1035,47 +1080,38 @@ def main() -> None:
             frontend_kwargs["stuff_prompts"] = [s.strip() for s in args.stuff_prompts.split(",")]
 
         build_kwargs = dict(
-            tracker_backend=args.tracker_backend,
+            sam_backend=args.sam_backend,
             sam3_checkpoint=args.sam3_checkpoint,
+            sam31_checkpoint=args.sam31_checkpoint,
             sam2_checkpoint=args.sam2_checkpoint,
             sam2_model_cfg=args.sam2_model_cfg,
-            edgetam_checkpoint=args.edgetam_checkpoint,
-            edgetam_model_cfg=args.edgetam_model_cfg,
-            efficientsam3_checkpoint=args.efficientsam3_checkpoint,
-            efficientsam3_repo_id=args.efficientsam3_repo_id,
-            efficientsam3_filename=args.efficientsam3_filename,
-            efficientsam3_cache_dir=args.efficientsam3_cache_dir,
-            efficientsam3_backbone_type=args.efficientsam3_backbone_type,
-            efficientsam3_model_name=args.efficientsam3_model_name,
-            efficientsam3_text_encoder_type=args.efficientsam3_text_encoder_type,
-            efficientsam3_text_context_length=args.efficientsam3_text_context_length,
+            detector_type=args.detector,
+            gdino_config=args.gdino_config,
+            gdino_checkpoint=args.gdino_checkpoint,
             yoloe_model=args.yoloe_model,
-            cutie_max_internal_size=args.cutie_max_internal_size,
-            sam3_cutie_sam_confidence_threshold=args.sam3_cutie_sam_confidence_threshold,
-            sam3_cutie_detection_frame_count=args.sam3_cutie_detection_frame_count,
-            sam3_cutie_max_prompt_dets_per_label=args.sam3_cutie_max_prompt_dets_per_label,
-            sam3_cutie_use_yoloe=bool(args.sam3_cutie_use_yoloe),
+            yoloe_batch_size=args.yoloe_batch_size,
+            yoloe_imgsz=args.yoloe_imgsz,
             sam31_offload_video_to_cpu=args.sam31_offload_video_to_cpu,
+            sam31_offload_outputs_to_cpu=args.sam31_offload_outputs_to_cpu,
             sam31_offload_sam_during_detection=args.sam31_offload_sam_during_detection,
             sam31_text_track_labels=args.sam31_text_track_labels,
+            sam31_direct_text_prompt_labels=args.sam31_direct_text_prompt_labels,
+            sam31_direct_text_prompt_frame_count=args.sam31_direct_text_prompt_frame_count,
             sam31_structure_prompt_labels=args.sam31_structure_prompt_labels,
             sam31_structure_prompt_frame_count=args.sam31_structure_prompt_frame_count,
             sam31_structure_prompt_chunk_stride=args.sam31_structure_prompt_chunk_stride,
             sam31_person_refresh_prompt_frames=args.sam31_person_refresh_prompt_frames,
             sam31_nontext_object_prompt_budget=args.sam31_nontext_object_prompt_budget,
             sam31_nontext_object_prompt_min_support=args.sam31_nontext_object_prompt_min_support,
+            sam31_text_object_prompt_budget=args.sam31_text_object_prompt_budget,
             sam31_nontext_sparse_support=bool(args.sam31_nontext_sparse_support),
             sam31_max_text_prompt_objects=args.sam31_max_text_prompt_objects,
+            sam31_max_internal_objects=args.sam31_max_internal_objects,
             sam31_max_movable_objects=args.sam31_max_movable_objects,
             sam31_max_static_objects=args.sam31_max_static_objects,
             sam31_max_structure_objects=args.sam31_max_structure_objects,
             device=args.device,
         )
-        if args.detector != "yoloe":
-            print(
-                "  Stage C note: run_pipeline_abc now uses EfficientVideoMaskletFrontend, "
-                "so --detector is ignored and YOLOE seeds are used."
-            )
 
     need_semantic_prior = (args.ttt_write_mode == "semantic") and (not args.geometry_eval_mode)
     prior_gen = SemanticPriorGenerator() if need_semantic_prior else None
@@ -1199,7 +1235,7 @@ def main() -> None:
         # ---- Stage C ----
         mo: Optional[MaskletOutput] = None
         if not args.geometry_eval_mode:
-            print(f"  Stage C: Efficient Video Masklet Front-end ...")
+            print(f"  Stage C: Video Masklet Front-end ...")
             t0 = time.time()
             assert chunk_full is not None
             if args.stage_memory_swap and str(args.device).startswith("cuda"):
@@ -1358,7 +1394,7 @@ def main() -> None:
 # ---------------------------------------------------------------------------
 # Lazy Stage C builder (so SAM2 + detector are only loaded when needed)
 # ---------------------------------------------------------------------------
-_frontend_instance: Optional[EfficientVideoMaskletFrontend] = None
+_frontend_instance: Optional[VideoMaskletFrontend] = None
 
 
 def _move_module_to_device(module: Any, device: str) -> None:
@@ -1440,10 +1476,11 @@ def _run_stage_c_lazy(
     global _frontend_instance
     if _frontend_instance is None:
         print(
-            "    Building EfficientVideoMaskletFrontend "
-            f"(tracker={build_kwargs.get('tracker_backend','?')}, detector=yoloe) ..."
+            "    Building VideoMaskletFrontend "
+            f"(sam_backend={build_kwargs.get('sam_backend','?')}, "
+            f"detector={build_kwargs.get('detector_type','?')}) ..."
         )
-        _frontend_instance = EfficientVideoMaskletFrontend.from_config(
+        _frontend_instance = VideoMaskletFrontend.from_config(
             **build_kwargs, **frontend_kwargs,
         )
     else:

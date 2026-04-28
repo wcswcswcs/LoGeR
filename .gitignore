@@ -3,6 +3,7 @@ results*/
 convert_ckpt_to_params.py
 *.pt
 *.pth
+*.ckpt
 .DS_Store
 *-checkpoint.ipynb
 .venv

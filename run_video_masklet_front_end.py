@@ -84,6 +84,8 @@ from loger.pipeline.video_masklet_frontend import (
 VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 DEFAULT_EFFICIENTSAM3_REPO_ID = "Simon7108528/EfficientSAM3"
 DEFAULT_EFFICIENTSAM3_FILENAME = "stage1_sam3p1/efficient_sam3p1_efficientvit_m_mobileclip_s0_ctx16.pt"
+_CLIPSEG_STUFF_CACHE: Dict[Tuple[str, str], Tuple[object, torch.nn.Module]] = {}
+_LSEG_STUFF_CACHE: Dict[Tuple[str, str, str, bool], torch.nn.Module] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -135,6 +137,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Experimental single-subject postprocess: merge dominant person tracks into one ID. Default 0 avoids merging different people.")
     p.add_argument("--sam31_min_chunk_size", type=int, default=96,
                    help="Standalone SAM3.1 optimization: coalesce smaller requested chunks up to this size; 0 disables. Default 96 reduces object-slot pressure under the 9GB VRAM target.")
+    p.add_argument("--sam31_route", default="custom", choices=["custom", "b_quality"],
+                   help="Preset route. b_quality = SAM3.1 text-prompt detection/tracking as the primary THING path, 720px tracking, YOLOE-11l low-res assist.")
 
     # Tracking backend
     p.add_argument("--sam_backend", choices=["sam2", "sam3", "sam31_multiplex"], default="sam2")
@@ -157,6 +161,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="SAM3.1 multiplex: also run reverse propagation inside each chunk (1/0). Default 0 is faster and avoids reverse-cache failures.")
     p.add_argument("--sam31_text_track_labels", default="person",
                    help="Comma-separated labels that use SAM3.1 text-video tracking; use 'all' to text-track every detected label. Person aliases remain detector sparse support by default.")
+    p.add_argument("--sam31_direct_text_prompt_labels", default="",
+                   help="Comma-separated THING labels that SAM3.1 should query directly with text prompts, independent of YOLOE detections.")
+    p.add_argument("--sam31_direct_text_prompt_frame_count", type=int, default=0,
+                   help="Number of direct SAM3.1 text-prompt frames per chunk for --sam31_direct_text_prompt_labels. 0 disables direct text discovery.")
     p.add_argument("--sam31_structure_prompt_labels", default="",
                    help="Comma-separated structure labels directly queried with SAM3.1 text prompts for tracked structure/STUFF support.")
     p.add_argument("--sam31_structure_prompt_frame_count", type=int, default=1,
@@ -169,6 +177,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Max non-text-tracked YOLOE candidates to propagate with SAM3.1 object prompts per chunk; 0 keeps the default path fast.")
     p.add_argument("--sam31_nontext_object_prompt_min_support", type=int, default=2,
                    help="Minimum multi-frame detector support for non-seed non-text object prompts.")
+    p.add_argument("--sam31_text_object_prompt_budget", type=int, default=0,
+                   help="Max unmatched YOLOE candidates for SAM3.1 text-tracked labels, e.g. person, to force through SAM3.1 object prompts per label/chunk; 0 keeps YOLOE as support-only.")
     p.add_argument("--sam31_nontext_sparse_support", type=int, default=1,
                    help="Keep high-confidence YOLOE person masks as sparse support without extra SAM3.1 propagation (1/0).")
     p.add_argument("--sam31_max_text_prompt_objects", type=int, default=12,
@@ -199,10 +209,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--stuff_prompts", default=None, help="Comma-separated.")
     p.add_argument("--disable_stuff_prompts", type=int, default=1,
                    help="Default 1 disables detector-side STUFF prompts in this THING-first frontend; set 0 to keep legacy sparse STUFF.")
-    p.add_argument("--stuff_backend", default="efficientsam3", choices=["efficientsam3", "clipseg"],
+    p.add_argument("--stuff_backend", default="efficientsam3", choices=["efficientsam3", "clipseg", "groupvit", "lseg"],
                    help="Per-frame STUFF backend used when --efficientsam3_stuff_enable=1.")
     p.add_argument("--efficientsam3_stuff_enable", type=int, default=0,
-                   help="Run a separate per-frame STUFF pass after THING tracking.")
+                   help="Run a per-frame STUFF pass. By default it is merged inside each chunk before global finalize.")
+    p.add_argument("--efficientsam3_stuff_chunk_mode", type=int, default=1,
+                   help="Run and merge STUFF inside each chunk before global finalize; required for pipeline-style Stage C outputs.")
     p.add_argument("--efficientsam3_stuff_prompts", default="wall surface,floor surface,ceiling surface",
                    help="Comma-separated STUFF labels queried by EfficientSAM3 when --efficientsam3_stuff_enable=1.")
     p.add_argument("--efficientsam3_stuff_stride", type=int, default=1,
@@ -261,9 +273,66 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Use autocast during CLIPSeg STUFF inference on CUDA.")
     p.add_argument("--clipseg_stuff_batch_size", type=int, default=8,
                    help="Number of video frames batched per CLIPSeg STUFF worker step.")
+    p.add_argument("--clipseg_stuff_inprocess", type=int, default=1,
+                   help="Run CLIPSeg STUFF in-process and cache the model across chunks. Disable if VRAM gets tight.")
     p.add_argument("--clipseg_stuff_worker", type=int, default=0, help=argparse.SUPPRESS)
     p.add_argument("--clipseg_stuff_frame_list", default=None, help=argparse.SUPPRESS)
     p.add_argument("--clipseg_stuff_output_pt", default=None, help=argparse.SUPPRESS)
+    p.add_argument("--groupvit_stuff_model", default="nvidia/groupvit-gcc-yfcc",
+                   help="Hugging Face GroupViT model id/path used when --stuff_backend=groupvit.")
+    p.add_argument("--groupvit_stuff_prompts", default="wall,floor,ceiling",
+                   help="Comma-separated open-vocabulary STUFF labels queried by GroupViT.")
+    p.add_argument("--groupvit_stuff_background_prompts", default="other",
+                   help="Comma-separated GroupViT reject/background labels. These labels compete in argmax but are not saved as STUFF tracks.")
+    p.add_argument("--groupvit_stuff_confidence_threshold", type=float, default=0.34,
+                   help="Minimum softmax probability for GroupViT per-pixel STUFF assignment.")
+    p.add_argument("--groupvit_stuff_min_area_ratio", type=float, default=0.010,
+                   help="Drop tiny GroupViT STUFF masks below this frame-area ratio.")
+    p.add_argument("--groupvit_stuff_max_area_ratio", type=float, default=0.92,
+                   help="Drop implausibly huge GroupViT STUFF masks above this frame-area ratio.")
+    p.add_argument("--groupvit_stuff_morph_kernel", type=int, default=0,
+                   help="Optional morphology kernel size for GroupViT STUFF cleanup; <=1 disables it.")
+    p.add_argument("--groupvit_stuff_amp", type=int, default=1,
+                   help="Use autocast during GroupViT STUFF inference on CUDA.")
+    p.add_argument("--groupvit_stuff_batch_size", type=int, default=16,
+                   help="Number of video frames batched per GroupViT STUFF worker step.")
+    p.add_argument("--groupvit_stuff_worker", type=int, default=0, help=argparse.SUPPRESS)
+    p.add_argument("--groupvit_stuff_frame_list", default=None, help=argparse.SUPPRESS)
+    p.add_argument("--groupvit_stuff_output_pt", default=None, help=argparse.SUPPRESS)
+    p.add_argument("--lseg_stuff_repo_root", default="third_party/LSM",
+                   help="LSM repo root used for its pure-PyTorch LSegFeatureExtractor wrapper.")
+    p.add_argument("--lseg_stuff_checkpoint", default="ckpts/LSeg/demo_e200.ckpt",
+                   help="LSeg demo_e200.ckpt checkpoint used by the LSM wrapper.")
+    p.add_argument("--lseg_stuff_prompts", default="wall,floor,ceiling",
+                   help="Comma-separated open-vocabulary STUFF labels queried by LSeg.")
+    p.add_argument("--lseg_stuff_prompt_template", default="there is a {classname} in the scene",
+                   help="Template sent to LSeg text encoder; {classname} is replaced with each label.")
+    p.add_argument("--lseg_stuff_background_prompts",
+                   default="person,people,clothing,hair,bag,chair,table,furniture,object,screen,sky,tree,vegetation,other",
+                   help="Reject/background labels that compete in LSeg argmax but are not saved as STUFF tracks.")
+    p.add_argument("--lseg_stuff_confidence_threshold", type=float, default=0.15,
+                   help="Minimum softmax probability for LSeg per-pixel STUFF assignment.")
+    p.add_argument("--lseg_stuff_min_area_ratio", type=float, default=0.010,
+                   help="Drop tiny LSeg STUFF masks below this frame-area ratio.")
+    p.add_argument("--lseg_stuff_max_area_ratio", type=float, default=0.85,
+                   help="Drop implausibly huge LSeg STUFF masks above this frame-area ratio.")
+    p.add_argument("--lseg_stuff_morph_kernel", type=int, default=3,
+                   help="Small morphology kernel for LSeg STUFF cleanup; <=1 disables it.")
+    p.add_argument("--lseg_stuff_batch_size", type=int, default=1,
+                   help="Number of video frames batched per LSeg STUFF step.")
+    p.add_argument("--lseg_stuff_max_side", type=int, default=512,
+                   help="Resize longest frame side for LSeg STUFF. 0 uses chunk frame size.")
+    p.add_argument("--lseg_stuff_half_res", type=int, default=0,
+                   help="Use LSM half-res feature decode path (1/0). Default 0 returns full-resolution logits before final resize.")
+    p.add_argument("--lseg_stuff_amp", type=int, default=1,
+                   help="Use autocast during LSeg STUFF inference on CUDA.")
+    p.add_argument("--lseg_stuff_device", default="auto",
+                   help="Device for LSeg STUFF. 'auto' uses cuda:1 when multiple visible GPUs exist, else --device.")
+    p.add_argument("--lseg_stuff_inprocess", type=int, default=1,
+                   help="Run LSeg STUFF in-process and cache the model across chunks. Disable to isolate VRAM.")
+    p.add_argument("--lseg_stuff_worker", type=int, default=0, help=argparse.SUPPRESS)
+    p.add_argument("--lseg_stuff_frame_list", default=None, help=argparse.SUPPRESS)
+    p.add_argument("--lseg_stuff_output_pt", default=None, help=argparse.SUPPRESS)
     p.add_argument("--box_threshold", type=float, default=0.30)
     p.add_argument("--text_threshold", type=float, default=0.25)
     p.add_argument("--ann_frame_idx", type=int, default=0,
@@ -1154,17 +1223,18 @@ def _run_efficientsam3_stuff_worker(args: argparse.Namespace) -> None:
     )
 
 
-def _augment_with_efficientsam3_stuff_subprocess(
-    mo: SparseMaskletOutput,
+def _run_efficientsam3_stuff_subprocess_payload(
     image_paths: List[str],
     args: argparse.Namespace,
     temp_dirs: List[str],
-) -> SparseMaskletOutput:
+    *,
+    prefix: str = "loger_efficientsam3_stuff_",
+) -> Dict:
     labels = _parse_comma_list(args.efficientsam3_stuff_prompts)
     if not labels or not bool(args.efficientsam3_stuff_enable):
-        return mo
+        return {"tracks": [], "debug": {"efficientsam3_stuff_skipped": "disabled_or_no_labels"}}
 
-    work_dir = tempfile.mkdtemp(prefix="loger_efficientsam3_stuff_")
+    work_dir = tempfile.mkdtemp(prefix=prefix)
     temp_dirs.append(work_dir)
     frame_list_path = os.path.join(work_dir, "frames.txt")
     output_pt = os.path.join(work_dir, "stuff_tracks.pt")
@@ -1208,6 +1278,26 @@ def _augment_with_efficientsam3_stuff_subprocess(
     t0 = time.time()
     subprocess.run(cmd, check=True)
     payload = torch.load(output_pt, map_location="cpu", weights_only=False)
+    payload.setdefault("debug", {})["efficientsam3_stuff_subprocess_seconds"] = float(time.time() - t0)
+    return payload
+
+
+def _augment_with_efficientsam3_stuff_subprocess(
+    mo: SparseMaskletOutput,
+    image_paths: List[str],
+    args: argparse.Namespace,
+    temp_dirs: List[str],
+) -> SparseMaskletOutput:
+    labels = _parse_comma_list(args.efficientsam3_stuff_prompts)
+    if not labels or not bool(args.efficientsam3_stuff_enable):
+        return mo
+
+    t0 = time.time()
+    payload = _run_efficientsam3_stuff_subprocess_payload(
+        image_paths,
+        args,
+        temp_dirs,
+    )
     augmented = _merge_efficientsam3_stuff_tracks(
         mo,
         payload,
@@ -1222,6 +1312,218 @@ def _augment_with_efficientsam3_stuff_subprocess(
         flush=True,
     )
     return augmented
+
+
+def _get_clipseg_stuff_model(args: argparse.Namespace):
+    from transformers import CLIPSegForImageSegmentation, CLIPSegProcessor
+
+    device = args.device if str(args.device).startswith("cuda") and torch.cuda.is_available() else "cpu"
+    model_id = str(args.clipseg_stuff_model)
+    key = (model_id, str(device))
+    cached = _CLIPSEG_STUFF_CACHE.get(key)
+    if cached is not None:
+        return cached[0], cached[1], device
+
+    print(f"CLIPSeg STUFF in-process loading {model_id} on {device}", flush=True)
+    processor = CLIPSegProcessor.from_pretrained(model_id, use_fast=True)
+    model = CLIPSegForImageSegmentation.from_pretrained(model_id).to(device).eval()
+    _CLIPSEG_STUFF_CACHE[key] = (processor, model)
+    return processor, model, device
+
+
+def _release_clipseg_stuff_cache() -> None:
+    if not _CLIPSEG_STUFF_CACHE:
+        return
+    _CLIPSEG_STUFF_CACHE.clear()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _trim_cuda_cache() -> None:
+    """Release inactive CUDA blocks between heavyweight model phases."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _run_clipseg_stuff_inprocess_payload(
+    image_paths: List[str],
+    args: argparse.Namespace,
+) -> Dict:
+    labels = _parse_comma_list(args.clipseg_stuff_prompts)
+    if not labels or not bool(args.efficientsam3_stuff_enable):
+        return {"tracks": [], "debug": {"clipseg_stuff_skipped": "disabled_or_no_labels"}}
+
+    from PIL import Image
+
+    if not image_paths:
+        return {"tracks": [], "debug": {"clipseg_stuff_skipped": "no_frames"}}
+    first = cv2.imread(image_paths[0], cv2.IMREAD_COLOR)
+    if first is None:
+        raise FileNotFoundError(f"Failed to read first CLIPSeg STUFF frame: {image_paths[0]}")
+    H, W = first.shape[:2]
+    processor, model, device = _get_clipseg_stuff_model(args)
+    model_id = str(args.clipseg_stuff_model)
+    print(
+        f"CLIPSeg STUFF in-process running {model_id} labels={labels} "
+        f"frames={len(image_paths)} stride={args.efficientsam3_stuff_stride}",
+        flush=True,
+    )
+
+    label_tracks = {
+        canonicalize_label(label): _make_sparse_stuff_track(label, H, W)
+        for label in labels
+    }
+    label_prompts = [(canonicalize_label(label), label) for label in labels]
+    stride = max(int(args.efficientsam3_stuff_stride), 1)
+    threshold = float(args.clipseg_stuff_confidence_threshold)
+    min_area_ratio = max(float(args.clipseg_stuff_min_area_ratio), 0.0)
+    max_area_ratio = min(max(float(args.clipseg_stuff_max_area_ratio), min_area_ratio), 1.0)
+    kernel_size = max(int(args.clipseg_stuff_morph_kernel), 0)
+    morph_kernel = (
+        np.ones((kernel_size, kernel_size), dtype=np.uint8)
+        if kernel_size > 1
+        else None
+    )
+    use_amp = bool(args.clipseg_stuff_amp) and str(device).startswith("cuda")
+    batch_size = max(int(getattr(args, "clipseg_stuff_batch_size", 1)), 1)
+    total_masks = 0
+    frames_with_any = 0
+    quality_reject_counts: Dict[str, int] = {}
+    t0 = time.time()
+
+    with torch.inference_mode():
+        frame_jobs = [
+            (int(frame_idx), image_path)
+            for frame_idx, image_path in enumerate(image_paths)
+            if int(frame_idx) % stride == 0
+        ]
+        for batch_start in range(0, len(frame_jobs), batch_size):
+            batch_jobs = frame_jobs[batch_start:batch_start + batch_size]
+            batch_images = []
+            for _frame_idx, image_path in batch_jobs:
+                image = Image.open(image_path).convert("RGB")
+                frame_h, frame_w = image.height, image.width
+                if frame_h != H or frame_w != W:
+                    raise ValueError(
+                        f"CLIPSeg STUFF frame size changed at {image_path}: "
+                        f"{frame_h}x{frame_w} vs {H}x{W}"
+                    )
+                batch_images.append(image)
+
+            prompts: List[str] = []
+            prompt_images: List[Image.Image] = []
+            for image in batch_images:
+                for _canonical, prompt in label_prompts:
+                    prompts.append(prompt)
+                    prompt_images.append(image)
+
+            amp_context = (
+                torch.autocast("cuda", dtype=torch.float16)
+                if use_amp
+                else contextlib.nullcontext()
+            )
+            with amp_context:
+                inputs = processor(
+                    text=prompts,
+                    images=prompt_images,
+                    return_tensors="pt",
+                ).to(device)
+                logits = model(**inputs).logits
+                probs = torch.sigmoid(logits).detach().float().cpu().numpy()
+
+            if probs.ndim == 2:
+                probs = probs[None, ...]
+            if probs.shape[0] != len(batch_jobs) * len(label_prompts):
+                continue
+            probs = probs.reshape(len(batch_jobs), len(label_prompts), probs.shape[-2], probs.shape[-1])
+
+            for batch_idx, (frame_idx, _image_path) in enumerate(batch_jobs):
+                resized_probs: List[np.ndarray] = []
+                for prob in probs[batch_idx]:
+                    resized_probs.append(
+                        cv2.resize(
+                            np.asarray(prob, dtype=np.float32),
+                            (W, H),
+                            interpolation=cv2.INTER_LINEAR,
+                        )
+                    )
+                if not resized_probs:
+                    continue
+                prob_stack = np.stack(resized_probs, axis=0)
+                winner = np.argmax(prob_stack, axis=0)
+                max_prob = np.max(prob_stack, axis=0)
+
+                frame_added = False
+                for label_idx, (canonical, _prompt) in enumerate(label_prompts):
+                    mask = (winner == int(label_idx)) & (max_prob >= threshold)
+                    if morph_kernel is not None:
+                        mask_u8 = mask.astype(np.uint8)
+                        mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, morph_kernel)
+                        mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, morph_kernel)
+                        mask = mask_u8.astype(bool)
+                    if not mask.any():
+                        continue
+                    area_ratio = float(mask.sum()) / max(float(H * W), 1.0)
+                    if area_ratio < min_area_ratio or area_ratio > max_area_ratio:
+                        continue
+                    score = float(np.percentile(prob_stack[label_idx][mask], 90))
+                    keep, reason = passes_structure_mask_quality(
+                        canonical,
+                        mask,
+                        _mask_to_box_np(mask),
+                        score,
+                        area_ratio,
+                        H,
+                        W,
+                    )
+                    if not keep:
+                        quality_reject_counts[str(reason)] = (
+                            int(quality_reject_counts.get(str(reason), 0)) + 1
+                        )
+                        continue
+
+                    track = label_tracks[canonical]
+                    track["mask_by_frame"][int(frame_idx)] = _pack_mask_np(mask)
+                    track["box_by_frame"][int(frame_idx)] = torch.from_numpy(_mask_to_box_np(mask))
+                    track["q_by_frame"][int(frame_idx)] = float(score)
+                    track["area_by_frame"][int(frame_idx)] = area_ratio
+                    if len(track["mask_by_frame"]) == 1:
+                        track["birth_frame"] = int(frame_idx)
+                    total_masks += 1
+                    frame_added = True
+                if frame_added:
+                    frames_with_any += 1
+
+            last_frame_idx = int(batch_jobs[-1][0])
+            if (last_frame_idx + 1) % 100 == 0 or batch_start + batch_size >= len(frame_jobs):
+                print(
+                    f"  CLIPSeg STUFF processed {last_frame_idx + 1}/{len(image_paths)} frames",
+                    flush=True,
+                )
+
+    tracks = [track for track in label_tracks.values() if track["mask_by_frame"]]
+    return {
+        "format": "clipseg_stuff_tracks_v1",
+        "num_frames": len(image_paths),
+        "frame_height": H,
+        "frame_width": W,
+        "tracks": tracks,
+        "debug": {
+            "clipseg_stuff_model": model_id,
+            "clipseg_stuff_labels": labels,
+            "clipseg_stuff_stride": int(stride),
+            "clipseg_stuff_batch_size": int(batch_size),
+            "clipseg_stuff_threshold": float(threshold),
+            "clipseg_stuff_tracks_added": int(len(tracks)),
+            "clipseg_stuff_masks_added": int(total_masks),
+            "clipseg_stuff_frames_with_any": int(frames_with_any),
+            "clipseg_stuff_elapsed_seconds": float(time.time() - t0),
+            "clipseg_stuff_inprocess_seconds": float(time.time() - t0),
+            "clipseg_stuff_quality_reject_counts": dict(quality_reject_counts),
+        },
+    }
 
 
 def _run_clipseg_stuff_worker(args: argparse.Namespace) -> None:
@@ -1418,17 +1720,18 @@ def _run_clipseg_stuff_worker(args: argparse.Namespace) -> None:
     )
 
 
-def _augment_with_clipseg_stuff_subprocess(
-    mo: SparseMaskletOutput,
+def _run_clipseg_stuff_subprocess_payload(
     image_paths: List[str],
     args: argparse.Namespace,
     temp_dirs: List[str],
-) -> SparseMaskletOutput:
+    *,
+    prefix: str = "loger_clipseg_stuff_",
+) -> Dict:
     labels = _parse_comma_list(args.clipseg_stuff_prompts)
     if not labels or not bool(args.efficientsam3_stuff_enable):
-        return mo
+        return {"tracks": [], "debug": {"clipseg_stuff_skipped": "disabled_or_no_labels"}}
 
-    work_dir = tempfile.mkdtemp(prefix="loger_clipseg_stuff_")
+    work_dir = tempfile.mkdtemp(prefix=prefix)
     temp_dirs.append(work_dir)
     frame_list_path = os.path.join(work_dir, "frames.txt")
     output_pt = os.path.join(work_dir, "stuff_tracks.pt")
@@ -1464,6 +1767,26 @@ def _augment_with_clipseg_stuff_subprocess(
     t0 = time.time()
     subprocess.run(cmd, check=True)
     payload = torch.load(output_pt, map_location="cpu", weights_only=False)
+    payload.setdefault("debug", {})["clipseg_stuff_subprocess_seconds"] = float(time.time() - t0)
+    return payload
+
+
+def _augment_with_clipseg_stuff_subprocess(
+    mo: SparseMaskletOutput,
+    image_paths: List[str],
+    args: argparse.Namespace,
+    temp_dirs: List[str],
+) -> SparseMaskletOutput:
+    labels = _parse_comma_list(args.clipseg_stuff_prompts)
+    if not labels or not bool(args.efficientsam3_stuff_enable):
+        return mo
+
+    t0 = time.time()
+    payload = _run_clipseg_stuff_subprocess_payload(
+        image_paths,
+        args,
+        temp_dirs,
+    )
     augmented = _merge_efficientsam3_stuff_tracks(
         mo,
         payload,
@@ -1476,6 +1799,724 @@ def _augment_with_clipseg_stuff_subprocess(
         f"CLIPSeg STUFF merge done in {time.time() - t0:.1f}s: "
         f"+{debug.get('clipseg_stuff_tracks_added', 0)} tracks, "
         f"+{debug.get('clipseg_stuff_masks_added', 0)} masks",
+        flush=True,
+    )
+    return augmented
+
+
+def _run_groupvit_stuff_worker(args: argparse.Namespace) -> None:
+    frame_list_path = args.groupvit_stuff_frame_list
+    output_pt = args.groupvit_stuff_output_pt
+    if not frame_list_path or not output_pt:
+        raise ValueError("GroupViT STUFF worker requires frame list and output path.")
+
+    with open(frame_list_path, "r", encoding="utf-8") as handle:
+        image_paths = [line.rstrip("\n") for line in handle if line.rstrip("\n")]
+    if not image_paths:
+        raise ValueError("GroupViT STUFF worker received no frames.")
+
+    labels = _parse_comma_list(args.groupvit_stuff_prompts)
+    if not labels:
+        torch.save({"tracks": [], "debug": {"groupvit_stuff_skipped": "no_labels"}}, output_pt)
+        return
+
+    from PIL import Image
+    from transformers import AutoProcessor, GroupViTModel
+
+    first = cv2.imread(image_paths[0], cv2.IMREAD_COLOR)
+    if first is None:
+        raise FileNotFoundError(f"Failed to read first GroupViT STUFF frame: {image_paths[0]}")
+    H, W = first.shape[:2]
+    device = args.device if str(args.device).startswith("cuda") and torch.cuda.is_available() else "cpu"
+    model_id = str(args.groupvit_stuff_model)
+    background_labels = _parse_comma_list(args.groupvit_stuff_background_prompts)
+    all_prompts = list(labels) + list(background_labels)
+    print(
+        f"GroupViT STUFF worker loading {model_id} labels={labels} "
+        f"background={background_labels} frames={len(image_paths)} "
+        f"stride={args.efficientsam3_stuff_stride}",
+        flush=True,
+    )
+    processor = AutoProcessor.from_pretrained(model_id)
+    model = GroupViTModel.from_pretrained(model_id).to(device).eval()
+
+    label_tracks = {
+        canonicalize_label(label): _make_sparse_stuff_track(label, H, W)
+        for label in labels
+    }
+    label_prompts = [(canonicalize_label(label), label) for label in labels]
+    stride = max(int(args.efficientsam3_stuff_stride), 1)
+    threshold = float(args.groupvit_stuff_confidence_threshold)
+    min_area_ratio = max(float(args.groupvit_stuff_min_area_ratio), 0.0)
+    max_area_ratio = min(max(float(args.groupvit_stuff_max_area_ratio), min_area_ratio), 1.0)
+    kernel_size = max(int(args.groupvit_stuff_morph_kernel), 0)
+    morph_kernel = (
+        np.ones((kernel_size, kernel_size), dtype=np.uint8)
+        if kernel_size > 1
+        else None
+    )
+    use_amp = bool(args.groupvit_stuff_amp) and str(device).startswith("cuda")
+    batch_size = max(int(getattr(args, "groupvit_stuff_batch_size", 1)), 1)
+    total_masks = 0
+    frames_with_any = 0
+    quality_reject_counts: Dict[str, int] = {}
+    t0 = time.time()
+
+    with torch.inference_mode():
+        frame_jobs = [
+            (int(frame_idx), image_path)
+            for frame_idx, image_path in enumerate(image_paths)
+            if int(frame_idx) % stride == 0
+        ]
+        for batch_start in range(0, len(frame_jobs), batch_size):
+            batch_jobs = frame_jobs[batch_start:batch_start + batch_size]
+            batch_images = []
+            for _frame_idx, image_path in batch_jobs:
+                image = Image.open(image_path).convert("RGB")
+                frame_h, frame_w = image.height, image.width
+                if frame_h != H or frame_w != W:
+                    raise ValueError(
+                        f"GroupViT STUFF frame size changed at {image_path}: "
+                        f"{frame_h}x{frame_w} vs {H}x{W}"
+                    )
+                batch_images.append(image)
+
+            amp_context = (
+                torch.autocast("cuda", dtype=torch.float16)
+                if use_amp
+                else contextlib.nullcontext()
+            )
+            with amp_context:
+                inputs = processor(
+                    text=all_prompts,
+                    images=batch_images,
+                    padding=True,
+                    return_tensors="pt",
+                ).to(device)
+                outputs = model(**inputs, output_segmentation=True)
+                logits = outputs.segmentation_logits
+                if logits is None:
+                    raise RuntimeError("GroupViT did not return segmentation_logits.")
+                probs = torch.softmax(logits.detach().float(), dim=1).cpu().numpy()
+
+            if probs.ndim != 4 or probs.shape[0] != len(batch_jobs):
+                raise RuntimeError(f"Unexpected GroupViT probability shape: {probs.shape}")
+            if probs.shape[1] < len(label_prompts):
+                raise RuntimeError(
+                    f"GroupViT returned {probs.shape[1]} labels for {len(label_prompts)} prompts."
+                )
+
+            for batch_idx, (frame_idx, _image_path) in enumerate(batch_jobs):
+                resized_probs: List[np.ndarray] = []
+                for prob in probs[batch_idx]:
+                    resized_probs.append(
+                        cv2.resize(
+                            np.asarray(prob, dtype=np.float32),
+                            (W, H),
+                            interpolation=cv2.INTER_LINEAR,
+                        )
+                    )
+                if not resized_probs:
+                    continue
+                prob_stack = np.stack(resized_probs, axis=0)
+                winner = np.argmax(prob_stack, axis=0)
+                max_prob = np.max(prob_stack, axis=0)
+
+                frame_added = False
+                for label_idx, (canonical, _prompt) in enumerate(label_prompts):
+                    mask = (winner == int(label_idx)) & (max_prob >= threshold)
+                    if morph_kernel is not None:
+                        mask_u8 = mask.astype(np.uint8)
+                        mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, morph_kernel)
+                        mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, morph_kernel)
+                        mask = mask_u8.astype(bool)
+                    if not mask.any():
+                        continue
+                    area_ratio = float(mask.sum()) / max(float(H * W), 1.0)
+                    if area_ratio < min_area_ratio or area_ratio > max_area_ratio:
+                        continue
+                    score = float(np.percentile(prob_stack[label_idx][mask], 90))
+                    keep, reason = passes_structure_mask_quality(
+                        canonical,
+                        mask,
+                        _mask_to_box_np(mask),
+                        score,
+                        area_ratio,
+                        H,
+                        W,
+                    )
+                    if not keep:
+                        quality_reject_counts[str(reason)] = (
+                            int(quality_reject_counts.get(str(reason), 0)) + 1
+                        )
+                        continue
+
+                    track = label_tracks[canonical]
+                    track["mask_by_frame"][int(frame_idx)] = _pack_mask_np(mask)
+                    track["box_by_frame"][int(frame_idx)] = torch.from_numpy(_mask_to_box_np(mask))
+                    track["q_by_frame"][int(frame_idx)] = float(score)
+                    track["area_by_frame"][int(frame_idx)] = area_ratio
+                    if len(track["mask_by_frame"]) == 1:
+                        track["birth_frame"] = int(frame_idx)
+                    total_masks += 1
+                    frame_added = True
+                if frame_added:
+                    frames_with_any += 1
+
+            last_frame_idx = int(batch_jobs[-1][0])
+            if (last_frame_idx + 1) % 100 == 0 or batch_start + batch_size >= len(frame_jobs):
+                print(
+                    f"  GroupViT STUFF processed {last_frame_idx + 1}/{len(image_paths)} frames",
+                    flush=True,
+                )
+
+    tracks = [track for track in label_tracks.values() if track["mask_by_frame"]]
+    payload = {
+        "format": "groupvit_stuff_tracks_v1",
+        "num_frames": len(image_paths),
+        "frame_height": H,
+        "frame_width": W,
+        "tracks": tracks,
+        "debug": {
+            "groupvit_stuff_model": model_id,
+            "groupvit_stuff_labels": labels,
+            "groupvit_stuff_background_labels": background_labels,
+            "groupvit_stuff_stride": int(stride),
+            "groupvit_stuff_batch_size": int(batch_size),
+            "groupvit_stuff_threshold": float(threshold),
+            "groupvit_stuff_tracks_added": int(len(tracks)),
+            "groupvit_stuff_masks_added": int(total_masks),
+            "groupvit_stuff_frames_with_any": int(frames_with_any),
+            "groupvit_stuff_elapsed_seconds": float(time.time() - t0),
+            "groupvit_stuff_quality_reject_counts": dict(quality_reject_counts),
+        },
+    }
+    os.makedirs(os.path.dirname(output_pt) or ".", exist_ok=True)
+    torch.save(payload, output_pt)
+    print(
+        f"GroupViT STUFF worker saved {len(tracks)} tracks, "
+        f"{total_masks} frame masks in {time.time() - t0:.1f}s -> {output_pt}",
+        flush=True,
+    )
+
+
+def _run_groupvit_stuff_subprocess_payload(
+    image_paths: List[str],
+    args: argparse.Namespace,
+    temp_dirs: List[str],
+    *,
+    prefix: str = "loger_groupvit_stuff_",
+) -> Dict:
+    labels = _parse_comma_list(args.groupvit_stuff_prompts)
+    if not labels or not bool(args.efficientsam3_stuff_enable):
+        return {"tracks": [], "debug": {"groupvit_stuff_skipped": "disabled_or_no_labels"}}
+
+    work_dir = tempfile.mkdtemp(prefix=prefix)
+    temp_dirs.append(work_dir)
+    frame_list_path = os.path.join(work_dir, "frames.txt")
+    output_pt = os.path.join(work_dir, "stuff_tracks.pt")
+    with open(frame_list_path, "w", encoding="utf-8") as handle:
+        for path in image_paths:
+            handle.write(f"{path}\n")
+
+    cmd = [
+        sys.executable,
+        os.path.abspath(__file__),
+        "--groupvit_stuff_worker", "1",
+        "--input", "__groupvit_stuff_worker__",
+        "--groupvit_stuff_frame_list", frame_list_path,
+        "--groupvit_stuff_output_pt", output_pt,
+        "--device", str(args.device),
+        "--efficientsam3_stuff_stride", str(args.efficientsam3_stuff_stride),
+        "--groupvit_stuff_model", str(args.groupvit_stuff_model),
+        "--groupvit_stuff_prompts", str(args.groupvit_stuff_prompts),
+        "--groupvit_stuff_background_prompts", str(args.groupvit_stuff_background_prompts),
+        "--groupvit_stuff_confidence_threshold", str(args.groupvit_stuff_confidence_threshold),
+        "--groupvit_stuff_min_area_ratio", str(args.groupvit_stuff_min_area_ratio),
+        "--groupvit_stuff_max_area_ratio", str(args.groupvit_stuff_max_area_ratio),
+        "--groupvit_stuff_morph_kernel", str(args.groupvit_stuff_morph_kernel),
+        "--groupvit_stuff_amp", str(args.groupvit_stuff_amp),
+        "--groupvit_stuff_batch_size", str(args.groupvit_stuff_batch_size),
+    ]
+
+    print(
+        "Running GroupViT STUFF subprocess "
+        f"(labels={labels}, stride={args.efficientsam3_stuff_stride}, "
+        f"batch={args.groupvit_stuff_batch_size}) ...",
+        flush=True,
+    )
+    t0 = time.time()
+    subprocess.run(cmd, check=True)
+    payload = torch.load(output_pt, map_location="cpu", weights_only=False)
+    payload.setdefault("debug", {})["groupvit_stuff_subprocess_seconds"] = float(time.time() - t0)
+    return payload
+
+
+def _augment_with_groupvit_stuff_subprocess(
+    mo: SparseMaskletOutput,
+    image_paths: List[str],
+    args: argparse.Namespace,
+    temp_dirs: List[str],
+) -> SparseMaskletOutput:
+    labels = _parse_comma_list(args.groupvit_stuff_prompts)
+    if not labels or not bool(args.efficientsam3_stuff_enable):
+        return mo
+
+    t0 = time.time()
+    payload = _run_groupvit_stuff_subprocess_payload(
+        image_paths,
+        args,
+        temp_dirs,
+    )
+    augmented = _merge_efficientsam3_stuff_tracks(
+        mo,
+        payload,
+        replace_existing=bool(args.efficientsam3_stuff_replace_existing),
+        subtract_things=bool(args.efficientsam3_stuff_subtract_things),
+        subtract_dilation=int(args.efficientsam3_stuff_subtract_dilation),
+    )
+    debug = payload.get("debug", {})
+    print(
+        f"GroupViT STUFF merge done in {time.time() - t0:.1f}s: "
+        f"+{debug.get('groupvit_stuff_tracks_added', 0)} tracks, "
+        f"+{debug.get('groupvit_stuff_masks_added', 0)} masks",
+        flush=True,
+    )
+    return augmented
+
+
+def _resolve_lseg_stuff_device(args: argparse.Namespace) -> str:
+    requested = str(getattr(args, "lseg_stuff_device", "auto")).strip()
+    if requested and requested.lower() != "auto":
+        return requested
+    if torch.cuda.is_available() and torch.cuda.device_count() >= 2:
+        return "cuda:1"
+    return args.device if str(args.device).startswith("cuda") and torch.cuda.is_available() else "cpu"
+
+
+def _resolve_lseg_repo_root(args: argparse.Namespace) -> str:
+    repo_root = os.path.abspath(os.path.expanduser(str(args.lseg_stuff_repo_root)))
+    if os.path.isdir(os.path.join(repo_root, "large_spatial_model")):
+        return repo_root
+    sibling_root = os.path.abspath(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "LSM")
+    )
+    if os.path.isdir(os.path.join(sibling_root, "large_spatial_model")):
+        print(
+            f"LSeg STUFF repo root not found at {repo_root}; using {sibling_root}",
+            flush=True,
+        )
+        return sibling_root
+    # This fallback is only for interactive experiments where we cloned LSM
+    # outside the project tree to avoid vendoring a large third-party repo.
+    probe_root = "/tmp/lsm_probe"
+    if os.path.isdir(os.path.join(probe_root, "large_spatial_model")):
+        print(
+            f"LSeg STUFF repo root not found at {repo_root}; using {probe_root}",
+            flush=True,
+        )
+        return probe_root
+    raise FileNotFoundError(
+        "LSeg STUFF requires the LSM repo for its pure-PyTorch LSeg wrapper. "
+        f"Expected {repo_root}; clone https://github.com/NVlabs/LSM.git with submodules "
+        "or pass --lseg_stuff_repo_root."
+    )
+
+
+def _resolve_lseg_checkpoint(args: argparse.Namespace) -> str:
+    checkpoint = os.path.abspath(os.path.expanduser(str(args.lseg_stuff_checkpoint)))
+    if os.path.exists(checkpoint):
+        return checkpoint
+    raise FileNotFoundError(
+        f"LSeg checkpoint not found: {checkpoint}. "
+        "Download LSeg demo_e200.ckpt, e.g. the LSM README Google Drive id "
+        "1FTuHY1xPUkM-5gaDtMfgCl3D0gR89WV7, and pass --lseg_stuff_checkpoint."
+    )
+
+
+def _resolve_lseg_load_checkpoint(checkpoint: str) -> str:
+    base, ext = os.path.splitext(checkpoint)
+    if ext.lower() == ".ckpt":
+        converted = f"{base}_net_state.pt"
+        if os.path.exists(converted):
+            return converted
+    return checkpoint
+
+
+def _get_lseg_stuff_model(args: argparse.Namespace) -> Tuple[torch.nn.Module, str, str]:
+    repo_root = _resolve_lseg_repo_root(args)
+    checkpoint = _resolve_lseg_checkpoint(args)
+    load_checkpoint = _resolve_lseg_load_checkpoint(checkpoint)
+    device = _resolve_lseg_stuff_device(args)
+    half_res = bool(int(getattr(args, "lseg_stuff_half_res", 0)))
+    key = (repo_root, load_checkpoint, str(device), half_res)
+    cached = _LSEG_STUFF_CACHE.get(key)
+    if cached is not None:
+        return cached, device, repo_root
+
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    from large_spatial_model.lseg import LSegFeatureExtractor
+
+    print(
+        f"LSeg STUFF loading via LSM wrapper repo={repo_root} "
+        f"checkpoint={load_checkpoint} device={device}",
+        flush=True,
+    )
+    prev_device: Optional[int] = None
+    if str(device).startswith("cuda") and torch.cuda.is_available():
+        prev_device = torch.cuda.current_device()
+        torch.cuda.set_device(torch.device(device))
+    try:
+        ckpt = torch.load(load_checkpoint, map_location="cpu", weights_only=False)
+        state_dict = ckpt.get("state_dict", ckpt)
+        state_dict = {
+            k[len("net."):]: v
+            for k, v in state_dict.items()
+            if str(k).startswith("net.")
+        }
+        if not state_dict and isinstance(ckpt, dict) and isinstance(ckpt.get("state_dict"), dict):
+            state_dict = dict(ckpt["state_dict"])
+        if not state_dict:
+            raise RuntimeError(f"LSeg checkpoint has no net.* weights: {load_checkpoint}")
+        model = LSegFeatureExtractor(half_res=half_res)
+        model.load_state_dict(state_dict, strict=True)
+        del ckpt
+        del state_dict
+    finally:
+        if prev_device is not None:
+            torch.cuda.set_device(prev_device)
+    model = model.to(device).eval()
+    for param in model.parameters():
+        param.requires_grad_(False)
+    _LSEG_STUFF_CACHE[key] = model
+    return model, device, repo_root
+
+
+def _release_lseg_stuff_cache() -> None:
+    if not _LSEG_STUFF_CACHE:
+        return
+    _LSEG_STUFF_CACHE.clear()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _read_lseg_rgb_tensor(
+    image_path: str,
+    *,
+    max_side: int,
+) -> Tuple[torch.Tensor, Tuple[int, int]]:
+    bgr = cv2.imread(image_path, cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise FileNotFoundError(f"Failed to read LSeg STUFF frame: {image_path}")
+    rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+    H, W = rgb.shape[:2]
+    if int(max_side) > 0 and max(H, W) > int(max_side):
+        scale = float(max_side) / float(max(H, W))
+        new_w = max(16, int(round((W * scale) / 16.0)) * 16)
+        new_h = max(16, int(round((H * scale) / 16.0)) * 16)
+        rgb = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    tensor = torch.from_numpy(rgb.astype(np.float32) / 255.0).permute(2, 0, 1)
+    tensor = (tensor - 0.5) / 0.5
+    return tensor, (H, W)
+
+
+def _format_lseg_text_prompt(label: str, template: str) -> str:
+    label = str(label).strip()
+    template = str(template).strip()
+    if not template:
+        return label
+    if "{classname}" in template:
+        return template.replace("{classname}", label)
+    return f"{template} {label}".strip()
+
+
+def _lseg_payload_from_probs(
+    probs: np.ndarray,
+    label_prompts: List[Tuple[str, str]],
+    image_paths: List[str],
+    *,
+    H: int,
+    W: int,
+    threshold: float,
+    min_area_ratio: float,
+    max_area_ratio: float,
+    morph_kernel: Optional[np.ndarray],
+) -> Tuple[List[Dict], Dict[str, int]]:
+    label_tracks = {
+        canonicalize_label(label): _make_sparse_stuff_track(label, H, W)
+        for _canonical, label in label_prompts
+    }
+    total_masks = 0
+    frames_with_any = 0
+    for frame_idx in range(probs.shape[0]):
+        prob_stack = probs[frame_idx]
+        winner = np.argmax(prob_stack, axis=0)
+        max_prob = np.max(prob_stack, axis=0)
+        frame_added = False
+        for label_idx, (canonical, _prompt) in enumerate(label_prompts):
+            mask = (winner == int(label_idx)) & (max_prob >= threshold)
+            if morph_kernel is not None:
+                mask_u8 = mask.astype(np.uint8)
+                mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, morph_kernel)
+                mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, morph_kernel)
+                mask = mask_u8.astype(bool)
+            if not mask.any():
+                continue
+            area_ratio = float(mask.sum()) / max(float(H * W), 1.0)
+            if area_ratio < min_area_ratio or area_ratio > max_area_ratio:
+                continue
+            score = float(np.percentile(prob_stack[label_idx][mask], 90))
+            track = label_tracks[canonical]
+            track["mask_by_frame"][int(frame_idx)] = _pack_mask_np(mask)
+            track["box_by_frame"][int(frame_idx)] = torch.from_numpy(_mask_to_box_np(mask))
+            track["q_by_frame"][int(frame_idx)] = float(score)
+            track["area_by_frame"][int(frame_idx)] = area_ratio
+            if len(track["mask_by_frame"]) == 1:
+                track["birth_frame"] = int(frame_idx)
+            total_masks += 1
+            frame_added = True
+        if frame_added:
+            frames_with_any += 1
+    tracks = [track for track in label_tracks.values() if track["mask_by_frame"]]
+    return tracks, {
+        "lseg_stuff_tracks_added": int(len(tracks)),
+        "lseg_stuff_masks_added": int(total_masks),
+        "lseg_stuff_frames_with_any": int(frames_with_any),
+        "lseg_stuff_num_input_frames": int(len(image_paths)),
+    }
+
+
+def _run_lseg_stuff_inprocess_payload(
+    image_paths: List[str],
+    args: argparse.Namespace,
+) -> Dict:
+    labels = _parse_comma_list(args.lseg_stuff_prompts)
+    if not labels or not bool(args.efficientsam3_stuff_enable):
+        return {"tracks": [], "debug": {"lseg_stuff_skipped": "disabled_or_no_labels"}}
+    if not image_paths:
+        return {"tracks": [], "debug": {"lseg_stuff_skipped": "no_frames"}}
+
+    first = cv2.imread(image_paths[0], cv2.IMREAD_COLOR)
+    if first is None:
+        raise FileNotFoundError(f"Failed to read first LSeg STUFF frame: {image_paths[0]}")
+    H, W = first.shape[:2]
+    model, device, repo_root = _get_lseg_stuff_model(args)
+    background_labels = _parse_comma_list(args.lseg_stuff_background_prompts)
+    prompt_template = str(args.lseg_stuff_prompt_template)
+    all_prompt_labels = list(labels) + list(background_labels)
+    all_prompts = [
+        _format_lseg_text_prompt(label, prompt_template)
+        for label in all_prompt_labels
+    ]
+    label_prompts = [(canonicalize_label(label), label) for label in labels]
+    stride = max(int(args.efficientsam3_stuff_stride), 1)
+    threshold = float(args.lseg_stuff_confidence_threshold)
+    min_area_ratio = max(float(args.lseg_stuff_min_area_ratio), 0.0)
+    max_area_ratio = min(max(float(args.lseg_stuff_max_area_ratio), min_area_ratio), 1.0)
+    kernel_size = max(int(args.lseg_stuff_morph_kernel), 0)
+    morph_kernel = (
+        np.ones((kernel_size, kernel_size), dtype=np.uint8)
+        if kernel_size > 1
+        else None
+    )
+    batch_size = max(int(args.lseg_stuff_batch_size), 1)
+    max_side = int(args.lseg_stuff_max_side)
+    use_amp = bool(args.lseg_stuff_amp) and str(device).startswith("cuda")
+    t0 = time.time()
+    print(
+        f"LSeg STUFF in-process running labels={labels} background={background_labels} "
+        f"frames={len(image_paths)} stride={stride} batch={batch_size} "
+        f"max_side={max_side} device={device}",
+        flush=True,
+    )
+
+    frame_jobs = [
+        (int(frame_idx), image_path)
+        for frame_idx, image_path in enumerate(image_paths)
+        if int(frame_idx) % stride == 0
+    ]
+    all_probs: List[Tuple[int, np.ndarray]] = []
+    with torch.inference_mode():
+        for batch_start in range(0, len(frame_jobs), batch_size):
+            batch_jobs = frame_jobs[batch_start:batch_start + batch_size]
+            tensors: List[torch.Tensor] = []
+            for _frame_idx, image_path in batch_jobs:
+                tensor, (frame_h, frame_w) = _read_lseg_rgb_tensor(image_path, max_side=max_side)
+                if frame_h != H or frame_w != W:
+                    raise ValueError(
+                        f"LSeg STUFF frame size changed at {image_path}: "
+                        f"{frame_h}x{frame_w} vs {H}x{W}"
+                    )
+                tensors.append(tensor)
+            batch = torch.stack(tensors, dim=0).to(device, non_blocking=True)
+            amp_context = (
+                torch.autocast("cuda", dtype=torch.float16)
+                if use_amp
+                else contextlib.nullcontext()
+            )
+            with amp_context:
+                logits = model(batch, labelset=all_prompts)
+                if logits.shape[-2:] != (H, W):
+                    logits = torch.nn.functional.interpolate(
+                        logits,
+                        size=(H, W),
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                probs = torch.softmax(logits.float(), dim=1).detach().cpu().numpy()
+            for local_idx, (frame_idx, _image_path) in enumerate(batch_jobs):
+                all_probs.append((int(frame_idx), probs[local_idx]))
+            last_frame_idx = int(batch_jobs[-1][0])
+            if (last_frame_idx + 1) % 100 == 0 or batch_start + batch_size >= len(frame_jobs):
+                print(
+                    f"  LSeg STUFF processed {last_frame_idx + 1}/{len(image_paths)} frames",
+                    flush=True,
+                )
+
+    dense_probs = np.zeros((len(image_paths), len(all_prompts), H, W), dtype=np.float32)
+    for frame_idx, frame_probs in all_probs:
+        dense_probs[int(frame_idx)] = frame_probs
+    tracks, counts = _lseg_payload_from_probs(
+        dense_probs,
+        label_prompts,
+        image_paths,
+        H=H,
+        W=W,
+        threshold=threshold,
+        min_area_ratio=min_area_ratio,
+        max_area_ratio=max_area_ratio,
+        morph_kernel=morph_kernel,
+    )
+    return {
+        "format": "lseg_stuff_tracks_v1",
+        "num_frames": len(image_paths),
+        "frame_height": H,
+        "frame_width": W,
+        "tracks": tracks,
+        "debug": {
+            "lseg_stuff_repo_root": repo_root,
+            "lseg_stuff_checkpoint": os.path.abspath(os.path.expanduser(str(args.lseg_stuff_checkpoint))),
+            "lseg_stuff_labels": labels,
+            "lseg_stuff_background_labels": background_labels,
+            "lseg_stuff_text_prompts": all_prompts,
+            "lseg_stuff_prompt_template": prompt_template,
+            "lseg_stuff_stride": int(stride),
+            "lseg_stuff_batch_size": int(batch_size),
+            "lseg_stuff_max_side": int(max_side),
+            "lseg_stuff_threshold": float(threshold),
+            "lseg_stuff_elapsed_seconds": float(time.time() - t0),
+            "lseg_stuff_inprocess_seconds": float(time.time() - t0),
+            **counts,
+        },
+    }
+
+
+def _run_lseg_stuff_worker(args: argparse.Namespace) -> None:
+    frame_list_path = args.lseg_stuff_frame_list
+    output_pt = args.lseg_stuff_output_pt
+    if not frame_list_path or not output_pt:
+        raise ValueError("LSeg STUFF worker requires frame list and output path.")
+    with open(frame_list_path, "r", encoding="utf-8") as handle:
+        image_paths = [line.rstrip("\n") for line in handle if line.rstrip("\n")]
+    payload = _run_lseg_stuff_inprocess_payload(image_paths, args)
+    os.makedirs(os.path.dirname(output_pt) or ".", exist_ok=True)
+    torch.save(payload, output_pt)
+    debug = payload.get("debug", {})
+    print(
+        f"LSeg STUFF worker saved {debug.get('lseg_stuff_tracks_added', 0)} tracks, "
+        f"{debug.get('lseg_stuff_masks_added', 0)} frame masks -> {output_pt}",
+        flush=True,
+    )
+
+
+def _run_lseg_stuff_subprocess_payload(
+    image_paths: List[str],
+    args: argparse.Namespace,
+    temp_dirs: List[str],
+    *,
+    prefix: str = "loger_lseg_stuff_",
+) -> Dict:
+    labels = _parse_comma_list(args.lseg_stuff_prompts)
+    if not labels or not bool(args.efficientsam3_stuff_enable):
+        return {"tracks": [], "debug": {"lseg_stuff_skipped": "disabled_or_no_labels"}}
+
+    work_dir = tempfile.mkdtemp(prefix=prefix)
+    temp_dirs.append(work_dir)
+    frame_list_path = os.path.join(work_dir, "frames.txt")
+    output_pt = os.path.join(work_dir, "stuff_tracks.pt")
+    with open(frame_list_path, "w", encoding="utf-8") as handle:
+        for path in image_paths:
+            handle.write(f"{path}\n")
+
+    cmd = [
+        sys.executable,
+        os.path.abspath(__file__),
+        "--lseg_stuff_worker", "1",
+        "--input", "__lseg_stuff_worker__",
+        "--lseg_stuff_frame_list", frame_list_path,
+        "--lseg_stuff_output_pt", output_pt,
+        "--device", str(args.device),
+        "--efficientsam3_stuff_enable", "1",
+        "--efficientsam3_stuff_stride", str(args.efficientsam3_stuff_stride),
+        "--lseg_stuff_repo_root", str(args.lseg_stuff_repo_root),
+        "--lseg_stuff_checkpoint", str(args.lseg_stuff_checkpoint),
+        "--lseg_stuff_prompts", str(args.lseg_stuff_prompts),
+        "--lseg_stuff_prompt_template", str(args.lseg_stuff_prompt_template),
+        "--lseg_stuff_background_prompts", str(args.lseg_stuff_background_prompts),
+        "--lseg_stuff_confidence_threshold", str(args.lseg_stuff_confidence_threshold),
+        "--lseg_stuff_min_area_ratio", str(args.lseg_stuff_min_area_ratio),
+        "--lseg_stuff_max_area_ratio", str(args.lseg_stuff_max_area_ratio),
+        "--lseg_stuff_morph_kernel", str(args.lseg_stuff_morph_kernel),
+        "--lseg_stuff_batch_size", str(args.lseg_stuff_batch_size),
+        "--lseg_stuff_max_side", str(args.lseg_stuff_max_side),
+        "--lseg_stuff_half_res", str(args.lseg_stuff_half_res),
+        "--lseg_stuff_amp", str(args.lseg_stuff_amp),
+        "--lseg_stuff_device", str(args.lseg_stuff_device),
+    ]
+
+    print(
+        "Running LSeg STUFF subprocess "
+        f"(labels={labels}, stride={args.efficientsam3_stuff_stride}, "
+        f"batch={args.lseg_stuff_batch_size}) ...",
+        flush=True,
+    )
+    t0 = time.time()
+    subprocess.run(cmd, check=True)
+    payload = torch.load(output_pt, map_location="cpu", weights_only=False)
+    payload.setdefault("debug", {})["lseg_stuff_subprocess_seconds"] = float(time.time() - t0)
+    return payload
+
+
+def _augment_with_lseg_stuff_subprocess(
+    mo: SparseMaskletOutput,
+    image_paths: List[str],
+    args: argparse.Namespace,
+    temp_dirs: List[str],
+) -> SparseMaskletOutput:
+    labels = _parse_comma_list(args.lseg_stuff_prompts)
+    if not labels or not bool(args.efficientsam3_stuff_enable):
+        return mo
+
+    t0 = time.time()
+    payload = _run_lseg_stuff_subprocess_payload(
+        image_paths,
+        args,
+        temp_dirs,
+    )
+    augmented = _merge_efficientsam3_stuff_tracks(
+        mo,
+        payload,
+        replace_existing=bool(args.efficientsam3_stuff_replace_existing),
+        subtract_things=bool(args.efficientsam3_stuff_subtract_things),
+        subtract_dilation=int(args.efficientsam3_stuff_subtract_dilation),
+    )
+    debug = payload.get("debug", {})
+    print(
+        f"LSeg STUFF merge done in {time.time() - t0:.1f}s: "
+        f"+{debug.get('lseg_stuff_tracks_added', 0)} tracks, "
+        f"+{debug.get('lseg_stuff_masks_added', 0)} masks",
         flush=True,
     )
     return augmented
@@ -1502,6 +2543,132 @@ def _write_local_track_into_global(
         track["box_by_frame"][global_t] = mo.B_mask[local_idx, t_local].clone()
         track["q_by_frame"][global_t] = float(mo.Q_mask[local_idx, t_local].item())
         track["area_by_frame"][global_t] = float(mo.A_ratio[local_idx, t_local].item())
+
+
+def _masklet_output_to_sparse_local(mo: MaskletOutput) -> SparseMaskletOutput:
+    """Represent one chunk output as sparse local-frame tracks for STUFF merging."""
+    tracks: List[Dict] = []
+    for j in range(mo.num_masklets):
+        birth_frame = int(mo.birth_frame[j]) if j < len(mo.birth_frame) else 0
+        track = _make_empty_track(mo.num_frames, mo.frame_height, mo.frame_width, mo, j, birth_frame)
+        _write_local_track_into_global(
+            track,
+            mo,
+            j,
+            global_start=0,
+            total_frames=mo.num_frames,
+            preserve_overlap_until=0,
+        )
+        if track["mask_by_frame"]:
+            tracks.append(track)
+    return SparseMaskletOutput(
+        tracks=tracks,
+        num_masklets=len(tracks),
+        num_frames=mo.num_frames,
+        frame_height=mo.frame_height,
+        frame_width=mo.frame_width,
+        debug=dict(getattr(mo, "debug", {}) or {}),
+    )
+
+
+def _merge_chunk_sparse_tracks_into_global(
+    global_tracks: List[Dict],
+    local_sparse: SparseMaskletOutput,
+    *,
+    chunk_idx: int,
+    start: int,
+    end: int,
+    total_frames: int,
+    chunk_overlap: int,
+    source_types: Optional[set] = None,
+) -> Dict[str, object]:
+    """Merge local sparse tracks, mainly per-frame STUFF, into global tracks."""
+    source_types = source_types or {"stuff_static"}
+    H = int(local_sparse.frame_height)
+    W = int(local_sparse.frame_width)
+    overlap = 0 if int(chunk_idx) == 0 else min(int(chunk_overlap), int(local_sparse.num_frames))
+    preserve_overlap_until = int(start) + int(overlap)
+    matched = 0
+    created = 0
+    written_masks = 0
+
+    for local_track in local_sparse.tracks:
+        source_type = str(local_track.get("source_type", "?"))
+        if source_type not in source_types:
+            continue
+        label = str(local_track.get("L_sem", "?"))
+        group = int(local_track.get("G_sem", label_to_group(label)))
+        global_idx: Optional[int] = None
+        for idx, track in enumerate(global_tracks):
+            if str(track.get("source_type", "?")) != source_type:
+                continue
+            if int(track.get("G_sem", -999)) != group:
+                continue
+            if not _labels_compatible(str(track.get("L_sem", "?")), label):
+                continue
+            global_idx = int(idx)
+            matched += 1
+            break
+
+        if global_idx is None:
+            new_track = {
+                "mask_by_frame": {},
+                "box_by_frame": {},
+                "q_by_frame": {},
+                "area_by_frame": {},
+                "L_sem": label,
+                "G_sem": group,
+                "W_sem": float(local_track.get("W_sem", DEFAULT_SEMANTIC_WEIGHTS.get(group, 0.15))),
+                "source_type": source_type,
+                "birth_frame": int(start) + int(local_track.get("birth_frame", 0)),
+                "frame_height": H,
+                "frame_width": W,
+            }
+            global_tracks.append(new_track)
+            global_idx = len(global_tracks) - 1
+            created += 1
+        else:
+            global_tracks[global_idx]["birth_frame"] = min(
+                int(global_tracks[global_idx].get("birth_frame", start)),
+                int(start) + int(local_track.get("birth_frame", 0)),
+            )
+
+        global_track = global_tracks[global_idx]
+        for local_frame, packed in local_track.get("mask_by_frame", {}).items():
+            global_frame = int(start) + int(local_frame)
+            if global_frame >= int(total_frames) or global_frame >= int(end):
+                continue
+            if (
+                global_frame < preserve_overlap_until
+                and global_frame in global_track["mask_by_frame"]
+            ):
+                continue
+            packed_np = np.asarray(packed, dtype=np.uint8)
+            global_track["mask_by_frame"][global_frame] = packed_np.copy()
+            box = local_track.get("box_by_frame", {}).get(local_frame)
+            if box is None:
+                mask = _unpack_mask_np(packed_np, H, W)
+                box = torch.from_numpy(_mask_to_box_np(mask))
+                area = float(mask.sum()) / max(float(H * W), 1.0)
+            else:
+                box = box.clone() if torch.is_tensor(box) else torch.as_tensor(box)
+                area = float(local_track.get("area_by_frame", {}).get(local_frame, 0.0))
+            global_track["box_by_frame"][global_frame] = box
+            global_track["q_by_frame"][global_frame] = float(
+                local_track.get("q_by_frame", {}).get(local_frame, 0.0)
+            )
+            global_track["area_by_frame"][global_frame] = area
+            written_masks += 1
+
+    return {
+        "chunk_index": int(chunk_idx),
+        "frame_range": (int(start), int(end)),
+        "num_local_sparse_tracks": int(local_sparse.num_masklets),
+        "num_sparse_tracks_matched": int(matched),
+        "num_sparse_tracks_created": int(created),
+        "num_sparse_masks_written": int(written_masks),
+        "source_types": sorted(source_types),
+    }
 
 
 def _build_chunk_seed_detections(
@@ -1619,6 +2786,50 @@ def build_chunk_discovery_indices(
     if not indices:
         return [start_idx]
     return indices
+
+
+def _cli_arg_provided(argv: List[str], name: str) -> bool:
+    return any(arg == name or arg.startswith(f"{name}=") for arg in argv)
+
+
+def apply_sam31_route_preset(args: argparse.Namespace, argv: List[str]) -> None:
+    """Apply named route defaults without blocking explicit CLI overrides."""
+    route = str(getattr(args, "sam31_route", "custom")).strip().lower()
+    if route not in {"b_quality"}:
+        return
+
+    def set_if_missing(flag: str, attr: str, value) -> None:
+        if not _cli_arg_provided(argv, flag):
+            setattr(args, attr, value)
+
+    # Route B: SAM3.1 text prompts own THING discovery/tracking; YOLOE-11l only
+    # supplies low-res support masks for prompt-frame selection and person repair.
+    set_if_missing("--sam_backend", "sam_backend", "sam31_multiplex")
+    set_if_missing("--detector", "detector", "yoloe")
+    set_if_missing("--yoloe_model", "yoloe_model", "yoloe-11l-seg.pt")
+    set_if_missing("--yoloe_imgsz", "yoloe_imgsz", 0)
+    set_if_missing("--detector_max_side", "detector_max_side", 0)
+    set_if_missing("--processing_max_side", "processing_max_side", 720)
+    set_if_missing("--disable_stuff_prompts", "disable_stuff_prompts", 1)
+    set_if_missing("--efficientsam3_stuff_enable", "efficientsam3_stuff_enable", 0)
+    set_if_missing(
+        "--sam31_text_track_labels",
+        "sam31_text_track_labels",
+        "person",
+    )
+    set_if_missing(
+        "--sam31_direct_text_prompt_labels",
+        "sam31_direct_text_prompt_labels",
+        "person",
+    )
+    set_if_missing("--sam31_direct_text_prompt_frame_count", "sam31_direct_text_prompt_frame_count", 1)
+    set_if_missing("--sam31_person_refresh_prompt_frames", "sam31_person_refresh_prompt_frames", 2)
+    set_if_missing("--sam31_nontext_sparse_support", "sam31_nontext_sparse_support", 1)
+    set_if_missing("--sam31_nontext_object_prompt_budget", "sam31_nontext_object_prompt_budget", 0)
+    set_if_missing("--sam31_max_text_prompt_objects", "sam31_max_text_prompt_objects", 12)
+    set_if_missing("--sam31_max_internal_objects", "sam31_max_internal_objects", 16)
+    set_if_missing("--sam31_min_chunk_size", "sam31_min_chunk_size", 96)
+    set_if_missing("--max_thing_objects", "max_thing_objects", 16)
 
 
 def _compute_local_track_seed_priority(
@@ -3643,12 +4854,19 @@ def print_masklet_output(mo) -> None:
 # ---------------------------------------------------------------------------
 def main() -> None:
     args = build_parser().parse_args()
+    apply_sam31_route_preset(args, sys.argv[1:])
 
     if bool(args.efficientsam3_stuff_worker):
         _run_efficientsam3_stuff_worker(args)
         return
     if bool(args.clipseg_stuff_worker):
         _run_clipseg_stuff_worker(args)
+        return
+    if bool(args.groupvit_stuff_worker):
+        _run_groupvit_stuff_worker(args)
+        return
+    if bool(args.lseg_stuff_worker):
+        _run_lseg_stuff_worker(args)
         return
 
     if args.sam_backend == "sam2":
@@ -3758,12 +4976,15 @@ def main() -> None:
             sam31_offload_sam_during_detection=args.sam31_offload_sam_during_detection,
             sam31_enable_backward=bool(args.sam31_enable_backward),
             sam31_text_track_labels=args.sam31_text_track_labels,
+            sam31_direct_text_prompt_labels=args.sam31_direct_text_prompt_labels,
+            sam31_direct_text_prompt_frame_count=args.sam31_direct_text_prompt_frame_count,
             sam31_structure_prompt_labels=args.sam31_structure_prompt_labels,
             sam31_structure_prompt_frame_count=args.sam31_structure_prompt_frame_count,
             sam31_structure_prompt_chunk_stride=args.sam31_structure_prompt_chunk_stride,
             sam31_person_refresh_prompt_frames=args.sam31_person_refresh_prompt_frames,
             sam31_nontext_object_prompt_budget=args.sam31_nontext_object_prompt_budget,
             sam31_nontext_object_prompt_min_support=args.sam31_nontext_object_prompt_min_support,
+            sam31_text_object_prompt_budget=args.sam31_text_object_prompt_budget,
             sam31_nontext_sparse_support=bool(args.sam31_nontext_sparse_support),
             sam31_max_text_prompt_objects=args.sam31_max_text_prompt_objects,
             sam31_max_internal_objects=args.sam31_max_internal_objects,
@@ -3821,21 +5042,116 @@ def main() -> None:
                 chunk_index=ci,
                 detector_image_paths=detector_image_paths[start:end],
             )
+            local_sparse_with_stuff: Optional[SparseMaskletOutput] = None
+            if bool(args.efficientsam3_stuff_enable) and bool(args.efficientsam3_stuff_chunk_mode):
+                stuff_t0 = time.time()
+                print(
+                    "  Stage C chunk STUFF: running "
+                    f"{str(args.stuff_backend).strip().lower()} on frames [{start}, {end}) ...",
+                    flush=True,
+                )
+                stuff_backend = str(args.stuff_backend).strip().lower()
+                _trim_cuda_cache()
+                if stuff_backend == "clipseg":
+                    if bool(args.clipseg_stuff_inprocess):
+                        stuff_payload = _run_clipseg_stuff_inprocess_payload(
+                            image_paths[start:end],
+                            args,
+                        )
+                    else:
+                        stuff_payload = _run_clipseg_stuff_subprocess_payload(
+                            image_paths[start:end],
+                            args,
+                            temp_dirs,
+                            prefix=f"loger_clipseg_stuff_chunk{ci:04d}_",
+                        )
+                elif stuff_backend == "groupvit":
+                    stuff_payload = _run_groupvit_stuff_subprocess_payload(
+                        image_paths[start:end],
+                        args,
+                        temp_dirs,
+                        prefix=f"loger_groupvit_stuff_chunk{ci:04d}_",
+                    )
+                elif stuff_backend == "lseg":
+                    if bool(args.lseg_stuff_inprocess):
+                        stuff_payload = _run_lseg_stuff_inprocess_payload(
+                            image_paths[start:end],
+                            args,
+                        )
+                    else:
+                        stuff_payload = _run_lseg_stuff_subprocess_payload(
+                            image_paths[start:end],
+                            args,
+                            temp_dirs,
+                            prefix=f"loger_lseg_stuff_chunk{ci:04d}_",
+                        )
+                else:
+                    stuff_payload = _run_efficientsam3_stuff_subprocess_payload(
+                        image_paths[start:end],
+                        args,
+                        temp_dirs,
+                        prefix=f"loger_efficientsam3_stuff_chunk{ci:04d}_",
+                    )
+                _trim_cuda_cache()
+                local_sparse = _masklet_output_to_sparse_local(chunk_output)
+                local_sparse_with_stuff = _merge_efficientsam3_stuff_tracks(
+                    local_sparse,
+                    stuff_payload,
+                    replace_existing=bool(args.efficientsam3_stuff_replace_existing),
+                    subtract_things=bool(args.efficientsam3_stuff_subtract_things),
+                    subtract_dilation=int(args.efficientsam3_stuff_subtract_dilation),
+                )
+                stuff_debug = stuff_payload.get("debug", {})
+                print(
+                    "  Stage C chunk STUFF done in "
+                    f"{time.time() - stuff_t0:.2f}s: "
+                    f"+{stuff_debug.get('efficientsam3_stuff_tracks_added', stuff_debug.get('clipseg_stuff_tracks_added', stuff_debug.get('groupvit_stuff_tracks_added', stuff_debug.get('lseg_stuff_tracks_added', 0))))} tracks, "
+                    f"+{stuff_debug.get('efficientsam3_stuff_masks_added', stuff_debug.get('clipseg_stuff_masks_added', stuff_debug.get('groupvit_stuff_masks_added', stuff_debug.get('lseg_stuff_masks_added', 0))))} masks",
+                    flush=True,
+                )
             print(f"  Stage C chunk done in {time.time() - chunk_t0:.2f}s")
             if chunk_output.debug.get("discovery_frames") is not None:
                 print(f"  Discovery frames (local): {chunk_output.debug['discovery_frames']}")
-            print_masklet_output(chunk_output)
-            chunk_match_debug.append(
-                merge_chunk_masklet_into_global(
+            print_masklet_output(
+                local_sparse_with_stuff
+                if local_sparse_with_stuff is not None
+                else chunk_output
+            )
+            chunk_debug = merge_chunk_masklet_into_global(
+                global_tracks,
+                chunk_output,
+                chunk_idx=ci,
+                start=start,
+                end=end,
+                total_frames=total_frames,
+                chunk_overlap=args.chunk_overlap,
+            )
+            if local_sparse_with_stuff is not None:
+                stuff_sparse = SparseMaskletOutput(
+                    tracks=[
+                        track for track in local_sparse_with_stuff.tracks
+                        if str(track.get("source_type", "")) == "stuff_static"
+                    ],
+                    num_masklets=sum(
+                        1 for track in local_sparse_with_stuff.tracks
+                        if str(track.get("source_type", "")) == "stuff_static"
+                    ),
+                    num_frames=local_sparse_with_stuff.num_frames,
+                    frame_height=local_sparse_with_stuff.frame_height,
+                    frame_width=local_sparse_with_stuff.frame_width,
+                    debug=dict(local_sparse_with_stuff.debug),
+                )
+                chunk_debug["chunk_stuff_merge_debug"] = _merge_chunk_sparse_tracks_into_global(
                     global_tracks,
-                    chunk_output,
+                    stuff_sparse,
                     chunk_idx=ci,
                     start=start,
                     end=end,
                     total_frames=total_frames,
                     chunk_overlap=args.chunk_overlap,
+                    source_types={"stuff_static"},
                 )
-            )
+            chunk_match_debug.append(chunk_debug)
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
 
@@ -3865,14 +5181,50 @@ def main() -> None:
             )
             masklet_output = upscale_sparse_masklet_output(masklet_output, orig_h, orig_w)
 
-        if bool(args.efficientsam3_stuff_enable):
-            if str(args.stuff_backend).strip().lower() == "clipseg":
-                masklet_output = _augment_with_clipseg_stuff_subprocess(
+        if bool(args.efficientsam3_stuff_enable) and not bool(args.efficientsam3_stuff_chunk_mode):
+            stuff_backend = str(args.stuff_backend).strip().lower()
+            _trim_cuda_cache()
+            if stuff_backend == "clipseg":
+                if bool(args.clipseg_stuff_inprocess):
+                    payload = _run_clipseg_stuff_inprocess_payload(original_image_paths, args)
+                    masklet_output = _merge_efficientsam3_stuff_tracks(
+                        masklet_output,
+                        payload,
+                        replace_existing=bool(args.efficientsam3_stuff_replace_existing),
+                        subtract_things=bool(args.efficientsam3_stuff_subtract_things),
+                        subtract_dilation=int(args.efficientsam3_stuff_subtract_dilation),
+                    )
+                else:
+                    masklet_output = _augment_with_clipseg_stuff_subprocess(
+                        masklet_output,
+                        original_image_paths,
+                        args,
+                        temp_dirs,
+                    )
+            elif stuff_backend == "groupvit":
+                masklet_output = _augment_with_groupvit_stuff_subprocess(
                     masklet_output,
                     original_image_paths,
                     args,
                     temp_dirs,
                 )
+            elif stuff_backend == "lseg":
+                if bool(args.lseg_stuff_inprocess):
+                    payload = _run_lseg_stuff_inprocess_payload(original_image_paths, args)
+                    masklet_output = _merge_efficientsam3_stuff_tracks(
+                        masklet_output,
+                        payload,
+                        replace_existing=bool(args.efficientsam3_stuff_replace_existing),
+                        subtract_things=bool(args.efficientsam3_stuff_subtract_things),
+                        subtract_dilation=int(args.efficientsam3_stuff_subtract_dilation),
+                    )
+                else:
+                    masklet_output = _augment_with_lseg_stuff_subprocess(
+                        masklet_output,
+                        original_image_paths,
+                        args,
+                        temp_dirs,
+                    )
             else:
                 masklet_output = _augment_with_efficientsam3_stuff_subprocess(
                     masklet_output,
@@ -3880,6 +5232,10 @@ def main() -> None:
                     args,
                     temp_dirs,
                 )
+            _trim_cuda_cache()
+
+        _release_clipseg_stuff_cache()
+        _release_lseg_stuff_cache()
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()

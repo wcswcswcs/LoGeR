@@ -815,12 +815,15 @@ class VideoMaskletFrontend:
         sam31_offload_state_to_cpu: bool = True,
         sam31_offload_sam_during_detection: bool = False,
         sam31_text_track_labels: Optional[List[str]] = None,
+        sam31_direct_text_prompt_labels: Optional[List[str]] = None,
+        sam31_direct_text_prompt_frame_count: int = 0,
         sam31_structure_prompt_labels: Optional[List[str]] = None,
         sam31_structure_prompt_frame_count: int = 1,
         sam31_structure_prompt_chunk_stride: int = 1,
         sam31_person_refresh_prompt_frames: int = 0,
         sam31_nontext_object_prompt_budget: int = 0,
         sam31_nontext_object_prompt_min_support: int = 2,
+        sam31_text_object_prompt_budget: int = 0,
         sam31_nontext_sparse_support: bool = False,
         sam31_max_text_prompt_objects: int = 0,
         sam31_max_movable_objects: int = 4,
@@ -854,6 +857,19 @@ class VideoMaskletFrontend:
             if sam31_text_track_labels is not None
             else ["person"]
         )
+        self.sam31_direct_text_prompt_labels = (
+            [
+                canonicalize_label(str(lbl).strip().lower())
+                for lbl in sam31_direct_text_prompt_labels
+                if str(lbl).strip()
+            ]
+            if sam31_direct_text_prompt_labels is not None
+            else []
+        )
+        self.sam31_direct_text_prompt_frame_count = max(
+            int(sam31_direct_text_prompt_frame_count),
+            0,
+        )
         self.sam31_structure_prompt_labels = (
             [str(lbl).strip().lower() for lbl in sam31_structure_prompt_labels if str(lbl).strip()]
             if sam31_structure_prompt_labels is not None
@@ -871,6 +887,9 @@ class VideoMaskletFrontend:
         )
         self.sam31_nontext_object_prompt_min_support = max(
             int(sam31_nontext_object_prompt_min_support), 1
+        )
+        self.sam31_text_object_prompt_budget = max(
+            int(sam31_text_object_prompt_budget), 0
         )
         self.sam31_nontext_sparse_support = bool(sam31_nontext_sparse_support)
         self.sam31_max_text_prompt_objects = max(int(sam31_max_text_prompt_objects), 0)
@@ -903,9 +922,10 @@ class VideoMaskletFrontend:
         if sem_group == SEMANTIC_GROUP_MOVABLE_THING and (
             _labels_compatible(label, "person") or _labels_compatible(label, "people")
         ):
-            # Keep prompt-only person recovery for detector misses, but reject
-            # tiny body-part fragments that otherwise survive as extra IDs.
-            return max(6, min(int(T), int(round(T * 0.18)))), 0.22, 0.0100, 0.60
+            # Route B relies on SAM3.1 text prompts to recover people that
+            # YOLOE misses. Keep the area floor low enough for distant/edge
+            # people, then let duplicate/false-track cleanup handle fragments.
+            return max(6, min(int(T), int(round(T * 0.18)))), 0.22, 0.0035, 0.35
         if sem_group == SEMANTIC_GROUP_MOVABLE_THING:
             return max(6, min(int(T), int(round(T * 0.25)))), 0.45, 0.0010, 0.35
         return max(6, min(int(T), int(round(T * 0.25)))), 0.50, 0.0020, 0.50
@@ -1024,6 +1044,42 @@ class VideoMaskletFrontend:
 
         return int(best_frame)
 
+    def _select_sam31_direct_text_prompt_frames(
+        self,
+        discovery_indices: List[int],
+        T: int,
+    ) -> List[int]:
+        count = int(self.sam31_direct_text_prompt_frame_count)
+        if count <= 0 or T <= 0:
+            return []
+        if count == 1:
+            return [0]
+
+        last_safe = max(int(T) - 2, 0)
+        available = sorted(
+            {
+                min(max(int(idx), 0), last_safe)
+                for idx in discovery_indices
+                if 0 <= int(idx) < int(T)
+            }
+        )
+        if not available:
+            available = [0]
+        if 0 not in available:
+            available.insert(0, 0)
+        if len(available) <= count:
+            return available
+
+        # Forward-only propagation cannot fill frames before a late prompt, so
+        # direct text prompts should be early/mid-chunk rather than at the tail.
+        max_target = min(float(last_safe), 0.72 * float(max(int(T) - 1, 1)))
+        targets = np.linspace(0.0, max_target, count)
+        chosen: List[int] = []
+        for target in targets:
+            frame = min(available, key=lambda idx: abs(float(idx) - float(target)))
+            chosen.append(int(frame))
+        return sorted(set(chosen))
+
     # -- Factory -----------------------------------------------------------
 
     @classmethod
@@ -1058,6 +1114,21 @@ class VideoMaskletFrontend:
                 ]
         else:
             sam31_text_track_labels = sam31_text_track_labels_arg
+        sam31_direct_text_prompt_labels_arg = kwargs.pop(
+            "sam31_direct_text_prompt_labels",
+            None,
+        )
+        if isinstance(sam31_direct_text_prompt_labels_arg, str):
+            sam31_direct_text_prompt_labels = [
+                s.strip()
+                for s in sam31_direct_text_prompt_labels_arg.split(",")
+                if s.strip()
+            ]
+        else:
+            sam31_direct_text_prompt_labels = sam31_direct_text_prompt_labels_arg
+        sam31_direct_text_prompt_frame_count = int(
+            kwargs.pop("sam31_direct_text_prompt_frame_count", 0)
+        )
         sam31_structure_prompt_labels_arg = kwargs.pop("sam31_structure_prompt_labels", None)
         if isinstance(sam31_structure_prompt_labels_arg, str):
             sam31_structure_prompt_labels = [
@@ -1080,6 +1151,9 @@ class VideoMaskletFrontend:
         )
         sam31_nontext_object_prompt_min_support = int(
             kwargs.pop("sam31_nontext_object_prompt_min_support", 2)
+        )
+        sam31_text_object_prompt_budget = int(
+            kwargs.pop("sam31_text_object_prompt_budget", 0)
         )
         sam31_nontext_sparse_support = bool(
             kwargs.pop("sam31_nontext_sparse_support", True)
@@ -1188,12 +1262,15 @@ class VideoMaskletFrontend:
                    sam31_offload_state_to_cpu=sam31_offload_outputs_to_cpu,
                    sam31_offload_sam_during_detection=sam31_offload_sam_during_detection,
                    sam31_text_track_labels=sam31_text_track_labels,
+                   sam31_direct_text_prompt_labels=sam31_direct_text_prompt_labels,
+                   sam31_direct_text_prompt_frame_count=sam31_direct_text_prompt_frame_count,
                    sam31_structure_prompt_labels=sam31_structure_prompt_labels,
                    sam31_structure_prompt_frame_count=sam31_structure_prompt_frame_count,
                    sam31_structure_prompt_chunk_stride=sam31_structure_prompt_chunk_stride,
                    sam31_person_refresh_prompt_frames=sam31_person_refresh_prompt_frames,
                    sam31_nontext_object_prompt_budget=sam31_nontext_object_prompt_budget,
                    sam31_nontext_object_prompt_min_support=sam31_nontext_object_prompt_min_support,
+                   sam31_text_object_prompt_budget=sam31_text_object_prompt_budget,
                    sam31_nontext_sparse_support=sam31_nontext_sparse_support,
                    sam31_max_text_prompt_objects=sam31_max_text_prompt_objects,
                    sam31_enable_backward=sam31_enable_backward,
@@ -1570,16 +1647,34 @@ class VideoMaskletFrontend:
             for det in candidates:
                 label_to_dets.setdefault(str(det["label"]), []).append(dict(det))
 
+        direct_text_labels = {
+            str(label).strip().lower()
+            for label in self.sam31_direct_text_prompt_labels
+            if str(label).strip()
+            and label_to_group(str(label).strip().lower())
+            in {SEMANTIC_GROUP_MOVABLE_THING, SEMANTIC_GROUP_STATIC_THING}
+        }
+        for label in sorted(direct_text_labels):
+            label_to_dets.setdefault(label, [])
+
         if not label_to_dets:
             return selected, thing_segments, thing_oid_map
 
         session_id = self._start_sam31_session(frame_resource)
         object_prompt_dets_by_frame: Dict[int, List[Dict[str, Any]]] = {}
+        direct_prompt_frames = self._select_sam31_direct_text_prompt_frames(
+            discovery_indices,
+            T,
+        )
 
         try:
             label_order = sorted(
                 label_to_dets.keys(),
-                key=lambda lbl: min(int(det.get("frame_idx", 0)) for det in label_to_dets[lbl]),
+                key=lambda lbl: (
+                    min(int(det.get("frame_idx", 0)) for det in label_to_dets[lbl])
+                    if label_to_dets[lbl]
+                    else 0
+                ),
             )
             for label in label_order:
                 if len(selected) >= self.max_thing_objects:
@@ -1613,13 +1708,15 @@ class VideoMaskletFrontend:
                         continue
                     candidate_dets.append(det)
 
-                if not candidate_dets:
+                is_direct_text_label = str(label).strip().lower() in direct_text_labels
+                if not candidate_dets and not is_direct_text_label:
                     continue
-                candidate_dets = self._assign_sam31_detection_cluster_ids(
-                    candidate_dets,
-                    area=area,
-                )
-                if not self._uses_sam31_text_tracking(label):
+                if candidate_dets:
+                    candidate_dets = self._assign_sam31_detection_cluster_ids(
+                        candidate_dets,
+                        area=area,
+                    )
+                if not self._uses_sam31_text_tracking(label) and not is_direct_text_label:
                     for det in candidate_dets:
                         object_prompt_dets_by_frame.setdefault(
                             int(det.get("frame_idx", 0)),
@@ -1627,11 +1724,16 @@ class VideoMaskletFrontend:
                         ).append(dict(det))
                     continue
 
-                prompt_frame = self._select_sam31_primary_prompt_frame(
-                    label,
-                    candidate_dets,
-                    T,
-                )
+                if candidate_dets:
+                    prompt_frame = self._select_sam31_primary_prompt_frame(
+                        label,
+                        candidate_dets,
+                        T,
+                    )
+                elif direct_prompt_frames:
+                    prompt_frame = int(direct_prompt_frames[0])
+                else:
+                    prompt_frame = 0
                 session_id, obj_segments, obj_scores = self._query_sam31_label_tracks(
                     frame_resource,
                     session_id,
@@ -1659,7 +1761,7 @@ class VideoMaskletFrontend:
                         "sem_group",
                         SEMANTIC_GROUP_UNCERTAIN_REGION,
                     )
-                )
+                ) if candidate_dets else int(label_to_group(label))
                 prompt_only_budget = self._sam31_prompt_only_budget(label, sem_group)
                 (
                     prompt_only_min_track_length,
@@ -1687,6 +1789,78 @@ class VideoMaskletFrontend:
                     prompt_only_min_area_ratio=prompt_only_min_area_ratio,
                     prompt_only_max_area_ratio=prompt_only_max_area_ratio,
                 )
+                if is_direct_text_label and direct_prompt_frames:
+                    queried_direct_frames = {int(prompt_frame)}
+                    for direct_frame in direct_prompt_frames:
+                        direct_frame = int(direct_frame)
+                        if direct_frame in queried_direct_frames:
+                            continue
+                        if len(prompt_candidates) >= int(self.max_thing_objects) - len(selected):
+                            break
+                        queried_direct_frames.add(direct_frame)
+                        session_id, direct_segments, direct_scores = (
+                            self._query_sam31_label_tracks(
+                                frame_resource,
+                                session_id,
+                                label,
+                                direct_frame,
+                                log_prefix="direct-",
+                            )
+                        )
+                        if not direct_segments:
+                            continue
+
+                        direct_matched: Dict[int, List[Tuple[Dict[str, Any], float]]] = {}
+                        for det in candidate_dets:
+                            match = self._match_detection_to_object_track(
+                                det=det,
+                                obj_segments=direct_segments,
+                            )
+                            if match is None:
+                                continue
+                            prompt_obj_id, match_score = match
+                            direct_matched.setdefault(int(prompt_obj_id), []).append(
+                                (det, float(match_score))
+                            )
+
+                        direct_candidates = self._build_sam31_prompt_track_candidates(
+                            label=label,
+                            matched_by_prompt_obj_id=direct_matched,
+                            obj_segments=direct_segments,
+                            obj_scores=direct_scores,
+                            prompt_frame_idx=direct_frame,
+                            include_unmatched_prompt_tracks=prompt_only_budget > 0,
+                            area=area,
+                            support_dets=candidate_dets,
+                            duplicate_threshold=0.76,
+                            min_support_frames=1,
+                            min_track_length=max(5, self.discovery_frame_stride + 1),
+                            min_obj_score=0.35,
+                            max_prompt_only_tracks=min(prompt_only_budget, 3),
+                            prompt_only_min_track_length=prompt_only_min_track_length,
+                            prompt_only_min_obj_score=(
+                                max(prompt_only_min_obj_score, 0.32)
+                                if prompt_only_min_obj_score is not None
+                                else 0.32
+                            ),
+                            prompt_only_min_area_ratio=prompt_only_min_area_ratio,
+                            prompt_only_max_area_ratio=min(prompt_only_max_area_ratio, 0.22),
+                        )
+                        if direct_candidates:
+                            prompt_candidates = (
+                                self._select_sam31_prompt_track_candidates(
+                                    prompt_candidates + direct_candidates,
+                                    duplicate_threshold=0.76,
+                                    min_support_frames=1,
+                                    min_track_length=max(5, self.discovery_frame_stride + 1),
+                                    min_obj_score=0.35,
+                                    max_prompt_only_tracks=prompt_only_budget,
+                                    prompt_only_min_track_length=prompt_only_min_track_length,
+                                    prompt_only_min_obj_score=prompt_only_min_obj_score,
+                                    prompt_only_min_area_ratio=prompt_only_min_area_ratio,
+                                    prompt_only_max_area_ratio=prompt_only_max_area_ratio,
+                                )
+                            )
                 remaining_budget = max(
                     0,
                     int(self.max_thing_objects) - len(selected) - len(prompt_candidates),
@@ -1834,10 +2008,13 @@ class VideoMaskletFrontend:
                                     )
 
                 object_fallback_budget = 0
+                if sem_group == SEMANTIC_GROUP_MOVABLE_THING:
+                    object_fallback_budget = int(self.sam31_text_object_prompt_budget)
                 # Object-prompt fallback is much slower than the text-track
-                # branch and often duplicates prompt-only person tracks. Keep it
-                # disabled by default; YOLOE detections still feed late text
-                # refresh above, which is cheaper and easier to deduplicate.
+                # branch and can duplicate prompt-only person tracks, so it is
+                # opt-in. When enabled, unmatched YOLOE detections get a chance
+                # to become SAM3.1 object-prompt tracks instead of remaining
+                # support-only masks.
 
                 remaining_object_budget = max(
                     0,
@@ -3251,6 +3428,8 @@ class VideoMaskletFrontend:
 
             raw_label = str(det.get("label", "unknown"))
             label = canonicalize_label(raw_label)
+            if label in _PERSON_ALIASES:
+                label = "person"
             sem_group = label_to_group(label)
             confidence = float(det.get("confidence", 0.0))
             if sem_group != SEMANTIC_GROUP_MOVABLE_THING and confidence < self.box_threshold:
