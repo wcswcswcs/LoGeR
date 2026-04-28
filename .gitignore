@@ -19,3 +19,5 @@ tmp/
 # local debug artifacts
 sam31_repro_*/
 tmp/sam3_probe/
+logs/
+*.ts
