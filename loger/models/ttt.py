@@ -195,6 +195,9 @@ def fast_weight_replay_update(
     muon_update_steps: int = 0,
     momentum: torch.Tensor | None = None,
     ttt_update_steps: int = 1,
+    token_prior0: torch.Tensor | None = None,
+    token_prior1: torch.Tensor | None = None,
+    token_prior2: torch.Tensor | None = None,
 ):
     """Replay TTT update with token-wise prior weighting.
 
@@ -213,7 +216,11 @@ def fast_weight_replay_update(
     lr0, lr1, lr2 : [b, l, 1]
         Cached per-token learning rates (η) from the original forward.
     token_prior : [b, l, 1]  or  [1, l, 1]
-        Write-allow prior p ∈ [0, 1] per token.  Multiplied onto lr.
+        Default write-allow prior p per token.  Multiplied onto lr.
+    token_prior0, token_prior1, token_prior2 : optional [b, l, 1] or [1, l, 1]
+        Branch-specific priors.  When omitted, ``token_prior`` is used for
+        that branch.  This keeps the old API while allowing selective
+        branch diagnostics.
     ttt_ua_order, muon_update_steps, momentum, ttt_update_steps :
         Same config as the original forward.
 
@@ -228,6 +235,9 @@ def fast_weight_replay_update(
     w0_norm = w0.detach().norm(dim=1, keepdim=True)
     w1_norm = w1.detach().norm(dim=1, keepdim=True)
     w2_norm = w2.detach().norm(dim=1, keepdim=True)
+    token_prior0 = token_prior if token_prior0 is None else token_prior0
+    token_prior1 = token_prior if token_prior1 is None else token_prior1
+    token_prior2 = token_prior if token_prior2 is None else token_prior2
 
     if momentum is not None:
         dw0_momentum = torch.zeros_like(w0)
@@ -242,9 +252,9 @@ def fast_weight_replay_update(
 
         ki = k[:, start:end, :]
         vi = v[:, start:end, :]
-        lr0i = lr0[:, start:end, :] * token_prior[:, start:end, :]
-        lr1i = lr1[:, start:end, :] * token_prior[:, start:end, :]
-        lr2i = lr2[:, start:end, :] * token_prior[:, start:end, :]
+        lr0i = lr0[:, start:end, :] * token_prior0[:, start:end, :]
+        lr1i = lr1[:, start:end, :] * token_prior1[:, start:end, :]
+        lr2i = lr2[:, start:end, :] * token_prior2[:, start:end, :]
 
         gate_before_act = ki @ w0_now
         hidden_before_mul = ki @ w2_now

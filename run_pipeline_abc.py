@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 from dataclasses import fields, is_dataclass
+import json
 import os
 import sys
 import time
@@ -75,8 +76,18 @@ from loger.pipeline.geometry_backbone import (
     WriteCacheOutput,
     LoGeRGeometryBackbone,
     load_images as loger_load_images,
+    TOKEN_TYPE_PATCH,
 )
-from loger.pipeline.dynamic_cue_extractor import CueOutput, DynamicCueExtractor
+from loger.pipeline.dynamic_cue_extractor import (
+    CueOutput,
+    DynamicCueExtractor,
+    CUE_STAT,
+    CUE_DYN,
+    CUE_OCC,
+    CUE_UNC,
+    CUE_ANCHOR,
+    NUM_CUE_CHANNELS,
+)
 from loger.pipeline.video_masklet_frontend import (
     VideoMaskletFrontend,
     MaskletOutput,
@@ -140,6 +151,28 @@ def score_masklets_by_cdyn(
             n += cnt
         scores[j] = total / n if n > 0 else 0.0
     return scores
+
+
+def _empty_masklet_output(num_frames: int, frame_height: int, frame_width: int) -> MaskletOutput:
+    """Construct an empty Stage-C output for geometry-only write-control runs."""
+    return MaskletOutput(
+        M_mask=torch.zeros(0, num_frames, frame_height, frame_width, dtype=torch.bool),
+        V_mask=torch.zeros(0, num_frames, dtype=torch.bool),
+        B_mask=torch.zeros(0, num_frames, 4, dtype=torch.float32),
+        Q_mask=torch.zeros(0, num_frames, dtype=torch.float32),
+        L_sem=[],
+        G_sem=torch.zeros(0, dtype=torch.long),
+        W_sem=torch.zeros(0, dtype=torch.float32),
+        A_ratio=torch.zeros(0, num_frames, dtype=torch.float32),
+        num_masklets=0,
+        num_frames=num_frames,
+        frame_height=frame_height,
+        frame_width=frame_width,
+        source_type=[],
+        birth_frame=[],
+        seed_global_track_idx=[],
+        debug={"stage_c_mode": "none"},
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -324,20 +357,26 @@ def run_geometry_eval_external_exact(
 
         print("  Stage A: Geometry Backbone ...")
         t0 = time.time()
-        use_controller_write_through = (
+        use_native_controller = (
             args.ttt_write_mode == "native" and args.native_write_through_controller
         )
+        use_replay_controller = args.ttt_write_mode == "unity_replay"
+        use_controller_write = use_native_controller or use_replay_controller
+        cache_ttt_primitives = use_replay_controller
         stage_a_result = backbone.run(
             chunk_loger,
             ttt_state=ttt_state,
-            cache_ttt_primitives=False,
+            cache_ttt_primitives=cache_ttt_primitives,
             window_size=args.window_size,
             overlap_size=args.overlap_size,
             reset_every=0,
             se3=False,
         )
-        geo = stage_a_result
-        write_cache = None
+        if cache_ttt_primitives:
+            geo, write_cache = stage_a_result
+        else:
+            geo = stage_a_result
+            write_cache = None
         if torch.cuda.is_available():
             torch.cuda.synchronize()
         print(f"    done in {time.time() - t0:.2f}s")
@@ -345,15 +384,20 @@ def run_geometry_eval_external_exact(
 
         window_raw_predictions.append(_rebuild_batched_raw_window(geo, start, end))
 
-        if use_controller_write_through:
-            print("  Stage E: TTT Write Controller (native write-through) ...")
-            t0 = time.time()
-            native_state = backbone.get_ttt_state()
-            write_cache = _build_native_write_cache_from_state(
-                native_state,
-                num_frames=geo.num_frames,
-                patch_grid=geo.patch_grid,
+        if use_controller_write:
+            stage_e_label = (
+                "native write-through" if use_native_controller else "unity replay"
             )
+            print(f"  Stage E: TTT Write Controller ({stage_e_label}) ...")
+            t0 = time.time()
+            if use_native_controller:
+                native_state = backbone.get_ttt_state()
+                write_cache = _build_native_write_cache_from_state(
+                    native_state,
+                    num_frames=geo.num_frames,
+                    patch_grid=geo.patch_grid,
+                )
+            assert write_cache is not None
             wr = controller.run(
                 write_cache,
                 A_tok=None,
@@ -640,10 +684,45 @@ def build_parser() -> argparse.ArgumentParser:
     # -- Stage B: Dynamic Cue Extractor ------------------------------------
     p.add_argument("--k_intra", type=int, default=3,
                    help="Temporal window-width parameter for Stage B; support candidates come from [t-k_intra//2, t+k_intra//2], and up to 4 views are sampled uniformly.")
+    p.add_argument("--disable_attention_prior", action="store_true",
+                   help="Disable Stage-A attention priors in Stage B.")
+    p.add_argument("--support_time_decay", type=float, default=2.0)
+    p.add_argument("--support_temporal_weight", type=float, default=0.35)
+    p.add_argument("--support_affinity_weight", type=float, default=0.45)
+    p.add_argument("--support_static_weight", type=float, default=0.20)
     p.add_argument("--sigma_pt", type=float, default=0.25)
+    p.add_argument("--stageb_proxy_mode", choices=["same_pixel", "reprojection"], default="same_pixel",
+                   help="Stage-B geometric consistency proxy. reprojection samples support frames at projected coordinates.")
+    p.add_argument("--stageb_nonocc_dynamic", type=int, default=0,
+                   help="Use C_dyn * (1-C_occ) * (1-C_unc) before Stage-B write-score construction.")
     p.add_argument("--tau_occ", type=float, default=0.05)
+    p.add_argument("--alpha_1", type=float, default=0.8)
+    p.add_argument("--alpha_3", type=float, default=0.5)
+    p.add_argument("--attn_stat_fusion_weight", type=float, default=0.35)
+    p.add_argument("--dyn_fusion_mode",
+                   choices=["explicit", "implicit", "max", "soft_or", "avg", "addclip", "calibrated_soft_or"],
+                   default="max",
+                   help="Stage-B C_dyn fusion mode used for geometry write control.")
+    p.add_argument("--implicit_weight", type=float, default=1.0,
+                   help="Implicit cue weight for implicit/calibrated fusion modes.")
+    p.add_argument("--implicit_gate_floor", type=float, default=0.25,
+                   help="Minimum implicit gate used by calibrated_soft_or.")
+    p.add_argument("--implicit_calib_min_range", type=float, default=1e-3,
+                   help="Disable calibrated implicit cue when q95-q50 is below this range.")
+    p.add_argument("--lambda_s", type=float, default=1.0,
+                   help="Stage-B G_write_geo C_stat weight.")
+    p.add_argument("--lambda_a", type=float, default=0.5,
+                   help="Stage-B G_write_geo C_anchor weight.")
+    p.add_argument("--lambda_d", type=float, default=0.8,
+                   help="Stage-B G_write_geo C_dyn penalty weight.")
+    p.add_argument("--lambda_o", type=float, default=0.3,
+                   help="Stage-B G_write_geo C_occ penalty weight.")
+    p.add_argument("--lambda_u", type=float, default=0.5,
+                   help="Stage-B G_write_geo C_unc penalty weight.")
 
     # -- Stage C: Video Masklet Front-end -----------------------------------
+    p.add_argument("--stage_c_mode", choices=["reference", "none"], default="reference",
+                   help="Use 'none' for geometry-only write-control without loading SAM/YOLOE.")
     p.add_argument("--sam_backend", choices=["sam2", "sam3", "sam31_multiplex"], default="sam31_multiplex",
                    help="Stage-C SAM backend. The quality path uses sam31_multiplex.")
     p.add_argument("--tracker_backend", default="sam2",
@@ -747,6 +826,41 @@ def build_parser() -> argparse.ArgumentParser:
     # -- Stage E: TTT Write Controller -------------------------------------
     p.add_argument("--lambda_min", type=float, default=0.0)
     p.add_argument("--lambda_max", type=float, default=1.0)
+    p.add_argument("--a_min_special", type=float, default=0.3,
+                   help="Minimum special-token prior in Stage D.")
+    p.add_argument("--a_token_floor", type=float, default=0.0,
+                   help="Clamp Stage-D token prior to at least this value; useful for light write suppression.")
+    p.add_argument("--prior_policy", choices=["suppressive", "eta_mean_preserving"], default="suppressive",
+                   help="Stage-D/E write policy. eta_mean_preserving reweights token priority around 1 and Stage-E preserves lr-weighted write mass.")
+    p.add_argument("--mp_alpha", type=float, default=0.2,
+                   help="Mean-preserving policy strength: multiplier = 1 + alpha * percentile_centered_score.")
+    p.add_argument("--mp_min", type=float, default=0.7,
+                   help="Lower clip bound for eta-mean-preserving token multiplier.")
+    p.add_argument("--mp_max", type=float, default=1.3,
+                   help="Upper clip bound for eta-mean-preserving token multiplier.")
+    p.add_argument("--mp_score_source",
+                   choices=["e_patch", "a_patch", "anchor", "positive", "dyn", "unc", "occ", "anchor_minus_dyn"],
+                   default="e_patch",
+                   help="Patch score used by eta_mean_preserving before percentile ranking.")
+    p.add_argument("--prior_branch_mask", default="0,1,2",
+                   help="Comma-separated TTT branches that receive the token prior, e.g. 0, 1, 2, or 0,2. Disabled branches use unity replay.")
+    p.add_argument("--prior_layer_mode", choices=["all", "early", "late", "middle", "single"], default="all",
+                   help="Which TTT layers receive the token prior. Disabled layers use unity replay.")
+    p.add_argument("--prior_single_layer", type=int, default=-1,
+                   help="Layer index used when --prior_layer_mode=single.")
+    p.add_argument("--debug_prior_mode",
+                   choices=["none", "patch_only", "special_only", "frame_ramp",
+                            "reverse_frame_ramp", "checkerboard", "roll"],
+                   default="none",
+                   help="Phase-0 synthetic variable-prior mode for TTT token-alignment diagnostics.")
+    p.add_argument("--debug_prior_roll_tokens", type=int, default=0,
+                   help="Circular shift for --debug_prior_mode=roll. 0 uses one quarter of patch tokens.")
+    p.add_argument("--prior_debug_jsonl", default=None,
+                   help="Optional JSONL path for per-chunk/per-layer prior alignment stats.")
+    p.add_argument("--rho_sem", type=float, default=0.6,
+                   help="Semantic modulation strength in Stage D.")
+    p.add_argument("--spg_use_g_write_geo", type=int, default=1,
+                   help="Use Stage-B G_write_geo directly as Stage-D geometry eligibility (1/0).")
     p.add_argument("--ttt_write_mode", choices=["semantic", "unity_replay", "native"], default="semantic",
                    help="Stage E mode: semantic=use Stage D prior, unity_replay=all-one prior replay, native=use model provisional W directly.")
     p.add_argument("--native_write_through_controller", action="store_true",
@@ -943,6 +1057,12 @@ def print_prior_output(prior: PriorOutput) -> None:
     print(f"  A_tok  max     : {prior.A_tok.max().item():.4f}")
     rho = prior.debug.get("rho_suppr_chunk", 0)
     print(f"  rho_suppr      : {rho:.4f}")
+    floor = prior.debug.get("a_token_floor", 0)
+    print(f"  A_token_floor  : {float(floor):.4f}")
+    if "prior_policy" in prior.debug:
+        print(f"  prior_policy   : {prior.debug['prior_policy']}")
+        print(f"  MP patch range : {prior.debug.get('mp_multiplier_min_patch', 0):.4f} .. "
+              f"{prior.debug.get('mp_multiplier_max_patch', 0):.4f}")
     print(f"{'='*72}\n")
 
 
@@ -959,8 +1079,282 @@ def print_write_result(wr: WriteResult) -> None:
         lam = d.get("lambda_write", "?")
         mp = d.get("mean_prior", "?")
         bg = d.get("budget_geo", "?")
-        print(f"    layer {li}: lambda={lam}, mean_prior={mp}, budget_geo={bg}")
+        eta = d.get("m_eta_after_lr0", d.get("m_eta_lr0", "?"))
+        print(f"    layer {li}: lambda={lam}, mean_prior={mp}, budget_geo={bg}, eta0={eta}")
     print(f"{'='*72}\n")
+
+
+def _token_frame_index(geo: GeometryOutput) -> torch.Tensor:
+    """Return frame index for each token under the per-frame LoGeR token layout."""
+    L_tok = int(geo.token_type.shape[0])
+    T = max(int(geo.num_frames), 1)
+    tokens_per_frame = max(L_tok // T, 1)
+    return (torch.arange(L_tok, dtype=torch.long) // tokens_per_frame).clamp_max(T - 1)
+
+
+def _centered_percentile_rank(values: torch.Tensor) -> torch.Tensor:
+    """Map scores to [-1, 1] by rank, preserving only within-chunk order."""
+    v = torch.nan_to_num(values.detach().cpu().float(), nan=0.0, posinf=1.0, neginf=0.0)
+    n = int(v.numel())
+    if n <= 1:
+        return torch.zeros_like(v)
+    if float((v.max() - v.min()).abs().item()) < 1e-8:
+        return torch.zeros_like(v)
+    order = torch.argsort(v, stable=True)
+    ranks = torch.empty_like(order, dtype=torch.float32)
+    ranks[order] = torch.arange(n, dtype=torch.float32)
+    percentile = ranks / float(n - 1)
+    return 2.0 * percentile - 1.0
+
+
+def _mp_centered_score(
+    *,
+    prior: PriorOutput,
+    cue: Optional[CueOutput],
+    num_patch: int,
+    score_source: str,
+) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+    """Return centered SD/MP score and raw score for diagnostics."""
+    if num_patch <= 0:
+        z = torch.zeros(0, dtype=torch.float32)
+        return z, z, {"mp_score_fallback": 1.0}
+
+    def _fallback() -> Tuple[torch.Tensor, torch.Tensor, Dict[str, float]]:
+        if score_source == "e_patch" and prior.E_patch_flat.numel() == num_patch:
+            raw = prior.E_patch_flat.detach().cpu().float()
+        elif prior.A_patch_flat.numel() == num_patch:
+            raw = prior.A_patch_flat.detach().cpu().float()
+        else:
+            raw = torch.ones(num_patch, dtype=torch.float32)
+        return _centered_percentile_rank(raw), raw, {"mp_score_fallback": 1.0}
+
+    if score_source in {"e_patch", "a_patch"}:
+        return _fallback()
+
+    if cue is None or cue.E_cue_patch is None:
+        return _fallback()
+
+    patch = cue.E_cue_patch.detach().cpu().float().reshape(-1, NUM_CUE_CHANNELS)
+    if patch.shape[0] != num_patch:
+        return _fallback()
+
+    stat = patch[:, CUE_STAT]
+    dyn = patch[:, CUE_DYN]
+    occ = patch[:, CUE_OCC]
+    unc = patch[:, CUE_UNC]
+    anchor = patch[:, CUE_ANCHOR]
+    info = {
+        "mp_score_fallback": 0.0,
+        "mp_mean_C_stat": float(stat.mean().item()),
+        "mp_mean_C_dyn": float(dyn.mean().item()),
+        "mp_mean_C_occ": float(occ.mean().item()),
+        "mp_mean_C_unc": float(unc.mean().item()),
+        "mp_mean_C_anchor": float(anchor.mean().item()),
+    }
+
+    if score_source == "anchor":
+        raw = anchor
+        centered = _centered_percentile_rank(raw)
+    elif score_source == "positive":
+        raw = 0.5 * stat + 0.5 * anchor
+        centered = _centered_percentile_rank(raw)
+    elif score_source == "dyn":
+        raw = dyn
+        centered = -_centered_percentile_rank(raw)
+    elif score_source == "unc":
+        raw = unc
+        centered = -_centered_percentile_rank(raw)
+    elif score_source == "occ":
+        raw = occ
+        centered = -_centered_percentile_rank(raw)
+    elif score_source == "anchor_minus_dyn":
+        raw = anchor - 0.5 * dyn
+        centered = _centered_percentile_rank(anchor) - 0.5 * _centered_percentile_rank(dyn)
+    else:
+        return _fallback()
+
+    return centered.float(), raw.float(), info
+
+
+def _apply_prior_policy(
+    prior: Optional[PriorOutput],
+    cue: Optional[CueOutput],
+    geo: GeometryOutput,
+    *,
+    policy: str,
+    alpha: float,
+    p_min: float,
+    p_max: float,
+    score_source: str,
+) -> Optional[PriorOutput]:
+    """Convert Stage-D suppressive scores into the selected write policy."""
+    if prior is None or policy == "suppressive":
+        return prior
+    if policy != "eta_mean_preserving":
+        raise ValueError(f"Unsupported prior_policy: {policy}")
+
+    token_type = geo.token_type.detach().cpu().long()
+    patch_mask = token_type == TOKEN_TYPE_PATCH
+    special_mask = ~patch_mask
+    num_patch = int(patch_mask.sum().item())
+
+    centered, patch_score, score_debug = _mp_centered_score(
+        prior=prior,
+        cue=cue,
+        num_patch=num_patch,
+        score_source=score_source,
+    )
+
+    lo = float(min(p_min, p_max))
+    hi = float(max(p_min, p_max))
+    p_patch = (1.0 + float(alpha) * centered).clamp(lo, hi)
+
+    A_tok = torch.ones(int(token_type.shape[0]), dtype=torch.float32)
+    if num_patch > 0:
+        A_tok[patch_mask] = p_patch
+    if special_mask.any():
+        A_tok[special_mask] = 1.0
+
+    prior.A_tok = A_tok
+    prior.A_patch_flat = p_patch.clone()
+    prior.A_special = 1.0
+    # Mean-preserving policy should not also down-scale the whole chunk.
+    prior.B_chunk_geo = 1.0
+    prior.debug.update({
+        "prior_policy": policy,
+        "mp_alpha": float(alpha),
+        "mp_min": lo,
+        "mp_max": hi,
+        "mp_score_source": score_source,
+        "mp_score_mean": float(patch_score.mean().item()) if patch_score.numel() else 0.0,
+        "mp_score_min": float(patch_score.min().item()) if patch_score.numel() else 0.0,
+        "mp_score_max": float(patch_score.max().item()) if patch_score.numel() else 0.0,
+        "mp_multiplier_mean_patch": float(p_patch.mean().item()) if p_patch.numel() else 1.0,
+        "mp_multiplier_min_patch": float(p_patch.min().item()) if p_patch.numel() else 1.0,
+        "mp_multiplier_max_patch": float(p_patch.max().item()) if p_patch.numel() else 1.0,
+        "mp_centered_score_mean": float(centered.mean().item()) if centered.numel() else 0.0,
+        "mp_centered_score_min": float(centered.min().item()) if centered.numel() else 0.0,
+        "mp_centered_score_max": float(centered.max().item()) if centered.numel() else 0.0,
+        "mp_special_fixed": 1.0,
+    })
+    prior.debug.update(score_debug)
+    return prior
+
+
+def _apply_debug_prior_mode(
+    prior: Optional[PriorOutput],
+    geo: GeometryOutput,
+    *,
+    mode: str,
+    roll_tokens: int = 0,
+) -> Optional[PriorOutput]:
+    """Override ``prior.A_tok`` with Phase-0 synthetic diagnostic priors."""
+    if prior is None or mode == "none":
+        return prior
+
+    token_type = geo.token_type.detach().cpu().long()
+    patch_mask = token_type == TOKEN_TYPE_PATCH
+    special_mask = ~patch_mask
+    L_tok = int(token_type.shape[0])
+    A_tok = torch.ones(L_tok, dtype=torch.float32)
+
+    if mode == "patch_only":
+        A_tok[patch_mask] = 0.7
+    elif mode == "special_only":
+        A_tok[special_mask] = 0.7
+    elif mode in {"frame_ramp", "reverse_frame_ramp"}:
+        frame_idx = _token_frame_index(geo).float()
+        denom = max(float(geo.num_frames - 1), 1.0)
+        ramp = 0.7 + 0.3 * (frame_idx / denom)
+        if mode == "reverse_frame_ramp":
+            ramp = 1.0 - 0.3 * (frame_idx / denom)
+        A_tok = ramp.float()
+    elif mode == "checkerboard":
+        A_tok[patch_mask] = 1.0
+        if geo.patch_meta.numel() > 0:
+            patch_vals = torch.ones(int(patch_mask.sum().item()), dtype=torch.float32)
+            parity = (geo.patch_meta[:, 1] + geo.patch_meta[:, 2]) % 2
+            patch_vals[parity.bool()] = 0.7
+            A_tok[patch_mask] = patch_vals[: int(patch_mask.sum().item())]
+    elif mode == "roll":
+        A_tok = prior.A_tok.detach().cpu().float().clone()
+        patch_vals = A_tok[patch_mask]
+        if patch_vals.numel() > 0:
+            shift = int(roll_tokens)
+            if shift == 0:
+                shift = max(1, int(patch_vals.numel()) // 4)
+            A_tok[patch_mask] = patch_vals.roll(shifts=shift)
+    else:
+        raise ValueError(f"Unsupported debug_prior_mode: {mode}")
+
+    prior.A_tok = A_tok.clamp(0.0, 1.0)
+    if prior.A_patch_flat.numel() == int(patch_mask.sum().item()):
+        prior.A_patch_flat = prior.A_tok[patch_mask].clone()
+    prior.A_special = float(prior.A_tok[special_mask].mean().item()) if special_mask.any() else 1.0
+    prior.B_chunk_geo = float(prior.A_patch_flat.mean().item()) if prior.A_patch_flat.numel() else prior.B_chunk_geo
+    prior.debug["debug_prior_mode"] = mode
+    prior.debug["debug_prior_roll_tokens"] = int(roll_tokens)
+    prior.debug["debug_prior_mean_A_tok"] = float(prior.A_tok.mean().item())
+    return prior
+
+
+def _append_prior_debug_jsonl(
+    path: Optional[str],
+    *,
+    args: argparse.Namespace,
+    chunk_idx: int,
+    start: int,
+    end: int,
+    geo: GeometryOutput,
+    prior: Optional[PriorOutput],
+    wr: WriteResult,
+) -> None:
+    if not path:
+        return
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    token_type = geo.token_type.detach().cpu().long()
+    patch_mask = token_type == TOKEN_TYPE_PATCH
+    special_mask = ~patch_mask
+    a_tok = prior.A_tok.detach().cpu().float() if prior is not None else None
+
+    base: Dict[str, Any] = {
+        "run_id": os.path.basename(os.path.dirname(args.output_txt or path)),
+        "chunk_idx": int(chunk_idx),
+        "start_frame": int(start),
+        "end_frame": int(end),
+        "prior_policy": str(args.prior_policy),
+        "debug_prior_mode": str(args.debug_prior_mode),
+        "mp_alpha": float(args.mp_alpha),
+        "mp_min": float(args.mp_min),
+        "mp_max": float(args.mp_max),
+        "mp_score_source": str(args.mp_score_source),
+        "L_tok": int(token_type.shape[0]),
+        "num_patch_tokens_in_A_tok": int(patch_mask.sum().item()),
+        "num_special_tokens_in_A_tok": int(special_mask.sum().item()),
+    }
+    if a_tok is not None:
+        base.update({
+            "mean_A_tok": float(a_tok.mean().item()),
+            "min_A_tok": float(a_tok.min().item()),
+            "max_A_tok": float(a_tok.max().item()),
+            "std_A_tok": float(a_tok.std(unbiased=False).item()),
+        })
+        if patch_mask.any():
+            base["mean_A_tok_patch"] = float(a_tok[patch_mask].mean().item())
+        if special_mask.any():
+            base["mean_A_tok_special"] = float(a_tok[special_mask].mean().item())
+        for key, value in sorted(prior.debug.items()):
+            if isinstance(value, (int, float, bool)):
+                base[f"prior_debug_{key}"] = float(value)
+
+    with open(path, "a", encoding="utf-8") as f:
+        for key, value in sorted(wr.debug.items()):
+            if not key.startswith("layer_") or not isinstance(value, dict):
+                continue
+            rec = dict(base)
+            rec["layer_idx"] = int(key.split("_", 1)[1])
+            rec.update(value)
+            f.write(json.dumps(rec, sort_keys=True) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -975,7 +1369,7 @@ def main() -> None:
         sys.exit(f"Checkpoint not found: {args.checkpoint}")
     if args.geometry_eval_mode and args.ttt_write_mode == "semantic":
         sys.exit("geometry_eval_mode cannot be used with ttt_write_mode=semantic; use native or unity_replay.")
-    if not args.geometry_eval_mode:
+    if not args.geometry_eval_mode and args.stage_c_mode != "none":
         if args.sam_backend == "sam2":
             if not args.sam2_checkpoint or not os.path.isfile(args.sam2_checkpoint):
                 sys.exit(f"SAM2 checkpoint not found: {args.sam2_checkpoint}")
@@ -1009,6 +1403,10 @@ def main() -> None:
         images_full = None
         H_full = W_full = 0
         print("Full-res images: skipped (--geometry_eval_mode)")
+    elif args.stage_c_mode == "none":
+        images_full = None
+        H_full = W_full = 0
+        print("Full-res images: skipped (--stage_c_mode=none)")
     else:
         images_full = load_images_tensor(image_paths)
         _, _, H_full, W_full = images_full.shape
@@ -1059,14 +1457,33 @@ def main() -> None:
     else:
         extractor = DynamicCueExtractor(
             k_intra=args.k_intra,
+            use_attention_prior=not args.disable_attention_prior,
+            support_time_decay=args.support_time_decay,
+            support_temporal_weight=args.support_temporal_weight,
+            support_affinity_weight=args.support_affinity_weight,
+            support_static_weight=args.support_static_weight,
             sigma_pt=args.sigma_pt,
+            proxy_mode=args.stageb_proxy_mode,
             tau_occ=args.tau_occ,
+            alpha_1=args.alpha_1,
+            alpha_3=args.alpha_3,
+            attn_stat_fusion_weight=args.attn_stat_fusion_weight,
+            dyn_fusion_mode=args.dyn_fusion_mode,
+            implicit_weight=args.implicit_weight,
+            implicit_gate_floor=args.implicit_gate_floor,
+            implicit_calib_min_range=args.implicit_calib_min_range,
+            nonocc_dynamic=bool(args.stageb_nonocc_dynamic),
+            lambda_s=args.lambda_s,
+            lambda_a=args.lambda_a,
+            lambda_d=args.lambda_d,
+            lambda_o=args.lambda_o,
+            lambda_u=args.lambda_u,
         )
 
     # Stage C
     frontend_kwargs: dict = {}
     build_kwargs: dict = {}
-    if not args.geometry_eval_mode:
+    if not args.geometry_eval_mode and args.stage_c_mode != "none":
         frontend_kwargs = dict(
             box_threshold=args.box_threshold,
             text_threshold=args.text_threshold,
@@ -1114,7 +1531,15 @@ def main() -> None:
         )
 
     need_semantic_prior = (args.ttt_write_mode == "semantic") and (not args.geometry_eval_mode)
-    prior_gen = SemanticPriorGenerator() if need_semantic_prior else None
+    prior_gen = (
+        SemanticPriorGenerator(
+            use_g_write_geo=bool(args.spg_use_g_write_geo),
+            rho_sem=args.rho_sem,
+            a_min_special=args.a_min_special,
+            a_token_floor=args.a_token_floor,
+        )
+        if need_semantic_prior else None
+    )
 
     # Stage E
     controller = TTTWriteController(
@@ -1122,6 +1547,10 @@ def main() -> None:
         lambda_max=args.lambda_max,
         device=args.device,
         write_mode=args.ttt_write_mode,
+        eta_mean_preserve=(args.prior_policy == "eta_mean_preserving"),
+        prior_branch_mask=args.prior_branch_mask,
+        prior_layer_mode=args.prior_layer_mode,
+        prior_single_layer=args.prior_single_layer,
     )
 
     if args.geometry_eval_mode and args.chunk_size > 0:
@@ -1175,6 +1604,7 @@ def main() -> None:
     all_cue: List[Optional[CueOutput]] = []
     all_masklet: List[Optional[MaskletOutput]] = []
     all_prior: List[Optional[PriorOutput]] = []
+    window_raw_predictions: List[Dict[str, Any]] = []
 
     for ci, (start, end) in enumerate(chunks):
         print(f"\n{'#'*72}")
@@ -1218,6 +1648,7 @@ def main() -> None:
         print(f"    done in {time.time() - t0:.2f}s")
         print_geometry_output(geo)
         all_geo.append(geo)
+        window_raw_predictions.append(_rebuild_batched_raw_window(geo, start, end))
 
         # ---- Stage B ----
         cue: Optional[CueOutput] = None
@@ -1235,18 +1666,23 @@ def main() -> None:
         # ---- Stage C ----
         mo: Optional[MaskletOutput] = None
         if not args.geometry_eval_mode:
-            print(f"  Stage C: Video Masklet Front-end ...")
-            t0 = time.time()
-            assert chunk_full is not None
-            if args.stage_memory_swap and str(args.device).startswith("cuda"):
-                _offload_backbone_to_cpu(backbone)
-            mo = _run_stage_c_lazy(build_kwargs, frontend_kwargs, chunk_full, ci)
-            if torch.cuda.is_available():
-                torch.cuda.synchronize()
-            print(f"    done in {time.time() - t0:.2f}s")
-            print_masklet_output(mo)
-            if args.stage_memory_swap and str(args.device).startswith("cuda"):
-                _offload_stage_c_frontend_to_cpu()
+            if args.stage_c_mode == "none":
+                print("  Stage C: skipped (--stage_c_mode=none)")
+                H_p, W_p = geo.local_points.shape[1:3]
+                mo = _empty_masklet_output(geo.num_frames, int(H_p), int(W_p))
+            else:
+                print(f"  Stage C: Video Masklet Front-end ...")
+                t0 = time.time()
+                assert chunk_full is not None
+                if args.stage_memory_swap and str(args.device).startswith("cuda"):
+                    _offload_backbone_to_cpu(backbone)
+                mo = _run_stage_c_lazy(build_kwargs, frontend_kwargs, chunk_full, ci)
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                print(f"    done in {time.time() - t0:.2f}s")
+                print_masklet_output(mo)
+                if args.stage_memory_swap and str(args.device).startswith("cuda"):
+                    _offload_stage_c_frontend_to_cpu()
         else:
             print("  Stage C: skipped (--geometry_eval_mode)")
         all_masklet.append(mo)
@@ -1258,6 +1694,22 @@ def main() -> None:
             t0 = time.time()
             assert prior_gen is not None
             prior = prior_gen.run(cue, mo, geo)
+            prior = _apply_prior_policy(
+                prior,
+                cue,
+                geo,
+                policy=args.prior_policy,
+                alpha=args.mp_alpha,
+                p_min=args.mp_min,
+                p_max=args.mp_max,
+                score_source=args.mp_score_source,
+            )
+            prior = _apply_debug_prior_mode(
+                prior,
+                geo,
+                mode=args.debug_prior_mode,
+                roll_tokens=args.debug_prior_roll_tokens,
+            )
             print(f"    done in {time.time() - t0:.2f}s")
             print_prior_output(prior)
         else:
@@ -1278,9 +1730,20 @@ def main() -> None:
                 prior.A_tok if prior is not None else None,
                 B_chunk_geo=prior.B_chunk_geo if prior is not None else None,
                 device=args.device,
+                token_type=geo.token_type if prior is not None else None,
             )
             print(f"    done in {time.time() - t0:.2f}s")
             print_write_result(wr)
+            _append_prior_debug_jsonl(
+                args.prior_debug_jsonl,
+                args=args,
+                chunk_idx=ci,
+                start=start,
+                end=end,
+                geo=geo,
+                prior=prior,
+                wr=wr,
+            )
 
             ttt_state = {"w0": wr.w0, "w1": wr.w1, "w2": wr.w2}
             if wr.history is not None:
@@ -1294,20 +1757,50 @@ def main() -> None:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-    all_geo_for_merge = align_chunk_geometry_outputs(all_geo, args.chunk_overlap)
+    if window_raw_predictions and args.chunk_size > 0:
+        # Use the same window-merging path as exact geometry evaluation.  The
+        # older ABC fallback aligned adjacent chunks only by overlap poses,
+        # which diverged from Pi3's reset-block-aware merge on long KITTI runs.
+        merged_raw = _merge_external_window_predictions(
+            backbone,
+            window_raw_predictions,
+            window_size=args.window_size,
+            overlap_size=args.overlap_size,
+            reset_every=args.reset_every,
+            se3=bool(args.se3),
+        )
+        T = images_loger.shape[0]
+        H = images_loger.shape[2]
+        W = images_loger.shape[3]
+        patch_h, patch_w = H // 14, W // 14
+        merged_geo = backbone._postprocess(
+            merged_raw,
+            images_loger.unsqueeze(0),
+            T,
+            H,
+            W,
+            patch_h,
+            patch_w,
+        )
+        merged_local_points = merged_geo.local_points
+        merged_world_points = merged_geo.world_points
+        merged_camera_poses = merged_geo.camera_poses
+        merged_confidence = merged_geo.confidence
+    else:
+        all_geo_for_merge = align_chunk_geometry_outputs(all_geo, args.chunk_overlap)
 
-    merged_local_points = merge_chunk_tensor_tail_trim(
-        [g.local_points for g in all_geo_for_merge], args.chunk_overlap,
-    )
-    merged_world_points = merge_chunk_tensor_tail_trim(
-        [g.world_points for g in all_geo_for_merge], args.chunk_overlap,
-    )
-    merged_camera_poses = merge_chunk_tensor_tail_trim(
-        [g.camera_poses for g in all_geo_for_merge], args.chunk_overlap,
-    )
-    merged_confidence = merge_chunk_tensor_tail_trim(
-        [g.confidence for g in all_geo_for_merge], args.chunk_overlap,
-    )
+        merged_local_points = merge_chunk_tensor_tail_trim(
+            [g.local_points for g in all_geo_for_merge], args.chunk_overlap,
+        )
+        merged_world_points = merge_chunk_tensor_tail_trim(
+            [g.world_points for g in all_geo_for_merge], args.chunk_overlap,
+        )
+        merged_camera_poses = merge_chunk_tensor_tail_trim(
+            [g.camera_poses for g in all_geo_for_merge], args.chunk_overlap,
+        )
+        merged_confidence = merge_chunk_tensor_tail_trim(
+            [g.confidence for g in all_geo_for_merge], args.chunk_overlap,
+        )
 
     if args.output_txt and merged_camera_poses is not None:
         timestamps = build_timestamps_for_output(image_paths, args.input)
@@ -1344,15 +1837,18 @@ def main() -> None:
             ds = dyn_scores.get(j, 0.0)
             print(f"  {j:3d}  {lbl:20s}  {stype:14s}  {ds:6.3f}")
 
-        create_video(
-            images_full[:chunks[0][1]],
-            mo, args.output_video,
-            fps=args.fps, alpha=args.mask_alpha,
-            prior=prior, per_masklet_dyn=dyn_scores,
-            save_frames_dir=args.save_frames,
-        )
+        if images_full is not None and (args.output_video or args.save_frames):
+            create_video(
+                images_full[:chunks[0][1]],
+                mo, args.output_video,
+                fps=args.fps, alpha=args.mask_alpha,
+                prior=prior, per_masklet_dyn=dyn_scores,
+                save_frames_dir=args.save_frames,
+            )
+        elif args.output_video or args.save_frames:
+            print("Visualisation skipped because full-res images were not loaded.")
 
-    if args.output_pt and args.geometry_eval_mode:
+    if args.output_pt and (args.geometry_eval_mode or args.stage_c_mode == "none"):
         os.makedirs(os.path.dirname(args.output_pt) or ".", exist_ok=True)
         save_dict: Dict[str, torch.Tensor] = {}
         if merged_local_points is not None:
@@ -1363,6 +1859,13 @@ def main() -> None:
             save_dict["camera_poses"] = merged_camera_poses
         if merged_confidence is not None:
             save_dict["conf"] = merged_confidence
+        if all_prior and all_prior[0] is not None:
+            save_dict["A_tok"] = all_prior[0].A_tok
+            save_dict["A_pix"] = all_prior[0].A_pix
+            save_dict["Elig_pix"] = all_prior[0].Elig_pix
+            save_dict["A_mask"] = all_prior[0].A_mask
+            save_dict["r_mask"] = all_prior[0].r_mask
+            save_dict["B_chunk_geo"] = torch.tensor(all_prior[0].B_chunk_geo)
         torch.save(save_dict, args.output_pt)
         print(f"Saved output to {args.output_pt}")
 

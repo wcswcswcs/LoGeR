@@ -66,6 +66,7 @@ class SemanticPriorGenerator:
         b_elig: float = 0.0,
         rho_sem: float = 0.6,
         a_min_special: float = 0.3,
+        a_token_floor: float = 0.0,
         value_structure: float = 1.0,
         value_background: float = 0.7,
         value_distractor: float = 0.4,
@@ -78,6 +79,7 @@ class SemanticPriorGenerator:
         self.b_elig = float(b_elig)
         self.rho_sem = float(rho_sem)
         self.a_min_special = float(a_min_special)
+        self.a_token_floor = float(a_token_floor)
 
         self.value_structure = float(value_structure)
         self.value_background = float(value_background)
@@ -143,6 +145,7 @@ class SemanticPriorGenerator:
                 "mean_elig": float(Elig_pix.mean().item()) if Elig_pix.numel() > 0 else 0.0,
                 "mean_a_pix": float(A_pix.mean().item()) if A_pix.numel() > 0 else 0.0,
                 "mean_r_mask": float(r_mask.mean().item()) if r_mask.numel() > 0 else 0.0,
+                "a_token_floor": self.a_token_floor,
             },
         )
 
@@ -337,6 +340,10 @@ class SemanticPriorGenerator:
                 if patch_idx < A_patch_flat.numel():
                     A_tok[i] = A_patch_flat[patch_idx]
                 patch_idx += 1
+
+        if self.a_token_floor > 0.0:
+            floor = float(max(0.0, min(1.0, self.a_token_floor)))
+            A_tok = A_tok.clamp_min(floor)
 
         return A_patch_flat, E_patch_flat, A_special, B_chunk_geo, A_tok
 

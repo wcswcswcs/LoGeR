@@ -1,5 +1,6 @@
 __pycache__/
 results*/
+wandb/
 convert_ckpt_to_params.py
 *.pt
 *.pth

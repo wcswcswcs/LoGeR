@@ -126,6 +126,7 @@ class DynamicCueExtractor:
         # sigma_pt = 0.25 puts the static P90 (≈0.08) at exp(-0.32)≈0.73,
         # while a walking person (r_pt≈0.3) drops to exp(-1.2)≈0.30.
         sigma_pt: float = 0.25,
+        proxy_mode: str = "same_pixel",
         # Occlusion depth threshold — fraction of scene scale.
         # tau_occ = 0.05 yields ~1.8% occlusion on small-motion indoor.
         tau_occ: float = 0.05,
@@ -137,6 +138,11 @@ class DynamicCueExtractor:
         attn_dyn_weight: float = 0.30,
         attn_gate_power: float = 1.0,
         attn_debias_kernel: int = 7,
+        dyn_fusion_mode: str = "max",
+        implicit_weight: float = 1.0,
+        implicit_gate_floor: float = 0.25,
+        implicit_calib_min_range: float = 1e-3,
+        nonocc_dynamic: bool = False,
         # C_unc parameters
         conf_floor: float = 0.1,
         unc_conf_weight: float = 0.3,
@@ -159,6 +165,10 @@ class DynamicCueExtractor:
         self.support_affinity_weight = support_affinity_weight
         self.support_static_weight = support_static_weight
         self.sigma_pt = sigma_pt
+        valid_proxy_modes = {"same_pixel", "reprojection"}
+        if proxy_mode not in valid_proxy_modes:
+            raise ValueError(f"Unsupported Stage-B proxy_mode: {proxy_mode}")
+        self.proxy_mode = proxy_mode
         self.tau_occ = tau_occ
 
         self.alpha_1 = alpha_1
@@ -168,6 +178,22 @@ class DynamicCueExtractor:
         self.attn_dyn_weight = attn_dyn_weight  # kept for CLI/API compatibility
         self.attn_gate_power = attn_gate_power
         self.attn_debias_kernel = max(int(attn_debias_kernel), 1)
+        valid_fusion = {
+            "explicit",
+            "implicit",
+            "max",
+            "soft_or",
+            "avg",
+            "addclip",
+            "calibrated_soft_or",
+        }
+        if dyn_fusion_mode not in valid_fusion:
+            raise ValueError(f"Unsupported dyn_fusion_mode: {dyn_fusion_mode}")
+        self.dyn_fusion_mode = dyn_fusion_mode
+        self.implicit_weight = float(implicit_weight)
+        self.implicit_gate_floor = float(implicit_gate_floor)
+        self.implicit_calib_min_range = float(implicit_calib_min_range)
+        self.nonocc_dynamic = bool(nonocc_dynamic)
 
         self.conf_floor = conf_floor
         self.unc_conf_weight = unc_conf_weight
@@ -256,11 +282,20 @@ class DynamicCueExtractor:
             ).clamp(0.0, 1.0)
             C_dyn_fusion_avg = (0.5 * (D_exp + attn_dyn_support)).clamp(0.0, 1.0)
             C_dyn_fusion_addclip = (D_exp + attn_dyn_support).clamp(0.0, 1.0)
-            C_dyn = C_dyn_fusion_max
+            C_dyn = self._select_dynamic_fusion(
+                D_exp=D_exp,
+                D_imp=attn_dyn_support,
+                C_stat=C_stat,
+                C_unc=C_unc,
+                fusion_max=C_dyn_fusion_max,
+                fusion_soft_or=C_dyn_fusion_soft_or,
+                fusion_avg=C_dyn_fusion_avg,
+                fusion_addclip=C_dyn_fusion_addclip,
+                debug_info=debug_info,
+            )
             debug_info["attention_dynamic_mean"] = attn_dynamic.mean().item()
             debug_info["attention_dynamic_used_mean"] = attn_dyn_evidence.mean().item()
             debug_info["attention_support_mean"] = attn_dyn_support.mean().item()
-            debug_info["attention_fusion_mode"] = "max_raw_average_no_scale"
         else:
             attn_dyn_support = torch.zeros_like(D_exp)
             C_dyn_fusion_max = D_exp
@@ -268,7 +303,9 @@ class DynamicCueExtractor:
             C_dyn_fusion_avg = D_exp
             C_dyn_fusion_addclip = D_exp
             C_dyn = D_exp
+            debug_info["attention_fusion_mode"] = "explicit_no_attention"
         debug_info["explicit_dynamic_mean"] = D_exp.mean().item()
+        debug_info["selected_dynamic_mean"] = C_dyn.mean().item()
 
         debug_info["attention_prior_used"] = bool(
             self.use_attention_prior
@@ -277,6 +314,15 @@ class DynamicCueExtractor:
         if frame_attention_prior is not None:
             debug_info["frame_attention_mean"] = frame_attention_prior.mean().item()
         debug_info["support_score_per_frame"] = support_score.sum(dim=1)
+
+        if self.nonocc_dynamic:
+            C_dyn_raw = C_dyn
+            C_dyn = (C_dyn * (1.0 - C_occ) * (1.0 - C_unc)).clamp(0.0, 1.0)
+            debug_info["nonocc_dynamic_enabled"] = True
+            debug_info["selected_dynamic_raw_mean"] = C_dyn_raw.mean().item()
+            debug_info["selected_dynamic_nonocc_mean"] = C_dyn.mean().item()
+        else:
+            debug_info["nonocc_dynamic_enabled"] = False
 
         # C_anchor = C_stat * (1 - C_dyn) * (1 - C_unc)
         C_anchor = C_stat * (1.0 - C_dyn) * (1.0 - C_unc)
@@ -318,6 +364,61 @@ class DynamicCueExtractor:
             patch_grid=geo.patch_grid,
             debug=debug_info,
         )
+
+    def _select_dynamic_fusion(
+        self,
+        *,
+        D_exp: torch.Tensor,
+        D_imp: torch.Tensor,
+        C_stat: torch.Tensor,
+        C_unc: torch.Tensor,
+        fusion_max: torch.Tensor,
+        fusion_soft_or: torch.Tensor,
+        fusion_avg: torch.Tensor,
+        fusion_addclip: torch.Tensor,
+        debug_info: Dict[str, Any],
+    ) -> torch.Tensor:
+        mode = self.dyn_fusion_mode
+        debug_info["attention_fusion_mode"] = mode
+        debug_info["implicit_weight"] = self.implicit_weight
+
+        if mode == "explicit":
+            return D_exp.clamp(0.0, 1.0)
+        if mode == "implicit":
+            return (self.implicit_weight * D_imp).clamp(0.0, 1.0)
+        if mode == "max":
+            return fusion_max
+        if mode == "soft_or":
+            return fusion_soft_or
+        if mode == "avg":
+            return fusion_avg
+        if mode == "addclip":
+            return fusion_addclip
+
+        # Calibrated weighted soft-or from the KITTI01 GSL-WC plan.
+        q50 = torch.quantile(D_imp.flatten().float(), 0.50)
+        q95 = torch.quantile(D_imp.flatten().float(), 0.95)
+        span = (q95 - q50).clamp_min(0.0)
+        if float(span.item()) < self.implicit_calib_min_range:
+            D_imp_cal = torch.zeros_like(D_imp)
+            effective_weight = 0.0
+        else:
+            D_imp_cal = ((D_imp - q50) / (span + 1e-6)).clamp(0.0, 1.0)
+            effective_weight = self.implicit_weight
+
+        C_anchor_exp = (C_stat * (1.0 - D_exp) * (1.0 - C_unc)).clamp(0.0, 1.0)
+        floor = float(self.implicit_gate_floor)
+        g_imp = (floor + (1.0 - floor) * (1.0 - C_anchor_exp)).clamp(floor, 1.0)
+        D_imp_weighted = (effective_weight * g_imp * D_imp_cal).clamp(0.0, 1.0)
+        C_dyn = (1.0 - (1.0 - D_exp) * (1.0 - D_imp_weighted)).clamp(0.0, 1.0)
+
+        debug_info["implicit_q50"] = float(q50.item())
+        debug_info["implicit_q95"] = float(q95.item())
+        debug_info["implicit_calib_span"] = float(span.item())
+        debug_info["implicit_effective_weight"] = float(effective_weight)
+        debug_info["implicit_calibrated_mean"] = float(D_imp_cal.mean().item())
+        debug_info["implicit_gate_mean"] = float(g_imp.mean().item())
+        return C_dyn
 
     # ---- support set -------------------------------------------------------
 
@@ -478,6 +579,9 @@ class DynamicCueExtractor:
 
         # Pre-compute world-point norms for the relative residual denominator
         norm_t = world_pts.norm(dim=-1)  # [T, H, W]
+        intrinsics = None
+        if self.proxy_mode == "reprojection":
+            intrinsics = self._estimate_pinhole_intrinsics(local_pts, conf)
 
         # -- Per-pair accumulators -----------------------------------------------
         # C_stat: pure geometric consistency (confidence goes to C_unc).
@@ -512,13 +616,33 @@ class DynamicCueExtractor:
             support_w_map = support_w[:, None, None].expand(T, H, W)
 
             # ---- gather support-frame data ---------------------------------
-            X_s = world_pts[s_idx]              # [T, H, W, 3]
-            conf_s = conf[s_idx]                # [T, H, W]
-            depth_s = local_pts[s_idx, ..., 2]  # [T, H, W]
+            R_s = T_cw[s_idx][:, :3, :3]     # [T, 3, 3]
+            t_s = T_cw[s_idx][:, :3, 3]      # [T, 3]
+            X_in_s = (
+                torch.einsum("tij, thwj -> thwi", R_s, world_pts)
+                + t_s[:, None, None, :]
+            )  # [T, H, W, 3]
+            z_proj = X_in_s[..., 2]           # projected depth in frame s
 
-            # ---- point residual (same-pixel world-space) -------------------
+            if self.proxy_mode == "reprojection":
+                assert intrinsics is not None
+                X_s, conf_s, depth_s, proj_valid = self._sample_support_reprojection(
+                    world_pts=world_pts,
+                    local_pts=local_pts,
+                    conf=conf,
+                    support_index=s_idx,
+                    X_in_support=X_in_s,
+                    intrinsics=intrinsics,
+                )
+            else:
+                X_s = world_pts[s_idx]              # [T, H, W, 3]
+                conf_s = conf[s_idx]                # [T, H, W]
+                depth_s = local_pts[s_idx, ..., 2]  # [T, H, W]
+                proj_valid = z_proj > 0
+
+            # ---- point residual --------------------------------------------
             diff = (world_pts - X_s).norm(dim=-1)  # [T, H, W]
-            r_pt = diff / (eps + norm_t)            # [T, H, W]
+            r_pt = diff / (eps + norm_t)           # [T, H, W]
 
             # Confidence-based pixel validity mask
             conf_ok = (conf > self.conf_floor) & (conf_s > self.conf_floor)
@@ -545,21 +669,13 @@ class DynamicCueExtractor:
             w = conf * conf_s  # [T, H, W]
 
             # ---- occlusion check (depth ordering) --------------------------
-            R_s = T_cw[s_idx][:, :3, :3]     # [T, 3, 3]
-            t_s = T_cw[s_idx][:, :3, 3]      # [T, 3]
-            X_in_s = (
-                torch.einsum("tij, thwj -> thwi", R_s, world_pts)
-                + t_s[:, None, None, :]
-            )  # [T, H, W, 3]
-            z_proj = X_in_s[..., 2]           # projected depth in frame s
-
             occ_flag = (z_proj - depth_s > self.tau_occ).float()
             occ_weighted_sum += occ_flag * w * support_w_map * vk
             weight_sum += w * support_w_map * vk
 
             # ---- validity (for C_unc) --------------------------------------
-            proj_valid = ((z_proj > 0) & conf_ok).float()
-            valid_weighted_sum += w * proj_valid * support_w_map * vk
+            pair_proj_valid = (proj_valid & conf_ok).float()
+            valid_weighted_sum += w * pair_proj_valid * support_w_map * vk
 
             # ---- debug accumulator -----------------------------------------
             r_pt_sum += r_pt * vk
@@ -612,9 +728,115 @@ class DynamicCueExtractor:
             "mean_point_residual_map": mean_rpt,
             "geometry_consistency_mean": C_stat_geom.mean().item(),
             "weighted_consistency_mean": weighted_consistency.mean().item(),
+            "stageb_proxy_mode": self.proxy_mode,
         }
 
         return C_stat, C_stat_geom, C_occ, C_unc, debug
+
+    def _estimate_pinhole_intrinsics(
+        self,
+        local_pts: torch.Tensor,
+        conf: torch.Tensor,
+    ) -> torch.Tensor:
+        """Fit per-frame pinhole parameters from the predicted pointmap."""
+        T, H, W, _ = local_pts.shape
+        yy, xx = torch.meshgrid(
+            torch.arange(H, dtype=torch.float32),
+            torch.arange(W, dtype=torch.float32),
+            indexing="ij",
+        )
+        intr = torch.zeros(T, 4, dtype=torch.float32)
+        default_fx = max(float(W - 1), 1.0)
+        default_fy = max(float(H - 1), 1.0)
+        default_cx = 0.5 * float(W - 1)
+        default_cy = 0.5 * float(H - 1)
+
+        for t in range(T):
+            z = local_pts[t, ..., 2]
+            valid = (z.abs() > 1e-6) & (conf[t] > self.conf_floor)
+            if int(valid.sum().item()) < 16:
+                intr[t] = torch.tensor([default_fx, default_fy, default_cx, default_cy])
+                continue
+            x_norm = (local_pts[t, ..., 0] / z).reshape(-1)
+            y_norm = (local_pts[t, ..., 1] / z).reshape(-1)
+            u = xx.reshape(-1)
+            v = yy.reshape(-1)
+            w = conf[t].reshape(-1).clamp_min(0.0)
+            m = valid.reshape(-1)
+            fx, cx = self._weighted_line_fit(x_norm[m], u[m], w[m], default_fx, default_cx)
+            fy, cy = self._weighted_line_fit(y_norm[m], v[m], w[m], default_fy, default_cy)
+            intr[t] = torch.tensor([fx, fy, cx, cy], dtype=torch.float32)
+        return intr
+
+    @staticmethod
+    def _weighted_line_fit(
+        x: torch.Tensor,
+        y: torch.Tensor,
+        weight: torch.Tensor,
+        default_slope: float,
+        default_intercept: float,
+    ) -> Tuple[float, float]:
+        w = weight.float().clamp_min(0.0)
+        w_sum = w.sum()
+        if float(w_sum.item()) <= 1e-6:
+            return float(default_slope), float(default_intercept)
+        mx = (w * x).sum() / w_sum
+        my = (w * y).sum() / w_sum
+        vx = (w * (x - mx).square()).sum() / w_sum
+        if float(vx.item()) <= 1e-8:
+            return float(default_slope), float(default_intercept)
+        cov = (w * (x - mx) * (y - my)).sum() / w_sum
+        slope = cov / vx
+        intercept = my - slope * mx
+        if not bool(torch.isfinite(slope)) or abs(float(slope.item())) <= 1e-6:
+            return float(default_slope), float(default_intercept)
+        if not bool(torch.isfinite(intercept)):
+            return float(default_slope), float(default_intercept)
+        return float(slope.item()), float(intercept.item())
+
+    def _sample_support_reprojection(
+        self,
+        *,
+        world_pts: torch.Tensor,
+        local_pts: torch.Tensor,
+        conf: torch.Tensor,
+        support_index: torch.Tensor,
+        X_in_support: torch.Tensor,
+        intrinsics: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Sample support-frame maps at projected coordinates."""
+        T, H, W, _ = world_pts.shape
+        fx = intrinsics[support_index, 0][:, None, None]
+        fy = intrinsics[support_index, 1][:, None, None]
+        cx = intrinsics[support_index, 2][:, None, None]
+        cy = intrinsics[support_index, 3][:, None, None]
+        z = X_in_support[..., 2].clamp_min(1e-6)
+        u = fx * (X_in_support[..., 0] / z) + cx
+        v = fy * (X_in_support[..., 1] / z) + cy
+        valid = (
+            (X_in_support[..., 2] > 1e-6)
+            & (u >= 0.0) & (u <= float(W - 1))
+            & (v >= 0.0) & (v <= float(H - 1))
+        )
+        u_norm = 2.0 * (u / max(float(W - 1), 1.0)) - 1.0
+        v_norm = 2.0 * (v / max(float(H - 1), 1.0)) - 1.0
+        grid = torch.stack([u_norm, v_norm], dim=-1)
+
+        support_world = world_pts[support_index].permute(0, 3, 1, 2)
+        support_conf = conf[support_index].unsqueeze(1)
+        support_depth = local_pts[support_index, ..., 2].unsqueeze(1)
+
+        sampled_world = F.grid_sample(
+            support_world, grid, mode="bilinear", padding_mode="zeros", align_corners=True,
+        ).permute(0, 2, 3, 1)
+        sampled_conf = F.grid_sample(
+            support_conf, grid, mode="bilinear", padding_mode="zeros", align_corners=True,
+        ).squeeze(1)
+        sampled_depth = F.grid_sample(
+            support_depth, grid, mode="bilinear", padding_mode="zeros", align_corners=True,
+        ).squeeze(1)
+
+        return sampled_world, sampled_conf, sampled_depth, valid
 
     # ---- trimmed mean ------------------------------------------------------
 

@@ -250,6 +250,24 @@ def print_cue_output(cue: CueOutput) -> None:
         ag = cue.debug.get("attention_support_mean")
         if ag is not None:
             print(f"    attention support   : {ag:.6f}")
+        fm = cue.debug.get("attention_fusion_mode")
+        if fm is not None:
+            print(f"    dynamic fusion mode : {fm}")
+        sdm = cue.debug.get("selected_dynamic_mean")
+        if sdm is not None:
+            print(f"    selected dynamic    : {sdm:.6f}")
+        iw = cue.debug.get("implicit_weight")
+        if iw is not None:
+            print(f"    implicit weight     : {iw:.4f}")
+        iqr = cue.debug.get("implicit_calib_span")
+        if iqr is not None:
+            print(f"    implicit q95-q50    : {iqr:.6f}")
+        icm = cue.debug.get("implicit_calibrated_mean")
+        if icm is not None:
+            print(f"    implicit calib mean : {icm:.6f}")
+        igm = cue.debug.get("implicit_gate_mean")
+        if igm is not None:
+            print(f"    implicit gate mean  : {igm:.6f}")
 
     print("=" * 72 + "\n")
 
