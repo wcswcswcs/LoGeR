@@ -1,0 +1,137 @@
+# Experiment Log
+
+## 2026-05-04 - KITTI 01 Phase F continuation check
+
+Context:
+
+- User request: previous experiment session was interrupted; continue using GPUs 0, 1, 2, 3 and conda env `loger`.
+- Check time: 2026-05-04, Asia/Singapore.
+- Result root: `results/kitti01_hmc_v2/phaseF_newcue_trainingfree/`.
+- GPU status after check: GPUs 0-3 were idle; no active `run_pipeline_abc_v2.py` or `kitti_benchmark` jobs were found.
+- Completion status: all 42 Phase F result directories under the root have `01.txt` and `kitti_benchmark.log`.
+
+Continuation runs from the interrupted session:
+
+| Run | ATE RMSE (m) | Rot RMSE (deg) | RPE t (%) | RPE r (deg/100m) | Status |
+|---|---:|---:|---:|---:|---|
+| `F3_08_keyavg_hybrid` | 39.8103 | 9.7032 | 92.3945 | 0.0096 | done 2026-04-30 21:28:25 |
+| `F7_02_olddyn_residual_b125` | 39.8884 | 9.8843 | 92.3957 | 0.0098 | done 2026-04-30 21:28:52 |
+| `F7_04_olddyn_alignment_b125` | 39.7311 | 9.6980 | 92.3930 | 0.0096 | done 2026-04-30 21:29:11 |
+| `F7_05_olddyn_resrel_sparse95_b125` | 39.7822 | 9.5632 | 92.3943 | 0.0094 | done 2026-04-30 21:29:12 |
+| `F7_06_addclip_resrel_b125` | 39.3149 | 9.7586 | 92.3914 | 0.0097 | done 2026-04-30 21:50:11 |
+| `F7_07_addclip_resrel_sparse95_b125` | 39.3864 | 9.7821 | 92.3940 | 0.0097 | done 2026-04-30 21:49:09 |
+
+Best / reference metrics:
+
+| Run | ATE RMSE (m) | Rot RMSE (deg) | RPE t (%) | RPE r (deg/100m) | Note |
+|---|---:|---:|---:|---:|---|
+| `F1_11_olddyn_addclip_b125` | 39.3103 | 9.7097 | 92.3912 | 0.0097 | best Phase F ATE so far |
+| `F7_06_addclip_resrel_b125` | 39.3149 | 9.7586 | 92.3914 | 0.0097 | best F7 continuation run; +0.0046 m vs F1_11 |
+| `F7_07_addclip_resrel_sparse95_b125` | 39.3864 | 9.7821 | 92.3940 | 0.0097 | sparse route loses ATE vs dense |
+| `F0E_E5_resrel_b125_repro` | 39.4881 | 9.7984 | 92.3950 | 0.0097 | Phase E numerical best reproduction |
+| `F0D_D5_07_repro_olddyn_b125` | 39.4903 | 9.8299 | 92.3937 | 0.0097 | Phase D D5-07 reproduction |
+
+Full Phase F controlled/full benchmark table:
+
+| Run | ATE RMSE (m) | Rot RMSE (deg) | RPE t (%) | RPE r (deg/100m) |
+|---|---:|---:|---:|---:|
+| `F0A_no_control_loger_full` | 41.7502 | 8.9928 | 92.3961 | 0.0084 |
+| `F0B_no_control_loger_star_full` | 47.9793 | 5.8502 | 90.7286 | 0.0075 |
+| `F0C_identity_hooks_loger_full` | 41.7502 | 8.9928 | 92.3961 | 0.0084 |
+| `F0D_D5_07_repro_olddyn_b125` | 39.4903 | 9.8299 | 92.3937 | 0.0097 |
+| `F0E_E5_resrel_b125_repro` | 39.4881 | 9.7984 | 92.3950 | 0.0097 |
+| `F1_01_explicit_b100` | 39.4191 | 9.5794 | 92.3956 | 0.0094 |
+| `F1_02_implicit_b100` | 39.8990 | 9.5933 | 92.3963 | 0.0095 |
+| `F1_03_olddyn_calib_b100` | 39.5127 | 9.7345 | 92.3937 | 0.0096 |
+| `F1_04_explicit_b125` | 39.4214 | 9.6600 | 92.3966 | 0.0096 |
+| `F1_05_implicit_b125` | 39.8656 | 9.6406 | 92.3962 | 0.0095 |
+| `F1_06_olddyn_calib_b125` | 39.4903 | 9.8299 | 92.3937 | 0.0097 |
+| `F1_07_olddyn_max_b125` | 39.5613 | 9.7416 | 92.3924 | 0.0096 |
+| `F1_08_olddyn_softor_b125` | 39.4147 | 9.8046 | 92.3907 | 0.0097 |
+| `F1_09_implicit_resrel_b125` | 39.9830 | 9.6336 | 92.3990 | 0.0095 |
+| `F1_10_olddyn_avg_b125` | 39.6868 | 9.7195 | 92.3939 | 0.0096 |
+| `F1_11_olddyn_addclip_b125` | 39.3103 | 9.7097 | 92.3912 | 0.0097 |
+| `F2_01_dyn4d_readonly` | 40.2555 | 9.5389 | 92.4008 | 0.0094 |
+| `F2_02_dyn4d_hybrid` | 39.9985 | 9.5368 | 92.3987 | 0.0094 |
+| `F2_03_qkvar_readonly` | 40.2060 | 9.5394 | 92.4011 | 0.0094 |
+| `F2_04_gram4d_readonly` | 41.1249 | 9.2537 | 92.3952 | 0.0087 |
+| `F2_05_gram4d_hybrid` | 40.8677 | 9.2598 | 92.3947 | 0.0087 |
+| `F2_06_qqkk_readonly` | 40.8638 | 9.4104 | 92.3970 | 0.0089 |
+| `F3_01_manualimplicit_readonly` | 40.1474 | 9.5945 | 92.3976 | 0.0095 |
+| `F3_02_manualimplicit_hybrid` | 39.8990 | 9.5933 | 92.3963 | 0.0095 |
+| `F3_03_keyavg_readonly` | 39.7820 | 9.7417 | 92.3953 | 0.0096 |
+| `F3_04_keyshallow_readonly` | 39.7820 | 9.7417 | 92.3953 | 0.0096 |
+| `F3_05_keydeep_readonly` | 39.7820 | 9.7417 | 92.3953 | 0.0096 |
+| `F3_06_entropy_key_readonly` | 41.0887 | 9.9225 | 92.3972 | 0.0097 |
+| `F3_07_shallowdeep_readonly` | 41.7316 | 8.9914 | 92.3960 | 0.0084 |
+| `F3_08_keyavg_hybrid` | 39.8103 | 9.7032 | 92.3945 | 0.0096 |
+| `F3_08_queryavg_readonly` | 41.7316 | 8.9914 | 92.3960 | 0.0084 |
+| `F3_09_queryshallow_readonly` | 41.7316 | 8.9914 | 92.3960 | 0.0084 |
+| `F3_10_querydeep_readonly` | 41.7316 | 8.9914 | 92.3960 | 0.0084 |
+| `F7_02_olddyn_residual_b125` | 39.8884 | 9.8843 | 92.3957 | 0.0098 |
+| `F7_04_olddyn_alignment_b125` | 39.7311 | 9.6980 | 92.3930 | 0.0096 |
+| `F7_05_olddyn_resrel_sparse95_b125` | 39.7822 | 9.5632 | 92.3943 | 0.0094 |
+| `F7_06_addclip_resrel_b125` | 39.3149 | 9.7586 | 92.3914 | 0.0097 |
+| `F7_07_addclip_resrel_sparse95_b125` | 39.3864 | 9.7821 | 92.3940 | 0.0097 |
+
+Gate / stop notes:
+
+- F3 key-cosine read-only reached 39.7820 m but did not improve with safe write; `F3_08_keyavg_hybrid` worsened to 39.8103 m.
+- F7 update-needed write does not clear the 39.0 m Phase F progress gate. The best F7 run, `F7_06_addclip_resrel_b125`, is effectively tied with the best prior Phase F run and does not produce a new candidate.
+- Sparse exact-preserve improves/keeps some rotation-side behavior but loses ATE versus dense addclip residual reliability.
+- F4 true-flow remains blocked: this repo still has only patch-match / Stage-B proxy flow, not a real RAFT/GMFlow residual. The Phase F plan explicitly disallows proxy flow as a substitute for true-flow full candidates.
+- No additional runnable gap was found after the interruption. Further GPU work would be a new sweep, not resuming an incomplete Phase F run.
+
+## 2026-05-04 - Attention Cue Library v1 first sweep
+
+Context:
+
+- User request: continue cue search from `docs/LoGeR_Internal_Attention_Cue_Library_Experiment_Plan_v1.md`.
+- GPUs used: 0-7.
+- Result root: `results/kitti01_hmc_v2/attention_cue_library_v1/`.
+- Runner update: exposed the first internal-attention cue batch directly through `--read_cue_source` in `run_pipeline_abc_v2.py` / `HybridMemoryController`.
+- Correctness gates: `ACL_P0_00_native_loger_full` and `ACL_P0_01_identity_hooks_loger_full` both reproduced `41.7502 / 8.9928`; `ACL_P0_02_f1_11_repro_olddyn_addclip_b125` reproduced `39.3103 / 9.7097`.
+
+Key finding:
+
+- New cue family found: `gg.qq.middle.low.robustq`.
+- Read-only result `ACL_P4_09_gg_qq_middle_low_b100`: `39.6811 / 9.2540`, passing the read-only gate versus CM02/key-cosine `39.7820`.
+- Hybrid-safe result with `probe_ttt_write + stage_d` improves monotonically through beta 2.50 in this sweep.
+- Best current Pipeline v2 result is now `ACL_P6_09_gg_qq_middle_low_hybrid_b250`: ATE `38.9714`, Rot `9.2084`, RPE t `92.3986`, RPE r `0.0091`.
+- This improves over previous Phase F best `F1_11_olddyn_addclip_b125` by `0.3389 m` ATE and improves rotation by `0.5013 deg`.
+
+Attention Cue Library v1 benchmark table:
+
+| Run | ATE RMSE (m) | Rot RMSE (deg) | RPE t (%) | RPE r (deg/100m) | Note |
+|---|---:|---:|---:|---:|---|
+| `ACL_P6_09_gg_qq_middle_low_hybrid_b250` | 38.9714 | 9.2084 | 92.3986 | 0.0091 | new best; clears `<39.0` |
+| `ACL_P6_08_gg_qq_middle_low_hybrid_b225` | 39.0044 | 9.2136 | 92.3983 | 0.0091 | just above 39.0 |
+| `ACL_P6_07_gg_qq_middle_low_hybrid_b200` | 39.0934 | 9.2236 | 92.3987 | 0.0091 | strong |
+| `ACL_P6_06_gg_qq_middle_low_hybrid_b175` | 39.1029 | 9.2222 | 92.3975 | 0.0091 | strong |
+| `ACL_P6_04_gg_qq_middle_low_hybrid_b150` | 39.1781 | 9.2155 | 92.3980 | 0.0091 | strong |
+| `ACL_P6_02_gg_qq_middle_low_hybrid_b125` | 39.2923 | 9.2201 | 92.3977 | 0.0091 | beats old Phase F best |
+| `ACL_P0_02_f1_11_repro_olddyn_addclip_b125` | 39.3103 | 9.7097 | 92.3912 | 0.0097 | previous best reproduced |
+| `ACL_P6_03_mix_old_route_gg_smd_hybrid_b100` | 39.4130 | 9.6559 | 92.3942 | 0.0096 | no hybrid gain over `gg.qq` |
+| `ACL_P6_01_gg_qq_middle_low_hybrid_b100` | 39.4182 | 9.2272 | 92.3972 | 0.0090 | useful |
+| `ACL_P6_05_gg_qq_middle_low_hybrid_b075` | 39.5562 | 9.2131 | 92.3967 | 0.0090 | lower beta loses ATE |
+| `ACL_P5_04_mix_old_route_gg_smd_b100` | 39.6804 | 9.6607 | 92.3947 | 0.0096 | read-only gate pass, but rotation worse |
+| `ACL_P4_09_gg_qq_middle_low_b100` | 39.6811 | 9.2540 | 92.3980 | 0.0090 | read-only gate pass |
+| `ACL_P5_03_mix_old_veto_gg_deep_static_l05_b100` | 39.8854 | 9.6151 | 92.3985 | 0.0095 | no promote |
+| `ACL_P5_01_mix_exp_add_fa_decay_l05_b100` | 40.0357 | 9.6863 | 92.3996 | 0.0095 | no promote |
+| `ACL_P5_02_mix_old_agree_fa_decay_l05_b100` | 40.0681 | 9.5101 | 92.4004 | 0.0094 | no promote |
+| `ACL_P4_06_fa_key_middle_high_b100` | 40.3812 | 9.3763 | 92.3947 | 0.0091 | best pure frame-attention cue |
+| `ACL_P4_03_fa_key_decay_b100` | 40.5603 | 9.2535 | 92.4002 | 0.0088 | frame cue signal, not enough |
+| `ACL_P4_02_fa_key_l4_high_b100` | 40.5861 | 9.3603 | 92.4014 | 0.0089 | not enough |
+| `ACL_P4_01_fa_key_l0_high_b100` | 40.6343 | 9.3177 | 92.4045 | 0.0091 | not enough |
+| `ACL_P4_05_gg_qk_middle_b100` | 40.7386 | 9.2043 | 92.3976 | 0.0089 | rotation useful, ATE weak |
+| `ACL_P4_11_gg_smd_a0b1g1_b100` | 40.7450 | 9.1944 | 92.3962 | 0.0087 | rotation useful, ATE weak |
+| `ACL_P4_07_fa_key_deep_low_b100` | 40.8123 | 9.2677 | 92.4001 | 0.0088 | not enough |
+| `ACL_P4_08_gg_smd_a1b1g1_b100` | 40.9064 | 9.0697 | 92.3952 | 0.0085 | best rotation diagnostic |
+| `ACL_P4_04_fa_key_layerVar_b100` | 41.3239 | 9.4160 | 92.4027 | 0.0088 | reject |
+| `ACL_P4_10_gg_kk_middle_low_b100` | 41.3694 | 9.4865 | 92.3928 | 0.0089 | reject |
+
+Interpretation:
+
+- The useful new signal is not generic global attention. `gg.qk`, `gg.kk`, and SMD products mostly improve rotation or fail ATE.
+- The winning signal is specifically low middle-layer global query-query similarity (`gg.qq.middle.low.robustq`): it appears to flag update/read regions that old dynamic cues miss while keeping rotation far healthier than old_dyn_addclip.
+- High beta is beneficial for this cue under `probe_ttt_write`; b0.75 is too weak, and the best tested point is b2.50. Do not assume b2.50 is the final optimum; next sweep should test b2.75/b3.00 and trajectory diagnostics before declaring a stable optimum.

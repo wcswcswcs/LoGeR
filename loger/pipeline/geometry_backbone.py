@@ -86,6 +86,9 @@ class GeometryOutput:
     frame_attn_cosine_key_layers: Optional[torch.Tensor] = None
     frame_attn_cosine_layer_ids: Optional[torch.Tensor] = None
 
+    # Hybrid Memory Controller v2 trace metadata collected at real hook sites.
+    hmc_trace: Optional[Dict[str, Any]] = None
+
     # Number of frames in this chunk
     num_frames: int = 0
 
@@ -117,6 +120,7 @@ class TTTLayerCache:
     muon_update_steps: int
     ttt_update_steps: int
     ttt_op_order: list
+    apply_output_raw: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -553,6 +557,8 @@ class LoGeRGeometryBackbone:
                     muon_update_steps=wc["muon_update_steps"],
                     ttt_update_steps=wc["ttt_update_steps"],
                     ttt_op_order=wc["ttt_op_order"],
+                    apply_output_raw=wc.get("apply_output_raw", None).cpu()
+                    if wc.get("apply_output_raw", None) is not None else None,
                 ))
 
             for li in range(n_layers):
@@ -576,10 +582,15 @@ class LoGeRGeometryBackbone:
                     if entry is None:
                         history_prov.append(None)
                     else:
-                        history_prov.append({
+                        copied = {
                             "k": entry["k"].detach().cpu(),
                             "v": entry["v"].detach().cpu(),
-                        })
+                        }
+                        if "k_post" in entry and entry["k_post"] is not None:
+                            copied["k_post"] = entry["k_post"].detach().cpu()
+                        if "v_post" in entry and entry["v_post"] is not None:
+                            copied["v_post"] = entry["v_post"].detach().cpu()
+                        history_prov.append(copied)
 
         return WriteCacheOutput(
             layer_caches=layer_caches,
@@ -651,6 +662,7 @@ class LoGeRGeometryBackbone:
         frame_attn_cosine_layer_ids = raw.get("frame_attn_cosine_layer_ids")
         if frame_attn_cosine_layer_ids is not None:
             frame_attn_cosine_layer_ids = frame_attn_cosine_layer_ids.squeeze(0).detach().cpu().long()
+        hmc_trace = raw.get("hmc_trace")
 
         if conf_out is not None and conf_out.dim() == 4:
             conf_out = conf_out.squeeze(-1)        # [T, H_p, W_p]
@@ -719,6 +731,7 @@ class LoGeRGeometryBackbone:
             frame_attn_cosine_query_layers=frame_attn_cosine_query_layers,
             frame_attn_cosine_key_layers=frame_attn_cosine_key_layers,
             frame_attn_cosine_layer_ids=frame_attn_cosine_layer_ids,
+            hmc_trace=hmc_trace,
             patch_meta=patch_meta,
             token_type=token_type,
             num_frames=T,

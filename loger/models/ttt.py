@@ -440,6 +440,7 @@ class FastWeightGluMLPMultihead(nn.Module):
             ttt_update_steps=self.ttt_update_steps,
         )
 
+        apply_output_raw = output.detach().clone() if cache_primitives else None
         output = self.o_norm(output)
 
         output = rearrange(
@@ -468,6 +469,7 @@ class FastWeightGluMLPMultihead(nn.Module):
                 "momentum": momentum.detach() if momentum is not None else None,
                 "muon_update_steps": self.muon_update_steps,
                 "ttt_update_steps": self.ttt_update_steps,
+                "apply_output_raw": apply_output_raw,
             })
 
         return output, state

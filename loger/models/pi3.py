@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from functools import partial
 from copy import deepcopy
-from typing import Optional, Union, List, Tuple
+from typing import Any, Dict, Optional, Union, List, Tuple
 
 from .dinov2.layers import Mlp
 from ..utils.geometry import homogenize_points, robust_scale_estimation
@@ -823,12 +823,592 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             ),
         }
 
+    @staticmethod
+    def _new_hmc_trace(hmc_control: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+        if not hmc_control:
+            return None
+        return {
+            "identity_hooks": bool(hmc_control.get("identity_hooks", False)),
+            "collect_trace": bool(hmc_control.get("collect_trace", True)),
+            "frame_attention": [],
+            "swa_read": [],
+            "ttt_apply": [],
+            "chunk_attention": [],
+        }
+
+    @staticmethod
+    def _hmc_hook_requested(hmc_control: Optional[Dict[str, Any]], key: str) -> bool:
+        if not hmc_control:
+            return False
+        return bool(
+            hmc_control.get("identity_hooks", False)
+            or hmc_control.get("collect_trace", False)
+            or hmc_control.get(key, False)
+        )
+
+    @staticmethod
+    def _append_hmc_trace(trace: Optional[Dict[str, Any]], key: str, record: Dict[str, Any]) -> None:
+        if trace is None:
+            return
+        if key not in trace:
+            trace[key] = []
+        trace[key].append(record)
+
+    @staticmethod
+    def _hmc_read_layer_enabled(
+        hmc_control: Optional[Dict[str, Any]],
+        *,
+        layer: int,
+        total_layers: int,
+    ) -> bool:
+        if not hmc_control or hmc_control.get("identity_hooks", False):
+            return False
+        mode = str(hmc_control.get("read_layer_mode", "all"))
+        if mode == "all":
+            return True
+        if mode == "single":
+            return int(layer) == int(hmc_control.get("read_single_layer", -1))
+        if mode == "early_quarter":
+            return int(layer) < max(1, int(total_layers) // 4)
+        if mode == "early_half":
+            return int(layer) < max(1, int(total_layers) // 2)
+        span = max(1, int(total_layers) // 3)
+        if mode == "early":
+            return int(layer) < span
+        if mode == "late":
+            return int(layer) >= int(total_layers) - span
+        if mode == "middle":
+            return span <= int(layer) < int(total_layers) - span
+        return True
+
+    def _make_frame_attention_bias(
+        self,
+        hmc_control: Optional[Dict[str, Any]],
+        *,
+        batch_size: int,
+        frame_num: int,
+        tokens_per_frame: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        """Build a real frame-attention bias tensor when non-identity control is requested.
+
+        Identity hooks return ``None`` so the exact native kernel path is kept,
+        while the hook call itself is still recorded at the real model site.
+        """
+        if not hmc_control or hmc_control.get("identity_hooks", False):
+            return None
+        if not hmc_control.get("enable_frame_read_control", False):
+            return None
+        beta = float(hmc_control.get("beta_frame", 0.0))
+        if beta == 0.0:
+            return None
+        D_tok = hmc_control.get("D_tok")
+        if D_tok is None:
+            return None
+        D = D_tok.to(device=device, dtype=torch.float32).reshape(batch_size, frame_num, tokens_per_frame)
+        P_ref = hmc_control.get("P_ref")
+        if P_ref is not None:
+            ref = P_ref.to(device=device, dtype=torch.float32).reshape(batch_size, frame_num, tokens_per_frame)
+            D = D * (1.0 - ref.clamp(0.0, 1.0))
+        D = D.reshape(batch_size * frame_num, tokens_per_frame)
+        Dq = D[:, :, None]
+        Dk = D[:, None, :]
+        mode = str(hmc_control.get("frame_bias_mode", "pair"))
+        if mode == "key":
+            keep = (1.0 - Dk).expand(-1, D.shape[1], -1)
+        elif mode == "query":
+            # A uniform per-query attention-logit shift cancels under softmax;
+            # query weakening is handled as an output gate below instead.
+            return None
+        else:
+            keep = 1.0 - (1.0 - Dq) * Dk
+        keep = keep.clamp_min(1e-4)
+        return (beta * torch.log(keep)).to(dtype=dtype).unsqueeze(1)
+
+    def _make_frame_attention_query_gate(
+        self,
+        hmc_control: Optional[Dict[str, Any]],
+        *,
+        batch_size: int,
+        frame_num: int,
+        tokens_per_frame: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if not hmc_control or hmc_control.get("identity_hooks", False):
+            return None
+        if str(hmc_control.get("frame_bias_mode", "pair")) != "query":
+            return None
+        if not hmc_control.get("enable_frame_read_control", False):
+            return None
+        beta = float(hmc_control.get("beta_frame", 0.0))
+        if beta == 0.0:
+            return None
+        D_tok = hmc_control.get("D_tok")
+        if D_tok is None:
+            return None
+        D = D_tok.to(device=device, dtype=torch.float32).reshape(batch_size, frame_num, tokens_per_frame)
+        P_ref = hmc_control.get("P_ref")
+        if P_ref is not None:
+            ref = P_ref.to(device=device, dtype=torch.float32).reshape(batch_size, frame_num, tokens_per_frame)
+            D = D * (1.0 - ref.clamp(0.0, 1.0))
+        gate = (1.0 - beta * D).clamp(0.0, 1.0)
+        return gate.reshape(batch_size * frame_num, tokens_per_frame, 1).to(dtype=dtype)
+
+    def _make_ttt_apply_gate(
+        self,
+        hmc_control: Optional[Dict[str, Any]],
+        *,
+        batch_size: int,
+        frame_num: int,
+        tokens_per_frame: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if not hmc_control or hmc_control.get("identity_hooks", False):
+            return None
+        if not hmc_control.get("enable_ttt_apply_control", False):
+            return None
+        rho = float(hmc_control.get("rho_ttt_apply", 0.0))
+        if rho == 0.0:
+            return None
+        D_tok = hmc_control.get("D_tok")
+        P_ref = hmc_control.get("P_ref")
+        if D_tok is None:
+            return None
+        D = D_tok.to(device=device, dtype=torch.float32).reshape(batch_size, frame_num, tokens_per_frame)
+        min_gate = float(hmc_control.get("ttt_apply_min_gate", 0.0))
+        gate = (1.0 - rho * D).clamp(min_gate, 1.0)
+        if P_ref is not None:
+            ref = P_ref.to(device=device, dtype=torch.float32).reshape(batch_size, frame_num, tokens_per_frame)
+            gate = torch.where(ref > 0.5, torch.ones_like(gate), gate)
+        return gate.unsqueeze(-1).to(dtype=dtype)
+
+    def _make_swa_prev_source_gate(
+        self,
+        hmc_control: Optional[Dict[str, Any]],
+        *,
+        history_tokens: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if not hmc_control or hmc_control.get("identity_hooks", False):
+            return None
+        if not hmc_control.get("enable_swa_read_control", False):
+            return None
+        rho = float(hmc_control.get("beta_swa", 0.0))
+        if rho == 0.0 or history_tokens <= 0:
+            return None
+        D_prev = hmc_control.get("D_prev_patch")
+        if D_prev is None:
+            return None
+        D = D_prev.to(device=device, dtype=torch.float32).reshape(-1)
+        if D.numel() < history_tokens:
+            # SWA history can span more than the immediately previous chunk.
+            # Gate only the most recent previous source tokens and leave older
+            # cached sources unchanged.
+            prefix = torch.zeros(history_tokens - D.numel(), device=device, dtype=torch.float32)
+            D = torch.cat([prefix, D], dim=0)
+        elif D.numel() != history_tokens:
+            # Keep the most recent source tokens if the persisted summary spans
+            # more frames than the active SWA cache.
+            D = D[-history_tokens:]
+        min_gate = float(hmc_control.get("swa_gate_min", 0.85))
+        gate = (1.0 - rho * D).clamp(min_gate, 1.0)
+        return gate.reshape(1, 1, history_tokens, 1).to(dtype=dtype)
+
+    @staticmethod
+    def _swa_overlap_layer_enabled(
+        hmc_control: Optional[Dict[str, Any]],
+        *,
+        layer_idx: int,
+        n_layers: int,
+    ) -> bool:
+        if not hmc_control or hmc_control.get("identity_hooks", False):
+            return False
+        if not hmc_control.get("enable_swa_overlap_bias", False):
+            return False
+        mode = str(hmc_control.get("swa_overlap_bias_layer_mode", "last"))
+        if mode == "all":
+            return True
+        if mode == "first":
+            return int(layer_idx) == 0
+        if mode == "last":
+            return int(layer_idx) == max(0, int(n_layers) - 1)
+        if mode == "single":
+            return int(layer_idx) == int(hmc_control.get("swa_overlap_bias_single_layer", -1))
+        return False
+
+    def _make_swa_overlap_attention_bias(
+        self,
+        hmc_control: Optional[Dict[str, Any]],
+        *,
+        batch_size: int,
+        frame_num: int,
+        tokens_per_frame: int,
+        history_tokens: int,
+        current_tokens: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
+        stats: Dict[str, Any] = {
+            "swa_overlap_bias_applied": False,
+            "swa_overlap_bias_query_tokens": 0,
+            "swa_overlap_bias_source_tokens": 0,
+        }
+        if not hmc_control or hmc_control.get("identity_hooks", False):
+            return None, stats
+        beta = float(hmc_control.get("swa_overlap_bias_beta", 0.0))
+        if beta == 0.0 or history_tokens <= 0 or current_tokens <= 0:
+            return None, stats
+        D_tok = hmc_control.get("D_tok")
+        D_prev = hmc_control.get("D_prev_patch")
+        if D_tok is None or D_prev is None:
+            return None, stats
+        if frame_num <= 0 or tokens_per_frame <= 0:
+            return None, stats
+        if current_tokens != frame_num * tokens_per_frame:
+            return None, stats
+
+        overlap_frames = max(int(hmc_control.get("swa_overlap_frames", 0)), 0)
+        if overlap_frames <= 0:
+            return None, stats
+
+        D_cur = D_tok.to(device=device, dtype=torch.float32).reshape(batch_size, frame_num, tokens_per_frame)
+        prev_flat = D_prev.to(device=device, dtype=torch.float32).reshape(-1)
+        if prev_flat.numel() < tokens_per_frame:
+            return None, stats
+        prev_frames = int(prev_flat.numel() // tokens_per_frame)
+        hist_frames = int(history_tokens // tokens_per_frame)
+        if prev_frames <= 0 or hist_frames <= 0:
+            return None, stats
+        usable_frames = min(prev_frames, hist_frames)
+        prev_flat = prev_flat[-usable_frames * tokens_per_frame:]
+        D_src_frames = prev_flat.reshape(1, usable_frames, tokens_per_frame).expand(batch_size, -1, -1)
+
+        ov = min(overlap_frames, frame_num, usable_frames)
+        if ov <= 0:
+            return None, stats
+        qn = ov * tokens_per_frame
+        sn = ov * tokens_per_frame
+        source_end = history_tokens
+        source_start = max(0, source_end - sn)
+        sn = source_end - source_start
+        if sn <= 0:
+            return None, stats
+
+        Dq = D_cur[:, :ov, :].reshape(batch_size, qn)
+        Ds = D_src_frames[:, -ov:, :].reshape(batch_size, ov * tokens_per_frame)
+        if Ds.shape[1] != sn:
+            Ds = Ds[:, -sn:]
+        if Dq.shape[1] != qn:
+            Dq = Dq[:, :qn]
+
+        mode = str(hmc_control.get("swa_overlap_bias_mode", "pair"))
+        Dq_c = Dq.clamp(0.0, 1.0)
+        Ds_c = Ds.clamp(0.0, 1.0)
+        if mode == "source":
+            keep = (1.0 - Ds_c).unsqueeze(1).expand(batch_size, qn, sn)
+        elif mode == "union":
+            keep = 1.0 - torch.maximum(Dq_c.unsqueeze(-1), Ds_c.unsqueeze(1))
+        elif mode == "intersection":
+            keep = 1.0 - torch.minimum(Dq_c.unsqueeze(-1), Ds_c.unsqueeze(1))
+        else:
+            keep = 1.0 - (1.0 - Dq_c).unsqueeze(-1) * Ds_c.unsqueeze(1)
+        min_keep = min(max(float(hmc_control.get("swa_overlap_bias_min_keep", 1e-4)), 1e-6), 1.0)
+        keep = keep.clamp_min(min_keep)
+
+        # Do not materialize a full [current_tokens, history+current] bias matrix.
+        # KITTI full chunks have ~40k current tokens; the dense mask would add
+        # multi-GB allocations.  The attention layer understands this compact
+        # descriptor and recomputes only the overlap query rows in small blocks.
+        bias_values = beta * torch.log(keep)
+        query_block = max(1, int(hmc_control.get("swa_overlap_bias_query_block", 128)))
+        compact_bias = {
+            "type": "overlap_bias",
+            "query_tokens": int(qn),
+            "source_start": int(source_start),
+            "source_end": int(source_end),
+            "bias_values": bias_values.to(dtype=dtype),
+            "query_block_size": int(query_block),
+        }
+        stats.update({
+            "swa_overlap_bias_applied": True,
+            "swa_overlap_bias_mode": mode,
+            "swa_overlap_bias_beta": beta,
+            "swa_overlap_bias_query_tokens": int(qn),
+            "swa_overlap_bias_source_tokens": int(sn),
+            "swa_overlap_bias_mean_keep": float(keep.mean().detach().cpu().item()),
+            "swa_overlap_bias_min_keep_observed": float(keep.min().detach().cpu().item()),
+            "swa_overlap_bias_query_block": int(query_block),
+            "swa_overlap_bias_mean_abs": float(bias_values.abs().mean().detach().cpu().item()),
+            "swa_overlap_bias_max_abs": float(bias_values.abs().max().detach().cpu().item()),
+            "swa_overlap_bias_compact": True,
+        })
+        return compact_bias, stats
+
+    @staticmethod
+    def _swa_overlap_source_layer_enabled(
+        hmc_control: Optional[Dict[str, Any]],
+        *,
+        layer_idx: int,
+        n_layers: int,
+    ) -> bool:
+        if not hmc_control or hmc_control.get("identity_hooks", False):
+            return False
+        if not hmc_control.get("enable_swa_overlap_source_gate", False):
+            return False
+        mode = str(hmc_control.get("swa_overlap_source_gate_layer_mode", "last"))
+        if mode == "all":
+            return True
+        if mode == "first":
+            return int(layer_idx) == 0
+        if mode == "last":
+            return int(layer_idx) == max(0, int(n_layers) - 1)
+        if mode == "single":
+            return int(layer_idx) == int(hmc_control.get("swa_overlap_source_gate_single_layer", -1))
+        return False
+
+    @staticmethod
+    def _swa_overlap_source_replace_layer_enabled(
+        hmc_control: Optional[Dict[str, Any]],
+        *,
+        layer_idx: int,
+        n_layers: int,
+    ) -> bool:
+        if not hmc_control or hmc_control.get("identity_hooks", False):
+            return False
+        if not hmc_control.get("enable_swa_overlap_source_replace", False):
+            return False
+        mode = str(hmc_control.get("swa_overlap_source_replace_layer_mode", "last"))
+        if mode == "all":
+            return True
+        if mode == "first":
+            return int(layer_idx) == 0
+        if mode == "last":
+            return int(layer_idx) == max(0, int(n_layers) - 1)
+        if mode == "single":
+            return int(layer_idx) == int(hmc_control.get("swa_overlap_source_replace_single_layer", -1))
+        return False
+
+    def _make_swa_overlap_source_gate(
+        self,
+        hmc_control: Optional[Dict[str, Any]],
+        *,
+        batch_size: int,
+        frame_num: int,
+        tokens_per_frame: int,
+        history_tokens: int,
+        current_tokens: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
+        stats: Dict[str, Any] = {
+            "swa_overlap_source_gate_applied": False,
+            "swa_overlap_source_gate_tokens": 0,
+        }
+        if not hmc_control or hmc_control.get("identity_hooks", False):
+            return None, stats
+        rho = float(hmc_control.get("swa_overlap_source_gate_rho", 0.0))
+        if rho == 0.0 or history_tokens <= 0 or current_tokens <= 0:
+            return None, stats
+        D_tok = hmc_control.get("D_tok")
+        D_prev = hmc_control.get("D_prev_patch")
+        if D_tok is None or D_prev is None:
+            return None, stats
+        if frame_num <= 0 or tokens_per_frame <= 0:
+            return None, stats
+        if current_tokens != frame_num * tokens_per_frame:
+            return None, stats
+
+        overlap_frames = max(int(hmc_control.get("swa_overlap_frames", 0)), 0)
+        if overlap_frames <= 0:
+            return None, stats
+
+        D_cur = D_tok.to(device=device, dtype=torch.float32).reshape(batch_size, frame_num, tokens_per_frame)
+        prev_flat = D_prev.to(device=device, dtype=torch.float32).reshape(-1)
+        if prev_flat.numel() < tokens_per_frame:
+            return None, stats
+        prev_frames = int(prev_flat.numel() // tokens_per_frame)
+        hist_frames = int(history_tokens // tokens_per_frame)
+        usable_frames = min(prev_frames, hist_frames)
+        if usable_frames <= 0:
+            return None, stats
+        ov = min(overlap_frames, frame_num, usable_frames)
+        if ov <= 0:
+            return None, stats
+
+        source_tokens = ov * tokens_per_frame
+        source_end = history_tokens
+        source_start = max(0, source_end - source_tokens)
+        source_tokens = source_end - source_start
+        if source_tokens <= 0:
+            return None, stats
+
+        prev_flat = prev_flat[-usable_frames * tokens_per_frame:]
+        D_src_frames = prev_flat.reshape(1, usable_frames, tokens_per_frame).expand(batch_size, -1, -1)
+        Ds = D_src_frames[:, -ov:, :].reshape(batch_size, ov * tokens_per_frame)
+        Dq = D_cur[:, :ov, :].reshape(batch_size, ov * tokens_per_frame)
+        if Ds.shape[1] != source_tokens:
+            Ds = Ds[:, -source_tokens:]
+        if Dq.shape[1] != source_tokens:
+            Dq = Dq[:, :source_tokens]
+
+        mode = str(hmc_control.get("swa_overlap_source_gate_mode", "source"))
+        Dq = Dq.clamp(0.0, 1.0)
+        Ds = Ds.clamp(0.0, 1.0)
+        if mode in {"source", "prev", "previous"}:
+            score = Ds
+        elif mode in {"current", "query"}:
+            score = Dq
+        elif mode == "union":
+            score = torch.maximum(Dq, Ds)
+        elif mode in {"intersection", "inter"}:
+            score = torch.minimum(Dq, Ds)
+        elif mode in {"disagreement", "mismatch"}:
+            score = (Dq - Ds).abs()
+        elif mode in {"agree_dyn", "product"}:
+            score = Dq * Ds
+        else:
+            raise ValueError(f"Unsupported SWA overlap source gate mode: {mode}")
+
+        min_gate = min(max(float(hmc_control.get("swa_overlap_source_gate_min", 0.85)), 0.0), 1.0)
+        gate_slice = (1.0 - rho * score).clamp(min_gate, 1.0).to(dtype=dtype)
+        gate = torch.ones(batch_size, 1, history_tokens, 1, device=device, dtype=dtype)
+        gate[:, :, source_start:source_end, :] = gate_slice.reshape(batch_size, 1, source_tokens, 1)
+        gate_delta = (1.0 - gate_slice.detach().float()).abs()
+        stats.update({
+            "swa_overlap_source_gate_applied": True,
+            "swa_overlap_source_gate_mode": mode,
+            "swa_overlap_source_gate_rho": rho,
+            "swa_overlap_source_gate_min": min_gate,
+            "swa_overlap_source_gate_tokens": int(source_tokens),
+            "swa_overlap_source_gate_source_start": int(source_start),
+            "swa_overlap_source_gate_source_end": int(source_end),
+            "swa_overlap_source_gate_mean": float(gate_slice.detach().float().mean().item()),
+            "swa_overlap_source_gate_p10": float(torch.quantile(gate_slice.detach().float(), 0.10).item()),
+            "swa_overlap_source_gate_p50": float(torch.quantile(gate_slice.detach().float(), 0.50).item()),
+            "swa_overlap_source_gate_p90": float(torch.quantile(gate_slice.detach().float(), 0.90).item()),
+            "swa_overlap_source_gate_mean_abs_delta": float(gate_delta.mean().item()),
+            "swa_overlap_source_gate_max_abs_delta": float(gate_delta.max().item()),
+            "swa_overlap_source_gate_score_mean": float(score.detach().float().mean().item()),
+            "swa_overlap_source_gate_score_q90": float(torch.quantile(score.detach().float(), 0.90).item()),
+        })
+        return gate, stats
+
+    def _make_swa_overlap_source_replace(
+        self,
+        hmc_control: Optional[Dict[str, Any]],
+        *,
+        batch_size: int,
+        frame_num: int,
+        tokens_per_frame: int,
+        history_tokens: int,
+        current_tokens: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        stats: Dict[str, Any] = {
+            "swa_overlap_source_replace_applied": False,
+            "swa_overlap_source_replace_tokens": 0,
+        }
+        if not hmc_control or hmc_control.get("identity_hooks", False):
+            return None, stats
+        alpha_max = max(float(hmc_control.get("swa_overlap_source_replace_alpha", 0.0)), 0.0)
+        if alpha_max <= 0.0 or history_tokens <= 0 or current_tokens <= 0:
+            return None, stats
+        D_tok = hmc_control.get("D_tok")
+        D_prev = hmc_control.get("D_prev_patch")
+        if D_tok is None or D_prev is None:
+            return None, stats
+        if frame_num <= 0 or tokens_per_frame <= 0:
+            return None, stats
+        if current_tokens != frame_num * tokens_per_frame:
+            return None, stats
+
+        overlap_frames = max(int(hmc_control.get("swa_overlap_frames", 0)), 0)
+        if overlap_frames <= 0:
+            return None, stats
+
+        D_cur = D_tok.to(device=device, dtype=torch.float32).reshape(batch_size, frame_num, tokens_per_frame)
+        prev_flat = D_prev.to(device=device, dtype=torch.float32).reshape(-1)
+        if prev_flat.numel() < tokens_per_frame:
+            return None, stats
+        prev_frames = int(prev_flat.numel() // tokens_per_frame)
+        hist_frames = int(history_tokens // tokens_per_frame)
+        usable_frames = min(prev_frames, hist_frames)
+        if usable_frames <= 0:
+            return None, stats
+        ov = min(overlap_frames, frame_num, usable_frames)
+        if ov <= 0:
+            return None, stats
+
+        source_tokens = ov * tokens_per_frame
+        source_end = history_tokens
+        source_start = max(0, source_end - source_tokens)
+        source_tokens = source_end - source_start
+        if source_tokens <= 0:
+            return None, stats
+
+        prev_flat = prev_flat[-usable_frames * tokens_per_frame:]
+        D_src_frames = prev_flat.reshape(1, usable_frames, tokens_per_frame).expand(batch_size, -1, -1)
+        Ds = D_src_frames[:, -ov:, :].reshape(batch_size, ov * tokens_per_frame)
+        Dq = D_cur[:, :ov, :].reshape(batch_size, ov * tokens_per_frame)
+        if Ds.shape[1] != source_tokens:
+            Ds = Ds[:, -source_tokens:]
+        if Dq.shape[1] != source_tokens:
+            Dq = Dq[:, :source_tokens]
+
+        mode = str(hmc_control.get("swa_overlap_source_replace_mode", "union"))
+        Dq = Dq.clamp(0.0, 1.0)
+        Ds = Ds.clamp(0.0, 1.0)
+        if mode in {"source", "prev", "previous"}:
+            score = Ds
+        elif mode in {"current", "query"}:
+            score = Dq
+        elif mode == "union":
+            score = torch.maximum(Dq, Ds)
+        elif mode in {"intersection", "inter"}:
+            score = torch.minimum(Dq, Ds)
+        elif mode in {"disagreement", "mismatch"}:
+            score = (Dq - Ds).abs()
+        elif mode in {"agree_dyn", "product"}:
+            score = Dq * Ds
+        else:
+            raise ValueError(f"Unsupported SWA overlap source replace mode: {mode}")
+
+        alpha = (alpha_max * score).clamp(0.0, min(alpha_max, 1.0)).to(dtype=dtype)
+        alpha_delta = alpha.detach().float()
+        desc = {
+            "source_start": int(source_start),
+            "source_end": int(source_end),
+            "source_tokens": int(source_tokens),
+            "alpha": alpha.reshape(batch_size, 1, source_tokens, 1),
+        }
+        stats.update({
+            "swa_overlap_source_replace_applied": True,
+            "swa_overlap_source_replace_mode": mode,
+            "swa_overlap_source_replace_alpha_max": float(alpha_max),
+            "swa_overlap_source_replace_tokens": int(source_tokens),
+            "swa_overlap_source_replace_source_start": int(source_start),
+            "swa_overlap_source_replace_source_end": int(source_end),
+            "swa_overlap_source_replace_alpha_mean": float(alpha_delta.mean().item()),
+            "swa_overlap_source_replace_alpha_p90": float(torch.quantile(alpha_delta, 0.90).item()),
+            "swa_overlap_source_replace_score_mean": float(score.detach().float().mean().item()),
+            "swa_overlap_source_replace_score_q90": float(torch.quantile(score.detach().float(), 0.90).item()),
+        })
+        return desc, stats
+
     def decode(self, hidden, N, H, W, ttt_dict: Optional[dict] = None, window_size: Optional[int] = None, overlap_size: Optional[int] = None, is_first_window: bool = False,
-               turn_off_ttt=False, turn_off_swa=False, cache_ttt_primitives: bool = False) -> torch.Tensor:
+               turn_off_ttt=False, turn_off_swa=False, cache_ttt_primitives: bool = False,
+               hmc_control: Optional[Dict[str, Any]] = None) -> torch.Tensor:
         BN, hw, _ = hidden.shape
         B = BN // N
 
         final_output = []
+        hmc_trace = self._new_hmc_trace(hmc_control)
+        total_decoder_layers = len(self.decoder)
         attn_prior_frame_parts: List[torch.Tensor] = []
         feature_key_parts: List[Tuple[int, torch.Tensor]] = []
         dyn4d_global_parts: List[Tuple[int, dict]] = []
@@ -884,12 +1464,14 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 hidden = hidden.reshape(B*N, hw, -1)
                 hidden_for_block = hidden
                 pos_for_block = pos_reshaped
+                hmc_attn_path = "frame_attention"
             else:
                 # global attention
                 pos_reshaped = pos.reshape(B, N*hw, -1) if pos is not None else None
                 hidden = hidden.reshape(B, N*hw, -1)
                 hidden_for_block = hidden
                 pos_for_block = pos_reshaped
+                hmc_attn_path = "chunk_attention"
 
             # Save pre-block hidden for the fixed no-skip-residual path.
             # With skip0 config removed, default behavior is skip0=False.
@@ -958,7 +1540,65 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 if dyn4d_stats is not None:
                     dyn4d_global_parts.append((i, dyn4d_stats))
 
-            hidden = blk(hidden_for_block, xpos=pos_for_block)
+            attn_mask = None
+            frame_query_gate = None
+            if hmc_attn_path == "frame_attention":
+                layer_enabled = self._hmc_read_layer_enabled(hmc_control, layer=i, total_layers=total_decoder_layers)
+                if layer_enabled:
+                    attn_mask = self._make_frame_attention_bias(
+                        hmc_control,
+                        batch_size=B,
+                        frame_num=N,
+                        tokens_per_frame=hw,
+                        device=hidden_for_block.device,
+                        dtype=hidden_for_block.dtype,
+                    )
+                    frame_query_gate = self._make_frame_attention_query_gate(
+                        hmc_control,
+                        batch_size=B,
+                        frame_num=N,
+                        tokens_per_frame=hw,
+                        device=hidden_for_block.device,
+                        dtype=hidden_for_block.dtype,
+                    )
+                hook_key = "enable_frame_read_control"
+            else:
+                # Dense chunk-attention bias is intentionally not materialized
+                # for identity/G2.  Non-identity chunk control should use a
+                # sparse/block implementation before Phase C.
+                layer_enabled = self._hmc_read_layer_enabled(hmc_control, layer=i, total_layers=total_decoder_layers)
+                hook_key = "enable_chunk_read_control"
+
+            if self._hmc_hook_requested(hmc_control, hook_key):
+                mean_abs_bias = 0.0
+                max_abs_bias = 0.0
+                if attn_mask is not None and torch.is_tensor(attn_mask):
+                    bias_abs = attn_mask.detach().float().abs()
+                    mean_abs_bias = float(bias_abs.mean().item()) if bias_abs.numel() else 0.0
+                    max_abs_bias = float(bias_abs.max().item()) if bias_abs.numel() else 0.0
+                mean_abs_query_gate_delta = 0.0
+                max_abs_query_gate_delta = 0.0
+                if frame_query_gate is not None:
+                    gate_delta = (1.0 - frame_query_gate.detach().float()).abs()
+                    mean_abs_query_gate_delta = float(gate_delta.mean().item()) if gate_delta.numel() else 0.0
+                    max_abs_query_gate_delta = float(gate_delta.max().item()) if gate_delta.numel() else 0.0
+                self._append_hmc_trace(hmc_trace, hmc_attn_path, {
+                    "layer": int(i),
+                    "identity": bool(hmc_control.get("identity_hooks", False)) if hmc_control else False,
+                    "layer_enabled": bool(layer_enabled),
+                    "shape": [int(x) for x in hidden_for_block.shape],
+                    "attn_mask_applied": attn_mask is not None,
+                    "query_gate_applied": frame_query_gate is not None,
+                    "mean_abs_bias": mean_abs_bias,
+                    "max_abs_bias": max_abs_bias,
+                    "mean_abs_query_gate_delta": mean_abs_query_gate_delta,
+                    "max_abs_query_gate_delta": max_abs_query_gate_delta,
+                    "hook_site": "decoder_block_attn",
+                })
+
+            hidden = blk(hidden_for_block, xpos=pos_for_block, attn_mask=attn_mask)
+            if frame_query_gate is not None:
+                hidden = hidden_before_block + (hidden - hidden_before_block) * frame_query_gate
 
             if ttt_state is not None and i in ttt_state.get("insert_after", []):
                 assert self.ttt_gate_projs is not None and self.ttt_layers is not None
@@ -982,7 +1622,28 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                     tokens_in, info, cache_primitives=cache_ttt_primitives,
                 )
 
+                ttt_apply_gate = self._make_ttt_apply_gate(
+                    hmc_control,
+                    batch_size=B,
+                    frame_num=N,
+                    tokens_per_frame=hw,
+                    device=ttt_output.device,
+                    dtype=ttt_output.dtype,
+                ) if self._hmc_read_layer_enabled(hmc_control, layer=i, total_layers=total_decoder_layers) else None
+                if self._hmc_hook_requested(hmc_control, "enable_ttt_apply_control"):
+                    self._append_hmc_trace(hmc_trace, "ttt_apply", {
+                        "layer": int(i),
+                        "ttt_layer": int(layer_idx),
+                        "identity": bool(hmc_control.get("identity_hooks", False)) if hmc_control else False,
+                        "layer_enabled": ttt_apply_gate is not None,
+                        "shape": [int(x) for x in ttt_output.shape],
+                        "gate_applied": ttt_apply_gate is not None,
+                        "hook_site": "ttt_apply_residual",
+                    })
+
                 update_term = ttt_output * gate_scale
+                if ttt_apply_gate is not None:
+                    update_term = update_term * ttt_apply_gate
 
                 tokens_out = update_term + tokens_post
 
@@ -1013,6 +1674,8 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                         "w0_old": output["w0_old"].detach().cpu(),
                         "w1_old": output["w1_old"].detach().cpu(),
                         "w2_old": output["w2_old"].detach().cpu(),
+                        "apply_output_raw": output["apply_output_raw"].detach().cpu()
+                        if output.get("apply_output_raw") is not None else None,
                         "momentum": output["momentum"].detach().cpu() if output.get("momentum") is not None else None,
                         "muon_update_steps": output.get("muon_update_steps", 0),
                         "ttt_update_steps": output.get("ttt_update_steps", 1),
@@ -1052,9 +1715,184 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                     v_cache = history["v"]  # [B, num_heads, N_hist * hw, head_dim]
                     # Forward with KV cache
                     x_curr_flat = x_in_for_layer.reshape(B, N * hw, -1)
+                    history_tokens = int(k_cache.shape[2])
+                    swa_attn_mask = None
+                    swa_overlap_bias_stats: Dict[str, Any] = {
+                        "swa_overlap_bias_applied": False,
+                        "swa_overlap_bias_query_tokens": 0,
+                        "swa_overlap_bias_source_tokens": 0,
+                    }
+                    swa_source_gate = None
+                    swa_layer_enabled = False
+                    if hmc_control and hmc_control.get("enable_swa_read_control", False):
+                        swa_layer_mode = str(hmc_control.get("swa_layer_mode", "first"))
+                        if swa_layer_mode in {"first", "first_swa_only"}:
+                            swa_layer_enabled = layer_idx == 0
+                        elif swa_layer_mode == "all":
+                            swa_layer_enabled = True
+                        elif swa_layer_mode == "single":
+                            swa_layer_enabled = layer_idx == int(hmc_control.get("swa_single_layer", 0))
+                    if swa_layer_enabled:
+                        swa_source_gate = self._make_swa_prev_source_gate(
+                            hmc_control,
+                            history_tokens=history_tokens,
+                            device=v_cache.device,
+                            dtype=v_cache.dtype,
+                        )
+                    swa_overlap_layer_enabled = self._swa_overlap_layer_enabled(
+                        hmc_control,
+                        layer_idx=layer_idx,
+                        n_layers=len(insert_after_list),
+                    )
+                    if swa_overlap_layer_enabled:
+                        swa_attn_mask, swa_overlap_bias_stats = self._make_swa_overlap_attention_bias(
+                            hmc_control,
+                            batch_size=B,
+                            frame_num=N,
+                            tokens_per_frame=hw,
+                            history_tokens=history_tokens,
+                            current_tokens=int(N * hw),
+                            device=x_curr_flat.device,
+                            dtype=x_curr_flat.dtype,
+                        )
+                    d_prev = hmc_control.get("D_prev_patch") if hmc_control else None
+                    d_prev_tokens = int(d_prev.numel()) if hasattr(d_prev, "numel") else 0
+                    k_cache_controlled = k_cache
+                    v_cache_controlled = v_cache
+                    if swa_source_gate is not None:
+                        v_cache_controlled = v_cache * swa_source_gate
+                    swa_overlap_source_gate = None
+                    swa_overlap_source_gate_stats: Dict[str, Any] = {
+                        "swa_overlap_source_gate_applied": False,
+                        "swa_overlap_source_gate_tokens": 0,
+                    }
+                    if self._swa_overlap_source_layer_enabled(
+                        hmc_control,
+                        layer_idx=layer_idx,
+                        n_layers=len(insert_after_list),
+                    ):
+                        swa_overlap_source_gate, swa_overlap_source_gate_stats = self._make_swa_overlap_source_gate(
+                            hmc_control,
+                            batch_size=B,
+                            frame_num=N,
+                            tokens_per_frame=hw,
+                            history_tokens=history_tokens,
+                            current_tokens=int(N * hw),
+                            device=v_cache.device,
+                            dtype=v_cache.dtype,
+                        )
+                        if swa_overlap_source_gate is not None:
+                            target = str(hmc_control.get("swa_overlap_source_gate_target", "v"))
+                            if target in {"v", "value", "kv", "both"}:
+                                v_cache_controlled = v_cache_controlled * swa_overlap_source_gate
+                            if target in {"k", "key", "kv", "both"}:
+                                k_cache_controlled = k_cache * swa_overlap_source_gate.to(
+                                    device=k_cache.device,
+                                    dtype=k_cache.dtype,
+                                )
+                    swa_overlap_source_replace_stats: Dict[str, Any] = {
+                        "swa_overlap_source_replace_applied": False,
+                        "swa_overlap_source_replace_tokens": 0,
+                    }
+                    if self._swa_overlap_source_replace_layer_enabled(
+                        hmc_control,
+                        layer_idx=layer_idx,
+                        n_layers=len(insert_after_list),
+                    ):
+                        source_replace, swa_overlap_source_replace_stats = self._make_swa_overlap_source_replace(
+                            hmc_control,
+                            batch_size=B,
+                            frame_num=N,
+                            tokens_per_frame=hw,
+                            history_tokens=history_tokens,
+                            current_tokens=int(N * hw),
+                            device=v_cache.device,
+                            dtype=v_cache.dtype,
+                        )
+                        if source_replace is not None:
+                            source_start = int(source_replace["source_start"])
+                            source_end = int(source_replace["source_end"])
+                            source_tokens = int(source_replace["source_tokens"])
+                            alpha = source_replace["alpha"]
+                            if pos is not None:
+                                pos_for_replace = pos.reshape(B, N, hw, -1)[:, :1].repeat(
+                                    1, N, 1, 1
+                                ).reshape(B, N * hw, -1)
+                            else:
+                                pos_for_replace = None
+                            k_cur_cache, v_cur_cache = self.swa_layers[layer_idx].compute_kv_cache(
+                                x_curr_flat,
+                                xpos=pos_for_replace,
+                            )
+                            target = str(hmc_control.get("swa_overlap_source_replace_target", "kv"))
+
+                            def _blend_source(cache_tensor: torch.Tensor, cur_tensor: torch.Tensor) -> torch.Tensor:
+                                if source_end <= source_start or cur_tensor.shape[2] < source_tokens:
+                                    return cache_tensor
+                                out = cache_tensor.clone()
+                                old = out[:, :, source_start:source_end, :]
+                                cur = cur_tensor[:, :, :source_tokens, :].to(device=old.device, dtype=old.dtype)
+                                a = alpha.to(device=old.device, dtype=old.dtype)
+                                out[:, :, source_start:source_end, :] = old * (1.0 - a) + cur * a
+                                return out
+
+                            if target in {"v", "value", "kv", "both"}:
+                                v_cache_controlled = _blend_source(v_cache_controlled, v_cur_cache)
+                            if target in {"k", "key", "kv", "both"}:
+                                k_cache_controlled = _blend_source(k_cache_controlled, k_cur_cache)
+                    if (
+                        self._hmc_hook_requested(hmc_control, "enable_swa_read_control")
+                        or self._hmc_hook_requested(hmc_control, "enable_swa_overlap_bias")
+                        or self._hmc_hook_requested(hmc_control, "enable_swa_overlap_source_gate")
+                        or self._hmc_hook_requested(hmc_control, "enable_swa_overlap_source_replace")
+                    ):
+                        gate_stats = {}
+                        if swa_source_gate is not None:
+                            gate_f = swa_source_gate.detach().float()
+                            gate_stats = {
+                                "source_gate_applied": True,
+                                "d_prev_tokens": d_prev_tokens,
+                                "source_pad_tokens": int(max(0, history_tokens - d_prev_tokens)),
+                                "source_trim_tokens": int(max(0, d_prev_tokens - history_tokens)),
+                                "swa_gate_mean": float(gate_f.mean().item()),
+                                "swa_gate_p10": float(torch.quantile(gate_f, 0.10).item()),
+                                "swa_gate_p50": float(torch.quantile(gate_f, 0.50).item()),
+                                "swa_gate_p90": float(torch.quantile(gate_f, 0.90).item()),
+                                "mean_abs_gate_delta": float((1.0 - gate_f).abs().mean().item()),
+                                "max_abs_gate_delta": float((1.0 - gate_f).abs().max().item()),
+                            }
+                        else:
+                            gate_stats = {
+                                "source_gate_applied": False,
+                                "d_prev_tokens": d_prev_tokens,
+                                "source_pad_tokens": 0,
+                                "source_trim_tokens": 0,
+                                "swa_gate_mean": 1.0,
+                                "swa_gate_p10": 1.0,
+                                "swa_gate_p50": 1.0,
+                                "swa_gate_p90": 1.0,
+                                "mean_abs_gate_delta": 0.0,
+                                "max_abs_gate_delta": 0.0,
+                            }
+                        self._append_hmc_trace(hmc_trace, "swa_read", {
+                            "layer": int(i),
+                            "swa_layer": int(layer_idx),
+                            "identity": bool(hmc_control.get("identity_hooks", False)) if hmc_control else False,
+                            "layer_enabled": bool(swa_layer_enabled),
+                            "used_kv_cache": True,
+                            "current_tokens": int(N * hw),
+                            "history_tokens": history_tokens,
+                            "attn_mask_applied": swa_attn_mask is not None,
+                            "hook_site": "swa_kv_cache_read",
+                            **gate_stats,
+                            **swa_overlap_bias_stats,
+                            **swa_overlap_source_gate_stats,
+                            **swa_overlap_source_replace_stats,
+                        })
                     swa_output_flat = self.swa_layers[layer_idx].forward_with_kv_cache(
-                        x_curr_flat, k_cache, v_cache,
+                        x_curr_flat, k_cache_controlled, v_cache_controlled,
                         xpos=pos_current,
+                        attn_mask=swa_attn_mask,
                     )
                     swa_output = swa_output_flat.reshape(B, N, hw, -1)
                 else:
@@ -1080,9 +1918,36 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                     else:
                         pos_swa = None
 
+                    swa_attn_mask = None
+                    if (
+                        self._hmc_hook_requested(hmc_control, "enable_swa_read_control")
+                        or self._hmc_hook_requested(hmc_control, "enable_swa_overlap_bias")
+                    ):
+                        self._append_hmc_trace(hmc_trace, "swa_read", {
+                            "layer": int(i),
+                            "swa_layer": int(layer_idx),
+                            "identity": bool(hmc_control.get("identity_hooks", False)) if hmc_control else False,
+                            "layer_enabled": False,
+                            "used_kv_cache": False,
+                            "current_tokens": int(N * hw),
+                            "history_tokens": int((N_total - N) * hw),
+                            "attn_mask_applied": False,
+                            "source_gate_applied": False,
+                            "swa_gate_mean": 1.0,
+                            "swa_gate_p10": 1.0,
+                            "swa_gate_p50": 1.0,
+                            "swa_gate_p90": 1.0,
+                            "mean_abs_gate_delta": 0.0,
+                            "max_abs_gate_delta": 0.0,
+                            "swa_overlap_bias_applied": False,
+                            "swa_overlap_bias_query_tokens": 0,
+                            "swa_overlap_bias_source_tokens": 0,
+                            "hook_site": "swa_full_read",
+                        })
                     swa_output_full = self.swa_layers[layer_idx](
                         x_swa, 
-                        xpos=pos_swa, 
+                        xpos=pos_swa,
+                        attn_mask=swa_attn_mask,
                     )
                     swa_output_full = swa_output_full.reshape(B, N_total, hw, x_in.shape[-1])
                     if history_raw is not None:
@@ -1117,12 +1982,24 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                     pos_for_cache = None
 
                 k_new, v_new = self.swa_layers[layer_idx].compute_kv_cache(x_for_cache_flat, xpos=pos_for_cache)
+
+                history_entry = {"k": k_new, "v": v_new}
+                if hmc_control and hmc_control.get("swa_write_cache_store_post", False):
+                    x_post_cache_flat = x_out_patch.reshape(B, N * hw, -1)
+                    k_post, v_post = self.swa_layers[layer_idx].compute_kv_cache(
+                        x_post_cache_flat,
+                        xpos=pos_for_cache,
+                    )
+                    history_entry["k_post"] = k_post
+                    history_entry["v_post"] = v_post
                 
                 if getattr(self, "detach_swa_history", False):
-                    k_new = k_new.detach()
-                    v_new = v_new.detach()
+                    history_entry = {
+                        key: value.detach() if torch.is_tensor(value) else value
+                        for key, value in history_entry.items()
+                    }
                 
-                ttt_output_info["history"][layer_idx] = {"k": k_new, "v": v_new}
+                ttt_output_info["history"][layer_idx] = history_entry
 
             if i+1 in [len(self.decoder)-1, len(self.decoder)]:
                 final_output.append(hidden.reshape(B*N, hw, -1))
@@ -1253,6 +2130,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             frame_attn_cosine_query_layers,
             frame_attn_cosine_key_layers,
             frame_attn_cosine_layer_ids,
+            hmc_trace,
         )
     
     def forward(self, imgs, *args, **kwargs):
@@ -1270,6 +2148,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         cache_ttt_primitives = kwargs.pop('cache_ttt_primitives', False)
         return_ttt_state = kwargs.pop('return_ttt_state', False)
         offload_adaptive_state_to_cpu = kwargs.pop('offload_adaptive_state_to_cpu', False)
+        hmc_control = kwargs.pop('hmc_control', None)
         ttt_state_input = kwargs.pop('ttt_state_input', None)
         swa_state_input = None
         if isinstance(ttt_state_input, dict):
@@ -1423,6 +2302,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             frame_attn_cosine_query_layers = None
             frame_attn_cosine_key_layers = None
             frame_attn_cosine_layer_ids = None
+            hmc_trace = None
 
             for _ in range(num_iterations):
                 if self.ttt_layers is not None and w0 is None:
@@ -1472,7 +2352,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                         "ttt": ttt_state,
                         "attn": attn_state,
                     }
-                hidden, pos, ttt_output_info, decode_avg_gate_scale, decode_avg_attn_gate_scale, _decode_gate_scales, frame_attention_prior, attn_dynamic_patch, dyn4d_patch, dyn4d_qq_mean_patch, dyn4d_qk_var_patch, dyn4d_kk_mean_patch, global_q_raw_patchvec, global_k_raw_patchvec, global_q_raw_patchvec_layers, global_k_raw_patchvec_layers, dyn4d_global_layer_ids, frame_attn_cosine_shallow, frame_attn_cosine_deep, frame_attn_cosine_avg, frame_attn_key_cosine_l0, frame_attn_key_cosine_l4, frame_attn_key_cosine_shallow, frame_attn_key_cosine_deep, frame_attn_key_cosine_avg, frame_attn_cosine_query_layers, frame_attn_cosine_key_layers, frame_attn_cosine_layer_ids = self.decode(
+                hidden, pos, ttt_output_info, decode_avg_gate_scale, decode_avg_attn_gate_scale, _decode_gate_scales, frame_attention_prior, attn_dynamic_patch, dyn4d_patch, dyn4d_qq_mean_patch, dyn4d_qk_var_patch, dyn4d_kk_mean_patch, global_q_raw_patchvec, global_k_raw_patchvec, global_q_raw_patchvec_layers, global_k_raw_patchvec_layers, dyn4d_global_layer_ids, frame_attn_cosine_shallow, frame_attn_cosine_deep, frame_attn_cosine_avg, frame_attn_key_cosine_l0, frame_attn_key_cosine_l4, frame_attn_key_cosine_shallow, frame_attn_key_cosine_deep, frame_attn_key_cosine_avg, frame_attn_cosine_query_layers, frame_attn_cosine_key_layers, frame_attn_cosine_layer_ids, hmc_trace = self.decode(
                     hidden_input, Nw, H, W,
                     ttt_dict=ttt_dict,
                     window_size=window_size,
@@ -1481,6 +2361,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                     turn_off_ttt=turn_off_ttt,
                     turn_off_swa=turn_off_swa,
                     cache_ttt_primitives=cache_ttt_primitives,
+                    hmc_control=hmc_control,
                 )
                 if decode_avg_gate_scale is not None:
                     all_gate_scales.append(decode_avg_gate_scale.detach().cpu())
@@ -1608,6 +2489,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 frame_attn_cosine_query_layers=maybe_detach(frame_attn_cosine_query_layers, no_detach=no_detach),
                 frame_attn_cosine_key_layers=maybe_detach(frame_attn_cosine_key_layers, no_detach=no_detach),
                 frame_attn_cosine_layer_ids=maybe_detach(frame_attn_cosine_layer_ids, no_detach=no_detach),
+                hmc_trace=hmc_trace,
                 _window_start=start_idx,
                 _window_end=end_idx,
             )
@@ -1627,6 +2509,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 del frame_attn_key_cosine_l0, frame_attn_key_cosine_l4
                 del frame_attn_key_cosine_shallow, frame_attn_key_cosine_deep, frame_attn_key_cosine_avg
                 del frame_attn_cosine_query_layers, frame_attn_cosine_key_layers, frame_attn_cosine_layer_ids
+                del hmc_trace
                 if metric_hidden is not None:
                     del metric_hidden
                 if camera_qvec is not None:

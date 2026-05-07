@@ -461,10 +461,18 @@ class FlashAttentionRope(AttentionRope):
         k_full = torch.cat([k_cache, k], dim=2)
         v_full = torch.cat([v_cache, v], dim=2)
         
-        # Compute attention
-        is_float_mask = (attn_mask is not None and torch.is_floating_point(attn_mask))
+        # Compute attention.  SWA overlap control can pass a compact descriptor
+        # instead of a dense mask; in that case we run the native full attention
+        # first and then recompute only the affected overlap query rows.
+        overlap_bias = attn_mask if isinstance(attn_mask, dict) and attn_mask.get("type") == "overlap_bias" else None
+        dense_attn_mask = None if overlap_bias is not None else attn_mask
+        is_float_mask = (
+            dense_attn_mask is not None
+            and torch.is_tensor(dense_attn_mask)
+            and torch.is_floating_point(dense_attn_mask)
+        )
         
-        if attn_mask is not None and FLEX_ATTENTION_AVAILABLE and not is_float_mask:
+        if dense_attn_mask is not None and FLEX_ATTENTION_AVAILABLE and not is_float_mask:
             target_dtype = v_full.dtype
             if q.dtype != target_dtype:
                 q = q.to(target_dtype)
@@ -473,7 +481,7 @@ class FlashAttentionRope(AttentionRope):
             
             x = flex_attention(
                 q, k_full, v_full,
-                block_mask=attn_mask,
+                block_mask=dense_attn_mask,
                 scale=None,
                 enable_gqa=False,
                 return_lse=False
@@ -484,7 +492,38 @@ class FlashAttentionRope(AttentionRope):
                     x = scaled_dot_product_attention(q, k_full, v_full)
             else:
                 with nn.attention.sdpa_kernel([SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION]):
-                    x = scaled_dot_product_attention(q, k_full, v_full, attn_mask=attn_mask)
+                    x = scaled_dot_product_attention(q, k_full, v_full, attn_mask=dense_attn_mask)
+
+        if overlap_bias is not None:
+            qn = min(int(overlap_bias.get("query_tokens", 0)), int(q.shape[2]))
+            source_start = max(0, int(overlap_bias.get("source_start", 0)))
+            source_end = min(int(overlap_bias.get("source_end", source_start)), int(k_full.shape[2]))
+            bias_values = overlap_bias.get("bias_values")
+            block_size = max(1, int(overlap_bias.get("query_block_size", 256)))
+            if qn > 0 and source_end > source_start and torch.is_tensor(bias_values):
+                sn = source_end - source_start
+                bias_values = bias_values.to(device=q.device, dtype=q.dtype)
+                bias_values = bias_values[:, :qn, :sn]
+                overlap_out = []
+                for q0 in range(0, qn, block_size):
+                    q1 = min(q0 + block_size, qn)
+                    q_chunk = q[:, :, q0:q1, :]
+                    local_bias = torch.zeros(
+                        q.shape[0],
+                        1,
+                        q1 - q0,
+                        k_full.shape[2],
+                        device=q.device,
+                        dtype=q.dtype,
+                    )
+                    local_bias[:, :, :, source_start:source_end] = bias_values[:, q0:q1, :].unsqueeze(1)
+                    with nn.attention.sdpa_kernel([SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION]):
+                        overlap_out.append(
+                            scaled_dot_product_attention(q_chunk, k_full, v_full, attn_mask=local_bias)
+                        )
+                if overlap_out:
+                    x = x.clone()
+                    x[:, :, :qn, :] = torch.cat(overlap_out, dim=2)
         
         x = x.transpose(1, 2).reshape([B, N_curr, C])
         x = self.proj(x)
