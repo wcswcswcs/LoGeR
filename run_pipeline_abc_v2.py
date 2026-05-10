@@ -30,7 +30,12 @@ import torch
 import yaml
 
 from loger.pipeline.dynamic_cue_extractor import DynamicCueExtractor, CueOutput
-from loger.pipeline.geometry_backbone import GeometryOutput, LoGeRGeometryBackbone, load_images as loger_load_images
+from loger.pipeline.geometry_backbone import (
+    GeometryOutput,
+    LoGeRGeometryBackbone,
+    TOKEN_TYPE_PATCH,
+    load_images as loger_load_images,
+)
 from loger.pipeline.hybrid_memory_controller import (
     HybridMemoryController,
     HybridMemoryControlPrior,
@@ -63,6 +68,7 @@ from run_pipeline_abc import (  # noqa: E402
     _move_tensor_tree_to_device,
     _offload_backbone_to_cpu,
     _offload_stage_c_frontend_to_cpu,
+    _render_mask_panel,
     _rebuild_batched_raw_window,
     _run_stage_c_lazy,
     _ensure_backbone_on_device,
@@ -89,6 +95,17 @@ HYBRID_MEMORY_MODES = (
     "hybrid",
     "probe_only",
 )
+
+DEFAULT_KITTI_VIDEO_THING_PROMPTS = (
+    "person,people,rider,bicycle,motorcycle,car,bus,truck,train,"
+    "door,window,traffic sign,traffic light,pole,guardrail,barrier"
+)
+DEFAULT_KITTI_VIDEO_STUFF_PROMPTS = (
+    "road,sidewalk,building,wall,fence,railing,bridge,sky,tree,"
+    "vegetation,grass,water,reflection,glass,cloud"
+)
+DEFAULT_KITTI_STRUCTURE_PROMPTS = "road,sidewalk,building,wall,fence,bridge"
+DEFAULT_KITTI_TEXT_TRACK_PROMPTS = "person,people,rider"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -134,6 +151,15 @@ def build_parser() -> argparse.ArgumentParser:
             "against the native provisional TTT state. Diagnostic only."
         ),
     )
+    p.add_argument(
+        "--ttt_write_gradient_reversal_chunk_gammas",
+        default="",
+        help=(
+            "Comma-separated CHUNK:GAMMA entries for chunk-specific TTT gradient "
+            "reversal strength. Overrides --ttt_write_gradient_reversal_chunks "
+            "when non-empty. Diagnostic only."
+        ),
+    )
     p.add_argument("--se3", action="store_true", default=None)
     p.add_argument("--geometry_edge_rtol", type=float, default=0.03)
     p.add_argument("--stage_memory_swap", type=int, default=1)
@@ -166,6 +192,21 @@ def build_parser() -> argparse.ArgumentParser:
 
     # -- Stage C ----------------------------------------------------------
     p.add_argument("--stage_c_mode", choices=["reference", "none"], default="reference")
+    p.add_argument("--stage_c_cache_dir", default=None,
+                   help="Directory for per-chunk Stage C MaskletOutput cache.")
+    p.add_argument("--stage_c_cache_mode",
+                   choices=("off", "read", "write", "readwrite", "refresh"),
+                   default="off")
+    p.add_argument("--stage_c_cache_require_hit", type=int, default=0,
+                   help="If set, fail instead of recomputing when a Stage C cache entry is missing.")
+    p.add_argument("--stage_c_cache_validate", type=int, default=0,
+                   help="Validate basic cache metadata before loading.")
+    p.add_argument("--stage_c_inline_when_ignored", type=int, default=0,
+                   help=(
+                       "Diagnostic only. If set, run/load Stage C even when the semantic "
+                       "prior is ignored by HMC. Default keeps no-op parity safe by skipping "
+                       "Stage C in the main LoGeR/HMC process when it cannot affect control."
+                   ))
     p.add_argument("--sam_backend", choices=["sam2", "sam3", "sam31_multiplex"], default="sam31_multiplex")
     p.add_argument("--tracker_backend", default="sam2",
                    choices=["sam2", "edgetam", "cutie", "efficientsam3", "efficient"],
@@ -177,16 +218,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sam31_offload_video_to_cpu", type=int, default=1)
     p.add_argument("--sam31_offload_outputs_to_cpu", type=int, default=1)
     p.add_argument("--sam31_offload_sam_during_detection", type=int, default=0)
-    p.add_argument("--sam31_text_track_labels", default="person")
-    p.add_argument("--sam31_direct_text_prompt_labels", default="person")
+    p.add_argument("--sam31_text_track_labels", default=DEFAULT_KITTI_TEXT_TRACK_PROMPTS)
+    p.add_argument("--sam31_direct_text_prompt_labels", default=DEFAULT_KITTI_TEXT_TRACK_PROMPTS)
     p.add_argument("--sam31_direct_text_prompt_frame_count", type=int, default=1)
-    p.add_argument("--sam31_structure_prompt_labels", default="wall,floor,ceiling")
+    p.add_argument("--sam31_structure_prompt_labels", default=DEFAULT_KITTI_STRUCTURE_PROMPTS)
     p.add_argument("--sam31_structure_prompt_frame_count", type=int, default=1)
     p.add_argument("--sam31_structure_prompt_chunk_stride", type=int, default=1)
     p.add_argument("--sam31_person_refresh_prompt_frames", type=int, default=1)
-    p.add_argument("--sam31_nontext_object_prompt_budget", type=int, default=0)
+    p.add_argument("--sam31_nontext_object_prompt_budget", type=int, default=8)
     p.add_argument("--sam31_nontext_object_prompt_min_support", type=int, default=2)
-    p.add_argument("--sam31_text_object_prompt_budget", type=int, default=0)
+    p.add_argument("--sam31_text_object_prompt_budget", type=int, default=2)
     p.add_argument("--sam31_nontext_sparse_support", type=int, default=1)
     p.add_argument("--sam31_max_text_prompt_objects", type=int, default=0)
     p.add_argument("--sam31_max_internal_objects", type=int, default=16)
@@ -204,8 +245,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max_thing_objects", type=int, default=24)
     p.add_argument("--box_threshold", type=float, default=0.30)
     p.add_argument("--text_threshold", type=float, default=0.25)
-    p.add_argument("--thing_prompts", default=DEFAULT_VIDEO_THING_PROMPTS)
-    p.add_argument("--stuff_prompts", default=DEFAULT_VIDEO_STUFF_PROMPTS)
+    p.add_argument("--thing_prompts", default=DEFAULT_KITTI_VIDEO_THING_PROMPTS)
+    p.add_argument("--stuff_prompts", default=DEFAULT_KITTI_VIDEO_STUFF_PROMPTS)
+    p.add_argument("--stage_c_save_video", type=int, default=0,
+                   help="If set, save a full-sequence Stage C masklet overlay video. Default: off.")
+    p.add_argument("--stage_c_video_path", default=None,
+                   help="Output path for --stage_c_save_video. Defaults to <run_dir>/stage_c_masklets.mp4.")
+    p.add_argument("--stage_c_video_fps", type=float, default=10.0)
+    p.add_argument("--stage_c_video_alpha", type=float, default=0.45)
 
     # -- Stage D / Hybrid Memory Controller -------------------------------
     p.add_argument("--hybrid_memory_mode", choices=HYBRID_MEMORY_MODES, default=None,
@@ -216,6 +263,12 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Phase C v5 commit isolation: choose which provisional memory becomes H_next.")
     p.add_argument("--ttt_write_mode", choices=["semantic", "unity_replay", "native"], default="semantic",
                    help="Legacy compatibility: semantic->ttt_write_only, unity_replay/native keep their meaning.")
+    p.add_argument("--semantic_prior_mode",
+                   choices=("disabled", "noop", "pass_through", "spg_v2"),
+                   default="spg_v2",
+                   help="Stage D semantic prior mode. disabled skips Stage D; pass_through emits A_tok=1.")
+    p.add_argument("--hmc_ignore_semantic_prior", type=int, default=0,
+                   help="Build Stage C/D for cache/debug but pass no Stage D prior into HMC.")
     p.add_argument("--lambda_min", type=float, default=1.0)
     p.add_argument("--lambda_max", type=float, default=1.0)
     p.add_argument("--a_min_special", type=float, default=1.0)
@@ -245,6 +298,63 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Optional transform applied to TTT write prior before it multiplies replay lr. Anti/signed modes allow low-prior tokens to push negative updates.")
     p.add_argument("--ttt_write_prior_anti_scale", type=float, default=0.0)
     p.add_argument("--ttt_write_prior_gamma", type=float, default=1.0)
+    p.add_argument("--ttt_write_special_token_policy",
+                   choices=("none", "patch_mean", "patch_q10", "patch_q25", "patch_median", "patch_min",
+                            "frame_mean", "frame_q10", "frame_q25", "frame_min"),
+                   default="none",
+                   help="Optional TTT replay policy for register/role token priors. Default keeps historical behavior.")
+    p.add_argument("--ttt_write_special_token_floor", type=float, default=0.0)
+    p.add_argument("--ttt_write_special_token_ceiling", type=float, default=1.0)
+    p.add_argument("--ttt_write_gradient_reversal_mode",
+                   choices=("none", "low_prior", "dynamic", "risk", "signed_low_prior", "hard", "hard_low_prior", "hard_dynamic", "negative_tail", "tail", "bottom_frac", "tail_low_prior", "two_replay", "separate_replay", "pos_neg_replay", "tri_replay", "three_replay", "pos_neu_neg_replay", "pos_neg_neu_replay"),
+                   default="none",
+                   help="Post-eta signed replay prior: low-prior/high-risk tokens can contribute negative TTT updates on selected branches.")
+    p.add_argument("--ttt_write_gradient_reversal_gamma", type=float, default=0.0,
+                   help="Negative replay multiplier for max-risk tokens when gradient reversal is enabled.")
+    p.add_argument("--ttt_write_gradient_reversal_branch_mask", default="0",
+                   help="Branches affected by TTT gradient reversal; default branch 0.")
+    p.add_argument("--ttt_write_gradient_reversal_branch_gammas", default="",
+                   help="Optional branch-specific reversal gamma map, e.g. '0:0.025,2:0.005'. Overrides branch mask/gamma for selected branches.")
+    p.add_argument("--ttt_write_gradient_reversal_layer_gammas", default="",
+                   help="Optional layer-specific reversal gamma map, e.g. '12:0.03,5:0.015'. Unlisted layers keep normal replay.")
+    p.add_argument("--ttt_write_gradient_reversal_head_routes", default="",
+                   help="Optional per-layer head routing for controlled replay, e.g. '12:0' or '12:0+1;13:2'.")
+    p.add_argument("--ttt_write_gradient_reversal_chunks", default="",
+                   help="Optional comma-separated chunk indices where gradient reversal is enabled. Empty means all chunks.")
+    p.add_argument("--ttt_write_gradient_reversal_negative_frac", type=float, default=0.0,
+                   help="For negative_tail mode, fraction of highest-risk tokens assigned to -gamma.")
+    p.add_argument("--ttt_write_gradient_reversal_risk_source", default="prior",
+                   choices=("prior", "write_prior", "low_prior", "d_tok", "control", "dg",
+                            "ttt_residual", "residual", "ttt_self_residual",
+                            "ttt_residual_x_dg", "residual_x_dg",
+                            "ttt_w0_conflict", "w0_conflict", "ttt_update_conflict", "update_conflict",
+                            "ttt_w0_anti", "w0_anti", "ttt_update_anti", "update_anti",
+                            "ttt_w0_energy", "w0_energy", "ttt_update_energy", "update_energy",
+                            "ttt_w0_conflict_energy", "w0_conflict_energy",
+                            "ttt_update_conflict_energy", "update_conflict_energy"),
+                   help="Risk source for gradient reversal. Default uses low write-prior; TTT self modes use replay residual/update conflict.")
+    p.add_argument("--ttt_write_tri_replay_positive_frac", type=float, default=0.35,
+                   help="For tri_replay mode, fraction of lowest-risk tokens assigned to positive replay.")
+    p.add_argument("--ttt_write_tri_replay_negative_frac", type=float, default=0.15,
+                   help="For tri_replay mode, fraction of highest-risk tokens assigned to negative replay.")
+    p.add_argument("--ttt_write_tri_replay_neutral_lambda", type=float, default=1.0,
+                   help="For tri_replay mode, scale for neutral replay delta.")
+    p.add_argument(
+        "--ttt_write_tri_replay_chunk_params",
+        default="",
+        help=(
+            "Optional chunk-specific tri_replay params as CHUNK:POS/NEG/NEU entries, "
+            "e.g. '10:0.45/0.08/1.0,11:0.45/0.08/1.0'. Unlisted chunks use the global tri_replay params."
+        ),
+    )
+    p.add_argument("--ttt_write_gradient_reversal_transient_mode", default="none",
+                   choices=("none", "one_hop_delta", "onehop_delta", "transient_delta", "ttl_delta", "short_delta",
+                            "dual_lifetime", "dual_fast_weight", "apply_short_delta", "short_apply_delta"),
+                   help="Store the gradient-reversal correction as a transient delta so it can be removed on the next TTT commit.")
+    p.add_argument("--ttt_write_gradient_reversal_transient_branch_mask", default="",
+                   help="Branches whose gradient-reversal delta should be transient. Empty/same means active GR branches.")
+    p.add_argument("--ttt_write_gradient_reversal_transient_long_scale", type=float, default=0.0,
+                   help="For dual_lifetime transient mode, fraction of GR delta retained in long-term TTT fast weights; the residual is stored as short apply-only delta.")
     p.add_argument("--ttt_write_replay_feature_gate_mode",
                    choices=(
                        "none",
@@ -297,6 +407,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Subtract the previous chunk's stored transient dynamic delta from final TTT commit. 0 disables.")
     p.add_argument("--ttt_write_transient_delta_branch_mask", default="0",
                    help="Branches affected by transient dynamic delta subtraction.")
+    p.add_argument("--ttt_write_transient_delta_ttl", type=int, default=1,
+                   help="Number of chunk commits to keep a stored transient delta before subtracting it. 1 is the original one-hop behavior.")
     p.add_argument("--ttt_write_commit_ema_alpha", type=float, default=1.0,
                    help="Final committed TTT fast-weight EMA alpha against W_m, after all replay/mix/gate steps.")
     p.add_argument("--ttt_write_commit_ema_branch_mask", default="all",
@@ -315,9 +427,19 @@ def build_parser() -> argparse.ArgumentParser:
                    default="none",
                    help="Post-replay commit-only TTT propagation filter; does not change current-chunk controlled output.")
     p.add_argument("--ttt_write_commit_filter_risk_source",
-                   choices=("d_tok", "write_prior"),
+                   choices=("d_tok", "write_prior",
+                            "ttt_residual", "residual", "ttt_self_residual",
+                            "ttt_residual_x_dg", "residual_x_dg",
+                            "ttt_w0_conflict", "w0_conflict",
+                            "ttt_update_conflict", "update_conflict",
+                            "ttt_w0_anti", "w0_anti",
+                            "ttt_update_anti", "update_anti",
+                            "ttt_w0_energy", "w0_energy",
+                            "ttt_update_energy", "update_energy",
+                            "ttt_w0_conflict_energy", "w0_conflict_energy",
+                            "ttt_update_conflict_energy", "update_conflict_energy"),
                    default="d_tok",
-                   help="Risk map for commit filter: raw dynamic D_tok, or 1-write_prior.")
+                   help="Risk map for commit filter: raw dynamic D_tok, 1-write_prior, TTT replay residual, or TTT update-conflict cue.")
     p.add_argument("--ttt_write_commit_filter_scope",
                    choices=("all", "tail_overlap", "head_overlap", "both_overlap"),
                    default="tail_overlap",
@@ -332,6 +454,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ttt_write_commit_filter_max", type=float, default=1.0)
     p.add_argument("--ttt_write_commit_filter_branch_mask", default="0",
                    help="Branches affected by commit risk filter; default branch 0.")
+    p.add_argument("--ttt_write_commit_filter_chunks", default="",
+                   help="Optional comma-separated chunk indices where commit filter is enabled. Empty means all chunks.")
     p.add_argument("--debug_prior_mode",
                    choices=["none", "patch_only", "special_only", "frame_ramp",
                             "reverse_frame_ramp", "checkerboard", "roll"],
@@ -342,6 +466,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Optional JSONL for per-chunk v2 probe/control state/debug records.")
     p.add_argument("--rho_sem", type=float, default=0.6)
     p.add_argument("--spg_use_g_write_geo", type=int, default=1)
+    p.add_argument("--spg_value_structure", type=float, default=1.0)
+    p.add_argument("--spg_value_background", type=float, default=0.7)
+    p.add_argument("--spg_value_distractor", type=float, default=0.4)
+    p.add_argument("--spg_value_movable", type=float, default=0.1)
+    p.add_argument("--spg_value_uncertain", type=float, default=0.4)
 
     # Read-path knobs. Identity hooks are used for G2 parity; non-identity
     # controls are intentionally conservative until Phase C.
@@ -468,7 +597,12 @@ def build_parser() -> argparse.ArgumentParser:
                             "stage_d_x_static_focal2",
                             "stage_d_x_dg_inv_pow4", "v5_stage_d_x_dg_inv_pow4",
                             "stage_d_x_static_focal4",
-                            "stage_d_x_dg_boundary_focal2", "v5_stage_d_x_dg_boundary_focal2"),
+                            "stage_d_x_dg_boundary_focal2", "v5_stage_d_x_dg_boundary_focal2",
+                            "semantic_value", "sem_value",
+                            "sem_x_dg_inv_sqrt", "semantic_x_dg_inv_sqrt",
+                            "stage_d_x_sem", "stage_d_x_semantic",
+                            "stage_d_x_sem_x_dg_inv_sqrt",
+                            "stage_d_x_semantic_x_dg_inv_sqrt"),
                    default="stage_d",
                    help="Phase E optional override for the explicit probe-cache TTT write prior.")
     p.add_argument("--hmc_write_sparse_ratio", type=float, default=1.0)
@@ -658,6 +792,252 @@ def _build_stage_c_kwargs(args: argparse.Namespace) -> Tuple[Dict[str, Any], Dic
     return build_kwargs, frontend_kwargs
 
 
+def _masklet_to_cache_dict(mo: MaskletOutput, *, manifest: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "manifest": manifest,
+        "M_mask": mo.M_mask.detach().cpu(),
+        "V_mask": mo.V_mask.detach().cpu(),
+        "B_mask": mo.B_mask.detach().cpu(),
+        "Q_mask": mo.Q_mask.detach().cpu(),
+        "L_sem": list(mo.L_sem),
+        "G_sem": mo.G_sem.detach().cpu(),
+        "W_sem": mo.W_sem.detach().cpu(),
+        "A_ratio": mo.A_ratio.detach().cpu(),
+        "num_masklets": int(mo.num_masklets),
+        "num_frames": int(mo.num_frames),
+        "frame_height": int(mo.frame_height),
+        "frame_width": int(mo.frame_width),
+        "source_type": list(mo.source_type),
+        "birth_frame": list(mo.birth_frame),
+        "seed_global_track_idx": list(mo.seed_global_track_idx),
+        "debug": dict(mo.debug),
+    }
+
+
+def _masklet_from_cache_dict(data: Dict[str, Any]) -> MaskletOutput:
+    return MaskletOutput(
+        M_mask=data["M_mask"].cpu(),
+        V_mask=data["V_mask"].cpu(),
+        B_mask=data["B_mask"].cpu(),
+        Q_mask=data["Q_mask"].cpu(),
+        L_sem=list(data.get("L_sem", [])),
+        G_sem=data["G_sem"].cpu(),
+        W_sem=data["W_sem"].cpu(),
+        A_ratio=data["A_ratio"].cpu(),
+        num_masklets=int(data.get("num_masklets", 0)),
+        num_frames=int(data.get("num_frames", 0)),
+        frame_height=int(data.get("frame_height", 0)),
+        frame_width=int(data.get("frame_width", 0)),
+        source_type=list(data.get("source_type", [])),
+        birth_frame=list(data.get("birth_frame", [])),
+        seed_global_track_idx=list(data.get("seed_global_track_idx", [])),
+        debug=dict(data.get("debug", {})),
+    )
+
+
+def _stage_c_cache_manifest(
+    args: argparse.Namespace,
+    *,
+    chunk_idx: int,
+    start: int,
+    end: int,
+    chunk_full: torch.Tensor,
+    build_kwargs: Dict[str, Any],
+    frontend_kwargs: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "chunk_idx": int(chunk_idx),
+        "start_frame": int(start),
+        "end_frame": int(end),
+        "chunk_shape": list(chunk_full.shape),
+        "stage_c_mode": str(args.stage_c_mode),
+        "sam_backend": str(args.sam_backend),
+        "detector": str(args.detector),
+        "build_kwargs": {k: str(v) for k, v in sorted(build_kwargs.items()) if k != "device"},
+        "frontend_kwargs": {k: str(v) for k, v in sorted(frontend_kwargs.items())},
+    }
+
+
+def _run_stage_c_cached(
+    args: argparse.Namespace,
+    build_kwargs: Dict[str, Any],
+    frontend_kwargs: Dict[str, Any],
+    chunk_full: torch.Tensor,
+    *,
+    chunk_idx: int,
+    start: int,
+    end: int,
+) -> MaskletOutput:
+    mode = str(args.stage_c_cache_mode or "off").lower()
+    if mode == "off" or not args.stage_c_cache_dir:
+        mo = _run_stage_c_lazy(build_kwargs, frontend_kwargs, chunk_full, chunk_idx)
+        mo.debug = {**dict(mo.debug), "stage_c_cache_hit": False, "stage_c_cache_mode": mode}
+        return mo
+
+    cache_root = Path(args.stage_c_cache_dir)
+    chunk_dir = cache_root / f"chunk_{chunk_idx:03d}_{int(start):06d}_{int(end):06d}"
+    cache_path = chunk_dir / "masklet.pt"
+    manifest_path = chunk_dir / "manifest.json"
+    want_read = mode in {"read", "readwrite"}
+    want_write = mode in {"write", "readwrite", "refresh"}
+    manifest = _stage_c_cache_manifest(
+        args,
+        chunk_idx=chunk_idx,
+        start=start,
+        end=end,
+        chunk_full=chunk_full,
+        build_kwargs=build_kwargs,
+        frontend_kwargs=frontend_kwargs,
+    )
+
+    if want_read and cache_path.is_file():
+        data = torch.load(cache_path, map_location="cpu")
+        if bool(args.stage_c_cache_validate):
+            cached_manifest = dict(data.get("manifest", {}))
+            for key in ("schema_version", "chunk_idx", "start_frame", "end_frame", "chunk_shape", "stage_c_mode"):
+                if cached_manifest.get(key) != manifest.get(key):
+                    raise RuntimeError(
+                        f"Stage C cache metadata mismatch for chunk {chunk_idx}: "
+                        f"{key} cached={cached_manifest.get(key)!r} expected={manifest.get(key)!r}"
+                    )
+        mo = _masklet_from_cache_dict(data)
+        mo.debug = {
+            **dict(mo.debug),
+            "stage_c_cache_hit": True,
+            "stage_c_cache_mode": mode,
+            "stage_c_cache_path": str(cache_path),
+        }
+        return mo
+
+    if bool(args.stage_c_cache_require_hit) and mode in {"read", "readwrite"}:
+        raise RuntimeError(f"Required Stage C cache miss for chunk {chunk_idx}: {cache_path}")
+
+    mo = _run_stage_c_lazy(build_kwargs, frontend_kwargs, chunk_full, chunk_idx)
+    mo.debug = {
+        **dict(mo.debug),
+        "stage_c_cache_hit": False,
+        "stage_c_cache_mode": mode,
+        "stage_c_cache_path": str(cache_path),
+    }
+
+    if want_write:
+        tmp_dir = chunk_dir.with_name(chunk_dir.name + ".tmp")
+        if tmp_dir.exists():
+            import shutil
+            shutil.rmtree(tmp_dir)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        torch.save(_masklet_to_cache_dict(mo, manifest=manifest), tmp_dir / "masklet.pt")
+        with open(tmp_dir / "manifest.json", "w", encoding="utf-8") as f:
+            json.dump(manifest, f, indent=2, sort_keys=True)
+        if chunk_dir.exists():
+            import shutil
+            shutil.rmtree(chunk_dir)
+        tmp_dir.rename(chunk_dir)
+        mo.debug["stage_c_cache_saved"] = True
+    return mo
+
+
+def _resolve_stage_c_video_path(args: argparse.Namespace) -> Path:
+    if args.stage_c_video_path:
+        return Path(args.stage_c_video_path)
+    run_dir = _infer_run_dir(args)
+    if run_dir is None:
+        run_dir = Path(args.output_video).parent if args.output_video else Path("results")
+    return run_dir / "stage_c_masklets.mp4"
+
+
+def _open_stage_c_video_writer(path: Path, *, width: int, height: int, fps: float) -> Any:
+    import cv2
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    writer = cv2.VideoWriter(
+        str(path),
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        float(fps),
+        (int(width), int(height)),
+    )
+    if not writer.isOpened():
+        raise RuntimeError(f"Failed to open Stage C video writer: {path}")
+    return writer
+
+
+def _append_stage_c_video_frames(
+    writer: Any,
+    chunk_full: torch.Tensor,
+    mo: MaskletOutput,
+    *,
+    chunk_idx: int,
+    num_chunks: int,
+    start: int,
+    overlap: int,
+    alpha: float,
+) -> int:
+    import cv2
+    import numpy as np
+
+    T = min(int(chunk_full.shape[0]), int(mo.num_frames))
+    trim = 0 if int(chunk_idx) == int(num_chunks) - 1 else max(int(overlap), 0)
+    keep_end = max(T - trim, 0)
+    height = int(mo.frame_height)
+    width = int(mo.frame_width)
+    for local_t in range(keep_end):
+        img = chunk_full[local_t].detach().cpu().float().clamp(0.0, 1.0)
+        rgb_np = (img.permute(1, 2, 0).numpy() * 255.0).astype(np.uint8)
+        if rgb_np.shape[0] != height or rgb_np.shape[1] != width:
+            rgb_np = cv2.resize(rgb_np, (width, height), interpolation=cv2.INTER_AREA)
+        panel = _render_mask_panel(rgb_np, mo, local_t, float(alpha))
+        text = f"global {int(start) + local_t:05d}  chunk {int(chunk_idx):03d}  local {local_t:02d}"
+        cv2.putText(
+            panel,
+            text,
+            (10, max(48, min(height - 12, 48))),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+        cv2.putText(
+            panel,
+            text,
+            (10, max(48, min(height - 12, 48))),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (0, 0, 0),
+            1,
+            cv2.LINE_AA,
+        )
+        writer.write(cv2.cvtColor(panel, cv2.COLOR_RGB2BGR))
+    return keep_end
+
+
+def _make_pass_through_prior(cue: CueOutput, mo: MaskletOutput, geo: GeometryOutput, *, mode: str) -> PriorOutput:
+    T = int(cue.num_frames)
+    H_p, W_p = cue.spatial_resolution
+    token_type = geo.token_type.detach().cpu().long()
+    patch_mask = token_type == TOKEN_TYPE_PATCH
+    num_patch = int(patch_mask.sum().item())
+    J = int(mo.num_masklets)
+    return PriorOutput(
+        A_mask=torch.ones(J, T, dtype=torch.float32) if J > 0 else torch.zeros(0, T, dtype=torch.float32),
+        A_pix=torch.ones(T, int(H_p), int(W_p), dtype=torch.float32),
+        A_tok=torch.ones(int(token_type.numel()), dtype=torch.float32),
+        A_patch_flat=torch.ones(num_patch, dtype=torch.float32),
+        Elig_pix=torch.ones(T, int(H_p), int(W_p), dtype=torch.float32),
+        r_mask=torch.ones(J, T, dtype=torch.float32) if J > 0 else torch.zeros(0, T, dtype=torch.float32),
+        E_patch_flat=torch.ones(num_patch, dtype=torch.float32),
+        B_chunk_geo=1.0,
+        A_special=1.0,
+        debug={
+            "semantic_prior_mode": mode,
+            "pass_through": True,
+            "semantic_prior_consumed_candidate": True,
+        },
+    )
+
+
 def _reset_hybrid_state_if_needed(state: Optional[HybridMemoryState]) -> Optional[HybridMemoryState]:
     if state is None or state.ttt_state is None:
         return state
@@ -702,6 +1082,28 @@ def _parse_chunk_float_map(value: str) -> Dict[int, float]:
             )
         chunk_s, scale_s = part.split(sep, 1)
         out[int(chunk_s.strip())] = float(scale_s.strip())
+    return out
+
+
+def _parse_chunk_tri_replay_params(value: str) -> Dict[int, Tuple[float, float, float]]:
+    out: Dict[int, Tuple[float, float, float]] = {}
+    for part in str(value or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        sep = ":" if ":" in part else "=" if "=" in part else None
+        if sep is None:
+            raise ValueError(
+                f"Expected CHUNK:POS/NEG/NEU in --ttt_write_tri_replay_chunk_params, got {part!r}"
+            )
+        chunk_s, values_s = part.split(sep, 1)
+        raw_values = [x.strip() for x in values_s.replace("|", "/").replace(";", "/").split("/")]
+        if len(raw_values) != 3 or any(not x for x in raw_values):
+            raise ValueError(
+                f"Expected exactly POS/NEG/NEU in --ttt_write_tri_replay_chunk_params, got {part!r}"
+            )
+        pos, neg, neu = (float(raw_values[0]), float(raw_values[1]), float(raw_values[2]))
+        out[int(chunk_s.strip())] = (pos, neg, neu)
     return out
 
 
@@ -1062,6 +1464,10 @@ def _append_hybrid_debug_jsonl(
             "prior_hmc_write_reliability_mean_patch": control_prior.debug.get("hmc_write_reliability_mean_patch"),
             "prior_hmc_write_corr_score_dyn": control_prior.debug.get("hmc_write_corr_score_dyn"),
             "prior_hmc_write_corr_score_exp_dyn": control_prior.debug.get("hmc_write_corr_score_exp_dyn"),
+            "prior_hmc_write_corr_score_sem_value": control_prior.debug.get("hmc_write_corr_score_sem_value"),
+            "prior_hmc_write_sem_value_mean": control_prior.debug.get("hmc_write_sem_value_mean"),
+            "prior_hmc_write_sem_value_q10": control_prior.debug.get("hmc_write_sem_value_q10"),
+            "prior_hmc_write_sem_value_q90": control_prior.debug.get("hmc_write_sem_value_q90"),
             "prior_hmc_write_corr_score_unc": control_prior.debug.get("hmc_write_corr_score_unc"),
             "prior_ttt_write_present": control_prior.debug.get("ttt_write_prior_present"),
             "prior_ttt_write_mean": control_prior.debug.get("ttt_write_prior_mean"),
@@ -1165,6 +1571,10 @@ def _append_hybrid_debug_jsonl(
                 "prior_hmc_write_score_mean", "prior_hmc_write_residual_mean_patch",
                 "prior_hmc_write_reliability_mean_patch",
                 "prior_hmc_write_corr_score_dyn", "prior_hmc_write_corr_score_exp_dyn",
+                "prior_hmc_write_corr_score_sem_value",
+                "prior_hmc_write_sem_value_mean",
+                "prior_hmc_write_sem_value_q10",
+                "prior_hmc_write_sem_value_q90",
                 "prior_hmc_write_corr_score_unc",
             )
         }
@@ -1404,8 +1814,24 @@ def main() -> None:
     print(f"Collected {total_frames} images.")
 
     needs_stage_b = (not args.geometry_eval_mode) and mode in {"ttt_write_only", "hybrid", "read_path_only", "probe_only"}
-    needs_stage_c = needs_stage_b and args.stage_c_mode != "none"
-    needs_prior = (not args.geometry_eval_mode) and mode in {"ttt_write_only", "hybrid"}
+    needs_prior = (
+        (not args.geometry_eval_mode)
+        and mode in {"ttt_write_only", "hybrid"}
+        and args.semantic_prior_mode in {"noop", "pass_through", "spg_v2"}
+    )
+    semantic_prior_consumed_by_hmc = needs_prior and not bool(args.hmc_ignore_semantic_prior)
+    stage_c_video_requested = bool(args.stage_c_save_video)
+    needs_stage_c = (
+        needs_stage_b
+        and args.stage_c_mode != "none"
+        and (
+            semantic_prior_consumed_by_hmc
+            or bool(args.stage_c_inline_when_ignored)
+            or stage_c_video_requested
+        )
+    )
+    if stage_c_video_requested and not needs_stage_b:
+        print("Stage C video requested, but this mode does not run Stage B/C; video will be skipped.")
 
     images_full: Optional[torch.Tensor]
     if needs_stage_c:
@@ -1423,6 +1849,13 @@ def main() -> None:
     print(f"\nChunk schedule: {len(chunks)} chunk(s), size={args.chunk_size or total_frames}, overlap={args.chunk_overlap}")
     for ci, (s, e) in enumerate(chunks):
         print(f"  chunk {ci}: frames [{s}, {e})")
+
+    stage_c_video_path: Optional[Path] = None
+    stage_c_video_writer: Any = None
+    stage_c_video_frame_count = 0
+    if stage_c_video_requested and needs_stage_c:
+        stage_c_video_path = _resolve_stage_c_video_path(args)
+        print(f"Stage C video: enabled -> {stage_c_video_path}")
 
     backbone_kwargs: Dict[str, Any] = dict(
         device=args.device,
@@ -1448,8 +1881,13 @@ def main() -> None:
             rho_sem=args.rho_sem,
             a_min_special=args.a_min_special,
             a_token_floor=args.a_token_floor,
+            value_structure=args.spg_value_structure,
+            value_background=args.spg_value_background,
+            value_distractor=args.spg_value_distractor,
+            value_movable=args.spg_value_movable,
+            value_uncertain=args.spg_value_uncertain,
         )
-        if needs_prior else None
+        if needs_prior and args.semantic_prior_mode == "spg_v2" else None
     )
     hmc = HybridMemoryController(
         device=args.device,
@@ -1466,6 +1904,23 @@ def main() -> None:
         ttt_write_prior_transform_mode=args.ttt_write_prior_transform_mode,
         ttt_write_prior_anti_scale=args.ttt_write_prior_anti_scale,
         ttt_write_prior_gamma=args.ttt_write_prior_gamma,
+        ttt_write_special_token_policy=args.ttt_write_special_token_policy,
+        ttt_write_special_token_floor=args.ttt_write_special_token_floor,
+        ttt_write_special_token_ceiling=args.ttt_write_special_token_ceiling,
+        ttt_write_gradient_reversal_mode=args.ttt_write_gradient_reversal_mode,
+        ttt_write_gradient_reversal_gamma=args.ttt_write_gradient_reversal_gamma,
+        ttt_write_gradient_reversal_branch_mask=args.ttt_write_gradient_reversal_branch_mask,
+        ttt_write_gradient_reversal_branch_gammas=args.ttt_write_gradient_reversal_branch_gammas,
+        ttt_write_gradient_reversal_layer_gammas=args.ttt_write_gradient_reversal_layer_gammas,
+        ttt_write_gradient_reversal_head_routes=args.ttt_write_gradient_reversal_head_routes,
+        ttt_write_gradient_reversal_negative_frac=args.ttt_write_gradient_reversal_negative_frac,
+        ttt_write_gradient_reversal_risk_source=args.ttt_write_gradient_reversal_risk_source,
+        ttt_write_tri_replay_positive_frac=args.ttt_write_tri_replay_positive_frac,
+        ttt_write_tri_replay_negative_frac=args.ttt_write_tri_replay_negative_frac,
+        ttt_write_tri_replay_neutral_lambda=args.ttt_write_tri_replay_neutral_lambda,
+        ttt_write_gradient_reversal_transient_mode=args.ttt_write_gradient_reversal_transient_mode,
+        ttt_write_gradient_reversal_transient_branch_mask=args.ttt_write_gradient_reversal_transient_branch_mask,
+        ttt_write_gradient_reversal_transient_long_scale=args.ttt_write_gradient_reversal_transient_long_scale,
         ttt_write_replay_feature_gate_mode=args.ttt_write_replay_feature_gate_mode,
         ttt_write_replay_feature_gate_rho=args.ttt_write_replay_feature_gate_rho,
         ttt_write_replay_feature_gate_min=args.ttt_write_replay_feature_gate_min,
@@ -1479,6 +1934,7 @@ def main() -> None:
         ttt_write_replay_token_filter_blend_mode=args.ttt_write_replay_token_filter_blend_mode,
         ttt_write_transient_delta_subtract_scale=args.ttt_write_transient_delta_subtract_scale,
         ttt_write_transient_delta_branch_mask=args.ttt_write_transient_delta_branch_mask,
+        ttt_write_transient_delta_ttl=args.ttt_write_transient_delta_ttl,
         ttt_write_commit_ema_alpha=args.ttt_write_commit_ema_alpha,
         ttt_write_commit_ema_branch_mask=args.ttt_write_commit_ema_branch_mask,
         ttt_write_native_delta_gate_mode=args.ttt_write_native_delta_gate_mode,
@@ -1593,6 +2049,17 @@ def main() -> None:
     window_raw_predictions: List[Dict[str, Any]] = []
     ttt_freeze_chunks = _parse_chunk_index_set(args.ttt_freeze_chunks)
     ttt_semantic_write_scale_chunks = _parse_chunk_float_map(args.ttt_semantic_write_scale_chunks)
+    ttt_gradient_reversal_chunks = _parse_chunk_index_set(args.ttt_write_gradient_reversal_chunks)
+    ttt_gradient_reversal_chunk_gammas = _parse_chunk_float_map(
+        args.ttt_write_gradient_reversal_chunk_gammas
+    )
+    ttt_tri_replay_chunk_params = _parse_chunk_tri_replay_params(
+        args.ttt_write_tri_replay_chunk_params
+    )
+    ttt_gradient_reversal_base_mode = str(args.ttt_write_gradient_reversal_mode or "none").strip().lower()
+    ttt_gradient_reversal_base_gamma = float(args.ttt_write_gradient_reversal_gamma)
+    ttt_commit_filter_chunks = _parse_chunk_index_set(args.ttt_write_commit_filter_chunks)
+    ttt_commit_filter_base_mode = str(args.ttt_write_commit_filter_mode or "none").strip().lower()
 
     for ci, (start, end) in enumerate(chunks):
         print(f"\n{'#'*72}")
@@ -1644,17 +2111,47 @@ def main() -> None:
                 print("  Stage C: skipped (--stage_c_mode=none)")
                 H_p, W_p = probe.geometry.local_points.shape[1:3]
                 mo = _empty_masklet_output(probe.geometry.num_frames, int(H_p), int(W_p))
+            elif not needs_stage_c:
+                print("  Stage C: skipped (semantic prior ignored; no inline Stage C for parity)")
+                H_p, W_p = probe.geometry.local_points.shape[1:3]
+                mo = _empty_masklet_output(probe.geometry.num_frames, int(H_p), int(W_p))
             else:
                 print("  Stage C: Video Masklet Front-end ...")
                 t0 = time.time()
                 assert chunk_full is not None
                 if args.stage_memory_swap and str(args.device).startswith("cuda"):
                     _offload_backbone_to_cpu(backbone)
-                mo = _run_stage_c_lazy(build_kwargs, frontend_kwargs, chunk_full, ci)
+                mo = _run_stage_c_cached(
+                    args,
+                    build_kwargs,
+                    frontend_kwargs,
+                    chunk_full,
+                    chunk_idx=ci,
+                    start=start,
+                    end=end,
+                )
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
                 print(f"    done in {time.time() - t0:.2f}s")
                 print_masklet_output(mo)
+                if stage_c_video_path is not None:
+                    if stage_c_video_writer is None:
+                        stage_c_video_writer = _open_stage_c_video_writer(
+                            stage_c_video_path,
+                            width=int(mo.frame_width),
+                            height=int(mo.frame_height),
+                            fps=float(args.stage_c_video_fps),
+                        )
+                    stage_c_video_frame_count += _append_stage_c_video_frames(
+                        stage_c_video_writer,
+                        chunk_full,
+                        mo,
+                        chunk_idx=ci,
+                        num_chunks=len(chunks),
+                        start=start,
+                        overlap=args.chunk_overlap,
+                        alpha=args.stage_c_video_alpha,
+                    )
                 if args.stage_memory_swap and str(args.device).startswith("cuda"):
                     _offload_stage_c_frontend_to_cpu()
                     _ensure_backbone_on_device(backbone, args.device)
@@ -1667,24 +2164,33 @@ def main() -> None:
         if needs_prior:
             print("  Stage D: Memory Control Prior Generator ...")
             t0 = time.time()
-            assert prior_gen is not None and cue is not None and mo is not None
-            prior = prior_gen.run(cue, mo, probe.geometry)
-            prior = _apply_prior_policy(
-                prior,
-                cue,
-                probe.geometry,
-                policy=args.prior_policy,
-                alpha=args.mp_alpha,
-                p_min=args.mp_min,
-                p_max=args.mp_max,
-                score_source=args.mp_score_source,
-            )
-            prior = _apply_debug_prior_mode(
-                prior,
-                probe.geometry,
-                mode=args.debug_prior_mode,
-                roll_tokens=args.debug_prior_roll_tokens,
-            )
+            assert cue is not None and mo is not None
+            if args.semantic_prior_mode in {"noop", "pass_through"}:
+                prior = _make_pass_through_prior(cue, mo, probe.geometry, mode=args.semantic_prior_mode)
+            else:
+                assert prior_gen is not None
+                prior = prior_gen.run(cue, mo, probe.geometry)
+                prior = _apply_prior_policy(
+                    prior,
+                    cue,
+                    probe.geometry,
+                    policy=args.prior_policy,
+                    alpha=args.mp_alpha,
+                    p_min=args.mp_min,
+                    p_max=args.mp_max,
+                    score_source=args.mp_score_source,
+                )
+                prior = _apply_debug_prior_mode(
+                    prior,
+                    probe.geometry,
+                    mode=args.debug_prior_mode,
+                    roll_tokens=args.debug_prior_roll_tokens,
+                )
+            if bool(args.hmc_ignore_semantic_prior):
+                prior.debug.update({
+                    "hmc_ignore_semantic_prior": True,
+                    "semantic_prior_consumed": False,
+                })
             print(f"    done in {time.time() - t0:.2f}s")
             print_prior_output(prior)
         else:
@@ -1694,9 +2200,16 @@ def main() -> None:
         control_prior = hmc.build_control_prior(
             probe=probe,
             cue=cue,
-            prior_output=prior,
+            prior_output=None if bool(args.hmc_ignore_semantic_prior) else prior,
             mode=mode,
         )
+        if control_prior is not None and bool(args.hmc_ignore_semantic_prior):
+            control_prior.debug["hmc_ignore_semantic_prior"] = True
+            control_prior.debug["semantic_prior_present"] = prior is not None
+            control_prior.debug["semantic_prior_consumed"] = False
+        elif control_prior is not None:
+            control_prior.debug["semantic_prior_present"] = prior is not None
+            control_prior.debug["semantic_prior_consumed"] = prior is not None
 
         result: Optional[HybridMemoryResult] = None
         if mode == "probe_only":
@@ -1704,6 +2217,62 @@ def main() -> None:
             final_geo = probe.geometry
             state_next = probe.native_provisional_state
         else:
+            gr_chunk_active = True
+            gr_chunk_gamma = ttt_gradient_reversal_base_gamma
+            if ttt_gradient_reversal_chunk_gammas or ttt_gradient_reversal_chunks:
+                if ttt_gradient_reversal_chunk_gammas:
+                    gr_chunk_active = ci in ttt_gradient_reversal_chunk_gammas
+                    gr_chunk_gamma = float(ttt_gradient_reversal_chunk_gammas.get(ci, 0.0))
+                else:
+                    gr_chunk_active = ci in ttt_gradient_reversal_chunks
+                    gr_chunk_gamma = ttt_gradient_reversal_base_gamma if gr_chunk_active else 0.0
+                ctrl = getattr(hmc, "ttt_update_controller", None)
+                if ctrl is not None:
+                    ctrl.gradient_reversal_mode = (
+                        ttt_gradient_reversal_base_mode if gr_chunk_active else "none"
+                    )
+                    ctrl.gradient_reversal_gamma = (
+                        gr_chunk_gamma if gr_chunk_active else 0.0
+                    )
+                if ttt_gradient_reversal_base_mode not in {"", "none", "off"}:
+                    print(
+                        "    TTT gradient reversal chunk gate: "
+                        f"{'on' if gr_chunk_active else 'off'} for chunk {ci}, "
+                        f"gamma={gr_chunk_gamma if gr_chunk_active else 0.0:.4g}"
+                    )
+            ctrl = getattr(hmc, "ttt_update_controller", None)
+            if ctrl is not None:
+                tri_pos = float(args.ttt_write_tri_replay_positive_frac)
+                tri_neg = float(args.ttt_write_tri_replay_negative_frac)
+                tri_neu = float(args.ttt_write_tri_replay_neutral_lambda)
+                if ttt_tri_replay_chunk_params and ci in ttt_tri_replay_chunk_params:
+                    tri_pos, tri_neg, tri_neu = ttt_tri_replay_chunk_params[ci]
+                    if ttt_gradient_reversal_base_mode in {
+                        "tri_replay",
+                        "three_replay",
+                        "pos_neu_neg_replay",
+                        "pos_neg_neu_replay",
+                    }:
+                        print(
+                            "    TTT tri-replay chunk params: "
+                            f"chunk {ci} pos={tri_pos:.4g} neg={tri_neg:.4g} neu={tri_neu:.4g}"
+                        )
+                ctrl.tri_replay_positive_frac = float(tri_pos)
+                ctrl.tri_replay_negative_frac = float(tri_neg)
+                ctrl.tri_replay_neutral_lambda = float(tri_neu)
+            if ttt_commit_filter_chunks:
+                cf_chunk_active = ci in ttt_commit_filter_chunks
+                ctrl = getattr(hmc, "ttt_update_controller", None)
+                if ctrl is not None:
+                    ctrl.commit_filter_mode = (
+                        ttt_commit_filter_base_mode if cf_chunk_active else "none"
+                    )
+                if ttt_commit_filter_base_mode not in {"", "none", "off"}:
+                    print(
+                        "    TTT commit filter chunk gate: "
+                        f"{'on' if cf_chunk_active else 'off'} for chunk {ci}, "
+                        f"mode={ttt_commit_filter_base_mode if cf_chunk_active else 'none'}"
+                    )
             print("  Pass 2: Controlled Geometry Backbone + Hybrid Memory Controller ...")
             t0 = time.time()
             result = hmc.run_controlled(
@@ -1746,6 +2315,34 @@ def main() -> None:
                 )
                 result.debug["probe_ttt_write_state_hash"] = hybrid_state_fingerprint(state_next)
                 result.debug["probe_ttt_write_debug"] = probe_write_result.debug if probe_write_result is not None else None
+                if ttt_gradient_reversal_chunks:
+                    result.debug["ttt_gradient_reversal_chunk_gate"] = {
+                        "chunk": int(ci),
+                        "active": bool(gr_chunk_active),
+                        "chunks": sorted(int(x) for x in ttt_gradient_reversal_chunks),
+                        "gamma": float(gr_chunk_gamma if gr_chunk_active else 0.0),
+                    }
+                if ttt_gradient_reversal_chunk_gammas:
+                    result.debug["ttt_gradient_reversal_chunk_gamma_gate"] = {
+                        "chunk": int(ci),
+                        "active": bool(gr_chunk_active),
+                        "gamma": float(gr_chunk_gamma if gr_chunk_active else 0.0),
+                        "chunk_gammas": {
+                            str(int(k)): float(v)
+                            for k, v in sorted(ttt_gradient_reversal_chunk_gammas.items())
+                        },
+                    }
+                if ttt_commit_filter_chunks:
+                    result.debug["ttt_commit_filter_chunk_gate"] = {
+                        "chunk": int(ci),
+                        "active": bool(ci in ttt_commit_filter_chunks),
+                        "chunks": sorted(int(x) for x in ttt_commit_filter_chunks),
+                        "mode": (
+                            ttt_commit_filter_base_mode
+                            if ci in ttt_commit_filter_chunks
+                            else "none"
+                        ),
+                    }
             else:
                 raise ValueError(f"Unsupported --hmc_commit_mode={args.hmc_commit_mode}")
             if ci in ttt_semantic_write_scale_chunks and state_next is not None:
@@ -1867,6 +2464,15 @@ def main() -> None:
         del probe, cue, mo, prior, control_prior, result
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    if stage_c_video_writer is not None:
+        stage_c_video_writer.release()
+        print(
+            f"Saved Stage C masklet video to {stage_c_video_path} "
+            f"({stage_c_video_frame_count} frames, {args.stage_c_video_fps:g} FPS)"
+        )
+    elif stage_c_video_path is not None:
+        print(f"Stage C video requested but no frames were written: {stage_c_video_path}")
 
     _write_hmc_correctness_summary(args)
     _write_cue_quality_summary(args)

@@ -86,6 +86,7 @@ DEFAULT_EFFICIENTSAM3_REPO_ID = "Simon7108528/EfficientSAM3"
 DEFAULT_EFFICIENTSAM3_FILENAME = "stage1_sam3p1/efficient_sam3p1_efficientvit_m_mobileclip_s0_ctx16.pt"
 _CLIPSEG_STUFF_CACHE: Dict[Tuple[str, str], Tuple[object, torch.nn.Module]] = {}
 _LSEG_STUFF_CACHE: Dict[Tuple[str, str, str, bool], torch.nn.Module] = {}
+_MASK2FORMER_CITYSCAPES_CACHE: Dict[Tuple[str, str], Tuple[object, torch.nn.Module]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -209,7 +210,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--stuff_prompts", default=None, help="Comma-separated.")
     p.add_argument("--disable_stuff_prompts", type=int, default=1,
                    help="Default 1 disables detector-side STUFF prompts in this THING-first frontend; set 0 to keep legacy sparse STUFF.")
-    p.add_argument("--stuff_backend", default="efficientsam3", choices=["efficientsam3", "clipseg", "groupvit", "lseg"],
+    p.add_argument("--stuff_backend", default="efficientsam3", choices=["efficientsam3", "clipseg", "groupvit", "lseg", "mask2former_cityscapes"],
                    help="Per-frame STUFF backend used when --efficientsam3_stuff_enable=1.")
     p.add_argument("--efficientsam3_stuff_enable", type=int, default=0,
                    help="Run a per-frame STUFF pass. By default it is merged inside each chunk before global finalize.")
@@ -333,6 +334,27 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--lseg_stuff_worker", type=int, default=0, help=argparse.SUPPRESS)
     p.add_argument("--lseg_stuff_frame_list", default=None, help=argparse.SUPPRESS)
     p.add_argument("--lseg_stuff_output_pt", default=None, help=argparse.SUPPRESS)
+    p.add_argument("--mask2former_cityscapes_model", default="facebook/mask2former-swin-large-cityscapes-panoptic",
+                   help="Hugging Face Mask2Former Cityscapes panoptic checkpoint used when --stuff_backend=mask2former_cityscapes.")
+    p.add_argument("--mask2former_cityscapes_labels",
+                   default="road,sidewalk,building,wall,fence,sky,vegetation,terrain",
+                   help="Comma-separated Cityscapes labels to export as semantic STUFF/structure tracks. terrain is remapped to grass by default.")
+    p.add_argument("--mask2former_cityscapes_label_map", default="terrain:grass",
+                   help="Comma-separated source:target label remaps for Mask2Former output labels.")
+    p.add_argument("--mask2former_cityscapes_confidence_threshold", type=float, default=0.50,
+                   help="Minimum panoptic segment score for Mask2Former Cityscapes segments.")
+    p.add_argument("--mask2former_cityscapes_min_area_ratio", type=float, default=0.003,
+                   help="Drop tiny Mask2Former Cityscapes masks below this frame-area ratio.")
+    p.add_argument("--mask2former_cityscapes_max_area_ratio", type=float, default=0.92,
+                   help="Drop implausibly huge Mask2Former Cityscapes masks above this frame-area ratio.")
+    p.add_argument("--mask2former_cityscapes_morph_kernel", type=int, default=3,
+                   help="Morphology kernel size for Mask2Former Cityscapes masks; <=1 disables it.")
+    p.add_argument("--mask2former_cityscapes_batch_size", type=int, default=1,
+                   help="Number of frames batched per Mask2Former Cityscapes step.")
+    p.add_argument("--mask2former_cityscapes_device", default="auto",
+                   help="Device for Mask2Former Cityscapes. 'auto' reuses --device.")
+    p.add_argument("--mask2former_cityscapes_amp", type=int, default=1,
+                   help="Use autocast during Mask2Former Cityscapes inference on CUDA.")
     p.add_argument("--box_threshold", type=float, default=0.30)
     p.add_argument("--text_threshold", type=float, default=0.25)
     p.add_argument("--ann_frame_idx", type=int, default=0,
@@ -2085,13 +2107,249 @@ def _augment_with_groupvit_stuff_subprocess(
     return augmented
 
 
+def _resolve_mask2former_cityscapes_device(args: argparse.Namespace) -> str:
+    requested = str(getattr(args, "mask2former_cityscapes_device", "auto")).strip()
+    if requested and requested.lower() != "auto":
+        if requested == "cuda" and torch.cuda.is_available():
+            return "cuda:0"
+        return requested
+    device = str(getattr(args, "device", "cpu"))
+    if device == "cuda" and torch.cuda.is_available():
+        return "cuda:0"
+    return device if device.startswith("cuda") and torch.cuda.is_available() else "cpu"
+
+
+def _parse_label_remap(value: Optional[str]) -> Dict[str, str]:
+    remap: Dict[str, str] = {}
+    for item in _parse_comma_list(value):
+        if ":" not in item:
+            continue
+        src, dst = item.split(":", 1)
+        src = canonicalize_label(src)
+        dst = canonicalize_label(dst)
+        if src and dst:
+            remap[src] = dst
+    return remap
+
+
+def _get_mask2former_cityscapes_model(args: argparse.Namespace) -> Tuple[object, torch.nn.Module, str, str]:
+    model_id = str(getattr(args, "mask2former_cityscapes_model", "facebook/mask2former-swin-large-cityscapes-panoptic"))
+    device = _resolve_mask2former_cityscapes_device(args)
+    key = (model_id, str(device))
+    cached = _MASK2FORMER_CITYSCAPES_CACHE.get(key)
+    if cached is not None:
+        processor, model = cached
+        return processor, model, device, model_id
+
+    from transformers import AutoImageProcessor, Mask2FormerForUniversalSegmentation
+
+    print(
+        f"Mask2Former Cityscapes loading model={model_id} device={device}",
+        flush=True,
+    )
+    processor = AutoImageProcessor.from_pretrained(model_id)
+    model = Mask2FormerForUniversalSegmentation.from_pretrained(model_id)
+    model.to(device)
+    model.eval()
+    _MASK2FORMER_CITYSCAPES_CACHE[key] = (processor, model)
+    return processor, model, device, model_id
+
+
+def _release_mask2former_cityscapes_cache() -> None:
+    _MASK2FORMER_CITYSCAPES_CACHE.clear()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _run_mask2former_cityscapes_inprocess_payload(
+    image_paths: List[str],
+    args: argparse.Namespace,
+) -> Dict:
+    labels = _parse_comma_list(args.mask2former_cityscapes_labels)
+    if not labels or not bool(args.efficientsam3_stuff_enable):
+        return {"tracks": [], "debug": {"mask2former_cityscapes_skipped": "disabled_or_no_labels"}}
+    if not image_paths:
+        return {"tracks": [], "debug": {"mask2former_cityscapes_skipped": "no_frames"}}
+
+    from PIL import Image
+
+    first = cv2.imread(image_paths[0], cv2.IMREAD_COLOR)
+    if first is None:
+        raise FileNotFoundError(f"Failed to read first Mask2Former Cityscapes frame: {image_paths[0]}")
+    H, W = first.shape[:2]
+    processor, model, device, model_id = _get_mask2former_cityscapes_model(args)
+    id2label = {
+        int(k): canonicalize_label(v)
+        for k, v in getattr(model.config, "id2label", {}).items()
+    }
+    remap = _parse_label_remap(args.mask2former_cityscapes_label_map)
+    allowed = {canonicalize_label(label) for label in labels}
+    allowed_mapped = {canonicalize_label(remap.get(label, label)) for label in allowed}
+    label_tracks = {
+        label: _make_sparse_stuff_track(label, H, W)
+        for label in sorted(allowed_mapped)
+    }
+
+    stride = max(int(args.efficientsam3_stuff_stride), 1)
+    threshold = float(args.mask2former_cityscapes_confidence_threshold)
+    min_area_ratio = max(float(args.mask2former_cityscapes_min_area_ratio), 0.0)
+    max_area_ratio = min(max(float(args.mask2former_cityscapes_max_area_ratio), min_area_ratio), 1.0)
+    kernel_size = max(int(args.mask2former_cityscapes_morph_kernel), 0)
+    morph_kernel = (
+        np.ones((kernel_size, kernel_size), dtype=np.uint8)
+        if kernel_size > 1
+        else None
+    )
+    batch_size = max(int(args.mask2former_cityscapes_batch_size), 1)
+    use_amp = bool(args.mask2former_cityscapes_amp) and str(device).startswith("cuda")
+    t0 = time.time()
+    print(
+        f"Mask2Former Cityscapes in-process running labels={labels} remap={remap} "
+        f"frames={len(image_paths)} stride={stride} batch={batch_size} device={device}",
+        flush=True,
+    )
+
+    frame_jobs = [
+        (int(frame_idx), image_path)
+        for frame_idx, image_path in enumerate(image_paths)
+        if int(frame_idx) % stride == 0
+    ]
+    total_masks = 0
+    frames_with_any = 0
+    observed_counts: Dict[str, int] = {}
+
+    with torch.inference_mode():
+        for batch_start in range(0, len(frame_jobs), batch_size):
+            batch_jobs = frame_jobs[batch_start:batch_start + batch_size]
+            batch_images = []
+            target_sizes: List[Tuple[int, int]] = []
+            for _frame_idx, image_path in batch_jobs:
+                image = Image.open(image_path).convert("RGB")
+                if image.height != H or image.width != W:
+                    raise ValueError(
+                        f"Mask2Former Cityscapes frame size changed at {image_path}: "
+                        f"{image.height}x{image.width} vs {H}x{W}"
+                    )
+                batch_images.append(image)
+                target_sizes.append((H, W))
+
+            inputs = processor(images=batch_images, return_tensors="pt").to(device)
+            amp_context = (
+                torch.autocast("cuda", dtype=torch.float16)
+                if use_amp
+                else contextlib.nullcontext()
+            )
+            with amp_context:
+                outputs = model(**inputs)
+            results = processor.post_process_panoptic_segmentation(
+                outputs,
+                target_sizes=target_sizes,
+            )
+
+            for _batch_idx, (frame_idx, _image_path) in enumerate(batch_jobs):
+                result = results[_batch_idx]
+                seg = result["segmentation"].detach().cpu().numpy().astype(np.int64)
+                segments_info = list(result.get("segments_info", []))
+                masks_by_label: Dict[str, np.ndarray] = {}
+                scores_by_label: Dict[str, List[float]] = {}
+                for segment in segments_info:
+                    raw_label_id = segment.get("label_id", segment.get("category_id", None))
+                    if raw_label_id is None:
+                        continue
+                    raw_label = id2label.get(int(raw_label_id), canonicalize_label(str(raw_label_id)))
+                    observed_counts[raw_label] = int(observed_counts.get(raw_label, 0)) + 1
+                    if raw_label not in allowed:
+                        continue
+                    mapped_label = canonicalize_label(remap.get(raw_label, raw_label))
+                    if mapped_label not in label_tracks:
+                        continue
+                    score = float(segment.get("score", 1.0))
+                    if score < threshold:
+                        continue
+                    segment_id = int(segment.get("id", -1))
+                    if segment_id < 0:
+                        continue
+                    segment_mask = seg == segment_id
+                    if not segment_mask.any():
+                        continue
+                    current = masks_by_label.get(mapped_label)
+                    if current is None:
+                        masks_by_label[mapped_label] = segment_mask.copy()
+                    else:
+                        np.logical_or(current, segment_mask, out=current)
+                    scores_by_label.setdefault(mapped_label, []).append(score)
+
+                frame_added = False
+                for label, mask in masks_by_label.items():
+                    if morph_kernel is not None:
+                        mask_u8 = mask.astype(np.uint8)
+                        mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, morph_kernel)
+                        mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, morph_kernel)
+                        mask = mask_u8.astype(bool)
+                    if not mask.any():
+                        continue
+                    area_ratio = float(mask.sum()) / max(float(H * W), 1.0)
+                    if area_ratio < min_area_ratio or area_ratio > max_area_ratio:
+                        continue
+                    scores = scores_by_label.get(label, [1.0])
+                    score = float(max(scores) if scores else 1.0)
+                    track = label_tracks[label]
+                    track["mask_by_frame"][int(frame_idx)] = _pack_mask_np(mask)
+                    track["box_by_frame"][int(frame_idx)] = torch.from_numpy(_mask_to_box_np(mask))
+                    track["q_by_frame"][int(frame_idx)] = score
+                    track["area_by_frame"][int(frame_idx)] = area_ratio
+                    if len(track["mask_by_frame"]) == 1:
+                        track["birth_frame"] = int(frame_idx)
+                    total_masks += 1
+                    frame_added = True
+                if frame_added:
+                    frames_with_any += 1
+
+            last_frame_idx = int(batch_jobs[-1][0])
+            if (last_frame_idx + 1) % 100 == 0 or batch_start + batch_size >= len(frame_jobs):
+                print(
+                    f"  Mask2Former Cityscapes processed {last_frame_idx + 1}/{len(image_paths)} frames",
+                    flush=True,
+                )
+
+    tracks = [track for track in label_tracks.values() if track["mask_by_frame"]]
+    return {
+        "format": "mask2former_cityscapes_tracks_v1",
+        "num_frames": len(image_paths),
+        "frame_height": H,
+        "frame_width": W,
+        "tracks": tracks,
+        "debug": {
+            "mask2former_cityscapes_model": model_id,
+            "mask2former_cityscapes_labels": labels,
+            "mask2former_cityscapes_label_map": remap,
+            "mask2former_cityscapes_allowed_mapped": sorted(allowed_mapped),
+            "mask2former_cityscapes_stride": int(stride),
+            "mask2former_cityscapes_batch_size": int(batch_size),
+            "mask2former_cityscapes_threshold": float(threshold),
+            "mask2former_cityscapes_tracks_added": int(len(tracks)),
+            "mask2former_cityscapes_masks_added": int(total_masks),
+            "mask2former_cityscapes_frames_with_any": int(frames_with_any),
+            "mask2former_cityscapes_observed_counts": dict(sorted(observed_counts.items())),
+            "mask2former_cityscapes_elapsed_seconds": float(time.time() - t0),
+            "mask2former_cityscapes_inprocess_seconds": float(time.time() - t0),
+        },
+    }
+
+
 def _resolve_lseg_stuff_device(args: argparse.Namespace) -> str:
     requested = str(getattr(args, "lseg_stuff_device", "auto")).strip()
     if requested and requested.lower() != "auto":
+        if requested == "cuda" and torch.cuda.is_available():
+            return "cuda:0"
         return requested
     if torch.cuda.is_available() and torch.cuda.device_count() >= 2:
         return "cuda:1"
-    return args.device if str(args.device).startswith("cuda") and torch.cuda.is_available() else "cpu"
+    device = str(args.device)
+    if device == "cuda" and torch.cuda.is_available():
+        return "cuda:0"
+    return device if device.startswith("cuda") and torch.cuda.is_available() else "cpu"
 
 
 def _resolve_lseg_repo_root(args: argparse.Namespace) -> str:
@@ -5072,6 +5330,11 @@ def main() -> None:
                         temp_dirs,
                         prefix=f"loger_groupvit_stuff_chunk{ci:04d}_",
                     )
+                elif stuff_backend == "mask2former_cityscapes":
+                    stuff_payload = _run_mask2former_cityscapes_inprocess_payload(
+                        image_paths[start:end],
+                        args,
+                    )
                 elif stuff_backend == "lseg":
                     if bool(args.lseg_stuff_inprocess):
                         stuff_payload = _run_lseg_stuff_inprocess_payload(
@@ -5105,8 +5368,8 @@ def main() -> None:
                 print(
                     "  Stage C chunk STUFF done in "
                     f"{time.time() - stuff_t0:.2f}s: "
-                    f"+{stuff_debug.get('efficientsam3_stuff_tracks_added', stuff_debug.get('clipseg_stuff_tracks_added', stuff_debug.get('groupvit_stuff_tracks_added', stuff_debug.get('lseg_stuff_tracks_added', 0))))} tracks, "
-                    f"+{stuff_debug.get('efficientsam3_stuff_masks_added', stuff_debug.get('clipseg_stuff_masks_added', stuff_debug.get('groupvit_stuff_masks_added', stuff_debug.get('lseg_stuff_masks_added', 0))))} masks",
+                    f"+{stuff_debug.get('efficientsam3_stuff_tracks_added', stuff_debug.get('clipseg_stuff_tracks_added', stuff_debug.get('groupvit_stuff_tracks_added', stuff_debug.get('mask2former_cityscapes_tracks_added', stuff_debug.get('lseg_stuff_tracks_added', 0)))))} tracks, "
+                    f"+{stuff_debug.get('efficientsam3_stuff_masks_added', stuff_debug.get('clipseg_stuff_masks_added', stuff_debug.get('groupvit_stuff_masks_added', stuff_debug.get('mask2former_cityscapes_masks_added', stuff_debug.get('lseg_stuff_masks_added', 0)))))} masks",
                     flush=True,
                 )
             print(f"  Stage C chunk done in {time.time() - chunk_t0:.2f}s")
@@ -5208,6 +5471,15 @@ def main() -> None:
                     args,
                     temp_dirs,
                 )
+            elif stuff_backend == "mask2former_cityscapes":
+                payload = _run_mask2former_cityscapes_inprocess_payload(original_image_paths, args)
+                masklet_output = _merge_efficientsam3_stuff_tracks(
+                    masklet_output,
+                    payload,
+                    replace_existing=bool(args.efficientsam3_stuff_replace_existing),
+                    subtract_things=bool(args.efficientsam3_stuff_subtract_things),
+                    subtract_dilation=int(args.efficientsam3_stuff_subtract_dilation),
+                )
             elif stuff_backend == "lseg":
                 if bool(args.lseg_stuff_inprocess):
                     payload = _run_lseg_stuff_inprocess_payload(original_image_paths, args)
@@ -5235,6 +5507,7 @@ def main() -> None:
             _trim_cuda_cache()
 
         _release_clipseg_stuff_cache()
+        _release_mask2former_cityscapes_cache()
         _release_lseg_stuff_cache()
 
         if torch.cuda.is_available():

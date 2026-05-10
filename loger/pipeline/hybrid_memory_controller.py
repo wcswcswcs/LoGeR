@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -36,6 +36,131 @@ from .geometry_backbone import (
 )
 from .semantic_prior_generator import PriorOutput
 from .ttt_write_controller import TTTWriteController, WriteResult
+
+
+_DUAL_LIFETIME_TRANSIENT_MODES = {
+    "dual_lifetime",
+    "dual_fast_weight",
+    "apply_short_delta",
+    "short_apply_delta",
+}
+
+
+def _is_dual_lifetime_transient_delta(transient_delta: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(transient_delta, dict):
+        return False
+    mode = str(transient_delta.get("_mode", "")).strip().lower()
+    if mode not in _DUAL_LIFETIME_TRANSIENT_MODES:
+        return False
+    ttl = int(transient_delta.get("_ttl_remaining", 0) or 0)
+    if ttl <= 0:
+        return False
+    for branch_name in ("w0", "w1", "w2"):
+        values = transient_delta.get(branch_name)
+        if isinstance(values, list) and any(v is not None for v in values):
+            return True
+    return False
+
+
+def _renorm_like(reference: torch.Tensor, candidate: torch.Tensor) -> torch.Tensor:
+    if candidate.ndim < 2:
+        return candidate.to(dtype=reference.dtype)
+    ref = reference.detach().float()
+    out = candidate.float()
+    ref_norm = ref.norm(dim=1, keepdim=True).clamp_min(1e-6)
+    out_norm = out.norm(dim=1, keepdim=True).clamp_min(1e-6)
+    return (out / out_norm * ref_norm).to(dtype=reference.dtype)
+
+
+def _apply_dual_lifetime_delta_to_branch(
+    branch_values: Any,
+    delta_values: Any,
+    *,
+    scale: float,
+) -> Any:
+    if not isinstance(branch_values, list) or not isinstance(delta_values, list):
+        return branch_values
+    out: List[Any] = list(branch_values)
+    for li, base in enumerate(branch_values):
+        if base is None or li >= len(delta_values):
+            continue
+        delta = delta_values[li]
+        if delta is None or not torch.is_tensor(base) or not torch.is_tensor(delta):
+            continue
+        if tuple(base.shape) != tuple(delta.shape):
+            continue
+        delta_t = delta.to(device=base.device, dtype=base.dtype)
+        candidate = base.float() + float(scale) * delta_t.float()
+        out[li] = _renorm_like(base, candidate)
+    return out
+
+
+def _ttt_state_with_dual_lifetime_apply(ttt_state: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not isinstance(ttt_state, dict):
+        return ttt_state
+    transient_delta = ttt_state.get("transient_delta")
+    if not _is_dual_lifetime_transient_delta(transient_delta):
+        return ttt_state
+    scale = float(transient_delta.get("_apply_scale", 1.0))
+    out = dict(ttt_state)
+    for branch_name in ("w0", "w1", "w2"):
+        out[branch_name] = _apply_dual_lifetime_delta_to_branch(
+            ttt_state.get(branch_name),
+            transient_delta.get(branch_name),
+            scale=scale,
+        )
+    out["_dual_lifetime_apply"] = {
+        "mode": str(transient_delta.get("_mode", "")),
+        "ttl": int(transient_delta.get("_ttl_remaining", 0) or 0),
+        "scale": float(scale),
+    }
+    return out
+
+
+def _write_cache_with_long_old_weights_for_dual_lifetime(
+    write_cache: WriteCacheOutput,
+    long_ttt_state: Optional[Dict[str, Any]],
+) -> Tuple[WriteCacheOutput, Dict[str, Any]]:
+    debug = {
+        "ttt_dual_lifetime_long_old_override": False,
+        "ttt_dual_lifetime_long_old_override_tensors": 0,
+    }
+    if not isinstance(long_ttt_state, dict):
+        return write_cache, debug
+    if not _is_dual_lifetime_transient_delta(long_ttt_state.get("transient_delta")):
+        return write_cache, debug
+    branch_fields = (
+        ("w0", "w0_old"),
+        ("w1", "w1_old"),
+        ("w2", "w2_old"),
+    )
+    new_layer_caches = []
+    replaced = 0
+    for li, layer_cache in enumerate(write_cache.layer_caches):
+        updates: Dict[str, torch.Tensor] = {}
+        for branch_name, field_name in branch_fields:
+            branch_values = long_ttt_state.get(branch_name)
+            if not isinstance(branch_values, list) or li >= len(branch_values):
+                continue
+            long_old = branch_values[li]
+            current_old = getattr(layer_cache, field_name, None)
+            if long_old is None or current_old is None:
+                continue
+            if not torch.is_tensor(long_old) or not torch.is_tensor(current_old):
+                continue
+            if tuple(long_old.shape) != tuple(current_old.shape):
+                continue
+            updates[field_name] = long_old.to(device=current_old.device, dtype=current_old.dtype)
+        if updates:
+            new_layer_caches.append(replace(layer_cache, **updates))
+            replaced += len(updates)
+        else:
+            new_layer_caches.append(layer_cache)
+    if replaced <= 0:
+        return write_cache, debug
+    debug["ttt_dual_lifetime_long_old_override"] = True
+    debug["ttt_dual_lifetime_long_old_override_tensors"] = int(replaced)
+    return replace(write_cache, layer_caches=new_layer_caches), debug
 
 
 @dataclass
@@ -55,7 +180,7 @@ class HybridMemoryState:
     debug: Dict[str, Any] = field(default_factory=dict)
 
     def to_ttt_input(self) -> Optional[Dict[str, Any]]:
-        return self.ttt_state
+        return _ttt_state_with_dual_lifetime_apply(self.ttt_state)
 
     @classmethod
     def from_ttt_state(cls, ttt_state: Optional[Dict[str, Any]]) -> "HybridMemoryState":
@@ -826,6 +951,23 @@ class HybridMemoryController:
         ttt_write_prior_transform_mode: str = "none",
         ttt_write_prior_anti_scale: float = 0.0,
         ttt_write_prior_gamma: float = 1.0,
+        ttt_write_special_token_policy: str = "none",
+        ttt_write_special_token_floor: float = 0.0,
+        ttt_write_special_token_ceiling: float = 1.0,
+        ttt_write_gradient_reversal_mode: str = "none",
+        ttt_write_gradient_reversal_gamma: float = 0.0,
+        ttt_write_gradient_reversal_branch_mask: str = "0",
+        ttt_write_gradient_reversal_branch_gammas: Optional[str] = None,
+        ttt_write_gradient_reversal_layer_gammas: Optional[str] = None,
+        ttt_write_gradient_reversal_head_routes: Optional[str] = None,
+        ttt_write_gradient_reversal_negative_frac: float = 0.0,
+        ttt_write_gradient_reversal_risk_source: str = "prior",
+        ttt_write_tri_replay_positive_frac: float = 0.35,
+        ttt_write_tri_replay_negative_frac: float = 0.15,
+        ttt_write_tri_replay_neutral_lambda: float = 1.0,
+        ttt_write_gradient_reversal_transient_mode: str = "none",
+        ttt_write_gradient_reversal_transient_branch_mask: str = "",
+        ttt_write_gradient_reversal_transient_long_scale: float = 0.0,
         ttt_write_replay_feature_gate_mode: str = "none",
         ttt_write_replay_feature_gate_rho: float = 0.0,
         ttt_write_replay_feature_gate_min: float = 0.5,
@@ -839,6 +981,7 @@ class HybridMemoryController:
         ttt_write_replay_token_filter_blend_mode: str = "linear",
         ttt_write_transient_delta_subtract_scale: float = 0.0,
         ttt_write_transient_delta_branch_mask: str = "0",
+        ttt_write_transient_delta_ttl: int = 1,
         ttt_write_commit_ema_alpha: float = 1.0,
         ttt_write_commit_ema_branch_mask: str = "all",
         ttt_write_native_delta_gate_mode: str = "none",
@@ -1042,6 +1185,23 @@ class HybridMemoryController:
             prior_transform_mode=ttt_write_prior_transform_mode,
             prior_anti_scale=ttt_write_prior_anti_scale,
             prior_gamma=ttt_write_prior_gamma,
+            special_token_policy=ttt_write_special_token_policy,
+            special_token_floor=ttt_write_special_token_floor,
+            special_token_ceiling=ttt_write_special_token_ceiling,
+            gradient_reversal_mode=ttt_write_gradient_reversal_mode,
+            gradient_reversal_gamma=ttt_write_gradient_reversal_gamma,
+            gradient_reversal_branch_mask=ttt_write_gradient_reversal_branch_mask,
+            gradient_reversal_branch_gammas=ttt_write_gradient_reversal_branch_gammas,
+            gradient_reversal_layer_gammas=ttt_write_gradient_reversal_layer_gammas,
+            gradient_reversal_head_routes=ttt_write_gradient_reversal_head_routes,
+            gradient_reversal_negative_frac=ttt_write_gradient_reversal_negative_frac,
+            gradient_reversal_risk_source=ttt_write_gradient_reversal_risk_source,
+            tri_replay_positive_frac=ttt_write_tri_replay_positive_frac,
+            tri_replay_negative_frac=ttt_write_tri_replay_negative_frac,
+            tri_replay_neutral_lambda=ttt_write_tri_replay_neutral_lambda,
+            gradient_reversal_transient_mode=ttt_write_gradient_reversal_transient_mode,
+            gradient_reversal_transient_branch_mask=ttt_write_gradient_reversal_transient_branch_mask,
+            gradient_reversal_transient_long_scale=ttt_write_gradient_reversal_transient_long_scale,
             update_token_scope=ttt_write_token_scope,
             update_token_scope_floor=ttt_write_token_scope_floor,
             replay_feature_gate_mode=ttt_write_replay_feature_gate_mode,
@@ -1057,6 +1217,7 @@ class HybridMemoryController:
             replay_token_filter_blend_mode=ttt_write_replay_token_filter_blend_mode,
             transient_delta_subtract_scale=ttt_write_transient_delta_subtract_scale,
             transient_delta_branch_mask=ttt_write_transient_delta_branch_mask,
+            transient_delta_ttl=ttt_write_transient_delta_ttl,
             commit_ema_alpha=ttt_write_commit_ema_alpha,
             commit_ema_branch_mask=ttt_write_commit_ema_branch_mask,
             native_delta_gate_mode=ttt_write_native_delta_gate_mode,
@@ -1086,7 +1247,11 @@ class HybridMemoryController:
         committed_hash = hybrid_state_fingerprint(state_m)
         geo, write_cache = backbone.run(
             images,
-            ttt_state=state_m.to_ttt_input() if state_m is not None else None,
+            # Probe/write-cache collection must stay on the long-lived TTT state.
+            # Dual-lifetime short deltas are apply-time evidence for the
+            # controlled pass; letting them enter probe would contaminate the
+            # long commit primitives we are trying to keep separate.
+            ttt_state=state_m.ttt_state if state_m is not None else None,
             cache_ttt_primitives=True,
             hmc_control=self._build_model_hmc_control(None, mode="probe", identity_hooks=True),
         )
@@ -1235,6 +1400,7 @@ class HybridMemoryController:
         read_patch: Optional[torch.Tensor],
         P_ref: torch.Tensor,
         base_write_prior: Optional[torch.Tensor] = None,
+        semantic_value_patch: Optional[torch.Tensor] = None,
     ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
         source = str(self.hmc_write_score_source)
         if source in {"stage_d", "prior", "bl01"}:
@@ -1276,9 +1442,31 @@ class HybridMemoryController:
         occ = _patch_or(0.0, occ_patch).clamp(0.0, 1.0)
         unc = _patch_or(0.0, unc_patch).clamp(0.0, 1.0)
         read = _patch_or(0.0, read_patch).clamp(0.0, 1.0)
+        sem_value = _patch_or(1.0, semantic_value_patch).clamp(0.0, 1.0)
         pref = P_ref[patch_mask].detach().cpu().float().clamp(0.0, 1.0)
         reliability = ((1.0 - read) * (1.0 - occ) * (1.0 - unc) * (1.0 - pref)).clamp(0.0, 1.0)
-        if base_write_prior is not None:
+        lo = min(float(self.hmc_write_min), float(self.hmc_write_max))
+        hi = max(float(self.hmc_write_min), float(self.hmc_write_max))
+        stage_d_composed_source = source.startswith("stage_d_x_") or source.startswith("v5_stage_d_x_")
+        semantic_write_sources = {
+            "semantic_value",
+            "sem_value",
+            "sem_x_dg_inv_sqrt",
+            "semantic_x_dg_inv_sqrt",
+            "stage_d_x_sem",
+            "stage_d_x_semantic",
+            "stage_d_x_sem_x_dg_inv_sqrt",
+            "stage_d_x_semantic_x_dg_inv_sqrt",
+        }
+        if source in semantic_write_sources:
+            # Semantic-composition sources should use the historical v5 stage_d
+            # dynamic-rank base, not the Stage D A_tok as the base prior.
+            # Otherwise the semantic prior is effectively used twice and the
+            # old stage_d_x_* override may erase semantic effects.
+            base_patch = (
+                1.0 + float(self.hmc_write_alpha) * (-_centered_percentile_rank(dyn))
+            ).clamp(lo, hi)
+        elif base_write_prior is not None:
             base_write = base_write_prior.detach().cpu().float().reshape(-1)
             if base_write.numel() >= L_tok:
                 base_patch = base_write[:L_tok][patch_mask].clamp(0.0, 2.0)
@@ -1286,8 +1474,23 @@ class HybridMemoryController:
                 padded = torch.ones(L_tok, dtype=torch.float32)
                 padded[: base_write.numel()] = base_write
                 base_patch = padded[patch_mask].clamp(0.0, 2.0)
+            if stage_d_composed_source and base_patch.numel() > 1:
+                spread = float((base_patch.max() - base_patch.min()).abs().item())
+                if spread < 1e-8:
+                    base_patch = (
+                        1.0 + float(self.hmc_write_alpha) * (-_centered_percentile_rank(dyn))
+                    ).clamp(lo, hi)
         else:
-            base_patch = torch.ones(num_patch, dtype=torch.float32)
+            if stage_d_composed_source:
+                # Historical v5 "stage_d" is the eta-mean-preserving dynamic-rank
+                # write prior. Rebuild it here when semantic prior is intentionally
+                # ignored, so D_g write-score variants remain true no-ops w.r.t.
+                # Stage C/D wiring.
+                base_patch = (
+                    1.0 + float(self.hmc_write_alpha) * (-_centered_percentile_rank(dyn))
+                ).clamp(lo, hi)
+            else:
+                base_patch = torch.ones(num_patch, dtype=torch.float32)
         base_score = _normalize01(base_patch)
 
         if source in {"dyn", "old_dyn"}:
@@ -1340,6 +1543,15 @@ class HybridMemoryController:
             static = (1.0 - read).clamp(0.0, 1.0)
             dynamic = read.clamp(0.0, 1.0)
             raw_score = (base_score * static * dynamic.square()).clamp(0.0, 1.0)
+        elif source in {"semantic_value", "sem_value"}:
+            raw_score = sem_value.clamp(0.0, 1.0)
+        elif source in {"sem_x_dg_inv_sqrt", "semantic_x_dg_inv_sqrt"}:
+            raw_score = (sem_value * torch.sqrt((1.0 - read).clamp(0.0, 1.0))).clamp(0.0, 1.0)
+        elif source in {"stage_d_x_sem", "stage_d_x_semantic"}:
+            raw_score = (base_score * sem_value).clamp(0.0, 1.0)
+        elif source in {"stage_d_x_sem_x_dg_inv_sqrt", "stage_d_x_semantic_x_dg_inv_sqrt"}:
+            dg_static = torch.sqrt((1.0 - read).clamp(0.0, 1.0))
+            raw_score = (base_score * sem_value * dg_static).clamp(0.0, 1.0)
         elif source in {"ttt_residual", "residual"}:
             raw_score = _normalize01(residual_patch)
         elif source in {"ttt_residual_reliable", "residual_reliable", "residual_reliability"}:
@@ -1350,8 +1562,6 @@ class HybridMemoryController:
             raw_score = (1.0 - dyn).clamp(0.0, 1.0)
 
         raw_score = torch.nan_to_num(raw_score.float(), nan=0.0, posinf=1.0, neginf=0.0)
-        lo = min(float(self.hmc_write_min), float(self.hmc_write_max))
-        hi = max(float(self.hmc_write_min), float(self.hmc_write_max))
         centered = _centered_percentile_rank(raw_score)
         p_patch = (1.0 + float(self.hmc_write_alpha) * centered).clamp(lo, hi)
 
@@ -1389,6 +1599,10 @@ class HybridMemoryController:
             "hmc_write_reliability_mean_patch": float(reliability.mean().item()) if reliability.numel() else 1.0,
             "hmc_write_corr_score_dyn": _pearson_corr(raw_score, dyn),
             "hmc_write_corr_score_exp_dyn": _pearson_corr(raw_score, exp_dyn),
+            "hmc_write_corr_score_sem_value": _pearson_corr(raw_score, sem_value),
+            "hmc_write_sem_value_mean": float(sem_value.mean().item()) if sem_value.numel() else 1.0,
+            "hmc_write_sem_value_q10": float(torch.quantile(sem_value, 0.1).item()) if sem_value.numel() else 1.0,
+            "hmc_write_sem_value_q90": float(torch.quantile(sem_value, 0.9).item()) if sem_value.numel() else 1.0,
             "hmc_write_corr_score_unc": _pearson_corr(raw_score, unc),
             "hmc_write_corr_score_residual": _pearson_corr(raw_score, residual_patch),
         }
@@ -1758,6 +1972,14 @@ class HybridMemoryController:
                 "stage_d_x_static_focal4",
                 "stage_d_x_dg_boundary_focal2",
                 "v5_stage_d_x_dg_boundary_focal2",
+                "semantic_value",
+                "sem_value",
+                "sem_x_dg_inv_sqrt",
+                "semantic_x_dg_inv_sqrt",
+                "stage_d_x_sem",
+                "stage_d_x_semantic",
+                "stage_d_x_sem_x_dg_inv_sqrt",
+                "stage_d_x_semantic_x_dg_inv_sqrt",
                 "residual_reliability",
             }
             fast_acl2_only = (
@@ -1907,13 +2129,29 @@ class HybridMemoryController:
                         read_patch=read_patch,
                         P_ref=P_ref,
                         base_write_prior=P_ttt_write,
+                        semantic_value_patch=getattr(prior_output, "V_sem_patch_flat", None),
                     )
                     if override_write is not None:
                         P_ttt_write = override_write
                         B_chunk_geo = 1.0
                     patch_debug.update(write_debug)
                 else:
-                    patch_debug.update({"hmc_write_score_source": self.hmc_write_score_source, "hmc_write_override": False})
+                    override_write, write_debug = self._phase_e_write_prior(
+                        probe=probe,
+                        token_type=token_type,
+                        dyn_patch=dyn_patch,
+                        explicit_dyn_patch=explicit_patch,
+                        occ_patch=occ_patch,
+                        unc_patch=unc_patch,
+                        read_patch=read_patch,
+                        P_ref=P_ref,
+                        base_write_prior=None,
+                        semantic_value_patch=None,
+                    )
+                    if override_write is not None:
+                        P_ttt_write = override_write
+                        B_chunk_geo = 1.0
+                    patch_debug.update(write_debug)
 
                 if mode in {"unity_replay", "native", "identity_hooks", "read_path_only", "probe_only"}:
                     P_ttt_write = None
@@ -2593,6 +2831,7 @@ class HybridMemoryController:
                 read_patch=read_patch if cue is not None and cue.E_cue_patch is not None else None,
                 P_ref=P_ref,
                 base_write_prior=P_ttt_write,
+                semantic_value_patch=getattr(prior_output, "V_sem_patch_flat", None),
             )
             if override_write is not None:
                 P_ttt_write = override_write
@@ -2736,8 +2975,12 @@ class HybridMemoryController:
             else:
                 old_mode = self.ttt_update_controller.write_mode
                 self.ttt_update_controller.write_mode = write_mode
-                write_result = self.ttt_update_controller.run(
+                write_cache_for_commit, dual_lifetime_debug = _write_cache_with_long_old_weights_for_dual_lifetime(
                     write_cache,
+                    state_m.ttt_state if state_m is not None else None,
+                )
+                write_result = self.ttt_update_controller.run(
+                    write_cache_for_commit,
                     A_tok,
                     B_chunk_geo=B_chunk_geo,
                     device=self.device,
@@ -2752,6 +2995,7 @@ class HybridMemoryController:
                     ),
                 )
                 self.ttt_update_controller.write_mode = old_mode
+                write_result.debug.update(dual_lifetime_debug)
                 gated_history, swa_write_debug = self._apply_swa_history_write_gate(
                     write_result.history,
                     control_prior,
@@ -2996,6 +3240,10 @@ class HybridMemoryController:
         write_cache = probe.hybrid_cache.ttt_cache
         if write_cache is None:
             return probe.native_provisional_state, None
+        write_cache, dual_lifetime_debug = _write_cache_with_long_old_weights_for_dual_lifetime(
+            write_cache,
+            prev_ttt_state,
+        )
         A_tok = control_prior.P_ttt_write if control_prior is not None else None
         B_chunk_geo = control_prior.B_chunk_geo if control_prior is not None else None
         old_mode = self.ttt_update_controller.write_mode
@@ -3016,6 +3264,7 @@ class HybridMemoryController:
             ),
         )
         self.ttt_update_controller.write_mode = old_mode
+        write_result.debug.update(dual_lifetime_debug)
         gated_history, swa_write_debug = self._apply_swa_history_write_gate(
             write_result.history,
             control_prior,

@@ -18,7 +18,7 @@ consumed by Stage E.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -47,6 +47,8 @@ class PriorOutput:
     Elig_pix: torch.Tensor
     r_mask: torch.Tensor
     E_patch_flat: torch.Tensor
+    V_sem_patch_flat: Optional[torch.Tensor] = None
+    R_mask_patch_flat: Optional[torch.Tensor] = None
 
     B_chunk_geo: float = 0.0
     A_special: float = 1.0
@@ -110,10 +112,11 @@ class SemanticPriorGenerator:
             H_p=H_p,
             W_p=W_p,
         )
-        A_pix = self._compute_pixel_prior(
+        A_pix, V_sem_pix, R_mask_pix = self._compute_pixel_prior(
             Elig_pix=Elig_pix,
             mo=masklet,
             A_mask=A_mask,
+            v_sem=v_sem,
             r_mask=r_mask,
             T=T,
             H_p=H_p,
@@ -127,6 +130,8 @@ class SemanticPriorGenerator:
             H_tok=H_tok,
             W_tok=W_tok,
         )
+        V_sem_patch_flat = self._pool_to_patch(V_sem_pix, H_tok, W_tok).reshape(-1).float().clamp(0.0, 1.0)
+        R_mask_patch_flat = self._pool_to_patch(R_mask_pix, H_tok, W_tok).reshape(-1).float().clamp(0.0, 1.0)
 
         return PriorOutput(
             A_mask=A_mask,
@@ -136,6 +141,8 @@ class SemanticPriorGenerator:
             Elig_pix=Elig_pix,
             r_mask=r_mask,
             E_patch_flat=E_patch_flat,
+            V_sem_patch_flat=V_sem_patch_flat,
+            R_mask_patch_flat=R_mask_patch_flat,
             B_chunk_geo=B_chunk_geo,
             A_special=A_special,
             debug={
@@ -145,6 +152,8 @@ class SemanticPriorGenerator:
                 "mean_elig": float(Elig_pix.mean().item()) if Elig_pix.numel() > 0 else 0.0,
                 "mean_a_pix": float(A_pix.mean().item()) if A_pix.numel() > 0 else 0.0,
                 "mean_r_mask": float(r_mask.mean().item()) if r_mask.numel() > 0 else 0.0,
+                "mean_v_sem_patch": float(V_sem_patch_flat.mean().item()) if V_sem_patch_flat.numel() > 0 else 1.0,
+                "mean_r_mask_patch": float(R_mask_patch_flat.mean().item()) if R_mask_patch_flat.numel() > 0 else 0.0,
                 "a_token_floor": self.a_token_floor,
             },
         )
@@ -247,20 +256,22 @@ class SemanticPriorGenerator:
         Elig_pix: torch.Tensor,
         mo: MaskletOutput,
         A_mask: torch.Tensor,
+        v_sem: torch.Tensor,
         r_mask: torch.Tensor,
         T: int,
         H_p: int,
         W_p: int,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         J = mo.num_masklets
         if J == 0:
-            return Elig_pix.clone()
+            return Elig_pix.clone(), torch.ones_like(Elig_pix), torch.zeros_like(Elig_pix)
 
         T_use = min(T, mo.num_frames)
         H_mask, W_mask = mo.frame_height, mo.frame_width
 
         best_score = torch.zeros(T, H_p, W_p, dtype=torch.float32)
         A_sem_pix = torch.zeros(T, H_p, W_p, dtype=torch.float32)
+        V_sem_pix = torch.ones(T, H_p, W_p, dtype=torch.float32)
         R_mask_pix = torch.zeros(T, H_p, W_p, dtype=torch.float32)
 
         for j in range(J):
@@ -288,6 +299,11 @@ class SemanticPriorGenerator:
                     torch.full_like(A_sem_pix[t], float(A_mask[j, t].item())),
                     A_sem_pix[t],
                 )
+                V_sem_pix[t] = torch.where(
+                    update,
+                    torch.full_like(V_sem_pix[t], float(v_sem[j].item())),
+                    V_sem_pix[t],
+                )
                 R_mask_pix[t] = torch.where(
                     update,
                     torch.full_like(R_mask_pix[t], float(r_mask[j, t].item())),
@@ -295,7 +311,7 @@ class SemanticPriorGenerator:
                 )
 
         A_pix = R_mask_pix * A_sem_pix + (1.0 - R_mask_pix) * Elig_pix
-        return A_pix.clamp(0.0, 1.0)
+        return A_pix.clamp(0.0, 1.0), V_sem_pix.clamp(0.0, 1.0), R_mask_pix.clamp(0.0, 1.0)
 
     # -- token projection ------------------------------------------------
 

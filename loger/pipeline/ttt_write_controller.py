@@ -39,7 +39,7 @@ class WriteResult:
     w1: List[Optional[torch.Tensor]]    # per-layer branch-1 weights
     w2: List[Optional[torch.Tensor]]    # per-layer branch-2 weights
     history: Optional[List[Optional[Dict[str, torch.Tensor]]]] = None
-    transient_delta: Optional[Dict[str, List[Optional[torch.Tensor]]]] = None
+    transient_delta: Optional[Dict[str, Any]] = None
 
     debug: Dict[str, Any] = field(default_factory=dict)
 
@@ -76,6 +76,23 @@ class TTTWriteController:
         prior_transform_mode: str = "none",
         prior_anti_scale: float = 0.0,
         prior_gamma: float = 1.0,
+        special_token_policy: str = "none",
+        special_token_floor: float = 0.0,
+        special_token_ceiling: float = 1.0,
+        gradient_reversal_mode: str = "none",
+        gradient_reversal_gamma: float = 0.0,
+        gradient_reversal_branch_mask: str = "0",
+        gradient_reversal_branch_gammas: Optional[str] = None,
+        gradient_reversal_layer_gammas: Optional[str] = None,
+        gradient_reversal_head_routes: Optional[str] = None,
+        gradient_reversal_negative_frac: float = 0.0,
+        gradient_reversal_risk_source: str = "prior",
+        tri_replay_positive_frac: float = 0.35,
+        tri_replay_negative_frac: float = 0.15,
+        tri_replay_neutral_lambda: float = 1.0,
+        gradient_reversal_transient_mode: str = "none",
+        gradient_reversal_transient_branch_mask: str = "",
+        gradient_reversal_transient_long_scale: float = 0.0,
         update_token_scope: str = "all",
         update_token_scope_floor: float = 0.0,
         replay_feature_gate_mode: str = "none",
@@ -91,6 +108,7 @@ class TTTWriteController:
         replay_token_filter_blend_mode: str = "linear",
         transient_delta_subtract_scale: float = 0.0,
         transient_delta_branch_mask: str = "0",
+        transient_delta_ttl: int = 1,
         commit_ema_alpha: float = 1.0,
         commit_ema_branch_mask: str = "all",
         native_delta_gate_mode: str = "none",
@@ -131,6 +149,28 @@ class TTTWriteController:
         self.prior_transform_mode = str(prior_transform_mode or "none").strip().lower()
         self.prior_anti_scale = float(prior_anti_scale)
         self.prior_gamma = float(prior_gamma)
+        self.special_token_policy = str(special_token_policy or "none").strip().lower()
+        self.special_token_floor = float(special_token_floor)
+        self.special_token_ceiling = float(special_token_ceiling)
+        self.gradient_reversal_mode = str(gradient_reversal_mode or "none").strip().lower()
+        self.gradient_reversal_gamma = float(gradient_reversal_gamma)
+        self.gradient_reversal_branch_mask = self._parse_branch_mask(gradient_reversal_branch_mask)
+        self.gradient_reversal_branch_gammas = self._parse_branch_gamma_map(gradient_reversal_branch_gammas)
+        self.gradient_reversal_layer_gammas = self._parse_layer_gamma_map(gradient_reversal_layer_gammas)
+        self.gradient_reversal_head_routes = self._parse_layer_head_routes(gradient_reversal_head_routes)
+        self.gradient_reversal_negative_frac = float(gradient_reversal_negative_frac)
+        self.gradient_reversal_risk_source = str(gradient_reversal_risk_source or "prior").strip().lower()
+        self.tri_replay_positive_frac = float(tri_replay_positive_frac)
+        self.tri_replay_negative_frac = float(tri_replay_negative_frac)
+        self.tri_replay_neutral_lambda = float(tri_replay_neutral_lambda)
+        self.gradient_reversal_transient_mode = str(gradient_reversal_transient_mode or "none").strip().lower()
+        self.gradient_reversal_transient_long_scale = float(gradient_reversal_transient_long_scale)
+        gr_transient_mask_text = str(gradient_reversal_transient_branch_mask or "").strip().lower()
+        self.gradient_reversal_transient_branch_mask = (
+            ()
+            if gr_transient_mask_text in {"", "same", "active"}
+            else self._parse_branch_mask(gradient_reversal_transient_branch_mask)
+        )
         self.update_token_scope = str(update_token_scope or "all")
         self.update_token_scope_floor = float(update_token_scope_floor)
         self.replay_feature_gate_mode = str(replay_feature_gate_mode or "none").strip().lower()
@@ -146,6 +186,7 @@ class TTTWriteController:
         self.replay_token_filter_blend_mode = str(replay_token_filter_blend_mode or "linear").strip().lower()
         self.transient_delta_subtract_scale = float(transient_delta_subtract_scale)
         self.transient_delta_branch_mask = self._parse_branch_mask(transient_delta_branch_mask)
+        self.transient_delta_ttl = max(int(transient_delta_ttl), 1)
         self.commit_ema_alpha = float(commit_ema_alpha)
         self.commit_ema_branch_mask = self._parse_branch_mask(commit_ema_branch_mask)
         self.native_delta_gate_mode = str(native_delta_gate_mode or "none").strip().lower()
@@ -175,7 +216,7 @@ class TTTWriteController:
         num_frames: Optional[int] = None,
         overlap_frames: int = 0,
         risk_tok: Optional[torch.Tensor] = None,
-        prev_transient_delta: Optional[Dict[str, List[Optional[torch.Tensor]]]] = None,
+        prev_transient_delta: Optional[Dict[str, Any]] = None,
     ) -> WriteResult:
         """Perform delayed write-back: W_m → W_{m+1}.
 
@@ -221,7 +262,7 @@ class TTTWriteController:
         w0_new: List[Optional[torch.Tensor]] = [None] * n_layers
         w1_new: List[Optional[torch.Tensor]] = [None] * n_layers
         w2_new: List[Optional[torch.Tensor]] = [None] * n_layers
-        transient_delta: Dict[str, List[Optional[torch.Tensor]]] = {
+        transient_delta: Dict[str, Any] = {
             "w0": [None] * n_layers,
             "w1": [None] * n_layers,
             "w2": [None] * n_layers,
@@ -240,7 +281,9 @@ class TTTWriteController:
                 effective_budget = B_chunk_geo
             w0_li, w1_li, w2_li, layer_debug, layer_transient_delta = self._replay_layer(
                 lc, effective_prior, effective_budget, dev,
+                layer_idx=int(li),
                 token_type=token_type,
+                risk_tok=risk_tok,
                 active_branch_mask=active_branch_mask,
                 layer_prior_enabled=bool(layer_prior_enabled),
                 num_frames=num_frames,
@@ -256,6 +299,7 @@ class TTTWriteController:
                         transient_delta[branch_name][li] = value
             debug_info[f"layer_{li}"] = layer_debug
 
+        self._summarize_ttt_self_cues(debug_info, n_layers)
         self._apply_native_delta_gate(write_cache, w0_new, w1_new, w2_new, debug_info)
         self._mix_with_native_provisional(write_cache, w0_new, w1_new, w2_new, debug_info)
         self._apply_commit_risk_filter(
@@ -271,18 +315,30 @@ class TTTWriteController:
             overlap_frames=overlap_frames,
         )
         self._apply_commit_ema(write_cache, w0_new, w1_new, w2_new, debug_info)
-        self._apply_previous_transient_delta(
+        carry_transient_delta = self._apply_previous_transient_delta(
             prev_transient_delta,
             w0_new,
             w1_new,
             w2_new,
             debug_info,
         )
-        transient_delta_out = transient_delta if self._has_transient_delta(transient_delta) else None
+        transient_delta_out = transient_delta if self._has_transient_delta(transient_delta) else carry_transient_delta
+        if self._has_transient_delta(transient_delta):
+            transient_delta_out["_ttl_remaining"] = int(self.transient_delta_ttl)
+            mode_tag = str(self.gradient_reversal_transient_mode or "none").strip().lower()
+            if mode_tag in {"dual_lifetime", "dual_fast_weight", "apply_short_delta", "short_apply_delta"}:
+                transient_delta_out["_mode"] = mode_tag
+                transient_delta_out["_apply_scale"] = 1.0
+                transient_delta_out["_long_scale"] = float(self.gradient_reversal_transient_long_scale)
+            else:
+                transient_delta_out["_mode"] = "subtract_delta"
         debug_info.update({
             "ttt_transient_delta_stored": transient_delta_out is not None,
+            "ttt_transient_delta_mode_out": str(transient_delta_out.get("_mode", "")) if isinstance(transient_delta_out, dict) else "",
             "ttt_transient_delta_subtract_scale": float(self.transient_delta_subtract_scale),
             "ttt_transient_delta_branch_mask": list(self.transient_delta_branch_mask),
+            "ttt_transient_delta_ttl": int(self.transient_delta_ttl),
+            "ttt_transient_delta_ttl_out": int(transient_delta_out.get("_ttl_remaining", 0)) if isinstance(transient_delta_out, dict) else 0,
         })
 
         return WriteResult(
@@ -303,7 +359,9 @@ class TTTWriteController:
         B_chunk_geo: Optional[float],
         device: str,
         *,
+        layer_idx: int = -1,
         token_type: Optional[torch.Tensor] = None,
+        risk_tok: Optional[torch.Tensor] = None,
         active_branch_mask: Tuple[int, ...] = (0, 1, 2),
         layer_prior_enabled: bool = True,
         num_frames: Optional[int] = None,
@@ -350,6 +408,12 @@ class TTTWriteController:
             num_frames=num_frames,
             overlap_frames=overlap_frames,
         )
+        prior_flat, special_debug = self._apply_special_token_policy(
+            prior_flat,
+            token_type=token_type,
+            cache_l=int(l),
+            align_mode=str(align_debug.get("ttt_prior_alignment_mode", "")),
+        )
         prior_flat, transform_debug = self._apply_prior_transform(prior_flat)
         token_prior = prior_flat.to(device).unsqueeze(0).unsqueeze(-1)  # [1, l, 1]
         unity_prior = torch.ones_like(token_prior)
@@ -394,6 +458,7 @@ class TTTWriteController:
         })
         debug.update(align_debug)
         debug.update(scope_debug)
+        debug.update(special_debug)
         debug.update(transform_debug)
 
         lam0 = lam if branch_enabled[0] else 1.0
@@ -421,6 +486,36 @@ class TTTWriteController:
                 "m_eta_after_lr1": post1,
                 "m_eta_after_lr2": post2,
             })
+
+        token_prior0_pre_gr = token_prior0
+        token_prior1_pre_gr = token_prior1
+        token_prior2_pre_gr = token_prior2
+        layer_branch_gammas = self._effective_gradient_reversal_branch_gammas(layer_idx)
+        gradient_reversal_risk_flat, gradient_reversal_risk_debug = self._build_gradient_reversal_risk_flat(
+            lc,
+            prior_flat=prior_flat,
+            risk_tok=risk_tok,
+            token_type=token_type,
+            cache_l=int(l),
+            effective_branch_gammas=layer_branch_gammas,
+        )
+        debug.update(gradient_reversal_risk_debug)
+        (
+            token_prior0,
+            token_prior1,
+            token_prior2,
+        ), gradient_reversal_debug = self._apply_gradient_reversal_prior(
+            prior_flat,
+            token_prior0,
+            token_prior1,
+            token_prior2,
+            branch_enabled=branch_enabled,
+            device=device,
+            risk_flat=gradient_reversal_risk_flat,
+            effective_branch_gammas=layer_branch_gammas,
+            layer_idx=layer_idx,
+        )
+        debug.update(gradient_reversal_debug)
 
         k_native_full, v_native_full = k, v
         k_gate_full, v_gate_full, replay_feature_debug = self._apply_replay_feature_gate(
@@ -558,8 +653,10 @@ class TTTWriteController:
                 branch_name: str,
                 candidate: torch.Tensor,
                 filt: torch.Tensor,
+                *,
+                scale: float = 1.0,
             ) -> None:
-                delta = candidate.float() - filt.float()
+                delta = (candidate.float() - filt.float()) * float(scale)
                 transient_delta[branch_name] = delta.detach().cpu().to(dtype=candidate.dtype)
                 delta_norm = delta.detach().float().norm(dim=1)
                 filt_delta_norm = (filt.float() - candidate.float()).detach().float().norm(dim=1)
@@ -670,6 +767,355 @@ class TTTWriteController:
                     return filt
                 return self._scale_delta_and_renorm(base, filt, token_filter_blend)
 
+            def maybe_store_gradient_reversal_transient(
+                candidate_w0: torch.Tensor,
+                candidate_w1: torch.Tensor,
+                candidate_w2: torch.Tensor,
+            ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                gr_transient_mode = str(self.gradient_reversal_transient_mode or "none").strip().lower()
+                token_filter_blend_debug["ttt_gradient_reversal_transient_mode"] = gr_transient_mode
+                token_filter_blend_debug["ttt_gradient_reversal_transient_applied"] = False
+                out_w0, out_w1, out_w2 = candidate_w0, candidate_w1, candidate_w2
+                if gr_transient_mode in {"", "none", "off"}:
+                    return out_w0, out_w1, out_w2
+                if gr_transient_mode not in {
+                    "one_hop_delta",
+                    "onehop_delta",
+                    "transient_delta",
+                    "ttl_delta",
+                    "short_delta",
+                    "dual_lifetime",
+                    "dual_fast_weight",
+                    "apply_short_delta",
+                    "short_apply_delta",
+                }:
+                    raise ValueError(
+                        f"Unsupported TTT gradient reversal transient mode: {self.gradient_reversal_transient_mode}"
+                    )
+                if not bool(gradient_reversal_debug.get("ttt_gradient_reversal_applied", False)):
+                    token_filter_blend_debug["ttt_gradient_reversal_transient_skip"] = "no_gradient_reversal"
+                    return out_w0, out_w1, out_w2
+                if filter_idx is not None:
+                    token_filter_blend_debug["ttt_gradient_reversal_transient_skip"] = "token_filter_active"
+                    return out_w0, out_w1, out_w2
+                active_gr = tuple(
+                    int(i)
+                    for i in gradient_reversal_debug.get("ttt_gradient_reversal_active_branches", [])
+                    if 0 <= int(i) <= 2
+                )
+                if len(active_gr) == 0:
+                    token_filter_blend_debug["ttt_gradient_reversal_transient_skip"] = "no_active_branch"
+                    return out_w0, out_w1, out_w2
+                transient_mask = (
+                    tuple(self.gradient_reversal_transient_branch_mask)
+                    if len(self.gradient_reversal_transient_branch_mask) > 0
+                    else active_gr
+                )
+                transient_mask = tuple(int(i) for i in transient_mask if int(i) in active_gr)
+                if len(transient_mask) == 0:
+                    token_filter_blend_debug["ttt_gradient_reversal_transient_skip"] = "empty_branch_mask"
+                    return out_w0, out_w1, out_w2
+
+                ref_w0, ref_w1, ref_w2 = replay_with_feature_select(
+                    k_native_full, v_native_full, k_gate_full, v_gate_full,
+                    lr0, lr1, lr2,
+                    token_prior,
+                    token_prior0_pre_gr,
+                    token_prior1_pre_gr,
+                    token_prior2_pre_gr,
+                    replay_order_full,
+                    momentum,
+                )
+                dual_lifetime = gr_transient_mode in {
+                    "dual_lifetime",
+                    "dual_fast_weight",
+                    "apply_short_delta",
+                    "short_apply_delta",
+                }
+                long_scale = min(max(float(self.gradient_reversal_transient_long_scale), 0.0), 1.0)
+
+                def split_long_candidate(candidate: torch.Tensor, reference: torch.Tensor) -> torch.Tensor:
+                    if not dual_lifetime or long_scale <= 0.0:
+                        return reference
+                    if long_scale >= 1.0:
+                        return candidate
+                    raw = reference.float() + long_scale * (candidate.float() - reference.float())
+                    return renorm_like(reference, raw)
+
+                mix_scales = self.update_native_mix_scales
+                if 0 in transient_mask:
+                    residual_scale = float(mix_scales[0]) * (1.0 - long_scale if dual_lifetime else 1.0)
+                    store_transient_delta("w0", candidate_w0, ref_w0, scale=residual_scale)
+                    if dual_lifetime:
+                        out_w0 = split_long_candidate(candidate_w0, ref_w0)
+                if 1 in transient_mask:
+                    residual_scale = float(mix_scales[1]) * (1.0 - long_scale if dual_lifetime else 1.0)
+                    store_transient_delta("w1", candidate_w1, ref_w1, scale=residual_scale)
+                    if dual_lifetime:
+                        out_w1 = split_long_candidate(candidate_w1, ref_w1)
+                if 2 in transient_mask:
+                    residual_scale = float(mix_scales[2]) * (1.0 - long_scale if dual_lifetime else 1.0)
+                    store_transient_delta("w2", candidate_w2, ref_w2, scale=residual_scale)
+                    if dual_lifetime:
+                        out_w2 = split_long_candidate(candidate_w2, ref_w2)
+                token_filter_blend_debug["ttt_gradient_reversal_transient_applied"] = True
+                token_filter_blend_debug["ttt_gradient_reversal_transient_dual_lifetime"] = bool(dual_lifetime)
+                token_filter_blend_debug["ttt_gradient_reversal_transient_long_scale"] = float(long_scale)
+                token_filter_blend_debug["ttt_gradient_reversal_transient_branch_mask"] = list(transient_mask)
+                token_filter_blend_debug["ttt_gradient_reversal_transient_native_mix_scales"] = [
+                    float(x) for x in mix_scales
+                ]
+                return out_w0, out_w1, out_w2
+
+            def maybe_apply_two_replay_negative(
+                candidate_w0: torch.Tensor,
+                candidate_w1: torch.Tensor,
+                candidate_w2: torch.Tensor,
+            ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                gr_mode = str(self.gradient_reversal_mode or "none").strip().lower()
+                token_filter_blend_debug["ttt_two_replay_mode"] = gr_mode
+                token_filter_blend_debug["ttt_two_replay_applied"] = False
+                tri_modes = {"tri_replay", "three_replay", "pos_neu_neg_replay", "pos_neg_neu_replay"}
+                if gr_mode not in {"two_replay", "separate_replay", "pos_neg_replay", *tri_modes}:
+                    return candidate_w0, candidate_w1, candidate_w2
+                if not bool(gradient_reversal_debug.get("ttt_gradient_reversal_applied", False)):
+                    token_filter_blend_debug["ttt_two_replay_skip"] = "gradient_reversal_inactive"
+                    return candidate_w0, candidate_w1, candidate_w2
+                if filter_idx is not None:
+                    token_filter_blend_debug["ttt_two_replay_skip"] = "token_filter_active"
+                    return candidate_w0, candidate_w1, candidate_w2
+
+                active = tuple(
+                    int(i)
+                    for i in gradient_reversal_debug.get("ttt_gradient_reversal_active_branches", [])
+                    if 0 <= int(i) <= 2
+                )
+                if len(active) == 0:
+                    token_filter_blend_debug["ttt_two_replay_skip"] = "no_active_branch"
+                    return candidate_w0, candidate_w1, candidate_w2
+
+                risk = gradient_reversal_risk_flat
+                if risk is None:
+                    p = prior_flat.detach().float().reshape(-1)
+                    p_min = p.min()
+                    p_max = p.max()
+                    risk = ((p_max - p) / (p_max - p_min).clamp_min(1e-6)).clamp(0.0, 1.0)
+                else:
+                    risk = risk.detach().float().reshape(-1).clamp(0.0, 1.0)
+                    if risk.numel() != int(l):
+                        aligned = torch.zeros(int(l), dtype=torch.float32, device=risk.device)
+                        n = min(int(risk.numel()), int(l))
+                        if n > 0:
+                            aligned[:n] = risk[:n]
+                        risk = aligned
+
+                if gr_mode in tri_modes:
+                    p = prior_flat.detach().float().reshape(-1)
+                    if p.numel() != int(l):
+                        p_aligned = torch.ones(int(l), dtype=torch.float32, device=p.device)
+                        n = min(int(p.numel()), int(l))
+                        if n > 0:
+                            p_aligned[:n] = p[:n]
+                        p = p_aligned
+                    pos_frac = min(max(float(self.tri_replay_positive_frac), 0.0), 1.0)
+                    neg_frac_cfg = float(self.tri_replay_negative_frac)
+                    if neg_frac_cfg <= 0.0:
+                        neg_frac_cfg = float(self.gradient_reversal_negative_frac)
+                    neg_frac = min(max(float(neg_frac_cfg), 0.0), 1.0)
+                    if pos_frac <= 0.0:
+                        pos_mask = torch.zeros_like(risk, dtype=torch.bool)
+                        pos_thr = torch.tensor(0.0, dtype=risk.dtype, device=risk.device)
+                    elif pos_frac >= 1.0:
+                        pos_mask = torch.ones_like(risk, dtype=torch.bool)
+                        pos_thr = torch.tensor(1.0, dtype=risk.dtype, device=risk.device)
+                    else:
+                        pos_thr = torch.quantile(risk, pos_frac)
+                        pos_mask = risk <= pos_thr
+                    if neg_frac <= 0.0:
+                        neg_mask = torch.zeros_like(risk, dtype=torch.bool)
+                        neg_thr = torch.tensor(1.0, dtype=risk.dtype, device=risk.device)
+                    elif neg_frac >= 1.0:
+                        neg_mask = torch.ones_like(risk, dtype=torch.bool)
+                        neg_thr = torch.tensor(0.0, dtype=risk.dtype, device=risk.device)
+                    else:
+                        neg_thr = torch.quantile(risk, 1.0 - neg_frac)
+                        neg_mask = risk >= neg_thr
+                    pos_mask = pos_mask & (~neg_mask)
+                    neu_mask = ~(pos_mask | neg_mask)
+
+                    def replay_group(group_vec: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                        group_prior = group_vec.to(device=device, dtype=token_prior0.dtype).view(1, -1, 1)
+                        gp0 = group_prior if 0 in active else token_prior0_pre_gr
+                        gp1 = group_prior if 1 in active else token_prior1_pre_gr
+                        gp2 = group_prior if 2 in active else token_prior2_pre_gr
+                        return replay_with_feature_select(
+                            k_native_full, v_native_full, k_gate_full, v_gate_full,
+                            lr0, lr1, lr2,
+                            group_prior,
+                            gp0,
+                            gp1,
+                            gp2,
+                            replay_order_full,
+                            momentum,
+                        )
+
+                    pos_vec = (p * pos_mask.float()).clamp_min(0.0)
+                    neu_vec = (p * neu_mask.float()).clamp_min(0.0)
+                    neg_vec = (risk * neg_mask.float()).clamp_min(0.0)
+                    pos_w0, pos_w1, pos_w2 = replay_group(pos_vec)
+                    neu_w0, neu_w1, neu_w2 = replay_group(neu_vec)
+                    neg_w0, neg_w1, neg_w2 = replay_group(neg_vec)
+                branch_gammas = {
+                    str(k): float(v)
+                    for k, v in gradient_reversal_debug.get(
+                        "ttt_gradient_reversal_active_branch_gammas", {}
+                    ).items()
+                }
+                neu_lambda = float(self.tri_replay_neutral_lambda)
+
+                def maybe_route_heads(
+                    branch_idx: int,
+                    name: str,
+                    base: torch.Tensor,
+                    controlled: torch.Tensor,
+                ) -> torch.Tensor:
+                    routed_heads = self._gradient_reversal_head_indices_for_layer(
+                        layer_idx=int(layer_idx),
+                        head_count=int(base.shape[0]) if base.ndim > 0 else 0,
+                    )
+                    if routed_heads is None:
+                        return controlled
+                    if branch_idx not in active:
+                        return base
+                    if len(routed_heads) == 0:
+                        token_filter_blend_debug[f"ttt_head_routed_{name}_skip"] = "empty"
+                        return base
+                    idx = torch.tensor(routed_heads, dtype=torch.long, device=base.device)
+                    out = base.clone()
+                    out.index_copy_(0, idx, controlled.index_select(0, idx))
+                    token_filter_blend_debug[f"ttt_head_routed_{name}_applied"] = True
+                    token_filter_blend_debug[f"ttt_head_routed_{name}_layer"] = int(layer_idx)
+                    token_filter_blend_debug[f"ttt_head_routed_{name}_heads"] = [int(x) for x in routed_heads]
+                    token_filter_blend_debug[f"ttt_head_routed_{name}_head_count"] = int(base.shape[0])
+                    return out
+
+                def apply_tri_branch(
+                    branch_idx: int,
+                    name: str,
+                    full_pos: torch.Tensor,
+                    pos: torch.Tensor,
+                    neu: torch.Tensor,
+                    neg: torch.Tensor,
+                    old: torch.Tensor,
+                ) -> torch.Tensor:
+                    if branch_idx not in active:
+                        return full_pos
+                    gamma = float(branch_gammas.get(str(branch_idx), self.gradient_reversal_gamma))
+                    raw = (
+                        old.float()
+                        + (pos.float() - old.float())
+                        + neu_lambda * (neu.float() - old.float())
+                        - gamma * (neg.float() - old.float())
+                    )
+                    token_filter_blend_debug[f"ttt_tri_replay_{name}_gamma"] = float(gamma)
+                    token_filter_blend_debug[f"ttt_tri_replay_{name}_pos_delta_norm_mean"] = float(
+                        (pos.float() - old.float()).detach().norm(dim=1).mean().item()
+                    )
+                    token_filter_blend_debug[f"ttt_tri_replay_{name}_neu_delta_norm_mean"] = float(
+                        (neu.float() - old.float()).detach().norm(dim=1).mean().item()
+                    )
+                    token_filter_blend_debug[f"ttt_tri_replay_{name}_neg_delta_norm_mean"] = float(
+                        (neg.float() - old.float()).detach().norm(dim=1).mean().item()
+                    )
+                    controlled = renorm_like(full_pos, raw)
+                    route_base = full_pos
+                    base_gamma = float(
+                        self.gradient_reversal_branch_gammas.get(
+                            int(branch_idx),
+                            self.gradient_reversal_gamma,
+                        )
+                    )
+                    if self.gradient_reversal_head_routes and base_gamma > 0.0:
+                        base_raw = (
+                            old.float()
+                            + (pos.float() - old.float())
+                            + neu_lambda * (neu.float() - old.float())
+                            - base_gamma * (neg.float() - old.float())
+                        )
+                        route_base = renorm_like(full_pos, base_raw)
+                        token_filter_blend_debug[f"ttt_head_routed_{name}_base_gamma"] = float(base_gamma)
+                    return maybe_route_heads(branch_idx, name, route_base, controlled)
+
+                out_w0 = apply_tri_branch(0, "w0", candidate_w0, pos_w0, neu_w0, neg_w0, w0_old)
+                out_w1 = apply_tri_branch(1, "w1", candidate_w1, pos_w1, neu_w1, neg_w1, w1_old)
+                out_w2 = apply_tri_branch(2, "w2", candidate_w2, pos_w2, neu_w2, neg_w2, w2_old)
+                risk_cpu = risk.detach().float().cpu()
+                token_filter_blend_debug["ttt_two_replay_applied"] = True
+                token_filter_blend_debug["ttt_tri_replay_applied"] = True
+                token_filter_blend_debug["ttt_tri_replay_active_branches"] = list(active)
+                token_filter_blend_debug["ttt_tri_replay_positive_frac"] = float(pos_frac)
+                token_filter_blend_debug["ttt_tri_replay_negative_frac"] = float(neg_frac)
+                token_filter_blend_debug["ttt_tri_replay_neutral_lambda"] = float(neu_lambda)
+                token_filter_blend_debug["ttt_tri_replay_pos_threshold"] = float(pos_thr.item())
+                token_filter_blend_debug["ttt_tri_replay_neg_threshold"] = float(neg_thr.item())
+                token_filter_blend_debug["ttt_tri_replay_pos_mass"] = float(pos_mask.float().mean().item())
+                token_filter_blend_debug["ttt_tri_replay_neu_mass"] = float(neu_mask.float().mean().item())
+                token_filter_blend_debug["ttt_tri_replay_neg_mass"] = float(neg_mask.float().mean().item())
+                token_filter_blend_debug["ttt_two_replay_active_branches"] = list(active)
+                token_filter_blend_debug["ttt_two_replay_risk_mean"] = float(risk_cpu.mean().item())
+                token_filter_blend_debug["ttt_two_replay_risk_p90"] = float(torch.quantile(risk_cpu, 0.90).item())
+                return out_w0, out_w1, out_w2
+
+                risk_prior = risk.to(device=device, dtype=token_prior0.dtype).view(1, -1, 1)
+                neg_prior0 = risk_prior if 0 in active else token_prior0_pre_gr
+                neg_prior1 = risk_prior if 1 in active else token_prior1_pre_gr
+                neg_prior2 = risk_prior if 2 in active else token_prior2_pre_gr
+                neg_w0, neg_w1, neg_w2 = replay_with_feature_select(
+                    k_native_full, v_native_full, k_gate_full, v_gate_full,
+                    lr0, lr1, lr2,
+                    risk_prior,
+                    neg_prior0,
+                    neg_prior1,
+                    neg_prior2,
+                    replay_order_full,
+                    momentum,
+                )
+
+                branch_gammas = {
+                    str(k): float(v)
+                    for k, v in gradient_reversal_debug.get(
+                        "ttt_gradient_reversal_active_branch_gammas", {}
+                    ).items()
+                }
+
+                def apply_branch(
+                    branch_idx: int,
+                    name: str,
+                    pos: torch.Tensor,
+                    neg: torch.Tensor,
+                    old: torch.Tensor,
+                ) -> torch.Tensor:
+                    if branch_idx not in active:
+                        return pos
+                    gamma = float(branch_gammas.get(str(branch_idx), self.gradient_reversal_gamma))
+                    candidate = pos.float() - gamma * (neg.float() - old.float())
+                    delta_norm = (neg.float() - old.float()).detach().norm(dim=1)
+                    token_filter_blend_debug[f"ttt_two_replay_{name}_gamma"] = float(gamma)
+                    token_filter_blend_debug[f"ttt_two_replay_{name}_neg_delta_norm_mean"] = float(
+                        delta_norm.mean().item()
+                    ) if delta_norm.numel() else 0.0
+                    return renorm_like(pos, candidate)
+
+                out_w0 = apply_branch(0, "w0", candidate_w0, neg_w0, w0_old)
+                out_w1 = apply_branch(1, "w1", candidate_w1, neg_w1, w1_old)
+                out_w2 = apply_branch(2, "w2", candidate_w2, neg_w2, w2_old)
+                risk_cpu = risk.detach().float().cpu()
+                token_filter_blend_debug["ttt_two_replay_applied"] = True
+                token_filter_blend_debug["ttt_two_replay_active_branches"] = list(active)
+                token_filter_blend_debug["ttt_two_replay_risk_mean"] = float(risk_cpu.mean().item())
+                token_filter_blend_debug["ttt_two_replay_risk_p90"] = float(torch.quantile(risk_cpu, 0.90).item())
+                return out_w0, out_w1, out_w2
+
             if token_filter_branch_isolated:
                 w0_base, w1_base, w2_base = replay_with_feature_select(
                     k_native_full, v_native_full, k_gate_full, v_gate_full,
@@ -710,6 +1156,9 @@ class TTTWriteController:
                         token_prior, token_prior0, token_prior1, token_prior2,
                         replay_order_full, momentum,
                     )
+
+            w0_new, w1_new, w2_new = maybe_apply_two_replay_negative(w0_new, w1_new, w2_new)
+            w0_new, w1_new, w2_new = maybe_store_gradient_reversal_transient(w0_new, w1_new, w2_new)
 
         debug.update({
             "ttt_replay_feature_branch_mask": list(self.replay_feature_gate_branch_mask),
@@ -785,6 +1234,120 @@ class TTTWriteController:
         debug["ttt_prior_alignment_padded"] = True
         return out, debug
 
+    def _apply_special_token_policy(
+        self,
+        prior_flat: torch.Tensor,
+        *,
+        token_type: Optional[torch.Tensor],
+        cache_l: int,
+        align_mode: str,
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Optionally tie register/role token write prior to patch-token risk.
+
+        LoGeR's replay layout usually repeats ``[registers, role, patches]``
+        per frame.  If special tokens are left at 1.0 while patch tokens are
+        suppressed, dynamic context can still enter the TTT fast weights
+        through those special tokens.  The policy is disabled by default and
+        only mutates exact/full token layouts, not patch-only diagnostic
+        replays.
+        """
+        mode = str(self.special_token_policy or "none").strip().lower()
+        debug: Dict[str, Any] = {
+            "ttt_special_token_policy": mode,
+            "ttt_special_token_policy_applied": False,
+            "ttt_special_token_floor": float(self.special_token_floor),
+            "ttt_special_token_ceiling": float(self.special_token_ceiling),
+        }
+        if mode in {"", "none", "off"} or prior_flat.numel() == 0 or token_type is None:
+            return prior_flat, debug
+        if str(align_mode) == "patch_token_type":
+            debug["ttt_special_token_policy_skipped"] = "patch_only_alignment"
+            return prior_flat, debug
+
+        tt = token_type.detach().cpu().long().reshape(-1)
+        if tt.numel() < int(cache_l):
+            debug["ttt_special_token_policy_skipped"] = "token_type_short"
+            return prior_flat, debug
+        tt = tt[: int(cache_l)]
+        if tt.numel() != prior_flat.numel():
+            debug["ttt_special_token_policy_skipped"] = "length_mismatch"
+            return prior_flat, debug
+
+        special_mask = tt != TOKEN_TYPE_PATCH
+        patch_mask = tt == TOKEN_TYPE_PATCH
+        if not bool(special_mask.any()) or not bool(patch_mask.any()):
+            debug["ttt_special_token_policy_skipped"] = "missing_patch_or_special"
+            return prior_flat, debug
+
+        out = prior_flat.detach().float().clone()
+        before = out[special_mask].clone()
+        patch_vals = out[patch_mask].float()
+        lo = max(0.0, min(float(self.special_token_floor), float(self.special_token_ceiling)))
+        hi = min(2.0, max(float(self.special_token_ceiling), lo))
+
+        def _stat(vals: torch.Tensor, stat_mode: str) -> float:
+            vals = vals.detach().float().reshape(-1)
+            if vals.numel() == 0:
+                return 1.0
+            if stat_mode in {"mean", "patch_mean", "global_mean"}:
+                v = vals.mean()
+            elif stat_mode in {"q10", "patch_q10", "global_q10"}:
+                v = torch.quantile(vals, 0.10)
+            elif stat_mode in {"q25", "patch_q25", "global_q25"}:
+                v = torch.quantile(vals, 0.25)
+            elif stat_mode in {"q50", "median", "patch_median", "global_median"}:
+                v = torch.quantile(vals, 0.50)
+            elif stat_mode in {"min", "patch_min", "global_min"}:
+                v = vals.min()
+            else:
+                v = vals.mean()
+            return float(v.clamp(lo, hi).item())
+
+        frame_modes = {
+            "frame_mean", "per_frame_mean",
+            "frame_q10", "per_frame_q10",
+            "frame_q25", "per_frame_q25",
+            "frame_min", "per_frame_min",
+        }
+        if mode in frame_modes:
+            stat_mode = mode.replace("per_", "").replace("frame_", "")
+            n = int(tt.numel())
+            i = 0
+            frames = 0
+            while i < n:
+                s0 = i
+                while i < n and int(tt[i].item()) != TOKEN_TYPE_PATCH:
+                    i += 1
+                p0 = i
+                while i < n and int(tt[i].item()) == TOKEN_TYPE_PATCH:
+                    i += 1
+                if s0 < p0 and p0 < i:
+                    val = _stat(out[p0:i], stat_mode)
+                    out[s0:p0] = val
+                    frames += 1
+                elif i == s0:
+                    i += 1
+            debug["ttt_special_token_policy_frames"] = int(frames)
+        else:
+            val = _stat(patch_vals, mode)
+            out[special_mask] = val
+            debug["ttt_special_token_policy_global_value"] = float(val)
+
+        after = out[special_mask].float()
+        debug.update({
+            "ttt_special_token_policy_applied": True,
+            "ttt_special_token_count": int(special_mask.sum().item()),
+            "ttt_special_token_patch_count": int(patch_mask.sum().item()),
+            "ttt_special_token_patch_mean": float(patch_vals.mean().item()),
+            "ttt_special_token_patch_q10": float(torch.quantile(patch_vals, 0.10).item()),
+            "ttt_special_token_patch_q25": float(torch.quantile(patch_vals, 0.25).item()),
+            "ttt_special_token_mean_before": float(before.float().mean().item()),
+            "ttt_special_token_mean_after": float(after.mean().item()),
+            "ttt_special_token_min_after": float(after.min().item()),
+            "ttt_special_token_max_after": float(after.max().item()),
+        })
+        return out.to(dtype=prior_flat.dtype), debug
+
     def _apply_prior_transform(self, prior_flat: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """Optionally reshape write eligibility before it multiplies TTT lr.
 
@@ -847,6 +1410,540 @@ class TTTWriteController:
             "ttt_write_prior_negative_mass": float((out_cpu < 0).float().mean().item()),
         })
         return out, debug
+
+    @staticmethod
+    def _normalize01_vec(x: torch.Tensor) -> torch.Tensor:
+        y = torch.nan_to_num(x.detach().float().reshape(-1), nan=0.0, posinf=0.0, neginf=0.0)
+        if y.numel() == 0:
+            return y
+        lo = y.min()
+        hi = y.max()
+        denom = (hi - lo).clamp_min(1e-6)
+        return ((y - lo) / denom).clamp(0.0, 1.0)
+
+    def _ttt_layer_residual_risk(self, lc: TTTLayerCache, cache_l: int) -> Optional[torch.Tensor]:
+        y = getattr(lc, "apply_output_raw", None)
+        v = getattr(lc, "v", None)
+        if y is None or v is None:
+            return None
+        if y.shape != v.shape or y.ndim < 2:
+            return None
+        y_cpu = y.detach().cpu().float()
+        v_cpu = v.detach().cpu().float()
+        res = (y_cpu - v_cpu).norm(dim=-1) / v_cpu.norm(dim=-1).clamp_min(1e-6)
+        if res.ndim == 1:
+            per_tok = res
+        else:
+            per_tok = res.reshape(-1, res.shape[-1]).mean(dim=0)
+        out = torch.zeros(int(cache_l), dtype=torch.float32)
+        n = min(int(per_tok.numel()), int(cache_l))
+        if n <= 0:
+            return None
+        out[:n] = per_tok[:n].detach().float()
+        return self._normalize01_vec(out)
+
+    def _build_gradient_reversal_risk_flat(
+        self,
+        lc: TTTLayerCache,
+        *,
+        prior_flat: torch.Tensor,
+        risk_tok: Optional[torch.Tensor],
+        token_type: Optional[torch.Tensor],
+        cache_l: int,
+        effective_branch_gammas: Optional[Dict[int, float]] = None,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
+        """Build an optional TTT-internal risk map for gradient reversal.
+
+        The default TTGR risk is derived from low write prior.  These alternate
+        sources let the TTT replay cache define what is actually harmful, while
+        leaving the positive write prior unchanged.
+        """
+        source = str(self.gradient_reversal_risk_source or "prior").strip().lower()
+        debug: Dict[str, Any] = {
+            "ttt_gradient_reversal_risk_source": source,
+            "ttt_gradient_reversal_risk_source_applied": False,
+        }
+        gr_mode = str(self.gradient_reversal_mode or "none").strip().lower()
+        branch_gamma_map = (
+            {int(k): max(float(v), 0.0) for k, v in effective_branch_gammas.items() if 0 <= int(k) <= 2}
+            if effective_branch_gammas is not None
+            else {
+                int(k): max(float(v), 0.0)
+                for k, v in self.gradient_reversal_branch_gammas.items()
+                if 0 <= int(k) <= 2
+            }
+        )
+        max_gamma = max(branch_gamma_map.values(), default=max(float(self.gradient_reversal_gamma), 0.0))
+        if gr_mode in {"", "none", "off"} or max_gamma <= 0.0:
+            debug["ttt_gradient_reversal_risk_source_skip"] = "gradient_reversal_off"
+            return None, debug
+        if source in {"", "prior", "write_prior", "low_prior", "none", "off"}:
+            return None, debug
+
+        residual_risk: Optional[torch.Tensor] = None
+        if source in {
+            "ttt_residual",
+            "residual",
+            "ttt_self_residual",
+            "self_residual",
+            "ttt_residual_x_dg",
+            "residual_x_dg",
+            "ttt_residual_times_dg",
+        }:
+            residual_risk = self._ttt_layer_residual_risk(lc, cache_l)
+            if residual_risk is None:
+                debug["ttt_gradient_reversal_risk_source_missing_residual"] = True
+                return None, debug
+
+        if source in {"ttt_residual", "residual", "ttt_self_residual", "self_residual"}:
+            risk = residual_risk
+        elif source in {
+            "ttt_w0_conflict",
+            "w0_conflict",
+            "ttt_update_conflict",
+            "update_conflict",
+            "ttt_w0_anti",
+            "w0_anti",
+            "ttt_update_anti",
+            "update_anti",
+            "ttt_w0_energy",
+            "w0_energy",
+            "ttt_update_energy",
+            "update_energy",
+            "ttt_w0_conflict_energy",
+            "w0_conflict_energy",
+            "ttt_update_conflict_energy",
+            "update_conflict_energy",
+        }:
+            risk, conflict_debug = self._ttt_layer_w0_update_risk(
+                lc,
+                cache_l=cache_l,
+                prior_flat=prior_flat,
+                mode=source,
+            )
+            debug.update(conflict_debug)
+            if risk is None:
+                debug["ttt_gradient_reversal_risk_source_missing_update_conflict"] = True
+                return None, debug
+        elif source in {"d_tok", "control", "control_prior", "external_d", "dg", "d_g"}:
+            if risk_tok is None:
+                debug["ttt_gradient_reversal_risk_source_missing_external"] = True
+                return None, debug
+            risk, align_debug = self._align_prior_to_replay_tokens(
+                risk_tok,
+                token_type=token_type,
+                cache_l=cache_l,
+            )
+            debug.update({
+                "ttt_gradient_reversal_risk_alignment_mode": align_debug.get("ttt_prior_alignment_mode"),
+                "ttt_gradient_reversal_risk_alignment_full_tokens": align_debug.get("ttt_prior_alignment_full_tokens"),
+            })
+            risk = risk.detach().float().reshape(-1).clamp(0.0, 1.0)
+        elif source in {"ttt_residual_x_dg", "residual_x_dg", "ttt_residual_times_dg"}:
+            if risk_tok is None:
+                debug["ttt_gradient_reversal_risk_source_missing_external"] = True
+                return None, debug
+            ext, align_debug = self._align_prior_to_replay_tokens(
+                risk_tok,
+                token_type=token_type,
+                cache_l=cache_l,
+            )
+            debug.update({
+                "ttt_gradient_reversal_risk_alignment_mode": align_debug.get("ttt_prior_alignment_mode"),
+                "ttt_gradient_reversal_risk_alignment_full_tokens": align_debug.get("ttt_prior_alignment_full_tokens"),
+            })
+            risk = self._normalize01_vec(residual_risk * ext.detach().float().reshape(-1).clamp(0.0, 1.0))
+        else:
+            raise ValueError(f"Unsupported TTT gradient reversal risk source: {self.gradient_reversal_risk_source}")
+
+        if risk is None or risk.numel() == 0:
+            return None, debug
+        risk = risk.detach().float().reshape(-1)
+        if risk.numel() != prior_flat.numel():
+            out = torch.zeros_like(prior_flat.detach().float().reshape(-1))
+            n = min(int(risk.numel()), int(out.numel()))
+            out[:n] = risk[:n]
+            risk = out
+        prior_cpu = prior_flat.detach().float().reshape(-1)
+        debug.update({
+            "ttt_gradient_reversal_risk_source_applied": True,
+            "ttt_gradient_reversal_risk_source_mean": float(risk.mean().item()),
+            "ttt_gradient_reversal_risk_source_p90": float(torch.quantile(risk, 0.90).item()),
+            "ttt_gradient_reversal_risk_source_corr_prior": self._corr_1d(risk, prior_cpu),
+        })
+        return risk, debug
+
+    def _ttt_layer_w0_update_risk(
+        self,
+        lc: TTTLayerCache,
+        *,
+        cache_l: int,
+        prior_flat: torch.Tensor,
+        mode: str,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
+        """Estimate token risk from the TTT w0 update geometry itself.
+
+        This is a lightweight pre-zeropower diagnostic.  For each token it
+        builds the raw w0 contribution direction and compares it with the
+        layer's aggregate w0 update direction.  Tokens with poor/negative
+        alignment are plausible negative evidence because they fight the
+        chunk's own continuity update, not merely because an external cue says
+        they look dynamic.
+        """
+        debug: Dict[str, Any] = {}
+        try:
+            k = getattr(lc, "k", None)
+            v = getattr(lc, "v", None)
+            lr0 = getattr(lc, "lr0", None)
+            w0 = getattr(lc, "w0_old", None)
+            w1 = getattr(lc, "w1_old", None)
+            w2 = getattr(lc, "w2_old", None)
+            if any(x is None for x in (k, v, lr0, w0, w1, w2)):
+                return None, debug
+            if k.ndim != 3 or v.ndim != 3 or lr0.ndim != 3:
+                return None, debug
+            if int(k.shape[1]) <= 0:
+                return None, debug
+
+            kf = k.detach().cpu().float()
+            vf = v.detach().cpu().float()
+            lr = lr0.detach().cpu().float()
+            w0f = w0.detach().cpu().float()
+            w1f = w1.detach().cpu().float()
+            w2f = w2.detach().cpu().float()
+            l = min(int(kf.shape[1]), int(cache_l), int(prior_flat.numel()))
+            if l <= 0:
+                return None, debug
+            kf = kf[:, :l, :]
+            vf = vf[:, :l, :]
+            lr = lr[:, :l, :]
+            p = prior_flat.detach().cpu().float().reshape(-1)[:l].view(1, l, 1)
+            lr_eff = lr * p
+
+            gate = torch.bmm(kf, w0f)
+            hidden_before_mul = torch.bmm(kf, w2f)
+            dhidden = torch.bmm(vf, w1f.transpose(1, 2))
+            dgate = dhidden * hidden_before_mul
+            sigma = torch.sigmoid(gate)
+            dgate_before_act = dgate * sigma * (1.0 + gate * (1.0 - sigma))
+
+            aggregate = torch.bmm((kf * lr_eff).transpose(1, 2), dgate_before_act)
+            agg_norm = aggregate.flatten(1).norm(dim=1).clamp_min(1e-6)
+            token_dot = (torch.bmm(kf, aggregate) * dgate_before_act).sum(dim=-1)
+            k_norm = kf.norm(dim=-1)
+            d_norm = dgate_before_act.norm(dim=-1)
+            denom = k_norm * d_norm * agg_norm.view(-1, 1) + 1e-6
+            cos = (token_dot / denom).clamp(-1.0, 1.0)
+            energy = (lr_eff.squeeze(-1).abs() * k_norm * d_norm).detach().float()
+            energy_risk = self._normalize01_vec(energy.reshape(-1)).view_as(energy)
+
+            mode_text = str(mode or "").strip().lower()
+            if mode_text in {"ttt_w0_anti", "w0_anti", "ttt_update_anti", "update_anti"}:
+                risk_b_l = (-cos).clamp_min(0.0)
+            elif mode_text in {"ttt_w0_energy", "w0_energy", "ttt_update_energy", "update_energy"}:
+                risk_b_l = energy_risk
+            elif mode_text in {
+                "ttt_w0_conflict_energy",
+                "w0_conflict_energy",
+                "ttt_update_conflict_energy",
+                "update_conflict_energy",
+            }:
+                risk_b_l = ((1.0 - cos) * 0.5).clamp(0.0, 1.0) * energy_risk
+            else:
+                risk_b_l = ((1.0 - cos) * 0.5).clamp(0.0, 1.0)
+
+            per_tok = risk_b_l.mean(dim=0)
+            out = torch.zeros(int(cache_l), dtype=torch.float32)
+            out[:l] = per_tok.detach().float()
+            cos_flat = cos.detach().float().reshape(-1)
+            energy_flat = energy.detach().float().reshape(-1)
+            risk_head = risk_b_l.detach().float().mean(dim=1)
+            energy_head = energy.detach().float().mean(dim=1)
+            cos_head = cos.detach().float().mean(dim=1)
+            head_count = int(risk_head.numel())
+            top_k = min(5, head_count)
+            if top_k > 0:
+                top_vals, top_idx = torch.topk(risk_head, k=top_k, largest=True)
+                top_energy = energy_head.index_select(0, top_idx)
+                top_cos = cos_head.index_select(0, top_idx)
+            else:
+                top_vals = top_idx = top_energy = top_cos = torch.empty(0)
+            debug.update({
+                "ttt_update_conflict_mode": mode_text,
+                "ttt_update_conflict_cos_mean": float(cos_flat.mean().item()),
+                "ttt_update_conflict_cos_p10": float(torch.quantile(cos_flat, 0.10).item()),
+                "ttt_update_conflict_cos_p90": float(torch.quantile(cos_flat, 0.90).item()),
+                "ttt_update_conflict_negative_cos_mass": float((cos_flat < 0).float().mean().item()),
+                "ttt_update_conflict_energy_mean": float(energy_flat.mean().item()),
+                "ttt_update_conflict_energy_p90": float(torch.quantile(energy_flat, 0.90).item()),
+                "ttt_update_conflict_risk_mean": float(risk_b_l.detach().float().mean().item()),
+                "ttt_update_conflict_risk_p90": float(torch.quantile(risk_b_l.detach().float().reshape(-1), 0.90).item()),
+                "ttt_update_conflict_head_count": head_count,
+                "ttt_update_conflict_risk_head_mean": [float(x) for x in risk_head.tolist()],
+                "ttt_update_conflict_energy_head_mean": [float(x) for x in energy_head.tolist()],
+                "ttt_update_conflict_cos_head_mean": [float(x) for x in cos_head.tolist()],
+                "ttt_update_conflict_top_head_indices_by_risk": [int(x) for x in top_idx.tolist()],
+                "ttt_update_conflict_top_head_risk_mean": [float(x) for x in top_vals.tolist()],
+                "ttt_update_conflict_top_head_energy_mean": [float(x) for x in top_energy.tolist()],
+                "ttt_update_conflict_top_head_cos_mean": [float(x) for x in top_cos.tolist()],
+            })
+            return self._normalize01_vec(out), debug
+        except RuntimeError as exc:
+            debug["ttt_update_conflict_error"] = str(exc)
+            return None, debug
+
+    def _summarize_ttt_self_cues(self, debug_info: Dict[str, Any], n_layers: int) -> None:
+        """Add a compact run-level summary for TTT-internal cue diagnostics."""
+        layers: List[int] = []
+        energy_mean: List[float] = []
+        energy_p90: List[float] = []
+        risk_mean: List[float] = []
+        risk_p90: List[float] = []
+        cos_mean: List[float] = []
+        neg_cos_mass: List[float] = []
+        top_head_by_layer: List[int] = []
+        top_head_risk_by_layer: List[float] = []
+        for li in range(int(n_layers)):
+            layer_debug = debug_info.get(f"layer_{li}")
+            if not isinstance(layer_debug, dict):
+                continue
+            if "ttt_update_conflict_energy_mean" not in layer_debug:
+                continue
+            layers.append(int(li))
+            energy_mean.append(float(layer_debug.get("ttt_update_conflict_energy_mean", 0.0)))
+            energy_p90.append(float(layer_debug.get("ttt_update_conflict_energy_p90", 0.0)))
+            risk_mean.append(float(layer_debug.get("ttt_update_conflict_risk_mean", 0.0)))
+            risk_p90.append(float(layer_debug.get("ttt_update_conflict_risk_p90", 0.0)))
+            cos_mean.append(float(layer_debug.get("ttt_update_conflict_cos_mean", 0.0)))
+            neg_cos_mass.append(float(layer_debug.get("ttt_update_conflict_negative_cos_mass", 0.0)))
+            top_heads = layer_debug.get("ttt_update_conflict_top_head_indices_by_risk") or []
+            top_risks = layer_debug.get("ttt_update_conflict_top_head_risk_mean") or []
+            top_head_by_layer.append(int(top_heads[0]) if len(top_heads) > 0 else -1)
+            top_head_risk_by_layer.append(float(top_risks[0]) if len(top_risks) > 0 else 0.0)
+        if not layers:
+            return
+        best_layer = layers[int(torch.tensor(risk_mean).argmax().item())]
+        debug_info.update({
+            "ttt_self_cue_update_conflict_present": True,
+            "ttt_self_cue_update_conflict_layers": layers,
+            "ttt_self_cue_update_conflict_energy_mean_by_layer": energy_mean,
+            "ttt_self_cue_update_conflict_energy_p90_by_layer": energy_p90,
+            "ttt_self_cue_update_conflict_risk_mean_by_layer": risk_mean,
+            "ttt_self_cue_update_conflict_risk_p90_by_layer": risk_p90,
+            "ttt_self_cue_update_conflict_cos_mean_by_layer": cos_mean,
+            "ttt_self_cue_update_conflict_negative_cos_mass_by_layer": neg_cos_mass,
+            "ttt_self_cue_update_conflict_top_head_by_layer": top_head_by_layer,
+            "ttt_self_cue_update_conflict_top_head_risk_by_layer": top_head_risk_by_layer,
+            "ttt_self_cue_update_conflict_peak_layer": int(best_layer),
+            "ttt_self_cue_update_conflict_peak_layer_risk_mean": float(max(risk_mean)),
+        })
+
+    @staticmethod
+    def _corr_1d(a: torch.Tensor, b: torch.Tensor) -> float:
+        aa = a.detach().float().reshape(-1)
+        bb = b.detach().float().reshape(-1)
+        n = min(int(aa.numel()), int(bb.numel()))
+        if n < 2:
+            return 0.0
+        aa = aa[:n]
+        bb = bb[:n]
+        aa = aa - aa.mean()
+        bb = bb - bb.mean()
+        den = aa.norm() * bb.norm()
+        if float(den.item()) <= 1e-8:
+            return 0.0
+        return float((aa @ bb / den).item())
+
+    def _apply_gradient_reversal_prior(
+        self,
+        prior_flat: torch.Tensor,
+        token_prior0: torch.Tensor,
+        token_prior1: torch.Tensor,
+        token_prior2: torch.Tensor,
+        *,
+        branch_enabled: Tuple[bool, bool, bool],
+        device: str,
+        risk_flat: Optional[torch.Tensor] = None,
+        effective_branch_gammas: Optional[Dict[int, float]] = None,
+        layer_idx: int = -1,
+    ) -> Tuple[Tuple[torch.Tensor, torch.Tensor, torch.Tensor], Dict[str, Any]]:
+        """Convert low-prior tokens into small negative replay evidence.
+
+        This hook runs after optional eta mean-preservation.  That ordering is
+        intentional: eta normalization still sees the normal write prior, while
+        selected branches can receive a signed multiplier in the actual replay.
+        A high-risk token therefore changes update direction instead of merely
+        reducing the positive learning-rate mass.
+        """
+        mode = str(self.gradient_reversal_mode or "none").strip().lower()
+        gamma = max(float(self.gradient_reversal_gamma), 0.0)
+        branch_mask = tuple(self.gradient_reversal_branch_mask)
+        branch_gamma_map = (
+            {int(k): max(float(v), 0.0) for k, v in effective_branch_gammas.items() if 0 <= int(k) <= 2}
+            if effective_branch_gammas is not None
+            else {
+                int(k): max(float(v), 0.0)
+                for k, v in self.gradient_reversal_branch_gammas.items()
+                if 0 <= int(k) <= 2
+            }
+        )
+        if branch_gamma_map:
+            branch_gammas = branch_gamma_map
+        else:
+            branch_gammas = {
+                int(i): gamma
+                for i in branch_mask
+                if 0 <= int(i) <= 2
+            }
+        max_gamma = max(branch_gammas.values(), default=0.0)
+        debug: Dict[str, Any] = {
+            "ttt_gradient_reversal_mode": mode,
+            "ttt_gradient_reversal_gamma": gamma,
+            "ttt_gradient_reversal_branch_mask": list(branch_mask),
+            "ttt_gradient_reversal_branch_gammas": {
+                str(int(k)): float(v)
+                for k, v in sorted(branch_gamma_map.items())
+            },
+            "ttt_gradient_reversal_layer_idx": int(layer_idx),
+            "ttt_gradient_reversal_layer_gammas": {
+                str(int(k)): float(v)
+                for k, v in sorted(self.gradient_reversal_layer_gammas.items())
+            },
+            "ttt_gradient_reversal_layer_routed": bool(self.gradient_reversal_layer_gammas),
+            "ttt_gradient_reversal_head_routes": {
+                str(int(k)): [int(x) for x in v]
+                for k, v in sorted(self.gradient_reversal_head_routes.items())
+            },
+            "ttt_gradient_reversal_negative_frac": float(self.gradient_reversal_negative_frac),
+            "ttt_gradient_reversal_applied": False,
+        }
+        if mode in {"", "none", "off"} or max_gamma <= 0.0 or prior_flat.numel() == 0:
+            return (token_prior0, token_prior1, token_prior2), debug
+        active = tuple(
+            int(i)
+            for i, g in sorted(branch_gammas.items())
+            if g > 0.0 and 0 <= int(i) <= 2 and branch_enabled[int(i)]
+        )
+        if len(active) == 0:
+            debug["ttt_gradient_reversal_no_active_branch"] = True
+            return (token_prior0, token_prior1, token_prior2), debug
+
+        p = prior_flat.detach().float().reshape(-1)
+        p_min = p.min()
+        p_max = p.max()
+        denom = (p_max - p_min).clamp_min(1e-6)
+        if risk_flat is not None:
+            r = risk_flat.detach().float().reshape(-1)
+            if r.numel() != p.numel():
+                r_aligned = torch.zeros_like(p)
+                n = min(int(r.numel()), int(p.numel()))
+                if n > 0:
+                    r_aligned[:n] = r[:n]
+                r = r_aligned
+            risk = r.clamp(0.0, 1.0)
+            risk_source_effective = str(self.gradient_reversal_risk_source or "prior").strip().lower()
+        else:
+            risk = ((p_max - p) / denom).clamp(0.0, 1.0)
+            risk_source_effective = "prior_low"
+
+        neg_mask: Optional[torch.Tensor] = None
+        if mode in {"negative_tail", "tail", "bottom_frac", "tail_low_prior"}:
+            neg_frac = max(min(float(self.gradient_reversal_negative_frac), 1.0), 0.0)
+            if neg_frac <= 0.0:
+                neg_mask = risk > 0.5
+                threshold = torch.tensor(0.5, device=risk.device, dtype=risk.dtype)
+            elif neg_frac >= 1.0:
+                neg_mask = torch.ones_like(risk, dtype=torch.bool)
+                threshold = torch.tensor(0.0, device=risk.device, dtype=risk.dtype)
+            else:
+                threshold = torch.quantile(risk, 1.0 - neg_frac)
+                neg_mask = risk >= threshold
+            debug["ttt_gradient_reversal_tail_threshold"] = float(threshold.item())
+        elif mode in {
+            "two_replay",
+            "separate_replay",
+            "pos_neg_replay",
+            "tri_replay",
+            "three_replay",
+            "pos_neu_neg_replay",
+            "pos_neg_neu_replay",
+        }:
+            neg_mask = None
+        elif mode not in {
+            "low_prior",
+            "dynamic",
+            "risk",
+            "signed_low_prior",
+            "hard",
+            "hard_low_prior",
+            "hard_dynamic",
+        }:
+            raise ValueError(f"Unsupported TTT gradient reversal mode: {self.gradient_reversal_mode}")
+
+        priors = [token_prior0, token_prior1, token_prior2]
+        signed_by_branch: Dict[int, torch.Tensor] = {}
+        for branch_idx in active:
+            branch_gamma = max(float(branch_gammas[int(branch_idx)]), 0.0)
+            if mode in {
+                "two_replay",
+                "separate_replay",
+                "pos_neg_replay",
+                "tri_replay",
+                "three_replay",
+                "pos_neu_neg_replay",
+                "pos_neg_neu_replay",
+            }:
+                signed = p
+            elif mode in {"low_prior", "dynamic", "risk", "signed_low_prior"}:
+                signed = p * (1.0 - risk) - branch_gamma * risk
+            elif mode in {"negative_tail", "tail", "bottom_frac", "tail_low_prior"}:
+                assert neg_mask is not None
+                signed = torch.where(
+                    neg_mask,
+                    -torch.full_like(p, branch_gamma),
+                    p,
+                )
+            else:
+                signed = torch.where(
+                    risk > 0.5,
+                    -torch.full_like(p, branch_gamma),
+                    p,
+                )
+            signed_by_branch[int(branch_idx)] = signed
+            signed_token = signed.to(device=device, dtype=token_prior0.dtype).view(1, -1, 1)
+            priors[int(branch_idx)] = signed_token
+
+        signed_stack = torch.stack([signed_by_branch[int(i)].detach().float() for i in active], dim=0)
+        signed_cpu = signed_stack.reshape(-1)
+        risk_cpu = risk.detach().float()
+        debug.update({
+            "ttt_gradient_reversal_applied": True,
+            "ttt_gradient_reversal_active_branches": list(active),
+            "ttt_gradient_reversal_active_branch_gammas": {
+                str(int(i)): float(branch_gammas[int(i)])
+                for i in active
+            },
+            "ttt_gradient_reversal_prior_min": float(p_min.item()),
+            "ttt_gradient_reversal_prior_max": float(p_max.item()),
+            "ttt_gradient_reversal_risk_source_effective": risk_source_effective,
+            "ttt_gradient_reversal_risk_mean": float(risk_cpu.mean().item()),
+            "ttt_gradient_reversal_risk_p90": float(torch.quantile(risk_cpu, 0.90).item()),
+            "ttt_gradient_reversal_signed_mean": float(signed_cpu.mean().item()),
+            "ttt_gradient_reversal_signed_min": float(signed_cpu.min().item()),
+            "ttt_gradient_reversal_signed_p10": float(torch.quantile(signed_cpu, 0.10).item()),
+            "ttt_gradient_reversal_signed_p50": float(torch.quantile(signed_cpu, 0.50).item()),
+            "ttt_gradient_reversal_signed_p90": float(torch.quantile(signed_cpu, 0.90).item()),
+            "ttt_gradient_reversal_negative_mass": float((signed_cpu < 0).float().mean().item()),
+            "ttt_gradient_reversal_branch_signed_mean": {
+                str(int(i)): float(signed_by_branch[int(i)].detach().float().mean().item())
+                for i in active
+            },
+            "ttt_gradient_reversal_branch_negative_mass": {
+                str(int(i)): float((signed_by_branch[int(i)].detach().float() < 0).float().mean().item())
+                for i in active
+            },
+        })
+        return (priors[0], priors[1], priors[2]), debug
 
     def _select_replay_token_indices(
         self,
@@ -1286,11 +2383,56 @@ class TTTWriteController:
             risk_source = "d_tok"
         if risk_source in {"prior", "write", "write_prior"}:
             risk_source = "write_prior"
-        if risk_source not in {"d_tok", "write_prior"}:
+        if risk_source in {"ttt_residual", "residual", "ttt_self_residual", "self_residual"}:
+            risk_source = "ttt_residual"
+        if risk_source in {"ttt_residual_x_dg", "residual_x_dg", "ttt_residual_times_dg"}:
+            risk_source = "ttt_residual_x_dg"
+        if risk_source in {
+            "ttt_w0_conflict",
+            "w0_conflict",
+            "ttt_update_conflict",
+            "update_conflict",
+            "ttt_w0_anti",
+            "w0_anti",
+            "ttt_update_anti",
+            "update_anti",
+            "ttt_w0_energy",
+            "w0_energy",
+            "ttt_update_energy",
+            "update_energy",
+            "ttt_w0_conflict_energy",
+            "w0_conflict_energy",
+            "ttt_update_conflict_energy",
+            "update_conflict_energy",
+        }:
+            risk_source = {
+                "ttt_w0_conflict": "update_conflict",
+                "w0_conflict": "update_conflict",
+                "ttt_update_conflict": "update_conflict",
+                "ttt_w0_anti": "update_anti",
+                "w0_anti": "update_anti",
+                "ttt_update_anti": "update_anti",
+                "ttt_w0_energy": "update_energy",
+                "w0_energy": "update_energy",
+                "ttt_update_energy": "update_energy",
+                "ttt_w0_conflict_energy": "update_conflict_energy",
+                "w0_conflict_energy": "update_conflict_energy",
+                "ttt_update_conflict_energy": "update_conflict_energy",
+            }.get(risk_source, risk_source)
+        if risk_source not in {
+            "d_tok",
+            "write_prior",
+            "ttt_residual",
+            "ttt_residual_x_dg",
+            "update_conflict",
+            "update_anti",
+            "update_energy",
+            "update_conflict_energy",
+        }:
             raise ValueError(f"Unsupported TTT commit filter risk source: {self.commit_filter_risk_source}")
 
         source_tok = risk_tok if risk_source == "d_tok" else A_tok
-        if source_tok is None:
+        if risk_source in {"d_tok", "write_prior"} and source_tok is None:
             debug_info.update({
                 "ttt_write_commit_filter_applied": False,
                 "ttt_write_commit_filter_missing_risk": True,
@@ -1328,36 +2470,114 @@ class TTTWriteController:
         for li, lc in enumerate(write_cache.layer_caches):
             if not self._layer_prior_enabled(li, n_layers):
                 continue
+            layer_debug = debug_info.get(f"layer_{li}")
             cache_l = int(lc.k.shape[1]) if lc.k is not None and lc.k.ndim >= 2 else 0
             if cache_l <= 0:
                 continue
-            risk_flat, align_debug = self._align_prior_to_replay_tokens(
-                source_tok,
-                token_type=token_type,
-                cache_l=cache_l,
-            )
-            risk_flat = risk_flat.detach().float().reshape(-1).clamp(0.0, 1.0)
-            if risk_source == "write_prior":
-                risk_flat = (1.0 - risk_flat).clamp(0.0, 1.0)
-            scope_mask, scope_debug = self._commit_filter_scope_mask(
-                cache_l=cache_l,
-                num_frames=num_frames,
-                overlap_frames=overlap_frames,
-                scope=scope,
-            )
-            if not bool(scope_debug.get("ttt_write_commit_filter_scope_valid", True)):
-                invalid_scope = True
-            if scope_mask.numel() != risk_flat.numel() or not bool(scope_mask.any().item()):
-                selected = risk_flat
+            align_debug: Dict[str, Any] = {}
+            risk_stat_override: Optional[float] = None
+            if risk_source in {"ttt_residual", "ttt_residual_x_dg"}:
+                residual = self._ttt_layer_residual_risk(lc, cache_l)
+                if residual is None:
+                    invalid_scope = True
+                    layer_debug = debug_info.get(f"layer_{li}")
+                    if isinstance(layer_debug, dict):
+                        layer_debug["ttt_write_commit_filter_missing_residual"] = True
+                    continue
+                risk_flat = residual.detach().float().reshape(-1).clamp(0.0, 1.0)
+                if risk_source == "ttt_residual_x_dg":
+                    if risk_tok is None:
+                        debug_info.update({
+                            "ttt_write_commit_filter_applied": False,
+                            "ttt_write_commit_filter_missing_external": True,
+                            "ttt_write_commit_filter_risk_source": risk_source,
+                        })
+                        return
+                    ext_flat, align_debug = self._align_prior_to_replay_tokens(
+                        risk_tok,
+                        token_type=token_type,
+                        cache_l=cache_l,
+                    )
+                    risk_flat = self._normalize01_vec(
+                        risk_flat * ext_flat.detach().float().reshape(-1).clamp(0.0, 1.0)
+                    )
+            elif risk_source in {
+                "update_conflict",
+                "update_anti",
+                "update_energy",
+                "update_conflict_energy",
+            }:
+                if scope == "all" and isinstance(layer_debug, dict):
+                    cached_key = None
+                    if stat_name == "mean":
+                        cached_key = "ttt_gradient_reversal_risk_source_mean"
+                    elif stat_name == "q90":
+                        cached_key = "ttt_gradient_reversal_risk_source_p90"
+                    if cached_key and cached_key in layer_debug:
+                        risk_stat_override = float(layer_debug[cached_key])
+                        align_debug["ttt_write_commit_filter_reused_gradient_risk_stat"] = True
+                        align_debug["ttt_write_commit_filter_reused_gradient_risk_key"] = cached_key
+                if risk_stat_override is None:
+                    if A_tok is None:
+                        prior_flat = torch.ones(int(cache_l), dtype=torch.float32)
+                    else:
+                        prior_flat, align_debug = self._align_prior_to_replay_tokens(
+                            A_tok,
+                            token_type=token_type,
+                            cache_l=cache_l,
+                        )
+                        prior_flat = prior_flat.detach().float().reshape(-1).clamp(0.0, 1.0)
+                    risk_vec, conflict_debug = self._ttt_layer_w0_update_risk(
+                        lc,
+                        cache_l=cache_l,
+                        prior_flat=prior_flat,
+                        mode=risk_source,
+                    )
+                    if risk_vec is None:
+                        invalid_scope = True
+                        if isinstance(layer_debug, dict):
+                            layer_debug["ttt_write_commit_filter_missing_update_conflict"] = True
+                        continue
+                    risk_flat = risk_vec.detach().float().reshape(-1).clamp(0.0, 1.0)
+                    align_debug.update(conflict_debug)
+                else:
+                    risk_flat = torch.empty(0, dtype=torch.float32)
             else:
-                selected = risk_flat[scope_mask]
-            risk_stat = self._commit_filter_stat(selected, stat_name)
+                risk_flat, align_debug = self._align_prior_to_replay_tokens(
+                    source_tok,
+                    token_type=token_type,
+                    cache_l=cache_l,
+                )
+                risk_flat = risk_flat.detach().float().reshape(-1).clamp(0.0, 1.0)
+                if risk_source == "write_prior":
+                    risk_flat = (1.0 - risk_flat).clamp(0.0, 1.0)
+            if risk_stat_override is not None:
+                scope_debug = {
+                    "ttt_write_commit_filter_scope_valid": True,
+                    "ttt_write_commit_filter_scope_tokens": int(cache_l),
+                    "ttt_write_commit_filter_scope_mass": 1.0,
+                    "ttt_write_commit_filter_overlap_frames": int(overlap_frames),
+                }
+                risk_stat = risk_stat_override
+            else:
+                scope_mask, scope_debug = self._commit_filter_scope_mask(
+                    cache_l=cache_l,
+                    num_frames=num_frames,
+                    overlap_frames=overlap_frames,
+                    scope=scope,
+                )
+                if not bool(scope_debug.get("ttt_write_commit_filter_scope_valid", True)):
+                    invalid_scope = True
+                if scope_mask.numel() != risk_flat.numel() or not bool(scope_mask.any().item()):
+                    selected = risk_flat
+                else:
+                    selected = risk_flat[scope_mask]
+                risk_stat = self._commit_filter_stat(selected, stat_name)
             risk_values.append(risk_stat)
             scale = base - gain * risk_stat if mode == "old_decay_by_risk" else base + gain * risk_stat
             scale = max(lo, min(hi, float(scale)))
             scale_values.append(scale)
 
-            layer_debug = debug_info.get(f"layer_{li}")
             if isinstance(layer_debug, dict):
                 layer_debug.update({
                     "ttt_write_commit_filter_risk": risk_stat,
@@ -1538,11 +2758,12 @@ class TTTWriteController:
 
     @staticmethod
     def _has_transient_delta(
-        transient_delta: Optional[Dict[str, List[Optional[torch.Tensor]]]],
+        transient_delta: Optional[Dict[str, Any]],
     ) -> bool:
         if not isinstance(transient_delta, dict):
             return False
-        for values in transient_delta.values():
+        for branch_name in ("w0", "w1", "w2"):
+            values = transient_delta.get(branch_name)
             if isinstance(values, list) and any(v is not None for v in values):
                 return True
         return False
@@ -1556,22 +2777,46 @@ class TTTWriteController:
 
     def _apply_previous_transient_delta(
         self,
-        prev_transient_delta: Optional[Dict[str, List[Optional[torch.Tensor]]]],
+        prev_transient_delta: Optional[Dict[str, Any]],
         w0_new: List[Optional[torch.Tensor]],
         w1_new: List[Optional[torch.Tensor]],
         w2_new: List[Optional[torch.Tensor]],
         debug_info: Dict[str, Any],
-    ) -> None:
+    ) -> Optional[Dict[str, Any]]:
         """Remove one-hop dynamic residuals before they become long-term TTT memory."""
         scale = float(self.transient_delta_subtract_scale)
         branch_mask = tuple(self.transient_delta_branch_mask)
-        debug_info["ttt_transient_delta_prev_present"] = self._has_transient_delta(prev_transient_delta)
+        prev_present = self._has_transient_delta(prev_transient_delta)
+        prev_ttl = int(prev_transient_delta.get("_ttl_remaining", 1)) if isinstance(prev_transient_delta, dict) else 0
+        debug_info["ttt_transient_delta_prev_present"] = prev_present
+        debug_info["ttt_transient_delta_prev_ttl_in"] = int(prev_ttl)
         debug_info["ttt_transient_delta_prev_subtract_scale"] = scale
         debug_info["ttt_transient_delta_prev_branch_mask"] = list(branch_mask)
-        if scale <= 0.0 or not self._has_transient_delta(prev_transient_delta):
+        if scale <= 0.0 or not prev_present:
             debug_info["ttt_transient_delta_prev_subtract_applied"] = False
             debug_info["ttt_transient_delta_prev_subtract_tensors"] = 0
-            return
+            prev_mode = str(prev_transient_delta.get("_mode", "")) if isinstance(prev_transient_delta, dict) else ""
+            if prev_present and prev_mode in {"dual_lifetime", "dual_fast_weight", "apply_short_delta", "short_apply_delta"}:
+                if prev_ttl > 1:
+                    carry = dict(prev_transient_delta)
+                    carry["_ttl_remaining"] = int(prev_ttl - 1)
+                    debug_info["ttt_transient_delta_prev_carry"] = True
+                    debug_info["ttt_transient_delta_prev_ttl_out"] = int(prev_ttl - 1)
+                    debug_info["ttt_transient_delta_prev_carry_reason"] = "dual_lifetime_no_subtract"
+                    return carry
+                debug_info["ttt_transient_delta_prev_carry"] = False
+                debug_info["ttt_transient_delta_prev_ttl_out"] = 0
+                debug_info["ttt_transient_delta_prev_carry_reason"] = "dual_lifetime_expired"
+            return None
+        if prev_ttl > 1:
+            carry = dict(prev_transient_delta) if isinstance(prev_transient_delta, dict) else None
+            if isinstance(carry, dict):
+                carry["_ttl_remaining"] = int(prev_ttl - 1)
+            debug_info["ttt_transient_delta_prev_subtract_applied"] = False
+            debug_info["ttt_transient_delta_prev_subtract_tensors"] = 0
+            debug_info["ttt_transient_delta_prev_carry"] = True
+            debug_info["ttt_transient_delta_prev_ttl_out"] = int(prev_ttl - 1)
+            return carry
 
         branches = (
             ("w0", 0, w0_new),
@@ -1609,6 +2854,9 @@ class TTTWriteController:
         debug_info["ttt_transient_delta_prev_norm_mean"] = (
             float(torch.tensor(norm_vals).mean().item()) if norm_vals else 0.0
         )
+        debug_info["ttt_transient_delta_prev_carry"] = False
+        debug_info["ttt_transient_delta_prev_ttl_out"] = 0
+        return None
 
     def _apply_native_delta_gate(
         self,
@@ -1902,6 +3150,146 @@ class TTTWriteController:
             if idx not in branches:
                 branches.append(idx)
         return tuple(branches)
+
+    @staticmethod
+    def _parse_branch_gamma_map(text: Optional[str]) -> Dict[int, float]:
+        if text is None:
+            return {}
+        raw = str(text).strip()
+        if raw == "" or raw.lower() in {"none", "off"}:
+            return {}
+        aliases = {
+            "w0": 0,
+            "b0": 0,
+            "branch0": 0,
+            "w1": 1,
+            "b1": 1,
+            "branch1": 1,
+            "w2": 2,
+            "b2": 2,
+            "branch2": 2,
+        }
+        out: Dict[int, float] = {}
+        for part in raw.replace(";", ",").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if ":" not in part:
+                raise ValueError(
+                    f"Invalid branch gamma entry '{part}', expected BRANCH:GAMMA"
+                )
+            key, value = part.split(":", 1)
+            key = key.strip().lower()
+            branch = aliases[key] if key in aliases else int(key)
+            if branch not in (0, 1, 2):
+                raise ValueError(f"gradient reversal branch must be 0, 1, or 2, got {branch}")
+            out[branch] = max(float(value), 0.0)
+        return dict(sorted(out.items()))
+
+    @staticmethod
+    def _parse_layer_gamma_map(text: Optional[str]) -> Dict[int, float]:
+        if text is None:
+            return {}
+        raw = str(text).strip()
+        if raw == "" or raw.lower() in {"none", "off"}:
+            return {}
+        out: Dict[int, float] = {}
+        for part in raw.replace(";", ",").split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if ":" not in part:
+                raise ValueError(
+                    f"Invalid layer gamma entry '{part}', expected LAYER:GAMMA"
+                )
+            key, value = part.split(":", 1)
+            layer = int(key.strip())
+            if layer < 0:
+                raise ValueError(f"gradient reversal layer must be non-negative, got {layer}")
+            out[layer] = max(float(value), 0.0)
+        return dict(sorted(out.items()))
+
+    @staticmethod
+    def _parse_layer_head_routes(text: Optional[str]) -> Dict[int, Tuple[int, ...]]:
+        if text is None:
+            return {}
+        raw = str(text).strip()
+        if raw == "" or raw.lower() in {"none", "off"}:
+            return {}
+        out: Dict[int, Tuple[int, ...]] = {}
+        for part in raw.replace("|", ";").split(";"):
+            part = part.strip()
+            if not part:
+                continue
+            if ":" not in part:
+                raise ValueError(
+                    f"Invalid layer head route entry '{part}', expected LAYER:HEADS"
+                )
+            key, value = part.split(":", 1)
+            layer = int(key.strip())
+            if layer < 0:
+                raise ValueError(f"gradient reversal head-route layer must be non-negative, got {layer}")
+            head_text = value.strip().lower()
+            if head_text in {"", "none", "off"}:
+                out[layer] = tuple()
+                continue
+            if head_text in {"all", "*"}:
+                out[layer] = (-1,)
+                continue
+            heads: List[int] = []
+            for head_part in head_text.replace("+", ",").replace("/", ",").split(","):
+                head_part = head_part.strip()
+                if not head_part:
+                    continue
+                head = int(head_part)
+                if head < 0:
+                    raise ValueError(f"gradient reversal head index must be non-negative, got {head}")
+                if head not in heads:
+                    heads.append(head)
+            out[layer] = tuple(heads)
+        return dict(sorted(out.items()))
+
+    def _effective_gradient_reversal_branch_gammas(self, layer_idx: int) -> Optional[Dict[int, float]]:
+        """Return branch gammas after optional layer routing.
+
+        When no layer map is configured, callers use the historical branch/global
+        gamma behavior by receiving ``None``.  When a layer map is configured,
+        listed layers get that gamma on the active branch mask; unlisted layers
+        fall back to the historical branch/global gamma behavior.  This allows a
+        layer map to act as a conflict-cue boost over an all-layer base; setting
+        the global gamma to zero still gives layer-only routing.
+        """
+        if not self.gradient_reversal_layer_gammas:
+            return None
+        if int(layer_idx) not in self.gradient_reversal_layer_gammas:
+            return None
+        layer_gamma = max(float(self.gradient_reversal_layer_gammas.get(int(layer_idx), 0.0)), 0.0)
+        if self.gradient_reversal_branch_gammas:
+            branches = tuple(
+                int(k)
+                for k in sorted(self.gradient_reversal_branch_gammas.keys())
+                if 0 <= int(k) <= 2
+            )
+        else:
+            branches = tuple(int(i) for i in self.gradient_reversal_branch_mask if 0 <= int(i) <= 2)
+        return {int(i): layer_gamma for i in branches}
+
+    def _gradient_reversal_head_indices_for_layer(
+        self,
+        *,
+        layer_idx: int,
+        head_count: int,
+    ) -> Optional[List[int]]:
+        if not self.gradient_reversal_head_routes:
+            return None
+        route = self.gradient_reversal_head_routes.get(int(layer_idx))
+        if route is None:
+            return None
+        if int(head_count) <= 0:
+            return []
+        if any(int(h) < 0 for h in route):
+            return list(range(int(head_count)))
+        return [int(h) for h in route if 0 <= int(h) < int(head_count)]
 
     @classmethod
     def _parse_layer_branch_policy(cls, policy: str) -> Tuple[Tuple[str, Tuple[int, int], Tuple[int, ...]], ...]:
