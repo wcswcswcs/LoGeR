@@ -1,0 +1,5 @@
+{
+  "dataset": "scannet",
+  "step": [10],
+  "cropformer_path": "third_party/seg_models/Mask2Former_hornet_3x_576d0b.pth"
+}

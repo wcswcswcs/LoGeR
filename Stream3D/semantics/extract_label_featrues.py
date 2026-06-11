@@ -2,6 +2,7 @@ import numpy as np
 import open_clip
 from open_clip import tokenizer
 import torch
+import os
 from evaluation.constants import MATTERPORT_LABELS, SCANNET_LABELS, SCANNETPP_LABELS
 import warnings
 from utils.config import get_dataset, get_args
@@ -11,8 +12,9 @@ warnings.simplefilter(action='ignore', category=UserWarning)
 
 def load_clip():
     print(f'[INFO] loading CLIP model...')
-    # model, _, _ = open_clip.create_model_and_transforms("ViT-H-14", pretrained="laion2b_s32b_b79k")
-    model, _, preprocess = open_clip.create_model_and_transforms("ViT-H-14", pretrained="./weights/open_clip_model.safetensors")
+    local_checkpoint = "./weights/open_clip_model.safetensors"
+    pretrained = local_checkpoint if os.path.exists(local_checkpoint) else "laion2b_s32b_b79k"
+    model, _, preprocess = open_clip.create_model_and_transforms("ViT-H-14", pretrained=pretrained)
     model.cuda()
     model.eval()
     print(f'[INFO]', ' finish loading CLIP model...')

@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$#" -lt 2 ]; then
+  echo "Usage: $0 GPU CANDIDATE_ID" >&2
+  echo "Candidates: SCALE_ONLINE_01 SCALE_ONLINE_02 SCALE_ONLINE_03 SCALE_ONLINE_04" >&2
+  exit 2
+fi
+
+GPU="$1"
+CANDIDATE_ID="$2"
+
+ROOT="${LOGER_ROOT:-/mnt/data/users/chengshun.wang/pjs/LoGeR}"
+ROLLOUT_BASE="${ROLLOUT_BASE:-results/kitti01_hmc_v2/acl2_v22_durable_contextskip_semanticallmemory_ttt_target25/phaseH5_online_scale/rollouts}"
+RUN_PREFIX="${RUN_PREFIX:-V22_H5_SCALE_R1}"
+RUN_NAME="${RUN_PREFIX}_${CANDIDATE_ID}_fullonline_H9parent_SWKS3"
+RUN_DIR="$ROOT/$ROLLOUT_BASE/$RUN_NAME"
+FORCE="${FORCE:-0}"
+
+if [ -d "$RUN_DIR" ]; then
+  if [ "$FORCE" != "1" ] && grep -q "DONE $RUN_NAME" "$RUN_DIR/run_status.txt" 2>/dev/null; then
+    echo "[$(date '+%F %T')] SKIP existing DONE $RUN_NAME"
+    exit 0
+  fi
+  stamp="$(date '+%Y%m%d_%H%M%S')"
+  mv "$RUN_DIR" "${RUN_DIR}.INVALID_RERUN_${stamp}"
+fi
+
+ONLINE_SCALE_STATE_MODE="none"
+ONLINE_SCALE_STATE_MIN="${ONLINE_SCALE_STATE_MIN:-0.90}"
+ONLINE_SCALE_STATE_MAX="${ONLINE_SCALE_STATE_MAX:-1.10}"
+ENABLE_CONTEXT_SOURCE_SKIP_VALUE=0
+CONTEXT_SOURCE_SKIP_IMPL_VALUE="compact_kv"
+CONTEXT_SOURCE_SKIP_SCOPE_VALUE="frame"
+CONTEXT_SOURCE_SKIP_MASK_VALUE="dg_q80"
+CONTEXT_SOURCE_SKIP_LAYER_MODE_VALUE="early"
+STAGE_C_MODE_VALUE="none"
+STAGE_C_CACHE_DIR_VALUE=""
+STAGE_C_CACHE_MODE_VALUE="off"
+STAGE_C_CACHE_REQUIRE_HIT_VALUE=0
+STAGE_C_CACHE_VALIDATE_VALUE=0
+
+STAGE_C_CACHE_DEFAULT="${STAGE_C_CACHE_DEFAULT:-results/kitti01_hmc_v2/acl2_v6_stage_c_cache_mask2former_cityscapes_full}"
+
+case "$CANDIDATE_ID" in
+  SCALE_ONLINE_01)
+    ONLINE_SCALE_STATE_MODE="pose_step_ema"
+    ;;
+  SCALE_ONLINE_02)
+    ONLINE_SCALE_STATE_MODE="pose_step_ema_ttt_conflict"
+    ;;
+  SCALE_ONLINE_03)
+    ONLINE_SCALE_STATE_MODE="pose_step_ema_semantic_structure"
+    STAGE_C_MODE_VALUE="reference"
+    STAGE_C_CACHE_DIR_VALUE="$STAGE_C_CACHE_DEFAULT"
+    STAGE_C_CACHE_MODE_VALUE="read"
+    STAGE_C_CACHE_REQUIRE_HIT_VALUE=1
+    ;;
+  SCALE_ONLINE_04)
+    ONLINE_SCALE_STATE_MODE="pose_step_ema_context_keep"
+    ENABLE_CONTEXT_SOURCE_SKIP_VALUE=1
+    ;;
+  *)
+    echo "Unsupported H5 candidate: $CANDIDATE_ID" >&2
+    exit 2
+    ;;
+esac
+
+mkdir -p "$RUN_DIR"
+mkdir -p "${MPLCONFIGDIR:-/mnt/data/users/chengshun.wang/tmp_torch/matplotlib_cache}"
+cat > "$RUN_DIR/v22_h5_candidate_manifest.yaml" <<EOF
+candidate_id: "$CANDIDATE_ID"
+run_name: "$RUN_NAME"
+result_class: "full_online_explicit_scale_state_diagnostic"
+counts_as_online_ttt_write_success: false
+online_scale_state_mode: "$ONLINE_SCALE_STATE_MODE"
+online_scale_state_min: "$ONLINE_SCALE_STATE_MIN"
+online_scale_state_max: "$ONLINE_SCALE_STATE_MAX"
+enable_context_source_skip: "$ENABLE_CONTEXT_SOURCE_SKIP_VALUE"
+stage_c_mode: "$STAGE_C_MODE_VALUE"
+stage_c_cache_dir: "$STAGE_C_CACHE_DIR_VALUE"
+EOF
+
+env \
+  MPLCONFIGDIR="${MPLCONFIGDIR:-/mnt/data/users/chengshun.wang/tmp_torch/matplotlib_cache}" \
+  KITTI_SEQ=01 \
+  ATTN_CUE_BASE="$ROLLOUT_BASE" \
+  RESET_EVERY=5 \
+  WRITE_ALPHA=0.125 \
+  READ_PATH=frame \
+  READ_LAYER_MODE=all \
+  FRAME_BIAS_MODE=pair \
+  BETA_SWA=4.75 \
+  READ_BETA_FRAME_CHUNKS="5:4.85,6:4.85,7:4.85,8:4.85,9:4.85,10:4.25,11:4.25,12:4.25,16:4.25" \
+  ENABLE_SWA_OVERLAP_SOURCE_REPLACE=1 \
+  SWA_OVERLAP_SOURCE_REPLACE_ALPHA=0.5 \
+  SWA_OVERLAP_SOURCE_REPLACE_MODE=source \
+  ENABLE_SWA_WRITE_CONTROL=1 \
+  SWA_WRITE_MODE=none \
+  SWA_WRITE_RHO=0.0 \
+  SWA_WRITE_MIN_GATE=0.0 \
+  SWA_WRITE_SCOPE=all \
+  SWA_WRITE_LAYER_MODE=last \
+  SWA_WRITE_KEEP_SCOPE=both_overlap \
+  SWA_WRITE_SCORE_SOURCE=read \
+  TTT_WRITE_GRADIENT_REVERSAL_MODE=tri_replay \
+  TTT_WRITE_GRADIENT_REVERSAL_RISK_SOURCE=update_conflict_energy \
+  TTT_WRITE_GRADIENT_REVERSAL_CHUNK_GAMMAS="5:0.005,6:0.005,7:0.005,8:0.005,9:0.005,10:0.003,11:0.003,12:0.003,16:0.0003" \
+  TTT_WRITE_NATIVE_MIX_SCALES="1.10,1.00,1.00" \
+  TTT_WRITE_TRI_REPLAY_POSITIVE_FRAC=0.35 \
+  TTT_WRITE_TRI_REPLAY_NEGATIVE_FRAC=0.12 \
+  TTT_WRITE_TRI_REPLAY_NEUTRAL_LAMBDA=0.85 \
+  TTT_WRITE_TRI_REPLAY_CHUNK_PARAMS="5:0.35/0.12/0.85,6:0.35/0.12/0.85,7:0.35/0.12/0.85,8:0.35/0.12/0.85,9:0.35/0.12/0.85,10:0.35/0.12/0.85,11:0.35/0.12/0.85,12:0.35/0.12/0.85,16:0.35/0.08/0.85" \
+  ONLINE_SCALE_STATE_MODE="$ONLINE_SCALE_STATE_MODE" \
+  ONLINE_SCALE_STATE_MIN="$ONLINE_SCALE_STATE_MIN" \
+  ONLINE_SCALE_STATE_MAX="$ONLINE_SCALE_STATE_MAX" \
+  ENABLE_CONTEXT_SOURCE_SKIP="$ENABLE_CONTEXT_SOURCE_SKIP_VALUE" \
+  CONTEXT_SOURCE_SKIP_IMPL="$CONTEXT_SOURCE_SKIP_IMPL_VALUE" \
+  CONTEXT_SOURCE_SKIP_SCOPE="$CONTEXT_SOURCE_SKIP_SCOPE_VALUE" \
+  CONTEXT_SOURCE_SKIP_MASK="$CONTEXT_SOURCE_SKIP_MASK_VALUE" \
+  CONTEXT_SOURCE_SKIP_LAYER_MODE="$CONTEXT_SOURCE_SKIP_LAYER_MODE_VALUE" \
+  STAGE_C_MODE="$STAGE_C_MODE_VALUE" \
+  STAGE_C_CACHE_DIR="$STAGE_C_CACHE_DIR_VALUE" \
+  STAGE_C_CACHE_MODE="$STAGE_C_CACHE_MODE_VALUE" \
+  STAGE_C_CACHE_REQUIRE_HIT="$STAGE_C_CACHE_REQUIRE_HIT_VALUE" \
+  STAGE_C_CACHE_VALIDATE="$STAGE_C_CACHE_VALIDATE_VALUE" \
+  "$ROOT/tools/run_attention_cue_experiment.sh" \
+  "$GPU" "$RUN_NAME" hybrid "acl2.gg.qq.low.g2_3.past_only.headmean.robustq" "4.75" "stage_d_x_dg_inv_sqrt"

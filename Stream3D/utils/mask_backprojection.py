@@ -1,12 +1,16 @@
 import numpy as np
-from pytorch3d.ops import ball_query
 import torch
 import open3d as o3d
 from utils.geometry import denoise
 from torch.nn.utils.rnn import pad_sequence
-from scipy.spatial import KDTree
+from scipy.spatial import KDTree, cKDTree
 from itertools import chain
 from sklearn.cluster import DBSCAN
+
+try:
+    from pytorch3d.ops import ball_query
+except ImportError:
+    ball_query = None
 
 # COVERAGE_THRESHOLD = 0.3
 # DISTANCE_THRESHOLD = 0.03
@@ -26,14 +30,47 @@ def backproject(depth, intrinisc_cam_parameters, extrinsics):
     convert color and depth to view pointcloud
     """
     depth = o3d.geometry.Image(depth)
-    pcld = o3d.geometry.PointCloud.create_from_depth_image(depth, intrinisc_cam_parameters, depth_scale=1, depth_trunc=DEPTH_TRUNC) # DEPTH_TRUNC
+    pcld = o3d.geometry.PointCloud.create_from_depth_image(depth, intrinisc_cam_parameters, depth_scale=1, depth_trunc=DEPTH_TRUNC_MAX)
     pcld.transform(extrinsics)
     return pcld
 
 
 def get_neighbor(valid_points, scene_points, lengths_1, lengths_2):
-    _, neighbor_in_scene_pcld, _ = ball_query(valid_points, scene_points, lengths_1, lengths_2, K=20, radius=DISTANCE_THRESHOLD, return_nn=False)
-    return neighbor_in_scene_pcld
+    if ball_query is not None:
+        _, neighbor_in_scene_pcld, _ = ball_query(valid_points, scene_points, lengths_1, lengths_2, K=20, radius=DISTANCE_THRESHOLD, return_nn=False)
+        return neighbor_in_scene_pcld
+
+    valid_points_np = valid_points.detach().cpu().numpy()
+    scene_points_np = scene_points.detach().cpu().numpy()
+    lengths_1_np = lengths_1.detach().cpu().numpy()
+    lengths_2_np = lengths_2.detach().cpu().numpy()
+
+    batch_size, max_points = valid_points_np.shape[:2]
+    neighbors = np.full((batch_size, max_points, 20), -1, dtype=np.int64)
+    for batch_idx in range(batch_size):
+        query_num = int(lengths_1_np[batch_idx])
+        scene_num = int(lengths_2_np[batch_idx])
+        if query_num == 0 or scene_num == 0:
+            continue
+
+        tree = cKDTree(scene_points_np[batch_idx, :scene_num])
+        k = min(20, scene_num)
+        distances, indices = tree.query(
+            valid_points_np[batch_idx, :query_num],
+            k=k,
+            distance_upper_bound=DISTANCE_THRESHOLD,
+        )
+        if k == 1:
+            distances = distances[:, None]
+            indices = indices[:, None]
+        valid = np.isfinite(distances) & (indices < scene_num)
+        padded = np.full((query_num, 20), -1, dtype=np.int64)
+        padded_neighbors = padded[:, :k]
+        padded_neighbors[valid] = indices[valid]
+        padded[:, :k] = padded_neighbors
+        neighbors[batch_idx, :query_num] = padded
+
+    return torch.from_numpy(neighbors).to(valid_points.device)
 
 
 def get_depth_mask(depth):
@@ -327,6 +364,17 @@ def turn_point_to_mask(dataset, scene_points, mask_image, frame_id, depth_max_pr
 def frame_backprojection(args, dataset, scene_points, frame_id, depth_max_pre):
 
     mask_image = dataset.get_segmentation(frame_id, align_with_depth=True)
+
+    geometry_provider = getattr(args, "geometry_provider", None)
+    if geometry_provider is not None:
+        projection = geometry_provider.project_frame_masks(
+            dataset=dataset,
+            scene_points=scene_points,
+            mask_image=mask_image,
+            frame_id=int(frame_id),
+            depth_max_pre=float(depth_max_pre),
+        )
+        return projection.mask_info, projection.frame_point_ids, projection.depth_max
 
     # mask_info, _, frame_point_ids = turn_mask_to_point(dataset, scene_points, mask_image, frame_id)
     

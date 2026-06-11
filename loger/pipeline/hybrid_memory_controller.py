@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -34,8 +35,27 @@ from .geometry_backbone import (
     TOKEN_TYPE_PATCH,
     WriteCacheOutput,
 )
-from .semantic_prior_generator import PriorOutput
+from .semantic_prior_generator import (
+    PriorOutput,
+    SEMANTIC_FINE_LABEL_UNKNOWN,
+    SEMANTIC_FINE_MOVABLE_IDS,
+    SEMANTIC_FINE_SKY_IDS,
+    SEMANTIC_FINE_STRUCTURE_IDS,
+    SEMANTIC_FINE_VEGETATION_IDS,
+    SEMANTIC_ROLE_FALLBACK,
+    SEMANTIC_ROLE_NEGATIVE_SHORT,
+    SEMANTIC_ROLE_NEUTRAL_KEEP,
+    SEMANTIC_ROLE_POSITIVE_LONG,
+    SEMANTIC_ROLE_PROTECT_NEUTRAL,
+)
 from .ttt_write_controller import TTTWriteController, WriteResult
+from .video_masklet_frontend import (
+    SEMANTIC_GROUP_LOW_VALUE_STUFF,
+    SEMANTIC_GROUP_MOVABLE_THING,
+    SEMANTIC_GROUP_STATIC_THING,
+    SEMANTIC_GROUP_STRUCTURE_ANCHOR,
+    SEMANTIC_GROUP_UNCERTAIN_REGION,
+)
 
 
 _DUAL_LIFETIME_TRANSIENT_MODES = {
@@ -70,6 +90,37 @@ def _renorm_like(reference: torch.Tensor, candidate: torch.Tensor) -> torch.Tens
     ref_norm = ref.norm(dim=1, keepdim=True).clamp_min(1e-6)
     out_norm = out.norm(dim=1, keepdim=True).clamp_min(1e-6)
     return (out / out_norm * ref_norm).to(dtype=reference.dtype)
+
+
+def _optional_1d_float_tensor(value: Any) -> Optional[torch.Tensor]:
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        out = value.detach().cpu().float().reshape(-1)
+    else:
+        try:
+            out = torch.as_tensor(value, dtype=torch.float32).detach().cpu().reshape(-1)
+        except (TypeError, ValueError):
+            return None
+    return out if int(out.numel()) > 0 else None
+
+
+def _parse_chunk_index_set(value: Any) -> set:
+    out = set()
+    for item in str(value or "").split(","):
+        token = item.strip()
+        if not token:
+            continue
+        if "-" in token:
+            left, right = token.split("-", 1)
+            start = int(left.strip())
+            end = int(right.strip())
+            if end < start:
+                start, end = end, start
+            out.update(range(start, end + 1))
+        else:
+            out.add(int(token))
+    return out
 
 
 def _apply_dual_lifetime_delta_to_branch(
@@ -227,6 +278,20 @@ class HybridMemoryControlPrior:
     R_tok: Optional[torch.Tensor] = None
     U_tok: Optional[torch.Tensor] = None
     P_ref: Optional[torch.Tensor] = None
+    S_tok: Optional[torch.Tensor] = None
+    G_sem_tok: Optional[torch.Tensor] = None
+    Q_sem_tok: Optional[torch.Tensor] = None
+    L_sem_tok: Optional[torch.Tensor] = None
+    V_sem_tok: Optional[torch.Tensor] = None
+    R_sem_tok: Optional[torch.Tensor] = None
+    R_frame_tok: Optional[torch.Tensor] = None
+    R_global_tok: Optional[torch.Tensor] = None
+    R_swa_tok: Optional[torch.Tensor] = None
+    R_ttt_tok: Optional[torch.Tensor] = None
+    C_ttt_conflict_tok: Optional[torch.Tensor] = None
+    S_scale_risk_tok: Optional[torch.Tensor] = None
+    A_anchor_tok: Optional[torch.Tensor] = None
+    A_anchor_mask_tok: Optional[torch.Tensor] = None
     P_ttt_write: Optional[torch.Tensor] = None
     P_ttt_read: Optional[torch.Tensor] = None
     P_swa_read_prev: Optional[torch.Tensor] = None
@@ -345,6 +410,290 @@ def _normalize01(values: torch.Tensor) -> torch.Tensor:
     if float((vmax - vmin).abs().item()) < 1e-8:
         return torch.zeros_like(safe, dtype=torch.float32)
     return ((safe - vmin) / (vmax - vmin)).clamp(0.0, 1.0)
+
+
+def _stable_semantic_score(
+    labels: Optional[torch.Tensor],
+    groups: Optional[torch.Tensor],
+    trust: Optional[torch.Tensor],
+    n_patch: int,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    score = torch.zeros((n_patch,), dtype=torch.float32)
+    debug: Dict[str, Any] = {
+        "semantic_anchor_label_missing": labels is None,
+        "semantic_anchor_group_missing": groups is None,
+        "semantic_anchor_trust_missing": trust is None,
+    }
+    if labels is not None and int(labels.numel()) == n_patch:
+        L = labels.detach().cpu().long().reshape(-1)
+        known = (L >= 0) & (L != int(SEMANTIC_FINE_LABEL_UNKNOWN))
+        structure = torch.zeros_like(known, dtype=torch.bool)
+        sky = torch.zeros_like(known, dtype=torch.bool)
+        vegetation = torch.zeros_like(known, dtype=torch.bool)
+        movable = torch.zeros_like(known, dtype=torch.bool)
+        for label_id in SEMANTIC_FINE_STRUCTURE_IDS:
+            structure |= L == int(label_id)
+        for label_id in SEMANTIC_FINE_SKY_IDS:
+            sky |= L == int(label_id)
+        for label_id in SEMANTIC_FINE_VEGETATION_IDS:
+            vegetation |= L == int(label_id)
+        for label_id in SEMANTIC_FINE_MOVABLE_IDS:
+            movable |= L == int(label_id)
+        score[structure & known] = 1.0
+        score[(sky | vegetation) & known] = 0.15
+        score[movable & known] = 0.0
+        debug.update({
+            "semantic_anchor_fine_structure_tokens": int((structure & known).sum().item()),
+            "semantic_anchor_fine_context_tokens": int(((sky | vegetation) & known).sum().item()),
+            "semantic_anchor_fine_dynamic_tokens": int((movable & known).sum().item()),
+        })
+    if groups is not None and int(groups.numel()) == n_patch:
+        G = groups.detach().cpu().long().reshape(-1)
+        coarse = torch.zeros_like(score)
+        coarse[G == int(SEMANTIC_GROUP_STRUCTURE_ANCHOR)] = 0.90
+        coarse[G == int(SEMANTIC_GROUP_STATIC_THING)] = 0.70
+        coarse[G == int(SEMANTIC_GROUP_LOW_VALUE_STUFF)] = 0.15
+        coarse[G == int(SEMANTIC_GROUP_MOVABLE_THING)] = 0.0
+        coarse[G == int(SEMANTIC_GROUP_UNCERTAIN_REGION)] = 0.0
+        score = torch.maximum(score, coarse)
+        debug.update({
+            "semantic_anchor_group_structure_tokens": int((G == int(SEMANTIC_GROUP_STRUCTURE_ANCHOR)).sum().item()),
+            "semantic_anchor_group_static_tokens": int((G == int(SEMANTIC_GROUP_STATIC_THING)).sum().item()),
+            "semantic_anchor_group_dynamic_tokens": int((G == int(SEMANTIC_GROUP_MOVABLE_THING)).sum().item()),
+        })
+    if trust is not None and int(trust.numel()) == n_patch:
+        score = score * trust.detach().cpu().float().reshape(-1).clamp(0.0, 1.0)
+    else:
+        score = torch.zeros_like(score)
+    return score.clamp(0.0, 1.0), debug
+
+
+def _deterministic_patch_noise(n_patch: int, *, seed: float) -> torch.Tensor:
+    idx = torch.arange(n_patch, dtype=torch.float32)
+    return torch.frac(torch.sin((idx + 1.0 + float(seed)) * 12.9898) * 43758.5453)
+
+
+def _select_spatially_diverse_anchors(
+    raw_score: torch.Tensor,
+    *,
+    num_frames: int,
+    patch_grid: Tuple[int, int],
+    target_ratio: float,
+    min_ratio: float,
+    max_ratio: float,
+    min_score: float,
+    grid_rows: int,
+    grid_cols: int,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    score = torch.nan_to_num(
+        raw_score.detach().cpu().float().reshape(-1),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    ).clamp(0.0, 1.0)
+    n_patch = int(score.numel())
+    mask = torch.zeros((n_patch,), dtype=torch.bool)
+    if n_patch <= 0:
+        return mask, {"semantic_anchor_select_reason": "empty_score"}
+    H, W = int(patch_grid[0]), int(patch_grid[1])
+    T = max(int(num_frames), 1)
+    if H <= 0 or W <= 0 or H * W * T != n_patch:
+        H, W, T = 1, n_patch, 1
+
+    eligible = torch.nonzero(score > float(min_score), as_tuple=False).reshape(-1)
+    if int(eligible.numel()) <= 0:
+        return mask, {
+            "semantic_anchor_select_reason": "no_score_above_min",
+            "semantic_anchor_min_score": float(min_score),
+        }
+
+    min_k = max(1, int(round(max(0.0, float(min_ratio)) * n_patch)))
+    max_k = max(min_k, int(round(max(float(max_ratio), float(min_ratio)) * n_patch)))
+    target_k = int(round(max(0.0, float(target_ratio)) * n_patch))
+    target_k = min(max(target_k, min_k), max_k, int(eligible.numel()))
+
+    patch_linear = torch.arange(n_patch) % max(H * W, 1)
+    rows = (patch_linear // max(W, 1)).long()
+    cols = (patch_linear % max(W, 1)).long()
+    gr = max(int(grid_rows), 1)
+    gc = max(int(grid_cols), 1)
+    rr = torch.clamp(rows * gr // max(H, 1), 0, gr - 1)
+    cc = torch.clamp(cols * gc // max(W, 1), 0, gc - 1)
+    cells = rr * gc + cc
+    num_cells = gr * gc
+    cell_cap = max(1, int(math.ceil(target_k / max(num_cells, 1))) * 2)
+    cell_counts = torch.zeros((num_cells,), dtype=torch.long)
+
+    order = eligible[torch.argsort(score[eligible], descending=True)]
+    for idx in order.tolist():
+        cell = int(cells[idx].item())
+        if int(cell_counts[cell].item()) >= cell_cap:
+            continue
+        mask[idx] = True
+        cell_counts[cell] += 1
+        if int(mask.sum().item()) >= target_k:
+            break
+    if int(mask.sum().item()) < target_k:
+        for idx in order.tolist():
+            if mask[idx]:
+                continue
+            mask[idx] = True
+            if int(mask.sum().item()) >= target_k:
+                break
+
+    hit_counts = cell_counts.float()
+    hit_counts = hit_counts[hit_counts > 0]
+    if hit_counts.numel() > 0:
+        probs = hit_counts / hit_counts.sum().clamp_min(1.0)
+        entropy = float((-(probs * probs.log()).sum() / math.log(max(num_cells, 2))).item())
+    else:
+        entropy = 0.0
+    return mask, {
+        "semantic_anchor_select_reason": "ok" if int(mask.sum().item()) > 0 else "empty_after_selection",
+        "semantic_anchor_target_ratio": float(target_ratio),
+        "semantic_anchor_min_ratio": float(min_ratio),
+        "semantic_anchor_max_ratio": float(max_ratio),
+        "semantic_anchor_min_score": float(min_score),
+        "semantic_anchor_target_tokens": int(target_k),
+        "semantic_anchor_eligible_tokens": int(eligible.numel()),
+        "semantic_anchor_cell_cap": int(cell_cap),
+        "semantic_anchor_spatial_entropy": entropy,
+        "semantic_anchor_spatial_cells_hit": int((cell_counts > 0).sum().item()),
+        "semantic_anchor_spatial_cells_total": int(num_cells),
+    }
+
+
+def _patch_labels_from_token_labels(
+    token_labels: Optional[torch.Tensor],
+    token_type: torch.Tensor,
+) -> Optional[torch.Tensor]:
+    if token_labels is None:
+        return None
+    labels = token_labels.detach().cpu().long().reshape(-1)
+    token_type_cpu = token_type.detach().cpu().long().reshape(-1)
+    if int(labels.numel()) != int(token_type_cpu.numel()):
+        return None
+    patch_mask = token_type_cpu == TOKEN_TYPE_PATCH
+    if not bool(patch_mask.any()):
+        return None
+    return labels[patch_mask]
+
+
+def _semantic_z_recondition_patch(
+    base_patch: torch.Tensor,
+    patch_labels: Optional[torch.Tensor],
+    *,
+    min_count: int = 32,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    base = torch.nan_to_num(base_patch.detach().cpu().float().reshape(-1), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+    debug: Dict[str, Any] = {
+        "v31_semantic_recondition_applied": False,
+        "v31_semantic_recondition_mode": "semantic_z",
+        "v31_semantic_label_count": 0,
+        "v31_semantic_label_fallback_ratio": 1.0,
+        "v31_semantic_min_count": int(min_count),
+    }
+    if patch_labels is None:
+        debug["v31_semantic_recondition_reason"] = "missing_patch_labels"
+        return base, debug
+    labels = patch_labels.detach().cpu().long().reshape(-1)
+    if int(labels.numel()) != int(base.numel()) or int(base.numel()) <= 0:
+        debug["v31_semantic_recondition_reason"] = "empty_patch_labels"
+        return base, debug
+    n = int(base.numel())
+    out = base.clone()
+    fallback = torch.zeros((n,), dtype=torch.bool)
+    label_stats: Dict[str, Dict[str, float]] = {}
+    applied_labels = 0
+    for label in labels.unique(sorted=True):
+        mask = labels == label
+        count = int(mask.sum().item())
+        if count < int(min_count):
+            fallback |= mask
+            continue
+        vals = base[mask]
+        std = vals.std(unbiased=False)
+        if not torch.isfinite(std) or float(std.item()) < 1e-6:
+            fallback |= mask
+            continue
+        mean = vals.mean()
+        z = ((vals - mean) / std.clamp_min(1e-6)).clamp(-6.0, 6.0)
+        out[mask] = torch.sigmoid(z)
+        label_stats[str(int(label.item()))] = {
+            "count": float(count),
+            "mean": float(mean.item()),
+            "std": float(std.item()),
+        }
+        applied_labels += 1
+    debug.update(
+        {
+            "v31_semantic_recondition_applied": bool(applied_labels > 0),
+            "v31_semantic_label_count": int(applied_labels),
+            "v31_semantic_label_fallback_ratio": float(fallback.float().mean().item()) if fallback.numel() else 1.0,
+            "v31_semantic_label_stats": label_stats,
+        }
+    )
+    if applied_labels <= 0:
+        debug["v31_semantic_recondition_reason"] = "no_label_with_nonzero_variance"
+    return out.clamp(0.0, 1.0), debug
+
+
+def _semantic_anchor_rescue_patch(
+    base_patch: torch.Tensor,
+    *,
+    token_type: torch.Tensor,
+    prior_output: Optional[PriorOutput],
+    gg_deep_static_patch: torch.Tensor,
+    conf_patch: torch.Tensor,
+    key_avg_patch: torch.Tensor,
+    alpha: float,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    base = torch.nan_to_num(
+        base_patch.detach().cpu().float().reshape(-1),
+        nan=0.0,
+        posinf=1.0,
+        neginf=0.0,
+    ).clamp(0.0, 1.0)
+    n_patch = int(base.numel())
+    debug: Dict[str, Any] = {
+        "semantic_anchor_rescue_applied": False,
+        "semantic_anchor_rescue_alpha": float(alpha),
+        "semantic_anchor_rescue_reason": "ok",
+    }
+    if prior_output is None or n_patch <= 0:
+        debug["semantic_anchor_rescue_reason"] = "missing_prior_or_empty_patch"
+        return base, debug
+    G_sem_tok = getattr(prior_output, "G_sem_tok", None)
+    Q_sem_tok = getattr(prior_output, "Q_sem_tok", None)
+    L_sem_tok = getattr(prior_output, "L_sem_tok", None)
+    label_patch = _patch_labels_from_token_labels(L_sem_tok, token_type)
+    group_patch = _patch_labels_from_token_labels(G_sem_tok, token_type)
+    trust_patch = None
+    if Q_sem_tok is not None:
+        q = Q_sem_tok.detach().cpu().float().reshape(-1)
+        token_type_cpu = token_type.detach().cpu().long().reshape(-1)
+        if int(q.numel()) == int(token_type_cpu.numel()):
+            trust_patch = q[token_type_cpu == TOKEN_TYPE_PATCH].clamp(0.0, 1.0)
+    sem_score, sem_debug = _stable_semantic_score(label_patch, group_patch, trust_patch, n_patch)
+    debug.update({f"rescue_{k}": v for k, v in sem_debug.items()})
+    if int(sem_score.numel()) != n_patch or not bool((sem_score > 0.0).any()):
+        debug["semantic_anchor_rescue_reason"] = "empty_semantic_stable_score"
+        return base, debug
+    static_score = _flatten_or_default(gg_deep_static_patch, base).clamp(0.0, 1.0)
+    conf_score = _flatten_or_default(conf_patch, base).clamp(0.0, 1.0)
+    source_score = 0.25 + 0.75 * _normalize01(_flatten_or_default(key_avg_patch, base))
+    rescue = (sem_score * (0.5 + 0.5 * static_score) * conf_score * source_score).clamp(0.0, 1.0)
+    out = (base * (1.0 - float(alpha) * rescue)).clamp(0.0, 1.0)
+    debug.update({
+        "semantic_anchor_rescue_applied": bool((out - base).abs().max().item() > 1e-8),
+        "semantic_anchor_rescue_score_mean": float(rescue.mean().item()) if rescue.numel() else 0.0,
+        "semantic_anchor_rescue_score_q90": float(torch.quantile(rescue, 0.9).item()) if rescue.numel() else 0.0,
+        "semantic_anchor_rescue_base_mean": float(base.mean().item()) if base.numel() else 0.0,
+        "semantic_anchor_rescue_after_mean": float(out.mean().item()) if out.numel() else 0.0,
+        "semantic_anchor_rescue_delta_mean": float((out - base).mean().item()) if out.numel() else 0.0,
+        "semantic_anchor_rescue_static_score_mean": float(static_score.mean().item()) if static_score.numel() else 0.0,
+    })
+    return out, debug
 
 
 def _robust_quantile01(
@@ -683,10 +1032,22 @@ def _global_centroid_metric(
     return _flatten_or_default(out, default)
 
 
-def _acl2_support_indices(num_frames: int, t: int, support: str) -> List[int]:
+def _acl2_support_indices(
+    num_frames: int,
+    t: int,
+    support: str,
+    *,
+    overlap_frames: int = 0,
+) -> List[int]:
     if num_frames <= 1:
         return []
     support = support.lower()
+    ov = min(max(int(overlap_frames), 0), max(int(num_frames) // 2, 0))
+    seam = set(range(0, ov)) | set(range(max(num_frames - ov, 0), num_frames)) if ov > 0 else set()
+    if support in {"full_chunk", "chunk_full", "full_chunk_true", "chunk_full_true"}:
+        return [s for s in range(num_frames) if s != t]
+    if support in {"full_chunk_no_overlap", "full_no_overlap", "no_overlap", "no_overlap_true"}:
+        return [s for s in range(num_frames) if s != t and s not in seam]
     if support == "off246":
         offsets = (-6, -4, -2, 2, 4, 6)
         return [t + d for d in offsets if 0 <= t + d < num_frames]
@@ -703,11 +1064,45 @@ def _acl2_support_indices(num_frames: int, t: int, support: str) -> List[int]:
         return list(range(0, t))
     if support in {"future", "future_only"}:
         return list(range(t + 1, num_frames))
+    if support in {"past_plus_near_future12", "past_near_future12", "causal_past_plus_near_future"}:
+        return list(range(0, t)) + [s for s in (t + 1, t + 2) if 0 <= s < num_frames]
+    if support in {"past_plus_future_light", "past_future_light", "past075_future025", "past_plus_future_light_real"}:
+        return [s for s in range(num_frames) if s != t]
     if support in {"full", "noovlp", "ovlp_only", "overlap_excluded"}:
         # The current HMC cue builder does not receive chunk-boundary metadata,
         # so noovlp/ovlp_only fall back to full support for this first ACL2 pass.
         return [s for s in range(num_frames) if s != t]
     return [s for s in range(num_frames) if s != t]
+
+
+_ACL2_PAST_FUTURE_LIGHT_SUPPORTS = {
+    "past_plus_future_light",
+    "past_future_light",
+    "past075_future025",
+    "past_plus_future_light_real",
+}
+
+
+def _acl2_weighted_past_future_centroid(
+    centroids: torch.Tensor,
+    t: int,
+    support_indices: List[int],
+) -> torch.Tensor:
+    past = [s for s in support_indices if s < t]
+    future = [s for s in support_indices if s > t]
+    pieces: List[torch.Tensor] = []
+    weights: List[float] = []
+    if past:
+        pieces.append(centroids[past].mean(dim=0))
+        weights.append(0.75)
+    if future:
+        pieces.append(centroids[future].mean(dim=0))
+        weights.append(0.25)
+    if not pieces:
+        return centroids[support_indices].permute(1, 0, 2)
+    w = torch.tensor(weights, dtype=centroids.dtype, device=centroids.device)
+    w = w / w.sum().clamp_min(1e-12)
+    return (torch.stack(pieces, dim=0) * w[:, None, None]).sum(dim=0).unsqueeze(1)
 
 
 def _acl2_layer_indices(n_layers: int, layerwin: str) -> torch.Tensor:
@@ -750,6 +1145,7 @@ def _global_acl2_centroid_metric(
     stat: str,
     layerwin: str,
     support: str,
+    overlap_frames: int = 0,
 ) -> torch.Tensor:
     """Head-mean ACL2 global q/k cue.
 
@@ -779,9 +1175,19 @@ def _global_acl2_centroid_metric(
     basis = basis.lower()
     stat = stat.lower()
     support_key = support.lower()
-    full_support = support_key in {"full", "noovlp", "ovlp_only", "overlap_excluded"}
+    full_support = support_key in {
+        "full",
+        "full_chunk",
+        "chunk_full",
+        "full_chunk_true",
+        "chunk_full_true",
+        "noovlp",
+        "ovlp_only",
+        "overlap_excluded",
+    }
+    no_overlap_support = support_key in {"full_chunk_no_overlap", "full_no_overlap", "no_overlap", "no_overlap_true"}
 
-    if full_support and stat != "var" and T > 1:
+    if full_support and not no_overlap_support and stat != "var" and T > 1:
         if basis == "kk":
             tgt_all = k
             cent_all = k_cent
@@ -802,19 +1208,28 @@ def _global_acl2_centroid_metric(
 
     per_frame: List[torch.Tensor] = []
     for t in range(T):
-        supp = _acl2_support_indices(T, t, support)
+        supp = _acl2_support_indices(T, t, support, overlap_frames=overlap_frames)
         if not supp:
             per_frame.append(torch.zeros((H * W,), dtype=torch.float32))
             continue
         if basis == "kk":
             tgt = k[t]
-            cent = k_cent[supp].permute(1, 0, 2)
+            if support_key in _ACL2_PAST_FUTURE_LIGHT_SUPPORTS:
+                cent = _acl2_weighted_past_future_centroid(k_cent, t, supp)
+            else:
+                cent = k_cent[supp].permute(1, 0, 2)
         elif basis == "qk":
             tgt = q[t]
-            cent = k_cent[supp].permute(1, 0, 2)
+            if support_key in _ACL2_PAST_FUTURE_LIGHT_SUPPORTS:
+                cent = _acl2_weighted_past_future_centroid(k_cent, t, supp)
+            else:
+                cent = k_cent[supp].permute(1, 0, 2)
         else:
             tgt = q[t]
-            cent = q_cent[supp].permute(1, 0, 2)
+            if support_key in _ACL2_PAST_FUTURE_LIGHT_SUPPORTS:
+                cent = _acl2_weighted_past_future_centroid(q_cent, t, supp)
+            else:
+                cent = q_cent[supp].permute(1, 0, 2)
         sim = torch.einsum("lpd,lsd->lps", tgt, cent)
         sim01 = ((sim + 1.0) * 0.5).clamp(0.0, 1.0)
         if stat == "var":
@@ -838,6 +1253,7 @@ def _acl2_global_patch(
     stat: str,
     layerwin: str,
     support: str,
+    overlap_frames: int = 0,
 ) -> torch.Tensor:
     raw = _global_acl2_centroid_metric(
         q_layers,
@@ -847,6 +1263,7 @@ def _acl2_global_patch(
         stat=stat,
         layerwin=layerwin,
         support=support,
+        overlap_frames=overlap_frames,
     )
     return _robust_quantile01(raw, num_frames=num_frames)
 
@@ -858,6 +1275,7 @@ def _acl2_read_patch_from_source(
     default: torch.Tensor,
     *,
     num_frames: int,
+    overlap_frames: int = 0,
 ) -> Optional[torch.Tensor]:
     src = source
     if src.startswith("acl2."):
@@ -877,6 +1295,7 @@ def _acl2_read_patch_from_source(
                 stat=stat,
                 layerwin=layerwin,
                 support=support,
+                overlap_frames=overlap_frames,
             )
 
     if not src.startswith("v4d."):
@@ -885,22 +1304,27 @@ def _acl2_read_patch_from_source(
     mean1 = _acl2_global_patch(
         q_layers, k_layers, default,
         num_frames=num_frames, basis="qq", stat="high", layerwin="g0", support="off246",
+        overlap_frames=overlap_frames,
     )
     var1 = _acl2_global_patch(
         q_layers, k_layers, default,
         num_frames=num_frames, basis="qq", stat="var", layerwin="g0_2", support="off246",
+        overlap_frames=overlap_frames,
     )
     mean2_low = _acl2_global_patch(
         q_layers, k_layers, default,
         num_frames=num_frames, basis="qq", stat="low", layerwin="g2_6", support="off246",
+        overlap_frames=overlap_frames,
     )
     mean3_high = _acl2_global_patch(
         q_layers, k_layers, default,
         num_frames=num_frames, basis="kk", stat="high", layerwin="g13_17", support="off246",
+        overlap_frames=overlap_frames,
     )
     var3_high = _acl2_global_patch(
         q_layers, k_layers, default,
         num_frames=num_frames, basis="qk", stat="var", layerwin="g13_15", support="off246",
+        overlap_frames=overlap_frames,
     )
     var3_low = (1.0 - var3_high).clamp(0.0, 1.0)
 
@@ -948,6 +1372,7 @@ class HybridMemoryController:
         ttt_write_delta_scale: float = 1.0,
         ttt_write_delta_scales: Optional[str] = None,
         ttt_write_native_mix_scales: Optional[str] = None,
+        ttt_write_native_mix_chunks: Optional[str] = None,
         ttt_write_prior_transform_mode: str = "none",
         ttt_write_prior_anti_scale: float = 0.0,
         ttt_write_prior_gamma: float = 1.0,
@@ -965,9 +1390,11 @@ class HybridMemoryController:
         ttt_write_tri_replay_positive_frac: float = 0.35,
         ttt_write_tri_replay_negative_frac: float = 0.15,
         ttt_write_tri_replay_neutral_lambda: float = 1.0,
+        ttt_write_tri_replay_role_mode: str = "fixed",
         ttt_write_gradient_reversal_transient_mode: str = "none",
         ttt_write_gradient_reversal_transient_branch_mask: str = "",
         ttt_write_gradient_reversal_transient_long_scale: float = 0.0,
+        ttt_write_gradient_reversal_transient_apply_scale: float = 1.0,
         ttt_write_replay_feature_gate_mode: str = "none",
         ttt_write_replay_feature_gate_rho: float = 0.0,
         ttt_write_replay_feature_gate_min: float = 0.5,
@@ -984,6 +1411,7 @@ class HybridMemoryController:
         ttt_write_transient_delta_ttl: int = 1,
         ttt_write_commit_ema_alpha: float = 1.0,
         ttt_write_commit_ema_branch_mask: str = "all",
+        ttt_write_commit_ema_chunks: Optional[str] = None,
         ttt_write_native_delta_gate_mode: str = "none",
         ttt_write_native_delta_gate_min_cos: float = 0.0,
         ttt_write_native_delta_gate_fallback: float = 0.0,
@@ -998,6 +1426,13 @@ class HybridMemoryController:
         ttt_write_commit_filter_min: float = 0.0,
         ttt_write_commit_filter_max: float = 1.0,
         ttt_write_commit_filter_branch_mask: str = "0",
+        ttt_write_scale_state_mode: str = "none",
+        ttt_write_scale_state_proxy: str = "pose_step_ema",
+        ttt_write_scale_state_carrier: str = "all",
+        ttt_write_scale_state_alpha: float = 0.0,
+        ttt_write_scale_state_branch_mask: str = "0",
+        ttt_write_scale_state_chunks: str = "",
+        ttt_write_scale_state_sample_tokens: int = 0,
         enable_frame_read_control: bool = False,
         enable_swa_read_control: bool = False,
         enable_ttt_apply_control: bool = False,
@@ -1025,6 +1460,33 @@ class HybridMemoryController:
         swa_overlap_source_replace_target: str = "kv",
         swa_overlap_source_replace_layer_mode: str = "last",
         swa_overlap_source_replace_single_layer: int = -1,
+        enable_context_source_skip: bool = False,
+        context_source_skip_impl: str = "bias",
+        context_source_skip_scope: str = "frame",
+        context_source_skip_mode: str = "hard",
+        context_source_skip_mask: str = "dg_q90",
+        context_source_skip_layer_mode: str = "early",
+        context_source_skip_single_layer: int = -1,
+        context_source_skip_soft_rho: float = 0.5,
+        context_source_skip_soft_min_keep: float = 0.5,
+        context_source_skip_record_attention_mass: bool = False,
+        context_source_skip_attention_mass_max_queries: int = 512,
+        semantic_role_policy: str = "none",
+        semantic_memory_paths: str = "",
+        semantic_role_highd_quantile: float = 0.80,
+        semantic_role_low_trust: float = 0.20,
+        semantic_role_positive_scale: float = 1.05,
+        semantic_role_neutral_scale: float = 0.85,
+        semantic_role_negative_scale: float = 0.65,
+        semantic_role_swa_negative_scale: float = 1.0,
+        semantic_anchor_mode: str = "semantic",
+        semantic_anchor_target_ratio: float = 0.12,
+        semantic_anchor_min_ratio: float = 0.03,
+        semantic_anchor_max_ratio: float = 0.30,
+        semantic_anchor_min_score: float = 0.02,
+        semantic_anchor_grid_rows: int = 4,
+        semantic_anchor_grid_cols: int = 4,
+        enable_semantic_anchor_ttt_floor: bool = False,
         rho_ttt_apply: float = 0.0,
         read_layer_mode: str = "all",
         read_single_layer: int = -1,
@@ -1081,6 +1543,15 @@ class HybridMemoryController:
         swa_write_cache_blend_target: str = "v",
         ttt_write_token_scope: str = "all",
         ttt_write_token_scope_floor: float = 0.0,
+        semantic_action_active_chunks: str = "",
+        semantic_action_inactive_read_cue_source: str = "",
+        v32_semantic_cue_active_chunks: str = "",
+        v32_semantic_cue_trigger_mode: str = "off",
+        v32_semantic_cue_trigger_high_threshold: float = 0.80,
+        v32_semantic_cue_trigger_k: float = 1.5,
+        v32_semantic_cue_trigger_min_mass: float = 0.05,
+        v32_semantic_cue_trigger_warmup: int = 3,
+        v32_semantic_cue_trigger_ema_alpha: float = 0.25,
         fast_cue_eval: bool = False,
     ):
         self.device = device
@@ -1111,6 +1582,45 @@ class HybridMemoryController:
         self.swa_overlap_source_replace_target = str(swa_overlap_source_replace_target)
         self.swa_overlap_source_replace_layer_mode = str(swa_overlap_source_replace_layer_mode)
         self.swa_overlap_source_replace_single_layer = int(swa_overlap_source_replace_single_layer)
+        self.enable_context_source_skip = bool(enable_context_source_skip)
+        self.context_source_skip_impl = str(context_source_skip_impl)
+        self.context_source_skip_scope = str(context_source_skip_scope)
+        self.context_source_skip_mode = str(context_source_skip_mode)
+        self.context_source_skip_mask = str(context_source_skip_mask)
+        self.context_source_skip_layer_mode = str(context_source_skip_layer_mode)
+        self.context_source_skip_single_layer = int(context_source_skip_single_layer)
+        self.context_source_skip_soft_rho = float(context_source_skip_soft_rho)
+        self.context_source_skip_soft_min_keep = float(context_source_skip_soft_min_keep)
+        self.context_source_skip_record_attention_mass = bool(context_source_skip_record_attention_mass)
+        self.context_source_skip_attention_mass_max_queries = int(context_source_skip_attention_mass_max_queries)
+        self.semantic_role_policy = str(semantic_role_policy)
+        self.semantic_memory_paths = str(semantic_memory_paths)
+        self.semantic_role_highd_quantile = float(semantic_role_highd_quantile)
+        self.semantic_role_low_trust = float(semantic_role_low_trust)
+        self.semantic_role_positive_scale = float(semantic_role_positive_scale)
+        self.semantic_role_neutral_scale = float(semantic_role_neutral_scale)
+        self.semantic_role_negative_scale = float(semantic_role_negative_scale)
+        self.semantic_role_swa_negative_scale = float(semantic_role_swa_negative_scale)
+        self.semantic_anchor_mode = str(semantic_anchor_mode or "semantic").strip().lower()
+        self.semantic_anchor_target_ratio = float(semantic_anchor_target_ratio)
+        self.semantic_anchor_min_ratio = float(semantic_anchor_min_ratio)
+        self.semantic_anchor_max_ratio = float(semantic_anchor_max_ratio)
+        self.semantic_anchor_min_score = float(semantic_anchor_min_score)
+        self.semantic_anchor_grid_rows = max(int(semantic_anchor_grid_rows), 1)
+        self.semantic_anchor_grid_cols = max(int(semantic_anchor_grid_cols), 1)
+        self.enable_semantic_anchor_ttt_floor = bool(enable_semantic_anchor_ttt_floor)
+        self.semantic_condition_conflict_level = "unavailable"
+        self.semantic_condition_conflict_source = "none"
+        self.semantic_condition_conflict_value = 0.0
+        self.semantic_condition_conflict_summary: Dict[str, Any] = {}
+        self.semantic_condition_conflict_tok: Optional[torch.Tensor] = None
+        self.semantic_condition_conflict_token_exact = False
+        self.semantic_condition_scale_level = "unavailable"
+        self.semantic_condition_scale_source = "none"
+        self.semantic_condition_scale_value = 0.0
+        self.semantic_condition_scale_summary: Dict[str, Any] = {}
+        self.semantic_condition_scale_tok: Optional[torch.Tensor] = None
+        self.semantic_condition_scale_token_exact = False
         self.rho_ttt_apply = float(rho_ttt_apply)
         self.read_layer_mode = str(read_layer_mode)
         self.read_single_layer = int(read_single_layer)
@@ -1167,6 +1677,18 @@ class HybridMemoryController:
         self.swa_write_cache_blend_target = str(swa_write_cache_blend_target)
         self.ttt_write_token_scope = str(ttt_write_token_scope)
         self.ttt_write_token_scope_floor = float(ttt_write_token_scope_floor)
+        self.semantic_action_active_chunks = _parse_chunk_index_set(semantic_action_active_chunks)
+        self.semantic_action_inactive_read_cue_source = str(semantic_action_inactive_read_cue_source or "")
+        self.v32_semantic_cue_active_chunks = _parse_chunk_index_set(v32_semantic_cue_active_chunks)
+        self.v32_semantic_cue_trigger_mode = str(v32_semantic_cue_trigger_mode or "off")
+        self.v32_semantic_cue_trigger_high_threshold = float(v32_semantic_cue_trigger_high_threshold)
+        self.v32_semantic_cue_trigger_k = float(v32_semantic_cue_trigger_k)
+        self.v32_semantic_cue_trigger_min_mass = float(v32_semantic_cue_trigger_min_mass)
+        self.v32_semantic_cue_trigger_warmup = max(int(v32_semantic_cue_trigger_warmup), 0)
+        self.v32_semantic_cue_trigger_ema_alpha = float(v32_semantic_cue_trigger_ema_alpha)
+        self._v32_semantic_cue_ema: Optional[float] = None
+        self._v32_semantic_cue_mad: Optional[float] = None
+        self._v32_semantic_cue_count = 0
         self.fast_cue_eval = bool(fast_cue_eval)
         self.ttt_update_controller = TTTWriteController(
             lambda_min=lambda_min,
@@ -1182,6 +1704,7 @@ class HybridMemoryController:
             update_delta_scale=ttt_write_delta_scale,
             update_delta_scales=ttt_write_delta_scales,
             update_native_mix_scales=ttt_write_native_mix_scales,
+            update_native_mix_chunks=ttt_write_native_mix_chunks,
             prior_transform_mode=ttt_write_prior_transform_mode,
             prior_anti_scale=ttt_write_prior_anti_scale,
             prior_gamma=ttt_write_prior_gamma,
@@ -1199,9 +1722,11 @@ class HybridMemoryController:
             tri_replay_positive_frac=ttt_write_tri_replay_positive_frac,
             tri_replay_negative_frac=ttt_write_tri_replay_negative_frac,
             tri_replay_neutral_lambda=ttt_write_tri_replay_neutral_lambda,
+            tri_replay_role_mode=ttt_write_tri_replay_role_mode,
             gradient_reversal_transient_mode=ttt_write_gradient_reversal_transient_mode,
             gradient_reversal_transient_branch_mask=ttt_write_gradient_reversal_transient_branch_mask,
             gradient_reversal_transient_long_scale=ttt_write_gradient_reversal_transient_long_scale,
+            gradient_reversal_transient_apply_scale=ttt_write_gradient_reversal_transient_apply_scale,
             update_token_scope=ttt_write_token_scope,
             update_token_scope_floor=ttt_write_token_scope_floor,
             replay_feature_gate_mode=ttt_write_replay_feature_gate_mode,
@@ -1220,6 +1745,7 @@ class HybridMemoryController:
             transient_delta_ttl=ttt_write_transient_delta_ttl,
             commit_ema_alpha=ttt_write_commit_ema_alpha,
             commit_ema_branch_mask=ttt_write_commit_ema_branch_mask,
+            commit_ema_chunks=ttt_write_commit_ema_chunks,
             native_delta_gate_mode=ttt_write_native_delta_gate_mode,
             native_delta_gate_min_cos=ttt_write_native_delta_gate_min_cos,
             native_delta_gate_fallback=ttt_write_native_delta_gate_fallback,
@@ -1234,6 +1760,13 @@ class HybridMemoryController:
             commit_filter_min=ttt_write_commit_filter_min,
             commit_filter_max=ttt_write_commit_filter_max,
             commit_filter_branch_mask=ttt_write_commit_filter_branch_mask,
+            scale_state_mode=ttt_write_scale_state_mode,
+            scale_state_proxy=ttt_write_scale_state_proxy,
+            scale_state_carrier=ttt_write_scale_state_carrier,
+            scale_state_alpha=ttt_write_scale_state_alpha,
+            scale_state_branch_mask=ttt_write_scale_state_branch_mask,
+            scale_state_chunks=ttt_write_scale_state_chunks,
+            scale_state_sample_tokens=ttt_write_scale_state_sample_tokens,
         )
 
     def run_probe(
@@ -1387,6 +1920,212 @@ class HybridMemoryController:
             accum[:n] += per_tok[:n]
             count[:n] += 1.0
         return torch.where(count > 0, accum / count.clamp_min(1.0), torch.zeros_like(accum))
+
+    def _build_semantic_anchor_bank(
+        self,
+        *,
+        token_type: torch.Tensor,
+        D_tok: torch.Tensor,
+        P_ttt_write: Optional[torch.Tensor],
+        G_sem_tok: Optional[torch.Tensor],
+        Q_sem_tok: Optional[torch.Tensor],
+        L_sem_tok: Optional[torch.Tensor],
+        conf_patch: Optional[torch.Tensor],
+        key_avg_patch: Optional[torch.Tensor],
+        num_frames: int,
+        patch_grid: Tuple[int, int],
+    ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
+        token_type_cpu = token_type.detach().cpu().long().reshape(-1)
+        patch_mask = token_type_cpu == TOKEN_TYPE_PATCH
+        L_tok = int(token_type_cpu.numel())
+        n_patch = int(patch_mask.sum().item())
+        A_tok = torch.zeros((L_tok,), dtype=torch.float32)
+        M_tok = torch.zeros((L_tok,), dtype=torch.float32)
+        debug: Dict[str, Any] = {
+            "semantic_anchor_mode": self.semantic_anchor_mode,
+            "semantic_anchor_bank_available": False,
+            "semantic_anchor_token_count": 0,
+            "semantic_anchor_token_ratio": 0.0,
+            "semantic_anchor_patch_tokens": int(n_patch),
+        }
+        if n_patch <= 0 or D_tok is None:
+            debug["semantic_anchor_reason"] = "missing_patch_or_D"
+            return A_tok, M_tok, debug
+
+        D = D_tok.detach().cpu().float().reshape(-1)
+        if int(D.numel()) != L_tok:
+            debug["semantic_anchor_reason"] = "D_shape_mismatch"
+            return A_tok, M_tok, debug
+        D_patch = D[patch_mask].clamp(0.0, 1.0)
+
+        label_patch = _patch_labels_from_token_labels(L_sem_tok, token_type_cpu)
+        group_patch = _patch_labels_from_token_labels(G_sem_tok, token_type_cpu)
+        trust_patch = None
+        if Q_sem_tok is not None:
+            q = Q_sem_tok.detach().cpu().float().reshape(-1)
+            if int(q.numel()) == L_tok:
+                trust_patch = q[patch_mask].clamp(0.0, 1.0)
+        sem_score, sem_debug = _stable_semantic_score(label_patch, group_patch, trust_patch, n_patch)
+        debug.update(sem_debug)
+
+        stage_missing = P_ttt_write is None or int(P_ttt_write.numel()) != L_tok
+        if stage_missing:
+            stage_patch = torch.ones((n_patch,), dtype=torch.float32)
+        else:
+            stage_patch = P_ttt_write.detach().cpu().float().reshape(-1)[patch_mask].clamp(0.0, 2.0)
+        stage_score = 0.25 + 0.75 * _normalize01(stage_patch)
+
+        if conf_patch is None or int(conf_patch.numel()) < n_patch:
+            conf_score = torch.ones((n_patch,), dtype=torch.float32)
+            conf_missing = True
+        else:
+            conf_score = conf_patch.detach().cpu().float().reshape(-1)[:n_patch].clamp(0.0, 1.0)
+            conf_missing = False
+        if key_avg_patch is None or int(key_avg_patch.numel()) < n_patch:
+            source_score = torch.ones((n_patch,), dtype=torch.float32)
+            source_missing = True
+        else:
+            source_score = 0.25 + 0.75 * _normalize01(key_avg_patch.detach().cpu().float().reshape(-1)[:n_patch])
+            source_missing = False
+
+        geo_score = (torch.sqrt((1.0 - D_patch).clamp(0.0, 1.0)) * stage_score * conf_score).clamp(0.0, 1.0)
+        raw_score = (sem_score * geo_score * source_score).clamp(0.0, 1.0)
+        mode = self.semantic_anchor_mode
+        base_mask, select_debug = _select_spatially_diverse_anchors(
+            raw_score,
+            num_frames=num_frames,
+            patch_grid=patch_grid,
+            target_ratio=self.semantic_anchor_target_ratio,
+            min_ratio=self.semantic_anchor_min_ratio,
+            max_ratio=self.semantic_anchor_max_ratio,
+            min_score=self.semantic_anchor_min_score,
+            grid_rows=self.semantic_anchor_grid_rows,
+            grid_cols=self.semantic_anchor_grid_cols,
+        )
+        score_for_selection = raw_score
+        selected = base_mask
+        if mode in {"random", "random_same_mass", "random_same_mass_anchor"}:
+            k = int(base_mask.sum().item())
+            eligible = torch.nonzero(raw_score > float(self.semantic_anchor_min_score), as_tuple=False).reshape(-1)
+            selected = torch.zeros_like(base_mask)
+            if k > 0 and int(eligible.numel()) > 0:
+                noise = _deterministic_patch_noise(n_patch, seed=1729.0 + float(getattr(self, "current_chunk_idx", 0)))
+                chosen = eligible[torch.argsort(noise[eligible], descending=True)[: min(k, int(eligible.numel()))]]
+                selected[chosen] = True
+                score_for_selection = torch.where(selected, raw_score[base_mask].mean() if bool(base_mask.any()) else raw_score, raw_score * 0.0)
+            select_debug["semantic_anchor_control"] = "random_same_mass"
+        elif mode in {"shuffled", "shuffled_semantic", "shuffled_semantic_label"}:
+            noise = _deterministic_patch_noise(n_patch, seed=31337.0 + float(getattr(self, "current_chunk_idx", 0)))
+            perm = torch.argsort(noise, descending=True)
+            shuffled_raw = (sem_score[perm] * geo_score * source_score).clamp(0.0, 1.0)
+            selected, select_debug = _select_spatially_diverse_anchors(
+                shuffled_raw,
+                num_frames=num_frames,
+                patch_grid=patch_grid,
+                target_ratio=self.semantic_anchor_target_ratio,
+                min_ratio=self.semantic_anchor_min_ratio,
+                max_ratio=self.semantic_anchor_max_ratio,
+                min_score=self.semantic_anchor_min_score,
+                grid_rows=self.semantic_anchor_grid_rows,
+                grid_cols=self.semantic_anchor_grid_cols,
+            )
+            score_for_selection = shuffled_raw
+            select_debug["semantic_anchor_control"] = "shuffled_semantic_label"
+
+        anchor_score = torch.zeros_like(raw_score)
+        if bool(selected.any()):
+            selected_score = score_for_selection[selected].clamp_min(self.semantic_anchor_min_score)
+            max_score = selected_score.max().clamp_min(1e-6)
+            anchor_score[selected] = (selected_score / max_score).clamp(0.0, 1.0)
+
+        A_tok[patch_mask] = anchor_score
+        M_tok[patch_mask] = selected.float()
+        anchor_count = int(selected.sum().item())
+        static_count = 0
+        dynamic_count = 0
+        if group_patch is not None and int(group_patch.numel()) == n_patch and anchor_count > 0:
+            G = group_patch.detach().cpu().long().reshape(-1)
+            static_mask = (
+                (G == int(SEMANTIC_GROUP_STRUCTURE_ANCHOR))
+                | (G == int(SEMANTIC_GROUP_STATIC_THING))
+            )
+            dynamic_mask = G == int(SEMANTIC_GROUP_MOVABLE_THING)
+            static_count = int((selected & static_mask).sum().item())
+            dynamic_count = int((selected & dynamic_mask).sum().item())
+        debug.update(select_debug)
+        debug.update({
+            "semantic_anchor_bank_available": bool(anchor_count > 0),
+            "semantic_anchor_reason": select_debug.get("semantic_anchor_select_reason"),
+            "semantic_anchor_token_count": anchor_count,
+            "semantic_anchor_token_ratio": float(anchor_count / max(n_patch, 1)),
+            "semantic_anchor_score_mean": float(anchor_score[selected].mean().item()) if anchor_count > 0 else 0.0,
+            "semantic_anchor_raw_score_mean": float(raw_score[selected].mean().item()) if anchor_count > 0 else 0.0,
+            "semantic_anchor_static_semantic_ratio": float(static_count / max(anchor_count, 1)),
+            "semantic_anchor_dynamic_semantic_ratio": float(dynamic_count / max(anchor_count, 1)),
+            "semantic_anchor_stage_proxy_missing": bool(stage_missing),
+            "semantic_anchor_conf_missing": bool(conf_missing),
+            "semantic_anchor_source_attention_proxy_missing": bool(source_missing),
+            "semantic_anchor_geo_score_mean": float(geo_score[selected].mean().item()) if anchor_count > 0 else 0.0,
+            "semantic_anchor_sem_score_mean": float(sem_score[selected].mean().item()) if anchor_count > 0 else 0.0,
+            "semantic_anchor_source_score_mean": float(source_score[selected].mean().item()) if anchor_count > 0 else 0.0,
+        })
+        return A_tok.clamp(0.0, 1.0), M_tok.clamp(0.0, 1.0), debug
+
+    def _apply_semantic_anchor_write_floor(
+        self,
+        *,
+        token_type: torch.Tensor,
+        P_ttt_write: Optional[torch.Tensor],
+        A_anchor_tok: Optional[torch.Tensor],
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
+        debug: Dict[str, Any] = {
+            "semantic_anchor_write_floor_enabled": bool(self.enable_semantic_anchor_ttt_floor),
+            "semantic_anchor_write_floor_applied": False,
+        }
+        if not self.enable_semantic_anchor_ttt_floor:
+            return P_ttt_write, debug
+        if P_ttt_write is None or A_anchor_tok is None:
+            debug["semantic_anchor_write_floor_reason"] = "missing_write_prior_or_anchor"
+            return P_ttt_write, debug
+        P = P_ttt_write.detach().cpu().float().reshape(-1).clone()
+        A = A_anchor_tok.detach().cpu().float().reshape(-1).clamp(0.0, 1.0)
+        token_type_cpu = token_type.detach().cpu().long().reshape(-1)
+        if int(P.numel()) != int(A.numel()) or int(P.numel()) != int(token_type_cpu.numel()):
+            debug["semantic_anchor_write_floor_reason"] = "shape_mismatch"
+            return P_ttt_write, debug
+        patch_mask = token_type_cpu == TOKEN_TYPE_PATCH
+        anchor = (A > 0.0) & patch_mask
+        non_anchor = (~anchor) & patch_mask
+        if not bool(anchor.any()):
+            debug["semantic_anchor_write_floor_reason"] = "empty_anchor"
+            return P_ttt_write, debug
+        mean_w = float(P[patch_mask].mean().item()) if bool(patch_mask.any()) else 1.0
+        mean_a = float(A[anchor].mean().item())
+        lam = min(max(mean_w / max(mean_a, 1e-6), 0.2), 1.0)
+        floor = (float(lam) * A).clamp(0.0, 1.0)
+        P_new = torch.maximum(P, floor)
+        changed = (P_new - P).abs() > 1e-8
+        repair_mode = "scalar_anchor_floor"
+        if not bool(changed[anchor].any()):
+            hard_floor = mean_w * (1.0 + 0.05 * A)
+            hard_floor = hard_floor.clamp_min(0.0)
+            P_new = torch.where(anchor, torch.maximum(P, hard_floor), P)
+            changed = (P_new - P).abs() > 1e-8
+            repair_mode = "hard_eligibility_floor_after_scalar_noop"
+        debug.update({
+            "semantic_anchor_write_floor_applied": bool(changed[anchor].any()),
+            "semantic_anchor_write_floor_reason": "ok",
+            "semantic_anchor_write_floor_lambda": float(lam),
+            "semantic_anchor_write_floor_repair_mode": repair_mode,
+            "anchor_write_floor_applied_count": int((changed & anchor).sum().item()),
+            "anchor_write_mass_before": float(P[anchor].mean().item()),
+            "anchor_write_mass": float(P_new[anchor].mean().item()),
+            "anchor_write_mass_delta": float((P_new[anchor] - P[anchor]).mean().item()),
+            "non_anchor_write_mass_before": float(P[non_anchor].mean().item()) if bool(non_anchor.any()) else None,
+            "non_anchor_write_mass": float(P_new[non_anchor].mean().item()) if bool(non_anchor.any()) else None,
+            "non_anchor_write_mass_delta": float((P_new[non_anchor] - P[non_anchor]).mean().item()) if bool(non_anchor.any()) else None,
+        })
+        return P_new.to(dtype=P_ttt_write.dtype), debug
 
     def _phase_e_write_prior(
         self,
@@ -1607,6 +2346,597 @@ class HybridMemoryController:
             "hmc_write_corr_score_residual": _pearson_corr(raw_score, residual_patch),
         }
         return A_tok, debug
+
+    def _semantic_path_enabled(self, path: str) -> bool:
+        paths = {
+            p.strip().lower()
+            for p in str(self.semantic_memory_paths or "").replace(";", ",").split(",")
+            if p.strip()
+        }
+        policy = str(self.semantic_role_policy or "none").strip().lower()
+        if policy in {"", "none", "off", "noop", "debug_only"}:
+            return False
+        return "all" in paths or path.lower() in paths
+
+    @staticmethod
+    def _role_counts(values: Optional[torch.Tensor]) -> Dict[str, int]:
+        if values is None:
+            return {}
+        v = values.detach().cpu().long().reshape(-1)
+        if v.numel() == 0:
+            return {}
+        unique, counts = torch.unique(v, return_counts=True)
+        return {str(int(k.item())): int(c.item()) for k, c in zip(unique, counts)}
+
+    @staticmethod
+    def _label_counts(values: Optional[torch.Tensor]) -> Dict[str, int]:
+        if values is None:
+            return {}
+        v = values.detach().cpu().long().reshape(-1)
+        if v.numel() == 0:
+            return {}
+        unique, counts = torch.unique(v, return_counts=True)
+        return {str(int(k.item())): int(c.item()) for k, c in zip(unique, counts)}
+
+    @classmethod
+    def _label_role_counts(
+        cls,
+        labels: Optional[torch.Tensor],
+        roles: Optional[torch.Tensor],
+        mask: Optional[torch.Tensor],
+    ) -> Dict[str, Dict[str, int]]:
+        if labels is None or roles is None:
+            return {}
+        l = labels.detach().cpu().long().reshape(-1)
+        r = roles.detach().cpu().long().reshape(-1)
+        if int(l.numel()) != int(r.numel()) or int(l.numel()) == 0:
+            return {}
+        if mask is not None:
+            m = mask.detach().cpu().bool().reshape(-1)
+            if int(m.numel()) == int(l.numel()):
+                l = l[m]
+                r = r[m]
+        out: Dict[str, Dict[str, int]] = {}
+        for label_id in torch.unique(l):
+            label_mask = l == label_id
+            out[str(int(label_id.item()))] = cls._role_counts(r[label_mask])
+        return out
+
+    @staticmethod
+    def _label_condition_metrics(
+        labels: Optional[torch.Tensor],
+        mask: Optional[torch.Tensor],
+        *,
+        D: torch.Tensor,
+        Q: torch.Tensor,
+        C: Optional[torch.Tensor] = None,
+        S: Optional[torch.Tensor] = None,
+    ) -> Dict[str, Dict[str, float]]:
+        if labels is None:
+            return {}
+        l = labels.detach().cpu().long().reshape(-1)
+        d = D.detach().cpu().float().reshape(-1)
+        q = Q.detach().cpu().float().reshape(-1)
+        c = C.detach().cpu().float().reshape(-1) if C is not None else None
+        s = S.detach().cpu().float().reshape(-1) if S is not None else None
+        if int(l.numel()) != int(d.numel()) or int(l.numel()) != int(q.numel()) or int(l.numel()) == 0:
+            return {}
+        if c is not None and int(c.numel()) != int(l.numel()):
+            c = None
+        if s is not None and int(s.numel()) != int(l.numel()):
+            s = None
+        if mask is not None:
+            m = mask.detach().cpu().bool().reshape(-1)
+            if int(m.numel()) == int(l.numel()):
+                l = l[m]
+                d = d[m]
+                q = q[m]
+                if c is not None:
+                    c = c[m]
+                if s is not None:
+                    s = s[m]
+        out: Dict[str, Dict[str, float]] = {}
+        for label_id in torch.unique(l):
+            label_mask = l == label_id
+            if not bool(label_mask.any()):
+                continue
+            d_vals = d[label_mask]
+            q_vals = q[label_mask]
+            out[str(int(label_id.item()))] = {
+                "token_count": float(label_mask.sum().item()),
+                "D_mean": float(d_vals.mean().item()),
+                "D_p90": float(torch.quantile(d_vals, 0.90).item()) if int(d_vals.numel()) > 1 else float(d_vals.mean().item()),
+                "Q_mean": float(q_vals.mean().item()),
+                "Q_p10": float(torch.quantile(q_vals, 0.10).item()) if int(q_vals.numel()) > 1 else float(q_vals.mean().item()),
+            }
+            if c is not None:
+                c_vals = c[label_mask]
+                out[str(int(label_id.item()))].update({
+                    "conflict_mean": float(c_vals.mean().item()),
+                    "conflict_p90": float(torch.quantile(c_vals, 0.90).item()) if int(c_vals.numel()) > 1 else float(c_vals.mean().item()),
+                })
+            if s is not None:
+                s_vals = s[label_mask]
+                out[str(int(label_id.item()))].update({
+                    "scale_risk_mean": float(s_vals.mean().item()),
+                    "scale_risk_p90": float(torch.quantile(s_vals, 0.90).item()) if int(s_vals.numel()) > 1 else float(s_vals.mean().item()),
+                })
+        return out
+
+    def set_semantic_condition_signals(
+        self,
+        *,
+        conflict_level: str = "unavailable",
+        conflict_source: str = "none",
+        conflict_value: float = 0.0,
+        conflict_summary: Optional[Dict[str, Any]] = None,
+        conflict_tok: Optional[Any] = None,
+        conflict_token_exact: bool = False,
+        scale_level: str = "unavailable",
+        scale_source: str = "none",
+        scale_value: float = 0.0,
+        scale_summary: Optional[Dict[str, Any]] = None,
+        scale_tok: Optional[Any] = None,
+        scale_token_exact: bool = False,
+    ) -> None:
+        """Set provenance-tagged semantic risk conditions for role routing.
+
+        v27 used audited chunk-level broadcasts for conflict/scale risk. v28
+        can pass token-level tensors; the provenance fields prevent token
+        proxies from being mistaken for stronger evidence than they are.
+        """
+
+        self.semantic_condition_conflict_level = str(conflict_level or "unavailable")
+        self.semantic_condition_conflict_source = str(conflict_source or "none")
+        self.semantic_condition_conflict_value = float(conflict_value or 0.0)
+        self.semantic_condition_conflict_summary = dict(conflict_summary or {})
+        self.semantic_condition_conflict_tok = _optional_1d_float_tensor(conflict_tok)
+        self.semantic_condition_conflict_token_exact = bool(conflict_token_exact and self.semantic_condition_conflict_tok is not None)
+        self.semantic_condition_scale_level = str(scale_level or "unavailable")
+        self.semantic_condition_scale_source = str(scale_source or "none")
+        self.semantic_condition_scale_value = float(scale_value or 0.0)
+        self.semantic_condition_scale_summary = dict(scale_summary or {})
+        self.semantic_condition_scale_tok = _optional_1d_float_tensor(scale_tok)
+        self.semantic_condition_scale_token_exact = bool(scale_token_exact and self.semantic_condition_scale_tok is not None)
+
+    def _fine_path_roles(
+        self,
+        *,
+        G: torch.Tensor,
+        L: torch.Tensor,
+        D: torch.Tensor,
+        Q: torch.Tensor,
+        patch_mask: torch.Tensor,
+        high_d: torch.Tensor,
+        low_d: torch.Tensor,
+        high_trust: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
+        """Build path-specific fine-label roles with D/Q and v27 risk signals."""
+
+        R_frame = torch.full_like(G, int(SEMANTIC_ROLE_FALLBACK), dtype=torch.long)
+        R_global = torch.full_like(G, int(SEMANTIC_ROLE_FALLBACK), dtype=torch.long)
+        R_swa = torch.full_like(G, int(SEMANTIC_ROLE_FALLBACK), dtype=torch.long)
+        R_ttt = torch.full_like(G, int(SEMANTIC_ROLE_FALLBACK), dtype=torch.long)
+        policy = str(self.semantic_role_policy or "").strip().lower()
+        causal_policy = policy.startswith("causal_")
+
+        conflict_level = str(getattr(self, "semantic_condition_conflict_level", "unavailable") or "unavailable")
+        scale_level = str(getattr(self, "semantic_condition_scale_level", "unavailable") or "unavailable")
+        conflict_available = conflict_level not in {"", "none", "off", "unavailable"}
+        scale_available = scale_level not in {"", "none", "off", "unavailable"}
+        conflict_value = float(getattr(self, "semantic_condition_conflict_value", 0.0) or 0.0)
+        scale_value = float(getattr(self, "semantic_condition_scale_value", 0.0) or 0.0)
+        conflict_tok = _optional_1d_float_tensor(getattr(self, "semantic_condition_conflict_tok", None))
+        scale_tok = _optional_1d_float_tensor(getattr(self, "semantic_condition_scale_tok", None))
+        conflict_token_exact = bool(
+            getattr(self, "semantic_condition_conflict_token_exact", False)
+            and conflict_tok is not None
+            and int(conflict_tok.numel()) == int(D.numel())
+        )
+        scale_token_exact = bool(
+            getattr(self, "semantic_condition_scale_token_exact", False)
+            and scale_tok is not None
+            and int(scale_tok.numel()) == int(D.numel())
+        )
+        if conflict_available and conflict_token_exact and conflict_tok is not None:
+            C = conflict_tok.to(dtype=D.dtype).reshape_as(D).clamp(0.0, 1.0)
+        else:
+            C = torch.full_like(D, max(0.0, min(1.0, conflict_value))) if conflict_available else torch.zeros_like(D)
+        if scale_available and scale_token_exact and scale_tok is not None:
+            S = scale_tok.to(dtype=D.dtype).reshape_as(D).clamp(0.0, 1.0)
+        else:
+            S = torch.full_like(D, max(0.0, min(1.0, scale_value))) if scale_available else torch.zeros_like(D)
+        high_conflict = C >= 0.50 if conflict_available else torch.zeros_like(patch_mask, dtype=torch.bool)
+        high_scale = S >= 0.50 if scale_available else torch.zeros_like(patch_mask, dtype=torch.bool)
+
+        known = (L != int(SEMANTIC_FINE_LABEL_UNKNOWN)) & (L >= 0) & patch_mask
+        structure = torch.zeros_like(patch_mask, dtype=torch.bool)
+        sky = torch.zeros_like(patch_mask, dtype=torch.bool)
+        vegetation = torch.zeros_like(patch_mask, dtype=torch.bool)
+        movable = torch.zeros_like(patch_mask, dtype=torch.bool)
+        for label_id in SEMANTIC_FINE_STRUCTURE_IDS:
+            structure |= L == int(label_id)
+        for label_id in SEMANTIC_FINE_SKY_IDS:
+            sky |= L == int(label_id)
+        for label_id in SEMANTIC_FINE_VEGETATION_IDS:
+            vegetation |= L == int(label_id)
+        for label_id in SEMANTIC_FINE_MOVABLE_IDS:
+            movable |= L == int(label_id)
+
+        structure = (structure | ((G == int(SEMANTIC_GROUP_STRUCTURE_ANCHOR)) & known)) & patch_mask
+        sky = sky & patch_mask
+        vegetation = (vegetation | ((G == int(SEMANTIC_GROUP_LOW_VALUE_STUFF)) & known & ~sky)) & patch_mask
+        movable = (movable | ((G == int(SEMANTIC_GROUP_MOVABLE_THING)) & patch_mask)) & patch_mask
+        unknown = patch_mask & (~known)
+
+        if causal_policy:
+            stable_structure = structure & low_d & high_trust & (~high_conflict) & (~high_scale)
+            risky_structure = structure & high_trust & (high_d | high_conflict | high_scale)
+        else:
+            stable_structure = structure & low_d & high_trust
+            risky_structure = structure & (~stable_structure)
+        sky_highd = sky & high_d & high_trust
+        lowstuff_highd = (sky | vegetation | movable) & high_d & high_trust
+        risky_nonstructure = (vegetation | movable) & high_d & high_trust
+        if causal_policy:
+            risky_nonstructure = (vegetation | movable) & high_d & high_trust & (high_conflict | high_scale | high_d)
+        weak_nonstructure = (vegetation | movable) & (~risky_nonstructure) & high_trust
+
+        # Frame/global source roles: source protection for stable structure,
+        # weak source for sky/vegetation, source skip only when semantic risk is
+        # also high-D. Query tokens remain untouched in the model hook.
+        R_frame[stable_structure] = int(SEMANTIC_ROLE_POSITIVE_LONG)
+        R_global[stable_structure] = int(SEMANTIC_ROLE_POSITIVE_LONG)
+        R_frame[risky_structure] = int(SEMANTIC_ROLE_PROTECT_NEUTRAL)
+        R_global[risky_structure] = int(SEMANTIC_ROLE_PROTECT_NEUTRAL)
+        R_frame[sky & high_trust] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+        R_global[sky & high_trust] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+        R_frame[weak_nonstructure] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+        R_global[weak_nonstructure] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+        R_frame[risky_nonstructure] = int(SEMANTIC_ROLE_NEGATIVE_SHORT)
+        R_global[risky_nonstructure] = int(SEMANTIC_ROLE_NEGATIVE_SHORT)
+        if policy in {"fine_fg_lowstuff_highd_skip", "causal_fg_semantic_risk_skip", "causal_fg_soft_skip"}:
+            R_frame[sky_highd] = int(SEMANTIC_ROLE_NEGATIVE_SHORT)
+            R_global[sky_highd] = int(SEMANTIC_ROLE_NEGATIVE_SHORT)
+        if causal_policy and policy in {"causal_fg_structure_conflict_protect", "causal_fg_risk_only"}:
+            R_frame[structure & (high_conflict | high_scale) & high_trust] = int(SEMANTIC_ROLE_PROTECT_NEUTRAL)
+            R_global[structure & (high_conflict | high_scale) & high_trust] = int(SEMANTIC_ROLE_PROTECT_NEUTRAL)
+
+        # SWA is local continuity: structure anchors are protected; sky is
+        # neutral context; vegetation/movable drops only under high-D risk.
+        R_swa[stable_structure | risky_structure] = int(SEMANTIC_ROLE_PROTECT_NEUTRAL)
+        R_swa[sky & high_trust] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+        R_swa[weak_nonstructure] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+        R_swa[risky_nonstructure] = int(SEMANTIC_ROLE_NEGATIVE_SHORT)
+
+        # TTT is long memory: stable structure is positive; sky is never
+        # positive/negative; vegetation/movable can only be short negative when
+        # high-D. Conflict/scale gates are explicitly unavailable here.
+        R_ttt[stable_structure] = int(SEMANTIC_ROLE_POSITIVE_LONG)
+        R_ttt[risky_structure] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+        R_ttt[sky & high_trust] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+        R_ttt[weak_nonstructure] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+        R_ttt[risky_nonstructure] = int(SEMANTIC_ROLE_NEGATIVE_SHORT)
+        if policy in {"fine_ttt_lowstuff_highd_short", "causal_ttt_lowstuff_highd_conflict_shortneg", "causal_ttt_full_role_tree"}:
+            R_ttt[lowstuff_highd] = int(SEMANTIC_ROLE_NEGATIVE_SHORT)
+        if causal_policy:
+            high_risk = high_conflict | high_scale
+            R_ttt[structure & high_trust & high_risk] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+            R_ttt[structure & low_d & high_trust & (~high_risk)] = int(SEMANTIC_ROLE_POSITIVE_LONG)
+            R_ttt[(vegetation | movable) & high_d & high_trust & high_risk] = int(SEMANTIC_ROLE_NEGATIVE_SHORT)
+            R_ttt[sky & high_trust] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+            if policy in {"causal_ttt_block_highconflict_structure_longwrite"}:
+                R_ttt[structure & high_conflict & high_trust] = int(SEMANTIC_ROLE_PROTECT_NEUTRAL)
+            if policy in {"causal_ttt_risk_only"}:
+                R_ttt[patch_mask & high_trust & high_risk] = int(SEMANTIC_ROLE_NEGATIVE_SHORT)
+                R_ttt[structure & high_trust & (~high_risk)] = int(SEMANTIC_ROLE_POSITIVE_LONG)
+
+        v57_group_level_source = torch.zeros_like(patch_mask, dtype=torch.bool)
+        if policy in {
+            "v57_forced_any_semantic_source_skip",
+            "v57_force_any_source_skip",
+            "forced_semantic_source_skip",
+        }:
+            semantic_any = (known | ((G != int(SEMANTIC_GROUP_UNCERTAIN_REGION)) & patch_mask)) & high_trust
+            v57_group_level_source |= semantic_any
+            R_frame[semantic_any] = int(SEMANTIC_ROLE_NEGATIVE_SHORT)
+            R_global[semantic_any] = int(SEMANTIC_ROLE_NEGATIVE_SHORT)
+            R_swa[semantic_any] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+            R_ttt[semantic_any] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+
+        if policy in {
+            "v57_sky_lowstuff_source_skip",
+            "v57_sky_lowstuff_vegetation_source_skip",
+            "sky_lowstuff_source_skip",
+        }:
+            weak_context_source = (sky | vegetation | ((G == int(SEMANTIC_GROUP_LOW_VALUE_STUFF)) & patch_mask)) & high_trust
+            v57_group_level_source |= weak_context_source
+            R_frame[weak_context_source] = int(SEMANTIC_ROLE_NEGATIVE_SHORT)
+            R_global[weak_context_source] = int(SEMANTIC_ROLE_NEGATIVE_SHORT)
+            R_swa[weak_context_source] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+            R_ttt[weak_context_source] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+
+        for R in (R_frame, R_global, R_swa, R_ttt):
+            R[(unknown & ~v57_group_level_source) | (~high_trust & patch_mask)] = int(SEMANTIC_ROLE_FALLBACK)
+
+        debug = {
+            "runtime_fine_role_policy_available": True,
+            "fine_label_token_count": int(known.sum().item()),
+            "fine_label_counts": self._label_counts(L[patch_mask]),
+            "condition_signal_D_available": True,
+            "condition_signal_Q_available": True,
+            "condition_signal_conflict_available": bool(conflict_available),
+            "condition_signal_scale_risk_available": bool(scale_available),
+            "condition_signal_conflict_level": conflict_level,
+            "condition_signal_scale_risk_level": scale_level,
+            "condition_signal_conflict_token_exact": bool(conflict_token_exact),
+            "condition_signal_scale_risk_token_exact": bool(scale_token_exact),
+            "condition_signal_conflict_token_nonempty": bool(conflict_tok is not None and int(conflict_tok.numel()) > 0),
+            "condition_signal_scale_risk_token_nonempty": bool(scale_tok is not None and int(scale_tok.numel()) > 0),
+            "condition_signal_conflict_token_count": int(conflict_tok.numel()) if conflict_tok is not None else 0,
+            "condition_signal_scale_risk_token_count": int(scale_tok.numel()) if scale_tok is not None else 0,
+            "condition_signal_conflict_token_mean": float(C[patch_mask].mean().item()) if conflict_available and bool(patch_mask.any()) else 0.0,
+            "condition_signal_conflict_token_p90": float(torch.quantile(C[patch_mask], 0.90).item()) if conflict_available and bool(patch_mask.any()) else 0.0,
+            "condition_signal_scale_risk_token_mean": float(S[patch_mask].mean().item()) if scale_available and bool(patch_mask.any()) else 0.0,
+            "condition_signal_scale_risk_token_p90": float(torch.quantile(S[patch_mask], 0.90).item()) if scale_available and bool(patch_mask.any()) else 0.0,
+            "condition_signal_conflict_source": str(getattr(self, "semantic_condition_conflict_source", "none")),
+            "condition_signal_scale_risk_source": str(getattr(self, "semantic_condition_scale_source", "none")),
+            "condition_signal_conflict_value": float(conflict_value),
+            "condition_signal_scale_risk_value": float(scale_value),
+            "condition_signal_conflict_summary": dict(getattr(self, "semantic_condition_conflict_summary", {}) or {}),
+            "condition_signal_scale_risk_summary": dict(getattr(self, "semantic_condition_scale_summary", {}) or {}),
+            "condition_fallback_note": (
+                "Risk condition levels and token_exact flags are recorded so "
+                "broadcast/proxy signals are not counted as stronger evidence."
+            ),
+            "fine_role_policy_variant": policy,
+            "R_frame_role_counts": self._role_counts(R_frame[patch_mask]),
+            "R_global_role_counts": self._role_counts(R_global[patch_mask]),
+            "R_swa_role_counts": self._role_counts(R_swa[patch_mask]),
+            "R_ttt_role_counts": self._role_counts(R_ttt[patch_mask]),
+            "fine_label_condition_metrics": self._label_condition_metrics(
+                L,
+                patch_mask,
+                D=D,
+                Q=Q,
+                C=C if conflict_available else None,
+                S=S if scale_available else None,
+            ),
+            "fine_label_path_role_counts": {
+                "frame": self._label_role_counts(L, R_frame, patch_mask),
+                "global": self._label_role_counts(L, R_global, patch_mask),
+                "swa": self._label_role_counts(L, R_swa, patch_mask),
+                "ttt": self._label_role_counts(L, R_ttt, patch_mask),
+            },
+        }
+        return R_frame, R_global, R_swa, R_ttt, debug
+
+    def _apply_semantic_role_policy(
+        self,
+        *,
+        token_type: torch.Tensor,
+        D_tok: torch.Tensor,
+        P_ref: torch.Tensor,
+        V_sem_tok: Optional[torch.Tensor],
+        G_sem_tok: Optional[torch.Tensor],
+        Q_sem_tok: Optional[torch.Tensor],
+        L_sem_tok: Optional[torch.Tensor],
+        R_sem_tok: Optional[torch.Tensor],
+        R_frame_tok: Optional[torch.Tensor],
+        R_global_tok: Optional[torch.Tensor],
+        R_swa_tok: Optional[torch.Tensor],
+        R_ttt_tok: Optional[torch.Tensor],
+        P_ttt_write: Optional[torch.Tensor],
+        D_swa_write_tok: Optional[torch.Tensor],
+    ) -> Tuple[
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        Dict[str, Any],
+    ]:
+        """Refine semantic roles with dynamic risk and route them to memory paths."""
+
+        policy = str(self.semantic_role_policy or "none").strip().lower()
+        paths = {
+            p.strip().lower()
+            for p in str(self.semantic_memory_paths or "").replace(";", ",").split(",")
+            if p.strip()
+        }
+        paths_requested = sorted(paths)
+        if policy in {"", "none", "off", "noop"}:
+            debug = {
+                "semantic_role_policy": policy or "none",
+                "semantic_memory_paths": paths_requested,
+                "semantic_role_consumed_any": False,
+                "semantic_role_reason": "disabled",
+            }
+            return R_sem_tok, R_frame_tok, R_global_tok, R_swa_tok, R_ttt_tok, P_ttt_write, D_swa_write_tok, debug
+
+        patch_mask = token_type.detach().cpu().long() == TOKEN_TYPE_PATCH
+        if G_sem_tok is None or D_tok is None or not bool(patch_mask.any()):
+            debug = {
+                "semantic_role_policy": policy,
+                "semantic_memory_paths": paths_requested,
+                "semantic_role_consumed_any": False,
+                "semantic_role_reason": "missing_semantic_or_dynamic_tokens",
+            }
+            return R_sem_tok, R_frame_tok, R_global_tok, R_swa_tok, R_ttt_tok, P_ttt_write, D_swa_write_tok, debug
+
+        G = G_sem_tok.detach().cpu().long().reshape(-1)
+        D = D_tok.detach().cpu().float().reshape(-1).clamp(0.0, 1.0)
+        L = (
+            L_sem_tok.detach().cpu().long().reshape(-1)
+            if L_sem_tok is not None
+            else torch.full_like(G, int(SEMANTIC_FINE_LABEL_UNKNOWN))
+        )
+        Q = (
+            Q_sem_tok.detach().cpu().float().reshape(-1).clamp(0.0, 1.0)
+            if Q_sem_tok is not None
+            else torch.ones_like(D)
+        )
+        if G.numel() != D.numel() or L.numel() != D.numel():
+            debug = {
+                "semantic_role_policy": policy,
+                "semantic_memory_paths": paths_requested,
+                "semantic_role_consumed_any": False,
+                "semantic_role_reason": "shape_mismatch",
+                "semantic_group_tokens": int(G.numel()),
+                "semantic_label_tokens": int(L.numel()),
+                "dynamic_tokens": int(D.numel()),
+            }
+            return R_sem_tok, R_frame_tok, R_global_tok, R_swa_tok, R_ttt_tok, P_ttt_write, D_swa_write_tok, debug
+
+        patch_scores = D[patch_mask]
+        if patch_scores.numel() > 0:
+            q = min(max(float(self.semantic_role_highd_quantile), 0.0), 1.0)
+            high_thr = float(torch.quantile(patch_scores, q).item())
+        else:
+            high_thr = 1.0
+        high_d = D >= high_thr
+        low_d = ~high_d
+        high_trust = Q >= float(self.semantic_role_low_trust)
+
+        path_role_override_policy = policy in {"v29c_masklet_override", "v36_synthetic_override"}
+        fine_policy = policy.startswith("fine_") or policy.startswith("causal_") or path_role_override_policy
+        fine_debug: Dict[str, Any] = {}
+        if path_role_override_policy:
+            def _valid_or_fallback(stream: Optional[torch.Tensor]) -> torch.Tensor:
+                if stream is None:
+                    return torch.full_like(G, int(SEMANTIC_ROLE_FALLBACK), dtype=torch.long)
+                r = stream.detach().cpu().long().reshape(-1)
+                if int(r.numel()) != int(G.numel()):
+                    return torch.full_like(G, int(SEMANTIC_ROLE_FALLBACK), dtype=torch.long)
+                return r.clone()
+
+            R_frame = _valid_or_fallback(R_frame_tok)
+            R_global = _valid_or_fallback(R_global_tok)
+            R_swa = _valid_or_fallback(R_swa_tok)
+            R_ttt = _valid_or_fallback(R_ttt_tok)
+            R = R_ttt.clone()
+            fine_debug = {
+                "runtime_fine_role_policy_available": True,
+                "fine_role_policy_variant": policy,
+                "v29c_path_role_override_consumed": True,
+                "fine_label_token_count": int(((L != int(SEMANTIC_FINE_LABEL_UNKNOWN)) & (L >= 0) & patch_mask).sum().item()),
+                "fine_label_counts": self._label_counts(L[patch_mask]),
+                "fine_label_path_role_counts": {
+                    "frame": self._label_role_counts(L, R_frame, patch_mask),
+                    "global": self._label_role_counts(L, R_global, patch_mask),
+                    "swa": self._label_role_counts(L, R_swa, patch_mask),
+                    "ttt": self._label_role_counts(L, R_ttt, patch_mask),
+                },
+            }
+        elif fine_policy:
+            R_frame, R_global, R_swa, R_ttt, fine_debug = self._fine_path_roles(
+                G=G,
+                L=L,
+                D=D,
+                Q=Q,
+                patch_mask=patch_mask,
+                high_d=high_d,
+                low_d=low_d,
+                high_trust=high_trust,
+            )
+            # Shared role is retained for legacy summaries. Model hook sites
+            # consume the path-specific roles where available.
+            R = R_ttt.clone()
+        else:
+            R = torch.full_like(G, int(SEMANTIC_ROLE_FALLBACK), dtype=torch.long)
+            structure = (G == SEMANTIC_GROUP_STRUCTURE_ANCHOR) & patch_mask
+            static = (G == SEMANTIC_GROUP_STATIC_THING) & patch_mask
+            movable = (G == SEMANTIC_GROUP_MOVABLE_THING) & patch_mask
+            lowstuff = (G == SEMANTIC_GROUP_LOW_VALUE_STUFF) & patch_mask
+            uncertain = (G == SEMANTIC_GROUP_UNCERTAIN_REGION) & patch_mask
+
+            R[structure & low_d & high_trust] = int(SEMANTIC_ROLE_POSITIVE_LONG)
+            R[structure & ~(low_d & high_trust)] = int(SEMANTIC_ROLE_PROTECT_NEUTRAL)
+            R[static & low_d & high_trust] = int(SEMANTIC_ROLE_POSITIVE_LONG)
+            R[static & ~(low_d & high_trust)] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+            R[lowstuff & low_d & high_trust] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+            R[lowstuff & high_d & high_trust] = int(SEMANTIC_ROLE_NEGATIVE_SHORT)
+            R[movable & high_d & high_trust] = int(SEMANTIC_ROLE_NEGATIVE_SHORT)
+            R[movable & ~(high_d & high_trust)] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+            R[uncertain | (~high_trust & patch_mask)] = int(SEMANTIC_ROLE_FALLBACK)
+            R_frame = R.clone()
+            R_global = R.clone()
+            R_swa = R.clone()
+            R_ttt = R.clone()
+
+        frame_on = self._semantic_path_enabled("frame")
+        global_on = self._semantic_path_enabled("global") or self._semantic_path_enabled("chunk")
+        swa_on = self._semantic_path_enabled("swa")
+        ttt_on = self._semantic_path_enabled("ttt")
+        lifecycle_on = self._semantic_path_enabled("lifecycle")
+
+        P_out = P_ttt_write
+        if (ttt_on or lifecycle_on) and P_ttt_write is not None:
+            P = P_ttt_write.detach().cpu().float().reshape(-1).clone()
+            pos = R_ttt == int(SEMANTIC_ROLE_POSITIVE_LONG)
+            neu = R_ttt == int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+            neg = R_ttt == int(SEMANTIC_ROLE_NEGATIVE_SHORT)
+            P[pos] = (P[pos] * float(self.semantic_role_positive_scale)).clamp(0.0, 1.5)
+            P[neu] = (P[neu] * float(self.semantic_role_neutral_scale)).clamp(0.0, 1.5)
+            P[neg] = (P[neg] * float(self.semantic_role_negative_scale)).clamp(0.0, 1.5)
+            P_out = P
+
+        D_swa_out = D_swa_write_tok
+        if swa_on:
+            base = (
+                D_swa_write_tok.detach().cpu().float().reshape(-1).clone()
+                if D_swa_write_tok is not None
+                else torch.zeros_like(D)
+            )
+            neg_score = (R_swa == int(SEMANTIC_ROLE_NEGATIVE_SHORT)).float() * float(self.semantic_role_swa_negative_scale)
+            D_swa_out = torch.maximum(base, neg_score).clamp(0.0, 1.0)
+
+        V = (
+            V_sem_tok.detach().cpu().float().reshape(-1).clamp(0.0, 1.0)
+            if V_sem_tok is not None and int(V_sem_tok.numel()) == int(G.numel())
+            else torch.ones_like(D)
+        )
+        groups = sorted({int(x.item()) for x in torch.unique(G[patch_mask])}) if bool(patch_mask.any()) else []
+        per_group: Dict[str, Dict[str, Any]] = {}
+        for group_id in groups:
+            mask = (G == group_id) & patch_mask
+            role_counts = self._role_counts(R[mask])
+            per_group[str(group_id)] = {
+                "token_count": int(mask.sum().item()),
+                "D_mean": float(D[mask].mean().item()) if bool(mask.any()) else 0.0,
+                "D_p90": float(torch.quantile(D[mask], 0.90).item()) if int(mask.sum().item()) > 1 else 0.0,
+                "Q_mean": float(Q[mask].mean().item()) if bool(mask.any()) else 0.0,
+                "V_mean": float(V[mask].mean().item()) if bool(mask.any()) else 0.0,
+                "role_counts": role_counts,
+            }
+
+        debug = {
+            "semantic_role_policy": policy,
+            "semantic_memory_paths": paths_requested,
+            "semantic_role_consumed_any": bool(frame_on or global_on or swa_on or ttt_on or lifecycle_on),
+            "path_specific_role_streams_available": bool(fine_policy),
+            "runtime_fine_role_policy_available": bool(fine_policy),
+            "frame_semantic_source_consumed": bool(frame_on),
+            "chunk_global_semantic_source_consumed": bool(global_on),
+            "swa_semantic_source_consumed": bool(swa_on),
+            "ttt_semantic_role_consumed": bool(ttt_on),
+            "lifecycle_semantic_role_consumed": bool(lifecycle_on),
+            "semantic_role_highd_quantile": float(self.semantic_role_highd_quantile),
+            "semantic_role_highd_threshold": float(high_thr),
+            "semantic_role_low_trust": float(self.semantic_role_low_trust),
+            "semantic_role_counts": self._role_counts(R[patch_mask]),
+            "R_frame_role_counts": self._role_counts(R_frame[patch_mask]),
+            "R_global_role_counts": self._role_counts(R_global[patch_mask]),
+            "R_swa_role_counts": self._role_counts(R_swa[patch_mask]),
+            "R_ttt_role_counts": self._role_counts(R_ttt[patch_mask]),
+            "semantic_group_role_metrics": per_group,
+            "semantic_role_ttt_adjusted": bool((ttt_on or lifecycle_on) and P_ttt_write is not None),
+            "semantic_role_swa_adjusted": bool(swa_on),
+        }
+        debug.update(fine_debug)
+        return R, R_frame, R_global, R_swa, R_ttt, P_out, D_swa_out, debug
 
     def _apply_swa_history_write_gate(
         self,
@@ -1911,6 +3241,41 @@ class HybridMemoryController:
         prior_output: Optional[PriorOutput],
         mode: str,
     ) -> HybridMemoryControlPrior:
+        saved_read_cue_source = self.read_cue_source
+        inactive_source = self.semantic_action_inactive_read_cue_source.strip()
+        use_inactive_source = bool(
+            inactive_source
+            and self.semantic_action_active_chunks
+            and not self._semantic_action_chunk_active()
+        )
+        if use_inactive_source:
+            self.read_cue_source = inactive_source
+        try:
+            out = self._build_control_prior_impl(
+                probe=probe,
+                cue=cue,
+                prior_output=None if use_inactive_source else prior_output,
+                mode=mode,
+            )
+            out.debug["semantic_action_read_cue_gate_mode"] = (
+                "fixed_chunks" if self.semantic_action_active_chunks else "ungated"
+            )
+            out.debug["semantic_action_read_cue_gate_active"] = bool(not use_inactive_source)
+            out.debug["semantic_action_inactive_read_cue_source"] = inactive_source or None
+            out.debug["semantic_action_active_chunks"] = sorted(int(v) for v in self.semantic_action_active_chunks)
+            out.debug["semantic_action_chunk_idx"] = int(getattr(self, "current_chunk_idx", -1))
+            return out
+        finally:
+            self.read_cue_source = saved_read_cue_source
+
+    def _build_control_prior_impl(
+        self,
+        *,
+        probe: ProbeOutput,
+        cue: Optional[CueOutput],
+        prior_output: Optional[PriorOutput],
+        mode: str,
+    ) -> HybridMemoryControlPrior:
         geo = probe.geometry
         token_type = geo.token_type.detach().cpu().long()
         L_tok = int(token_type.shape[0])
@@ -2003,6 +3368,7 @@ class HybridMemoryController:
                     geo.global_k_raw_patchvec_layers,
                     dyn_patch,
                     num_frames=num_frames,
+                    overlap_frames=self.read_overlap_frames,
                 )
                 if read_patch is None:
                     read_patch = dyn_patch
@@ -2119,6 +3485,38 @@ class HybridMemoryController:
                 if prior_output is not None:
                     P_ttt_write = prior_output.A_tok.detach().cpu().float()
                     B_chunk_geo = float(prior_output.B_chunk_geo)
+                    S_tok = _token_from_patch_values(
+                        geo,
+                        getattr(prior_output, "V_sem_patch_flat", torch.ones(0)),
+                        special_value=1.0,
+                    ) if getattr(prior_output, "V_sem_patch_flat", None) is not None else None
+                    G_sem_tok = getattr(prior_output, "G_sem_tok", None)
+                    if G_sem_tok is not None:
+                        G_sem_tok = G_sem_tok.detach().cpu().long()
+                    Q_sem_tok = getattr(prior_output, "Q_sem_tok", None)
+                    if Q_sem_tok is not None:
+                        Q_sem_tok = Q_sem_tok.detach().cpu().float()
+                    L_sem_tok = getattr(prior_output, "L_sem_tok", None)
+                    if L_sem_tok is not None:
+                        L_sem_tok = L_sem_tok.detach().cpu().long()
+                    V_sem_tok = getattr(prior_output, "V_sem_tok", None)
+                    if V_sem_tok is not None:
+                        V_sem_tok = V_sem_tok.detach().cpu().float()
+                    R_sem_tok = getattr(prior_output, "R_sem_tok", None)
+                    if R_sem_tok is not None:
+                        R_sem_tok = R_sem_tok.detach().cpu().long()
+                    R_frame_tok = getattr(prior_output, "R_frame_tok", None)
+                    if R_frame_tok is not None:
+                        R_frame_tok = R_frame_tok.detach().cpu().long()
+                    R_global_tok = getattr(prior_output, "R_global_tok", None)
+                    if R_global_tok is not None:
+                        R_global_tok = R_global_tok.detach().cpu().long()
+                    R_swa_tok = getattr(prior_output, "R_swa_tok", None)
+                    if R_swa_tok is not None:
+                        R_swa_tok = R_swa_tok.detach().cpu().long()
+                    R_ttt_tok = getattr(prior_output, "R_ttt_tok", None)
+                    if R_ttt_tok is not None:
+                        R_ttt_tok = R_ttt_tok.detach().cpu().long()
                     override_write, write_debug = self._phase_e_write_prior(
                         probe=probe,
                         token_type=token_type,
@@ -2136,6 +3534,16 @@ class HybridMemoryController:
                         B_chunk_geo = 1.0
                     patch_debug.update(write_debug)
                 else:
+                    S_tok = None
+                    G_sem_tok = None
+                    Q_sem_tok = None
+                    L_sem_tok = None
+                    V_sem_tok = None
+                    R_sem_tok = None
+                    R_frame_tok = None
+                    R_global_tok = None
+                    R_swa_tok = None
+                    R_ttt_tok = None
                     override_write, write_debug = self._phase_e_write_prior(
                         probe=probe,
                         token_type=token_type,
@@ -2156,12 +3564,81 @@ class HybridMemoryController:
                 if mode in {"unity_replay", "native", "identity_hooks", "read_path_only", "probe_only"}:
                     P_ttt_write = None
                     B_chunk_geo = None
+                (
+                    R_sem_tok,
+                    R_frame_tok,
+                    R_global_tok,
+                    R_swa_tok,
+                    R_ttt_tok,
+                    P_ttt_write,
+                    D_swa_write_tok,
+                    role_debug,
+                ) = self._apply_semantic_role_policy(
+                    token_type=token_type,
+                    D_tok=D_tok,
+                    P_ref=P_ref,
+                    V_sem_tok=V_sem_tok,
+                    G_sem_tok=G_sem_tok,
+                    Q_sem_tok=Q_sem_tok,
+                    L_sem_tok=L_sem_tok,
+                    R_sem_tok=R_sem_tok,
+                    R_frame_tok=R_frame_tok,
+                    R_global_tok=R_global_tok,
+                    R_swa_tok=R_swa_tok,
+                    R_ttt_tok=R_ttt_tok,
+                    P_ttt_write=P_ttt_write,
+                    D_swa_write_tok=D_swa_write_tok,
+                )
+                patch_debug.update(role_debug)
+
+                key_avg_patch_anchor = _normalize01(_flatten_or_default(geo.frame_attn_key_cosine_avg, dyn_patch))
+                A_anchor_tok, A_anchor_mask_tok, anchor_debug = self._build_semantic_anchor_bank(
+                    token_type=token_type,
+                    D_tok=D_tok,
+                    P_ttt_write=P_ttt_write,
+                    G_sem_tok=G_sem_tok,
+                    Q_sem_tok=Q_sem_tok,
+                    L_sem_tok=L_sem_tok,
+                    conf_patch=conf_patch,
+                    key_avg_patch=key_avg_patch_anchor,
+                    num_frames=num_frames,
+                    patch_grid=(int(geo.patch_grid[0]), int(geo.patch_grid[1])),
+                )
+                P_ttt_write, anchor_floor_debug = self._apply_semantic_anchor_write_floor(
+                    token_type=token_type,
+                    P_ttt_write=P_ttt_write,
+                    A_anchor_tok=A_anchor_tok,
+                )
+                patch_debug.update(anchor_debug)
+                patch_debug.update(anchor_floor_debug)
 
                 return HybridMemoryControlPrior(
                     D_tok=D_tok,
                     R_tok=R_tok,
                     U_tok=U_tok,
                     P_ref=P_ref,
+                    S_tok=S_tok,
+                    G_sem_tok=G_sem_tok,
+                    Q_sem_tok=Q_sem_tok,
+                    L_sem_tok=L_sem_tok,
+                    V_sem_tok=V_sem_tok,
+                    R_sem_tok=R_sem_tok,
+                    R_frame_tok=R_frame_tok,
+                    R_global_tok=R_global_tok,
+                    R_swa_tok=R_swa_tok,
+                    R_ttt_tok=R_ttt_tok,
+                    A_anchor_tok=A_anchor_tok,
+                    A_anchor_mask_tok=A_anchor_mask_tok,
+                    C_ttt_conflict_tok=(
+                        _optional_1d_float_tensor(getattr(self, "semantic_condition_conflict_tok", None))
+                        if bool(role_debug.get("condition_signal_conflict_token_exact", False))
+                        else None
+                    ),
+                    S_scale_risk_tok=(
+                        _optional_1d_float_tensor(getattr(self, "semantic_condition_scale_tok", None))
+                        if bool(role_debug.get("condition_signal_scale_risk_token_exact", False))
+                        else None
+                    ),
                     P_ttt_write=P_ttt_write,
                     P_ttt_read=None,
                     P_swa_read_prev=None,
@@ -2453,12 +3930,14 @@ class HybridMemoryController:
             cue_gate = 1.0
             fallback_rate = 0.0
             cue_source_effective = self.read_cue_source
+            cue_extra_debug: Dict[str, Any] = {}
             acl2_patch = _acl2_read_patch_from_source(
                 self.read_cue_source,
                 geo.global_q_raw_patchvec_layers,
                 geo.global_k_raw_patchvec_layers,
                 dyn_patch,
                 num_frames=num_frames,
+                overlap_frames=self.read_overlap_frames,
             )
 
             if acl2_patch is not None:
@@ -2547,6 +4026,7 @@ class HybridMemoryController:
                     geo.global_k_raw_patchvec_layers,
                     dyn_patch,
                     num_frames=num_frames,
+                    overlap_frames=self.read_overlap_frames,
                 )
                 D4 = _acl2_read_patch_from_source(
                     "acl2.gg.qq.low.g4.full.headmean.robustq",
@@ -2554,6 +4034,7 @@ class HybridMemoryController:
                     geo.global_k_raw_patchvec_layers,
                     dyn_patch,
                     num_frames=num_frames,
+                    overlap_frames=self.read_overlap_frames,
                 )
                 if D23 is None:
                     D23 = dyn_patch
@@ -2586,6 +4067,7 @@ class HybridMemoryController:
                     geo.global_k_raw_patchvec_layers,
                     dyn_patch,
                     num_frames=num_frames,
+                    overlap_frames=self.read_overlap_frames,
                 )
                 if D_g is None:
                     D_g = dyn_patch
@@ -2604,6 +4086,155 @@ class HybridMemoryController:
                     read_patch = torch.where(g_on & (~aux_on), (lam_g * D_g).clamp(0.0, 1.0), read_patch)
                     read_patch = torch.where((~g_on) & aux_on, (lam_aux * aux).clamp(0.0, 1.0), read_patch)
                 cue_source_effective = self.read_cue_source
+            elif self.read_cue_source in {
+                "semantic_anchor_rescue.c23past_l025",
+                "semantic_anchor_rescue.c23past_l050",
+            }:
+                D_g = _acl2_read_patch_from_source(
+                    "acl2.gg.qq.low.g2_3.past_only.headmean.robustq",
+                    geo.global_q_raw_patchvec_layers,
+                    geo.global_k_raw_patchvec_layers,
+                    dyn_patch,
+                    num_frames=num_frames,
+                    overlap_frames=self.read_overlap_frames,
+                )
+                if D_g is None:
+                    D_g = dyn_patch
+                alpha = 0.25 if self.read_cue_source.endswith("_l025") else 0.50
+                read_patch, rescue_debug = _semantic_anchor_rescue_patch(
+                    D_g.clamp(0.0, 1.0),
+                    token_type=token_type,
+                    prior_output=prior_output,
+                    gg_deep_static_patch=gg_deep_static_patch,
+                    conf_patch=conf_patch,
+                    key_avg_patch=key_avg_patch,
+                    alpha=alpha,
+                )
+                cue_extra_debug.update(rescue_debug)
+                cue_source_effective = self.read_cue_source
+            elif self.read_cue_source in {
+                "v31.sem_z_fine.c23past",
+                "v31.sem_z_coarse.c23past",
+            } or (
+                self.read_cue_source.startswith(("v31.sem_resid_fine_l", "v31.sem_resid_coarse_l"))
+                and self.read_cue_source.endswith(".c23past")
+            ):
+                D_g = _acl2_read_patch_from_source(
+                    "acl2.gg.qq.low.g2_3.past_only.headmean.robustq",
+                    geo.global_q_raw_patchvec_layers,
+                    geo.global_k_raw_patchvec_layers,
+                    dyn_patch,
+                    num_frames=num_frames,
+                    overlap_frames=self.read_overlap_frames,
+                )
+                if D_g is None:
+                    D_g = dyn_patch
+                D_g = D_g.clamp(0.0, 1.0)
+                label_field = "G_sem_tok" if "_coarse" in self.read_cue_source else "L_sem_tok"
+                label_tok = getattr(prior_output, label_field, None) if prior_output is not None else None
+                patch_labels = _patch_labels_from_token_labels(label_tok, token_type)
+                sem_z_patch, sem_z_debug = _semantic_z_recondition_patch(
+                    D_g,
+                    patch_labels,
+                    min_count=32,
+                )
+                sem_z_high_mass = float(
+                    (sem_z_patch >= self.v32_semantic_cue_trigger_high_threshold).float().mean().item()
+                ) if sem_z_patch.numel() else 0.0
+                sem_d_mean = float(sem_z_patch.mean().item()) if sem_z_patch.numel() else 0.0
+                sem_d_q90 = float(torch.quantile(sem_z_patch.float().flatten(), 0.9).item()) if sem_z_patch.numel() else 0.0
+                current_chunk_idx = int(getattr(self, "current_chunk_idx", -1))
+                v32_gate_mode = "ungated"
+                v32_gate_reason = "ungated_all_chunks"
+                v32_semantic_cue_active = True
+                trigger_threshold = None
+                trigger_ema_before = self._v32_semantic_cue_ema
+                trigger_mad_before = self._v32_semantic_cue_mad
+                if self.v32_semantic_cue_active_chunks:
+                    v32_gate_mode = "fixed_chunks"
+                    v32_semantic_cue_active = current_chunk_idx in self.v32_semantic_cue_active_chunks
+                    v32_gate_reason = "fixed_chunk_active" if v32_semantic_cue_active else "fixed_chunk_inactive"
+                elif self.v32_semantic_cue_trigger_mode in {
+                    "semantic_z_ema_mad",
+                    "semantic_d_mean_ema_mad",
+                    "semantic_d_q90_ema_mad",
+                }:
+                    v32_gate_mode = self.v32_semantic_cue_trigger_mode
+                    if self.v32_semantic_cue_trigger_mode == "semantic_d_mean_ema_mad":
+                        trigger_metric = sem_d_mean
+                    elif self.v32_semantic_cue_trigger_mode == "semantic_d_q90_ema_mad":
+                        trigger_metric = sem_d_q90
+                    else:
+                        trigger_metric = sem_z_high_mass
+                    if self._v32_semantic_cue_ema is None:
+                        trigger_threshold = self.v32_semantic_cue_trigger_min_mass
+                    else:
+                        trigger_threshold = max(
+                            self.v32_semantic_cue_trigger_min_mass,
+                            self._v32_semantic_cue_ema
+                            + self.v32_semantic_cue_trigger_k * float(self._v32_semantic_cue_mad or 0.0),
+                        )
+                    warmup_done = self._v32_semantic_cue_count >= self.v32_semantic_cue_trigger_warmup
+                    v32_semantic_cue_active = bool(warmup_done and trigger_metric > float(trigger_threshold))
+                    v32_gate_reason = "runtime_trigger_active" if v32_semantic_cue_active else "runtime_trigger_inactive"
+                    alpha = min(max(self.v32_semantic_cue_trigger_ema_alpha, 0.0), 1.0)
+                    if self._v32_semantic_cue_ema is None:
+                        self._v32_semantic_cue_ema = trigger_metric
+                        self._v32_semantic_cue_mad = 0.0
+                    else:
+                        prev_ema = self._v32_semantic_cue_ema
+                        self._v32_semantic_cue_ema = (1.0 - alpha) * self._v32_semantic_cue_ema + alpha * trigger_metric
+                        abs_dev = abs(trigger_metric - prev_ema)
+                        self._v32_semantic_cue_mad = (1.0 - alpha) * float(self._v32_semantic_cue_mad or 0.0) + alpha * abs_dev
+                    self._v32_semantic_cue_count += 1
+                if not v32_semantic_cue_active:
+                    read_patch = D_g
+                    sem_z_debug["v31_semantic_recondition_applied"] = False
+                    sem_z_debug["v31_semantic_recondition_reason"] = v32_gate_reason
+                elif ".sem_resid_" in self.read_cue_source:
+                    lam_sem = 0.25
+                    try:
+                        lam_token = self.read_cue_source.split("_l", 1)[1].split(".", 1)[0]
+                        if lam_token.isdigit():
+                            lam_sem = min(max(float(int(lam_token)) / 100.0, 0.0), 1.0)
+                    except IndexError:
+                        lam_sem = 0.25
+                    read_patch = ((1.0 - lam_sem) * D_g + lam_sem * sem_z_patch).clamp(0.0, 1.0)
+                    sem_z_debug["v31_semantic_recondition_mode"] = f"semantic_residual_l{int(round(lam_sem * 100)):03d}"
+                    sem_z_debug["v31_semantic_residual_lambda"] = float(lam_sem)
+                else:
+                    read_patch = sem_z_patch.clamp(0.0, 1.0)
+                sem_z_debug["v31_semantic_label_field"] = label_field
+                sem_z_debug["v32_semantic_cue_gate_mode"] = v32_gate_mode
+                sem_z_debug["v32_semantic_cue_active"] = bool(v32_semantic_cue_active)
+                sem_z_debug["v32_semantic_cue_gate_reason"] = v32_gate_reason
+                sem_z_debug["v32_semantic_cue_chunk_idx"] = int(current_chunk_idx)
+                sem_z_debug["v32_semantic_z_high_mass"] = float(sem_z_high_mass)
+                sem_z_debug["v32_semantic_d_mean"] = float(sem_d_mean)
+                sem_z_debug["v32_semantic_d_q90"] = float(sem_d_q90)
+                sem_z_debug["v32_semantic_trigger_metric"] = (
+                    float(trigger_metric) if "trigger_metric" in locals() else None
+                )
+                sem_z_debug["v32_semantic_z_high_threshold"] = float(self.v32_semantic_cue_trigger_high_threshold)
+                sem_z_debug["v32_semantic_trigger_threshold"] = (
+                    float(trigger_threshold) if trigger_threshold is not None else None
+                )
+                sem_z_debug["v32_semantic_trigger_ema_before"] = (
+                    float(trigger_ema_before) if trigger_ema_before is not None else None
+                )
+                sem_z_debug["v32_semantic_trigger_mad_before"] = (
+                    float(trigger_mad_before) if trigger_mad_before is not None else None
+                )
+                sem_z_debug["v32_semantic_trigger_ema_after"] = (
+                    float(self._v32_semantic_cue_ema) if self._v32_semantic_cue_ema is not None else None
+                )
+                sem_z_debug["v32_semantic_trigger_mad_after"] = (
+                    float(self._v32_semantic_cue_mad) if self._v32_semantic_cue_mad is not None else None
+                )
+                sem_z_debug["v32_semantic_trigger_count"] = int(self._v32_semantic_cue_count)
+                cue_source_effective = self.read_cue_source
+                fallback_rate = float(sem_z_debug.get("v31_semantic_label_fallback_ratio", fallback_rate))
+                cue_extra_debug.update(sem_z_debug)
             elif self.read_cue_source == "old_dyn_switch_flow_proxy":
                 dyn_mass_flow = float((flow_proxy_calib > 0.5).float().mean().item()) if flow_proxy_calib.numel() else 0.0
                 anchor_flow = float(
@@ -2793,6 +4424,7 @@ class HybridMemoryController:
                 "flow_residual_thr": self.flow_residual_thr,
                 "gram_layer_groups": self.gram_layer_groups,
                 **protect_debug,
+                **cue_extra_debug,
             }
         else:
             D_tok = torch.zeros(L_tok, dtype=torch.float32)
@@ -2804,6 +4436,7 @@ class HybridMemoryController:
         P_ref = (token_type != TOKEN_TYPE_PATCH).float() if self.read_protect_ref else torch.zeros(L_tok, dtype=torch.float32)
         if bool((P_safe > 0.0).any()):
             P_ref = torch.maximum(P_ref, P_safe)
+        D_swa_write_tok = D_tok.detach().cpu().float().clone()
         raw_frame_bias_energy = _frame_bias_energy(
             D_tok,
             P_ref,
@@ -2821,6 +4454,38 @@ class HybridMemoryController:
         if prior_output is not None:
             P_ttt_write = prior_output.A_tok.detach().cpu().float()
             B_chunk_geo = float(prior_output.B_chunk_geo)
+            S_tok = _token_from_patch_values(
+                geo,
+                getattr(prior_output, "V_sem_patch_flat", torch.ones(0)),
+                special_value=1.0,
+            ) if getattr(prior_output, "V_sem_patch_flat", None) is not None else None
+            G_sem_tok = getattr(prior_output, "G_sem_tok", None)
+            if G_sem_tok is not None:
+                G_sem_tok = G_sem_tok.detach().cpu().long()
+            Q_sem_tok = getattr(prior_output, "Q_sem_tok", None)
+            if Q_sem_tok is not None:
+                Q_sem_tok = Q_sem_tok.detach().cpu().float()
+            L_sem_tok = getattr(prior_output, "L_sem_tok", None)
+            if L_sem_tok is not None:
+                L_sem_tok = L_sem_tok.detach().cpu().long()
+            V_sem_tok = getattr(prior_output, "V_sem_tok", None)
+            if V_sem_tok is not None:
+                V_sem_tok = V_sem_tok.detach().cpu().float()
+            R_sem_tok = getattr(prior_output, "R_sem_tok", None)
+            if R_sem_tok is not None:
+                R_sem_tok = R_sem_tok.detach().cpu().long()
+            R_frame_tok = getattr(prior_output, "R_frame_tok", None)
+            if R_frame_tok is not None:
+                R_frame_tok = R_frame_tok.detach().cpu().long()
+            R_global_tok = getattr(prior_output, "R_global_tok", None)
+            if R_global_tok is not None:
+                R_global_tok = R_global_tok.detach().cpu().long()
+            R_swa_tok = getattr(prior_output, "R_swa_tok", None)
+            if R_swa_tok is not None:
+                R_swa_tok = R_swa_tok.detach().cpu().long()
+            R_ttt_tok = getattr(prior_output, "R_ttt_tok", None)
+            if R_ttt_tok is not None:
+                R_ttt_tok = R_ttt_tok.detach().cpu().long()
             override_write, write_debug = self._phase_e_write_prior(
                 probe=probe,
                 token_type=token_type,
@@ -2838,20 +4503,99 @@ class HybridMemoryController:
                 B_chunk_geo = 1.0
             patch_debug.update(write_debug)
         else:
+            S_tok = None
+            G_sem_tok = None
+            Q_sem_tok = None
+            L_sem_tok = None
+            V_sem_tok = None
+            R_sem_tok = None
+            R_frame_tok = None
+            R_global_tok = None
+            R_swa_tok = None
+            R_ttt_tok = None
             patch_debug.update({"hmc_write_score_source": self.hmc_write_score_source, "hmc_write_override": False})
 
         if mode in {"unity_replay", "native", "identity_hooks", "read_path_only", "probe_only"}:
             P_ttt_write = None
             B_chunk_geo = None
+        (
+            R_sem_tok,
+            R_frame_tok,
+            R_global_tok,
+            R_swa_tok,
+            R_ttt_tok,
+            P_ttt_write,
+            D_swa_write_tok,
+            role_debug,
+        ) = self._apply_semantic_role_policy(
+            token_type=token_type,
+            D_tok=D_tok,
+            P_ref=P_ref,
+            V_sem_tok=V_sem_tok,
+            G_sem_tok=G_sem_tok,
+            Q_sem_tok=Q_sem_tok,
+            L_sem_tok=L_sem_tok,
+            R_sem_tok=R_sem_tok,
+            R_frame_tok=R_frame_tok,
+            R_global_tok=R_global_tok,
+            R_swa_tok=R_swa_tok,
+            R_ttt_tok=R_ttt_tok,
+            P_ttt_write=P_ttt_write,
+            D_swa_write_tok=D_swa_write_tok,
+        )
+        patch_debug.update(role_debug)
+
+        A_anchor_tok, A_anchor_mask_tok, anchor_debug = self._build_semantic_anchor_bank(
+            token_type=token_type,
+            D_tok=D_tok,
+            P_ttt_write=P_ttt_write,
+            G_sem_tok=G_sem_tok,
+            Q_sem_tok=Q_sem_tok,
+            L_sem_tok=L_sem_tok,
+            conf_patch=conf_patch if cue is not None and cue.E_cue_patch is not None else None,
+            key_avg_patch=key_avg_patch if cue is not None and cue.E_cue_patch is not None else None,
+            num_frames=num_frames,
+            patch_grid=(int(geo.patch_grid[0]), int(geo.patch_grid[1])),
+        )
+        P_ttt_write, anchor_floor_debug = self._apply_semantic_anchor_write_floor(
+            token_type=token_type,
+            P_ttt_write=P_ttt_write,
+            A_anchor_tok=A_anchor_tok,
+        )
+        patch_debug.update(anchor_debug)
+        patch_debug.update(anchor_floor_debug)
 
         return HybridMemoryControlPrior(
             D_tok=D_tok,
             R_tok=R_tok,
             U_tok=U_tok,
             P_ref=P_ref,
+            S_tok=S_tok,
+            G_sem_tok=G_sem_tok,
+            Q_sem_tok=Q_sem_tok,
+            L_sem_tok=L_sem_tok,
+            V_sem_tok=V_sem_tok,
+            R_sem_tok=R_sem_tok,
+            R_frame_tok=R_frame_tok,
+            R_global_tok=R_global_tok,
+            R_swa_tok=R_swa_tok,
+            R_ttt_tok=R_ttt_tok,
+            A_anchor_tok=A_anchor_tok,
+            A_anchor_mask_tok=A_anchor_mask_tok,
+            C_ttt_conflict_tok=(
+                _optional_1d_float_tensor(getattr(self, "semantic_condition_conflict_tok", None))
+                if bool(role_debug.get("condition_signal_conflict_token_exact", False))
+                else None
+            ),
+            S_scale_risk_tok=(
+                _optional_1d_float_tensor(getattr(self, "semantic_condition_scale_tok", None))
+                if bool(role_debug.get("condition_signal_scale_risk_token_exact", False))
+                else None
+            ),
             P_ttt_write=P_ttt_write,
             P_ttt_read=None,
             P_swa_read_prev=None,
+            D_swa_write_tok=D_swa_write_tok,
             frame_bias_spec={
                 "enabled": self.enable_frame_read_control,
                 "beta": self.beta_frame,
@@ -3097,6 +4841,36 @@ class HybridMemoryController:
                 for rec in records
                 if isinstance(rec, dict) and rec.get("swa_overlap_source_replace_score_mean") is not None
             ]
+            source_keep_ratio_vals = [
+                float(rec.get("source_keep_ratio", 1.0))
+                for rec in records
+                if isinstance(rec, dict) and rec.get("source_keep_ratio") is not None
+            ]
+            source_skip_token_vals = [
+                int(rec.get("source_skip_tokens", 0) or 0)
+                for rec in records
+                if isinstance(rec, dict)
+            ]
+            source_control_token_vals = [
+                int(rec.get("source_control_tokens", 0) or 0)
+                for rec in records
+                if isinstance(rec, dict)
+            ]
+            source_boost_token_vals = [
+                int(rec.get("source_boost_tokens", 0) or 0)
+                for rec in records
+                if isinstance(rec, dict)
+            ]
+            source_boost_applied_vals = [
+                bool(rec.get("semantic_anchor_boost_applied", False))
+                for rec in records
+                if isinstance(rec, dict)
+            ]
+            empty_source_event_vals = [
+                int(rec.get("empty_source_events", 0) or 0)
+                for rec in records
+                if isinstance(rec, dict)
+            ]
             history_token_vals = [
                 int(rec.get("history_tokens", 0) or 0)
                 for rec in records
@@ -3107,6 +4881,41 @@ class HybridMemoryController:
                 for rec in records
                 if isinstance(rec, dict)
             ]
+            attention_mass_removed_before_vals = [
+                float(rec.get("attention_mass_removed_before"))
+                for rec in records
+                if isinstance(rec, dict) and rec.get("attention_mass_removed_before") is not None
+            ]
+            attention_mass_removed_after_vals = [
+                float(rec.get("attention_mass_removed_after"))
+                for rec in records
+                if isinstance(rec, dict) and rec.get("attention_mass_removed_after") is not None
+            ]
+            attention_mass_retained_before_vals = [
+                float(rec.get("attention_mass_retained_before"))
+                for rec in records
+                if isinstance(rec, dict) and rec.get("attention_mass_retained_before") is not None
+            ]
+            attention_mass_retained_after_vals = [
+                float(rec.get("attention_mass_retained_after"))
+                for rec in records
+                if isinstance(rec, dict) and rec.get("attention_mass_retained_after") is not None
+            ]
+            attention_mass_actual_after_vals = [
+                float(rec.get("attention_mass_actual_after"))
+                for rec in records
+                if isinstance(rec, dict) and rec.get("attention_mass_actual_after") is not None
+            ]
+            attention_mass_query_sample_vals = [
+                float(rec.get("attention_mass_query_sample_tokens_mean"))
+                for rec in records
+                if isinstance(rec, dict) and rec.get("attention_mass_query_sample_tokens_mean") is not None
+            ]
+            attention_mass_metrics = sorted({
+                str(rec.get("attention_mass_metric"))
+                for rec in records
+                if isinstance(rec, dict) and rec.get("attention_mass_metric") is not None
+            })
             hook_effect_summary[path_name] = {
                 "num_calls": len(records),
                 "num_enabled_layers": sum(
@@ -3132,6 +4941,9 @@ class HybridMemoryController:
                 "num_source_gate_applied": sum(
                     1 for rec in records if isinstance(rec, dict) and bool(rec.get("source_gate_applied", False))
                 ),
+                "num_context_source_skip_applied": sum(
+                    1 for rec in records if isinstance(rec, dict) and bool(rec.get("context_source_skip_applied", False))
+                ),
                 "mean_abs_bias": float(torch.tensor(mean_vals).mean().item()) if mean_vals else 0.0,
                 "max_abs_bias": max(max_vals) if max_vals else 0.0,
                 "mean_swa_gate": float(torch.tensor(gate_mean_vals).mean().item()) if gate_mean_vals else 1.0,
@@ -3153,6 +4965,27 @@ class HybridMemoryController:
                 if overlap_source_replace_alpha_p90_vals else 0.0,
                 "mean_swa_overlap_source_replace_score": float(torch.tensor(overlap_source_replace_score_vals).mean().item())
                 if overlap_source_replace_score_vals else 0.0,
+                "mean_context_source_keep_ratio": float(torch.tensor(source_keep_ratio_vals).mean().item())
+                if source_keep_ratio_vals else 1.0,
+                "max_context_source_skip_tokens": max(source_skip_token_vals) if source_skip_token_vals else 0,
+                "max_context_source_control_tokens": max(source_control_token_vals) if source_control_token_vals else 0,
+                "max_context_source_boost_tokens": max(source_boost_token_vals) if source_boost_token_vals else 0,
+                "num_semantic_anchor_boost_applied": int(sum(1 for v in source_boost_applied_vals if v)),
+                "num_context_empty_source_events": int(sum(empty_source_event_vals)) if empty_source_event_vals else 0,
+                "attention_mass_available": bool(attention_mass_removed_before_vals),
+                "attention_mass_metrics_seen": attention_mass_metrics,
+                "mean_attention_mass_removed_before": float(torch.tensor(attention_mass_removed_before_vals).mean().item())
+                if attention_mass_removed_before_vals else None,
+                "mean_attention_mass_removed_after": float(torch.tensor(attention_mass_removed_after_vals).mean().item())
+                if attention_mass_removed_after_vals else None,
+                "mean_attention_mass_actual_after": float(torch.tensor(attention_mass_actual_after_vals).mean().item())
+                if attention_mass_actual_after_vals else None,
+                "mean_attention_mass_retained_before": float(torch.tensor(attention_mass_retained_before_vals).mean().item())
+                if attention_mass_retained_before_vals else None,
+                "mean_attention_mass_retained_after": float(torch.tensor(attention_mass_retained_after_vals).mean().item())
+                if attention_mass_retained_after_vals else None,
+                "mean_attention_mass_query_sample_tokens": float(torch.tensor(attention_mass_query_sample_vals).mean().item())
+                if attention_mass_query_sample_vals else None,
                 "max_history_tokens": max(history_token_vals) if history_token_vals else 0,
                 "max_d_prev_tokens": max(d_prev_token_vals) if d_prev_token_vals else 0,
             }
@@ -3173,6 +5006,8 @@ class HybridMemoryController:
                 implemented_paths.append("swa_overlap_source_gate")
             elif self.enable_swa_overlap_source_replace:
                 implemented_paths.append("swa_overlap_source_replace")
+            if self.enable_context_source_skip:
+                implemented_paths.append("context_source_skip")
             if self.enable_ttt_apply_control:
                 implemented_paths.append("ttt_apply")
             if self.enable_chunk_read_control:
@@ -3188,6 +5023,8 @@ class HybridMemoryController:
                 implemented_paths.append("swa_overlap_source_gate")
             elif self.enable_swa_overlap_source_replace:
                 implemented_paths.append("swa_overlap_source_replace")
+            if self.enable_context_source_skip:
+                implemented_paths.append("context_source_skip")
             if self.enable_ttt_apply_control:
                 implemented_paths.append("ttt_apply")
             if self.enable_chunk_read_control:
@@ -3290,6 +5127,15 @@ class HybridMemoryController:
         )
         return state_next, write_result
 
+    def _semantic_action_chunk_active(self) -> bool:
+        if not self.semantic_action_active_chunks:
+            return True
+        try:
+            chunk_idx = int(getattr(self, "current_chunk_idx"))
+        except (TypeError, ValueError):
+            return False
+        return chunk_idx in self.semantic_action_active_chunks
+
     def _build_model_hmc_control(
         self,
         control_prior: Optional[HybridMemoryControlPrior],
@@ -3298,11 +5144,35 @@ class HybridMemoryController:
         identity_hooks: bool = False,
     ) -> Dict[str, Any]:
         is_identity = bool(identity_hooks or mode == "identity_hooks")
+        semantic_action_active = (not is_identity) and self._semantic_action_chunk_active()
+        semantic_gate_mode = "fixed_chunks" if self.semantic_action_active_chunks else "ungated"
+        semantic_paths = self.semantic_memory_paths if semantic_action_active else ""
+        semantic_policy = self.semantic_role_policy if semantic_action_active else "none"
+        context_source_skip_enabled = bool(self.enable_context_source_skip and semantic_action_active)
         return {
             "identity_hooks": is_identity,
             "collect_trace": True,
             "D_tok": control_prior.D_tok if control_prior is not None else None,
             "P_ref": control_prior.P_ref if control_prior is not None else None,
+            "S_tok": control_prior.S_tok if control_prior is not None else None,
+            "G_sem_tok": control_prior.G_sem_tok if control_prior is not None else None,
+            "Q_sem_tok": control_prior.Q_sem_tok if control_prior is not None else None,
+            "L_sem_tok": control_prior.L_sem_tok if control_prior is not None else None,
+            "V_sem_tok": control_prior.V_sem_tok if control_prior is not None else None,
+            "R_sem_tok": control_prior.R_sem_tok if control_prior is not None else None,
+            "R_frame_tok": control_prior.R_frame_tok if control_prior is not None else None,
+            "R_global_tok": control_prior.R_global_tok if control_prior is not None else None,
+            "R_swa_tok": control_prior.R_swa_tok if control_prior is not None else None,
+            "R_ttt_tok": control_prior.R_ttt_tok if control_prior is not None else None,
+            "A_anchor_tok": control_prior.A_anchor_tok if control_prior is not None else None,
+            "A_anchor_mask_tok": control_prior.A_anchor_mask_tok if control_prior is not None else None,
+            "semantic_anchor_mode": self.semantic_anchor_mode,
+            "semantic_action_chunk_gate_mode": semantic_gate_mode,
+            "semantic_action_chunk_gate_active": bool(semantic_action_active),
+            "semantic_action_active_chunks": sorted(int(v) for v in self.semantic_action_active_chunks),
+            "semantic_action_chunk_idx": int(getattr(self, "current_chunk_idx", -1)),
+            "semantic_role_policy": semantic_policy,
+            "semantic_memory_paths": semantic_paths,
             "enable_frame_read_control": False if is_identity else self.enable_frame_read_control,
             "enable_swa_read_control": False if is_identity else self.enable_swa_read_control,
             "enable_ttt_apply_control": False if is_identity else self.enable_ttt_apply_control,
@@ -3333,6 +5203,17 @@ class HybridMemoryController:
             "swa_overlap_source_replace_target": self.swa_overlap_source_replace_target,
             "swa_overlap_source_replace_layer_mode": self.swa_overlap_source_replace_layer_mode,
             "swa_overlap_source_replace_single_layer": self.swa_overlap_source_replace_single_layer,
+            "enable_context_source_skip": context_source_skip_enabled,
+            "context_source_skip_impl": "bias" if is_identity else self.context_source_skip_impl,
+            "context_source_skip_scope": self.context_source_skip_scope,
+            "context_source_skip_mode": self.context_source_skip_mode,
+            "context_source_skip_mask": self.context_source_skip_mask,
+            "context_source_skip_layer_mode": self.context_source_skip_layer_mode,
+            "context_source_skip_single_layer": self.context_source_skip_single_layer,
+            "context_source_skip_soft_rho": 0.0 if is_identity else self.context_source_skip_soft_rho,
+            "context_source_skip_soft_min_keep": self.context_source_skip_soft_min_keep,
+            "context_source_skip_record_attention_mass": False if is_identity else self.context_source_skip_record_attention_mass,
+            "context_source_skip_attention_mass_max_queries": self.context_source_skip_attention_mass_max_queries,
             "swa_write_cache_store_post": self.enable_swa_write_control and self.swa_write_cache_blend_alpha > 0.0,
             "swa_overlap_frames": int(self.read_overlap_frames),
             "beta_chunk": 0.0 if is_identity else self.beta_chunk,

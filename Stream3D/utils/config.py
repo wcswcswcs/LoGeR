@@ -2,8 +2,12 @@ import argparse
 from dataset.scannet import ScanNetDataset
 from dataset.matterport import MatterportDataset
 from dataset.scannetpp import ScanNetPPDataset
-from dataset.demo import DemoDataset
 import json
+
+try:
+    from dataset.demo import DemoDataset
+except ImportError:
+    DemoDataset = None
 
 def update_args(args):
     config_path = f'configs/{args.config}.json'
@@ -34,9 +38,10 @@ def get_dataset(args, model):
     elif args.dataset == 'matterport3d':
         dataset = MatterportDataset(args.seq_name, model)
     elif args.dataset == 'demo':
+        if DemoDataset is None:
+            raise ImportError("dataset.demo is not available in this checkout")
         dataset = DemoDataset(args.seq_name)
     else:
         print(args.dataset)
         raise NotImplementedError
     return dataset
-

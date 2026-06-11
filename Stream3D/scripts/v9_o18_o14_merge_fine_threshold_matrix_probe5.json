@@ -1,0 +1,98 @@
+[
+  {
+    "method": "P0 Stream3D on S0",
+    "prediction_config": "scannet",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_p0_on_s0_scannet_probe5",
+    "eval_policy": "stream3d_self_probe5",
+    "split": "probe5"
+  },
+  {
+    "method": "O16 merge minIoC 0.30 own",
+    "prediction_config": "stream4d_v9_o16_o14_merge_mioc030_probe5",
+    "pre_points_config": "stream4d_v9_o16_o14_merge_mioc030_probe5",
+    "output_config": "stream4d_v9_o16_o14_merge_mioc030_probe5",
+    "eval_policy": "own_recompute_o14_overlap_merge_mioc030",
+    "split": "probe5"
+  },
+  {
+    "method": "O16 0.30 on S0",
+    "prediction_config": "stream4d_v9_o16_o14_merge_mioc030_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o16_o14_merge_mioc030_on_s0_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O18 merge minIoC 0.15 own",
+    "prediction_config": "stream4d_v9_o18_o14_merge_mioc015_probe5",
+    "pre_points_config": "stream4d_v9_o18_o14_merge_mioc015_probe5",
+    "output_config": "stream4d_v9_o18_o14_merge_mioc015_probe5",
+    "eval_policy": "own_recompute_o14_overlap_merge_mioc015",
+    "split": "probe5"
+  },
+  {
+    "method": "O18 0.15 on S0",
+    "prediction_config": "stream4d_v9_o18_o14_merge_mioc015_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o18_o14_merge_mioc015_on_s0_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O18 0.15 on S1",
+    "prediction_config": "stream4d_v9_o18_o14_merge_mioc015_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_o18_o14_merge_mioc015_on_s1_probe5",
+    "eval_policy": "method_on_32f_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O18 merge minIoC 0.20 own",
+    "prediction_config": "stream4d_v9_o18_o14_merge_mioc020_probe5",
+    "pre_points_config": "stream4d_v9_o18_o14_merge_mioc020_probe5",
+    "output_config": "stream4d_v9_o18_o14_merge_mioc020_probe5",
+    "eval_policy": "own_recompute_o14_overlap_merge_mioc020",
+    "split": "probe5"
+  },
+  {
+    "method": "O18 0.20 on S0",
+    "prediction_config": "stream4d_v9_o18_o14_merge_mioc020_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o18_o14_merge_mioc020_on_s0_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O18 0.20 on S1",
+    "prediction_config": "stream4d_v9_o18_o14_merge_mioc020_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_o18_o14_merge_mioc020_on_s1_probe5",
+    "eval_policy": "method_on_32f_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O18 merge minIoC 0.40 own",
+    "prediction_config": "stream4d_v9_o18_o14_merge_mioc040_probe5",
+    "pre_points_config": "stream4d_v9_o18_o14_merge_mioc040_probe5",
+    "output_config": "stream4d_v9_o18_o14_merge_mioc040_probe5",
+    "eval_policy": "own_recompute_o14_overlap_merge_mioc040",
+    "split": "probe5"
+  },
+  {
+    "method": "O18 0.40 on S0",
+    "prediction_config": "stream4d_v9_o18_o14_merge_mioc040_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o18_o14_merge_mioc040_on_s0_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O18 0.40 on S1",
+    "prediction_config": "stream4d_v9_o18_o14_merge_mioc040_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_o18_o14_merge_mioc040_on_s1_probe5",
+    "eval_policy": "method_on_32f_support",
+    "split": "probe5"
+  }
+]

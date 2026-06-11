@@ -1,0 +1,50 @@
+[
+  {
+    "method": "P0 Stream3D on S0",
+    "prediction_config": "scannet",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_p0_on_s0_scannet_probe5",
+    "eval_policy": "stream3d_self_probe5",
+    "split": "probe5"
+  },
+  {
+    "method": "O25 refine inside050 on S0",
+    "prediction_config": "stream4d_v9_o25_o23_refine_inside050_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o25_o23_refine_inside050_probe5_on_s0_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O28 S0-aware rank diagnostic on S0",
+    "prediction_config": "stream4d_v9_o28_o25_s0aware_rank_g040_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o28_o25_s0aware_rank_g040_probe5_on_s0_probe5",
+    "eval_policy": "diagnostic_target_support_aware_rank_on_s0",
+    "split": "probe5"
+  },
+  {
+    "method": "O28 S0-aware rank diagnostic on S1",
+    "prediction_config": "stream4d_v9_o28_o25_s0aware_rank_g040_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_o28_o25_s0aware_rank_g040_probe5_on_s1_probe5",
+    "eval_policy": "diagnostic_target_support_aware_rank_on_s1",
+    "split": "probe5"
+  },
+  {
+    "method": "O28 S1-aware rank diagnostic on S1",
+    "prediction_config": "stream4d_v9_o28_o25_s1aware_rank_g040_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_o28_o25_s1aware_rank_g040_probe5_on_s1_probe5",
+    "eval_policy": "diagnostic_target_support_aware_rank_on_s1",
+    "split": "probe5"
+  },
+  {
+    "method": "O28 S1-aware rank diagnostic on S0",
+    "prediction_config": "stream4d_v9_o28_o25_s1aware_rank_g040_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o28_o25_s1aware_rank_g040_probe5_on_s0_probe5",
+    "eval_policy": "diagnostic_target_support_aware_rank_on_s0",
+    "split": "probe5"
+  }
+]

@@ -1,8 +1,34 @@
-import os, sys, argparse
+import os, sys, argparse, json
 from copy import deepcopy
+from pathlib import Path
 import numpy as np
-import torch
 from evaluation.utils_3d import get_instances
+
+
+def _config_from_pred_path(pred_path: str) -> str:
+    name = Path(pred_path).name
+    for suffix in ("_class_agnostic", "_semantic"):
+        if name.endswith(suffix):
+            return name[: -len(suffix)]
+    return name
+
+
+def _manifest_candidates(pred_path: str, tmp_root: str, tmp_config: str) -> list[Path]:
+    candidates = [Path(pred_path) / "config_manifest.json"]
+    if tmp_config:
+        candidates.append(Path(tmp_root) / tmp_config / "config_manifest.json")
+    return candidates
+
+
+def _load_eval_manifest(pred_path: str, tmp_root: str, tmp_config: str) -> tuple[dict | None, Path | None]:
+    for path in _manifest_candidates(pred_path, tmp_root, tmp_config):
+        if not path.exists():
+            continue
+        try:
+            return json.loads(path.read_text(encoding="utf-8")), path
+        except Exception as exc:
+            return {"manifest_parse_error": f"{type(exc).__name__}: {exc}"}, path
+    return None, None
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--pred_path', required=True, help='path to directory of predicted .txt files')
@@ -11,7 +37,70 @@ parser.add_argument('--gt_path', required=True, help='path to directory of groun
 parser.add_argument('--dataset', required=True, help='type of dataset, e.g. matterport3d, scannet, etc.')
 parser.add_argument('--output_file', default='', help='path to output file')
 parser.add_argument('--no_class', action='store_true', help='class agnostic evaluation')
+parser.add_argument('--tmp_root', default='data/TMP', help='root containing {dataset_or_config}/{scene_id}_pre_points.npy')
+parser.add_argument('--tmp_config', default='', help='subdirectory under --tmp_root; defaults to prediction directory without _class_agnostic')
+parser.add_argument('--allow-oracle-eval', action='store_true', help='explicitly allow evaluating oracle diagnostic configs')
+parser.add_argument('--require-manifest', action='store_true', help='refuse evaluation when config_manifest.json is missing')
 opt = parser.parse_args()
+if opt.tmp_config == '':
+    opt.tmp_config = _config_from_pred_path(opt.pred_path)
+
+oracle_tokens = [
+    str(opt.pred_path).lower(),
+    str(opt.output_file).lower(),
+    str(opt.tmp_config).lower(),
+]
+if any("oracle" in item for item in oracle_tokens) and not opt.allow_oracle_eval:
+    raise ValueError(
+        "Refusing to evaluate oracle-named prediction/TMP/output without --allow-oracle-eval. "
+        "Oracle outputs are diagnostic-only and must not enter method result tables."
+    )
+
+eval_manifest, eval_manifest_path = _load_eval_manifest(opt.pred_path, opt.tmp_root, opt.tmp_config)
+if eval_manifest is None and opt.require_manifest:
+    raise ValueError(
+        "Refusing to evaluate without config_manifest.json because --require-manifest was set. "
+        f"Checked: {[str(path) for path in _manifest_candidates(opt.pred_path, opt.tmp_root, opt.tmp_config)]}"
+    )
+if eval_manifest is not None:
+    if eval_manifest.get("manifest_parse_error"):
+        raise ValueError(f"Could not parse prediction manifest {eval_manifest_path}: {eval_manifest['manifest_parse_error']}")
+    if bool(eval_manifest.get("uses_gt_for_prediction", False)):
+        if not opt.allow_oracle_eval:
+            raise ValueError(
+                "Refusing to evaluate manifest uses_gt_for_prediction=true without --allow-oracle-eval. "
+                f"Manifest: {eval_manifest_path}"
+            )
+        if bool(eval_manifest.get("is_method_result", False)) or not bool(
+            eval_manifest.get("is_diagnostic_only", False)
+        ):
+            raise ValueError(
+                "Refusing to evaluate GT-selected oracle artifact unless it is diagnostic-only "
+                "and not a method result. "
+                f"Manifest: {eval_manifest_path}"
+            )
+    if bool(eval_manifest.get("uses_gt", False)) and not opt.allow_oracle_eval:
+        raise ValueError(
+            "Refusing to evaluate manifest uses_gt=true without --allow-oracle-eval. "
+            f"Manifest: {eval_manifest_path}"
+        )
+    if bool(eval_manifest.get("uses_gt_for_diagnostic", False)) and not opt.allow_oracle_eval:
+        raise ValueError(
+            "Refusing to evaluate manifest uses_gt_for_diagnostic=true without --allow-oracle-eval. "
+            f"Manifest: {eval_manifest_path}"
+        )
+    if bool(eval_manifest.get("is_diagnostic_only", False)) and not opt.allow_oracle_eval:
+        raise ValueError(
+            "Refusing to evaluate diagnostic-only manifest without --allow-oracle-eval. "
+            f"Manifest: {eval_manifest_path}"
+        )
+
+try:
+    import torch
+    _TORCH_AVAILABLE = True
+except ModuleNotFoundError:
+    torch = None
+    _TORCH_AVAILABLE = False
 
 # ---------- Label info ---------- #
 from evaluation.constants import MATTERPORT_LABELS, MATTERPORT_IDS, SCANNET_LABELS, SCANNET_IDS, SCANNETPP_LABELS, SCANNETPP_IDS
@@ -253,9 +342,14 @@ def get_gt_tensor(gt_ids, gt_instances):
     point_num = len(gt_ids)
     for label in gt_instances:
         gt_instance_num = len(gt_instances[label])
-        gt_tensor = torch.zeros((point_num, gt_instance_num), dtype=torch.bool).cuda()
-        for i, gt_instance_info in enumerate(gt_instances[label]):
-            gt_tensor[:, i] = torch.from_numpy(gt_ids == gt_instance_info['instance_id'])
+        if _TORCH_AVAILABLE:
+            gt_tensor = torch.zeros((point_num, gt_instance_num), dtype=torch.bool).cuda()
+            for i, gt_instance_info in enumerate(gt_instances[label]):
+                gt_tensor[:, i] = torch.from_numpy(gt_ids == gt_instance_info['instance_id'])
+        else:
+            gt_tensor = np.zeros((point_num, gt_instance_num), dtype=bool)
+            for i, gt_instance_info in enumerate(gt_instances[label]):
+                gt_tensor[:, i] = gt_ids == gt_instance_info['instance_id']
         gt_tensor_dict[label] = gt_tensor
     return gt_tensor_dict
 
@@ -316,7 +410,7 @@ def assign_instances_for_scan(pred_file, gt_file):
         if intersection > 0, then the prediction is considered a match
     '''
 
-    title = '......../Seq3D/TMP/'
+    title = 'TMP'
     import re
     path = gt_file
     # print(gt_file)
@@ -333,7 +427,15 @@ def assign_instances_for_scan(pred_file, gt_file):
         match = re.search(r"gt/([^/]+)\.txt$", path)
         scene_id = match.group(1)
     
-    loaded_array = np.load(title + config + '/' + scene_id + '_pre_points.npy')
+    if opt.tmp_config:
+        tmp_config = opt.tmp_config
+    else:
+        tmp_config = os.path.basename(os.path.dirname(pred_file))
+        if tmp_config.endswith('_class_agnostic'):
+            tmp_config = tmp_config[: -len('_class_agnostic')]
+        if not tmp_config:
+            tmp_config = config
+    loaded_array = np.load(os.path.join(opt.tmp_root, tmp_config, scene_id + '_pre_points.npy'))
 
 
     pred_info = read_pridiction_npz(os.path.join(pred_file), loaded_array)
@@ -544,10 +646,12 @@ def assign_instances_for_scan(pred_file, gt_file):
         # intersection = compute_intersection_async(gt_tensor, pred_mask)   # 8.0 min
         # intersection = compute_intersection_smart(gt_tensor, pred_mask)
         # intersection = compute_intersection_safe(gt_tensor, pred_mask)
-        intersection = compute_intersection_with_auto_gpu(gt_tensor, pred_mask)
-
-
-        intersect_ids = torch.nonzero(intersection).cpu().numpy().reshape(-1)
+        if _TORCH_AVAILABLE:
+            intersection = compute_intersection_with_auto_gpu(gt_tensor, pred_mask)
+            intersect_ids = torch.nonzero(intersection).cpu().numpy().reshape(-1)
+        else:
+            intersection = np.sum(gt_tensor & pred_mask.reshape(-1, 1), axis=0).astype(np.int64)
+            intersect_ids = np.flatnonzero(intersection).reshape(-1)
         for gt_id in intersect_ids:
             gt_copy = gt_instances[label_name][gt_id].copy()
             pred_copy = pred_instance.copy()

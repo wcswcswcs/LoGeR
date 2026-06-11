@@ -1,0 +1,162 @@
+[
+  {
+    "method": "S2 area same-count own",
+    "prediction_config": "stream4d_v11_s2_area_same_count_probe5",
+    "pre_points_config": "stream4d_v11_s2_area_same_count_probe5",
+    "output_config": "stream4d_v11_s2_area_same_count_probe5",
+    "eval_policy": "own_recompute_posterior_proxy",
+    "support_source": "own",
+    "geometry_source": "rgbd_eval_bridge",
+    "split": "probe5"
+  },
+  {
+    "method": "P0 on S2 support",
+    "prediction_config": "scannet",
+    "pre_points_config": "stream4d_v11_s2_area_same_count_probe5",
+    "output_config": "stream4d_v11_p0_on_s2_area_same_count_probe5",
+    "eval_policy": "cross_fixed_support",
+    "support_source": "named_config",
+    "geometry_source": "rgbd_eval_bridge",
+    "split": "probe5"
+  },
+  {
+    "method": "S2 area on S0",
+    "prediction_config": "stream4d_v11_s2_area_same_count_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v11_s2_area_on_s0_probe5",
+    "eval_policy": "cross_fixed_support",
+    "support_source": "stream3d_s0",
+    "geometry_source": "rgbd_eval_bridge",
+    "split": "probe5"
+  },
+  {
+    "method": "S2 area on S1",
+    "prediction_config": "stream4d_v11_s2_area_same_count_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v11_s2_area_on_s1_probe5",
+    "eval_policy": "cross_fixed_support",
+    "support_source": "stream4d_s1",
+    "geometry_source": "rgbd_eval_bridge",
+    "split": "probe5"
+  },
+  {
+    "method": "S3 real D4RT maskcount own",
+    "prediction_config": "stream4d_v11_s3_d4rt_maskcount_probe5",
+    "pre_points_config": "stream4d_v11_s3_d4rt_maskcount_probe5",
+    "output_config": "stream4d_v11_s3_d4rt_maskcount_probe5",
+    "eval_policy": "own_recompute_posterior_proxy",
+    "support_source": "own",
+    "geometry_source": "rgbd_eval_bridge",
+    "split": "probe5"
+  },
+  {
+    "method": "P0 on S3 support",
+    "prediction_config": "scannet",
+    "pre_points_config": "stream4d_v11_s3_d4rt_maskcount_probe5",
+    "output_config": "stream4d_v11_p0_on_s3_d4rt_maskcount_probe5",
+    "eval_policy": "cross_fixed_support",
+    "support_source": "named_config",
+    "geometry_source": "rgbd_eval_bridge",
+    "split": "probe5"
+  },
+  {
+    "method": "S3 real D4RT on S0",
+    "prediction_config": "stream4d_v11_s3_d4rt_maskcount_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v11_s3_d4rt_on_s0_probe5",
+    "eval_policy": "cross_fixed_support",
+    "support_source": "stream3d_s0",
+    "geometry_source": "rgbd_eval_bridge",
+    "split": "probe5"
+  },
+  {
+    "method": "S3 real D4RT on S1",
+    "prediction_config": "stream4d_v11_s3_d4rt_maskcount_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v11_s3_d4rt_on_s1_probe5",
+    "eval_policy": "cross_fixed_support",
+    "support_source": "stream4d_s1",
+    "geometry_source": "rgbd_eval_bridge",
+    "split": "probe5"
+  },
+  {
+    "method": "S4 shuffled D4RT own",
+    "prediction_config": "stream4d_v11_s4_shuffle_maskcount_probe5",
+    "pre_points_config": "stream4d_v11_s4_shuffle_maskcount_probe5",
+    "output_config": "stream4d_v11_s4_shuffle_maskcount_probe5",
+    "eval_policy": "own_recompute_posterior_proxy_control",
+    "support_source": "own",
+    "geometry_source": "rgbd_eval_bridge",
+    "split": "probe5"
+  },
+  {
+    "method": "P0 on S4 support",
+    "prediction_config": "scannet",
+    "pre_points_config": "stream4d_v11_s4_shuffle_maskcount_probe5",
+    "output_config": "stream4d_v11_p0_on_s4_shuffle_maskcount_probe5",
+    "eval_policy": "cross_fixed_support",
+    "support_source": "named_config",
+    "geometry_source": "rgbd_eval_bridge",
+    "split": "probe5"
+  },
+  {
+    "method": "S4 shuffled on S0",
+    "prediction_config": "stream4d_v11_s4_shuffle_maskcount_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v11_s4_shuffle_on_s0_probe5",
+    "eval_policy": "cross_fixed_support",
+    "support_source": "stream3d_s0",
+    "geometry_source": "rgbd_eval_bridge",
+    "split": "probe5"
+  },
+  {
+    "method": "S4 shuffled on S1",
+    "prediction_config": "stream4d_v11_s4_shuffle_maskcount_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v11_s4_shuffle_on_s1_probe5",
+    "eval_policy": "cross_fixed_support",
+    "support_source": "stream4d_s1",
+    "geometry_source": "rgbd_eval_bridge",
+    "split": "probe5"
+  },
+  {
+    "method": "S5 no-track own",
+    "prediction_config": "stream4d_v11_s5_no_track_probe5",
+    "pre_points_config": "stream4d_v11_s5_no_track_probe5",
+    "output_config": "stream4d_v11_s5_no_track_probe5",
+    "eval_policy": "own_recompute_posterior_proxy_control",
+    "support_source": "own",
+    "geometry_source": "rgbd_eval_bridge",
+    "split": "probe5"
+  },
+  {
+    "method": "P0 on S5 support",
+    "prediction_config": "scannet",
+    "pre_points_config": "stream4d_v11_s5_no_track_probe5",
+    "output_config": "stream4d_v11_p0_on_s5_no_track_probe5",
+    "eval_policy": "cross_fixed_support",
+    "support_source": "named_config",
+    "geometry_source": "rgbd_eval_bridge",
+    "split": "probe5"
+  },
+  {
+    "method": "S5 no-track on S0",
+    "prediction_config": "stream4d_v11_s5_no_track_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v11_s5_no_track_on_s0_probe5",
+    "eval_policy": "cross_fixed_support",
+    "support_source": "stream3d_s0",
+    "geometry_source": "rgbd_eval_bridge",
+    "split": "probe5"
+  },
+  {
+    "method": "S5 no-track on S1",
+    "prediction_config": "stream4d_v11_s5_no_track_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v11_s5_no_track_on_s1_probe5",
+    "eval_policy": "cross_fixed_support",
+    "support_source": "stream4d_s1",
+    "geometry_source": "rgbd_eval_bridge",
+    "split": "probe5"
+  }
+]

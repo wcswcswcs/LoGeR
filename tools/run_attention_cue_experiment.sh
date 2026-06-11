@@ -3,7 +3,7 @@ set -euo pipefail
 
 if [ "$#" -lt 3 ]; then
   echo "Usage: $0 GPU RUN_NAME MODE [CUE] [BETA] [WRITE_SCORE]" >&2
-  echo "MODE: native | identity_hooks | readonly | hybrid" >&2
+  echo "MODE: native | identity_hooks | readonly | hybrid | probe_only | controlled_probe_only" >&2
   exit 2
 fi
 
@@ -16,6 +16,8 @@ WRITE_SCORE="${6:-stage_d}"
 
 ROOT="${LOGER_ROOT:-/mnt/data/users/chengshun.wang/pjs/LoGeR}"
 PY="${LOGER_PY:-/mnt/data/users/chengshun.wang/miniconda3/envs/loger/bin/python}"
+CHECKPOINT="${LOGER_CHECKPOINT:-$ROOT/ckpts/LoGeR/latest.pt}"
+CONFIG="${LOGER_CONFIG:-$ROOT/ckpts/LoGeR/original_config.yaml}"
 SEQ="${KITTI_SEQ:-01}"
 DATA="${KITTI_IMAGES:-/mnt/data/users/chengshun.wang/data/kitti_odometry/dataset/sequences/$SEQ/image_2}"
 POSES="${KITTI_POSES:-/mnt/data/users/chengshun.wang/data/kitti_odometry/dataset/poses}"
@@ -28,16 +30,41 @@ OUT="$BASE/$RUN_NAME"
 FRAME_BIAS="${FRAME_BIAS_MODE:-pair}"
 READ_PATH="${READ_PATH:-frame}"
 READ_LAYER_MODE="${READ_LAYER_MODE:-early}"
+READ_BETA_FRAME_CHUNKS="${READ_BETA_FRAME_CHUNKS:-}"
 READ_TOPK_FRAC="${READ_TOPK_FRAC:-0.0}"
 READ_CALIB_MODE="${READ_CALIB_MODE:-none}"
 READ_TARGET_MASS="${READ_TARGET_MASS:-0.06}"
 READ_CALIB_TAU="${READ_CALIB_TAU:-0.05}"
 READ_BLEND_LAMBDA="${READ_BLEND_LAMBDA:-0.25}"
+SEMANTIC_ACTION_ACTIVE_CHUNKS="${SEMANTIC_ACTION_ACTIVE_CHUNKS:-}"
+SEMANTIC_ACTION_INACTIVE_READ_CUE_SOURCE="${SEMANTIC_ACTION_INACTIVE_READ_CUE_SOURCE:-}"
+READ_QUALITY_MASS_MIN="${READ_QUALITY_MASS_MIN:-0.03}"
+READ_QUALITY_MASS_MAX="${READ_QUALITY_MASS_MAX:-0.20}"
+READ_QUALITY_ANCHOR_MAX="${READ_QUALITY_ANCHOR_MAX:-0.35}"
+READ_QUALITY_FRAG_MAX="${READ_QUALITY_FRAG_MAX:-0.15}"
+GRAM_LAYER_GROUPS="${GRAM_LAYER_GROUPS:-shallow,middle,deep}"
+BETA_POLICY="${BETA_POLICY:-fixed}"
+BETA_ENERGY_TARGET="${BETA_ENERGY_TARGET:-0.0}"
+BETA_MIN="${BETA_MIN:-0.5}"
+BETA_MAX="${BETA_MAX:-1.5}"
 SWA_GATE_MIN="${SWA_GATE_MIN:-0.85}"
 BETA_SWA="${BETA_SWA:-$BETA}"
 END_FRAME="${END_FRAME:-10000}"
+START_FRAME="${START_FRAME:-0}"
+OUTPUT_VIDEO="${OUTPUT_VIDEO-}"
 OUTPUT_PT="${OUTPUT_PT-}"
 PER_CHUNK_GEOMETRY_DIR="${PER_CHUNK_GEOMETRY_DIR-}"
+GLOBAL_CHUNK_OFFSET="${GLOBAL_CHUNK_OFFSET:-}"
+SAVE_HMC_STATES="${SAVE_HMC_STATES:-}"
+SAVE_HMC_STATE_CHUNKS="${SAVE_HMC_STATE_CHUNKS:-}"
+SAVE_HMC_STATE_KINDS="${SAVE_HMC_STATE_KINDS:-}"
+LOAD_HMC_STATE_AT_CHUNK="${LOAD_HMC_STATE_AT_CHUNK:-}"
+LOAD_HMC_STATE_AT_CHUNK_INDEX="${LOAD_HMC_STATE_AT_CHUNK_INDEX:-}"
+SAVE_MERGE_STATES="${SAVE_MERGE_STATES:-}"
+SAVE_MERGE_STATE_CHUNKS="${SAVE_MERGE_STATE_CHUNKS:-}"
+SAVE_MERGE_STATE_KINDS="${SAVE_MERGE_STATE_KINDS:-}"
+LOAD_MERGE_STATE_AT_CHUNK="${LOAD_MERGE_STATE_AT_CHUNK:-}"
+LOAD_MERGE_STATE_AT_CHUNK_INDEX="${LOAD_MERGE_STATE_AT_CHUNK_INDEX:-}"
 RESET_EVERY="${RESET_EVERY:-5}"
 FAST_CUE_EVAL="${FAST_CUE_EVAL:-1}"
 STAGE_C_MODE="${STAGE_C_MODE:-none}"
@@ -75,6 +102,7 @@ PRIOR_LAYER_BRANCH_POLICY="${PRIOR_LAYER_BRANCH_POLICY:-}"
 TTT_WRITE_DELTA_SCALE="${TTT_WRITE_DELTA_SCALE:-1.0}"
 TTT_WRITE_DELTA_SCALES="${TTT_WRITE_DELTA_SCALES:-}"
 TTT_WRITE_NATIVE_MIX_SCALES="${TTT_WRITE_NATIVE_MIX_SCALES:-}"
+TTT_WRITE_NATIVE_MIX_CHUNKS="${TTT_WRITE_NATIVE_MIX_CHUNKS:-}"
 TTT_WRITE_PRIOR_TRANSFORM_MODE="${TTT_WRITE_PRIOR_TRANSFORM_MODE:-none}"
 TTT_WRITE_PRIOR_ANTI_SCALE="${TTT_WRITE_PRIOR_ANTI_SCALE:-0.0}"
 TTT_WRITE_PRIOR_GAMMA="${TTT_WRITE_PRIOR_GAMMA:-1.0}"
@@ -94,10 +122,12 @@ TTT_WRITE_GRADIENT_REVERSAL_RISK_SOURCE="${TTT_WRITE_GRADIENT_REVERSAL_RISK_SOUR
 TTT_WRITE_TRI_REPLAY_POSITIVE_FRAC="${TTT_WRITE_TRI_REPLAY_POSITIVE_FRAC:-0.35}"
 TTT_WRITE_TRI_REPLAY_NEGATIVE_FRAC="${TTT_WRITE_TRI_REPLAY_NEGATIVE_FRAC:-0.15}"
 TTT_WRITE_TRI_REPLAY_NEUTRAL_LAMBDA="${TTT_WRITE_TRI_REPLAY_NEUTRAL_LAMBDA:-1.0}"
+TTT_WRITE_TRI_REPLAY_ROLE_MODE="${TTT_WRITE_TRI_REPLAY_ROLE_MODE:-fixed}"
 TTT_WRITE_TRI_REPLAY_CHUNK_PARAMS="${TTT_WRITE_TRI_REPLAY_CHUNK_PARAMS:-}"
 TTT_WRITE_GRADIENT_REVERSAL_TRANSIENT_MODE="${TTT_WRITE_GRADIENT_REVERSAL_TRANSIENT_MODE:-none}"
 TTT_WRITE_GRADIENT_REVERSAL_TRANSIENT_BRANCH_MASK="${TTT_WRITE_GRADIENT_REVERSAL_TRANSIENT_BRANCH_MASK:-}"
 TTT_WRITE_GRADIENT_REVERSAL_TRANSIENT_LONG_SCALE="${TTT_WRITE_GRADIENT_REVERSAL_TRANSIENT_LONG_SCALE:-0.0}"
+TTT_WRITE_GRADIENT_REVERSAL_TRANSIENT_APPLY_SCALE="${TTT_WRITE_GRADIENT_REVERSAL_TRANSIENT_APPLY_SCALE:-1.0}"
 TTT_WRITE_REPLAY_FEATURE_GATE_MODE="${TTT_WRITE_REPLAY_FEATURE_GATE_MODE:-none}"
 TTT_WRITE_REPLAY_FEATURE_GATE_RHO="${TTT_WRITE_REPLAY_FEATURE_GATE_RHO:-0.0}"
 TTT_WRITE_REPLAY_FEATURE_GATE_MIN="${TTT_WRITE_REPLAY_FEATURE_GATE_MIN:-0.5}"
@@ -114,6 +144,7 @@ TTT_WRITE_TRANSIENT_DELTA_BRANCH_MASK="${TTT_WRITE_TRANSIENT_DELTA_BRANCH_MASK:-
 TTT_WRITE_TRANSIENT_DELTA_TTL="${TTT_WRITE_TRANSIENT_DELTA_TTL:-1}"
 TTT_WRITE_COMMIT_EMA_ALPHA="${TTT_WRITE_COMMIT_EMA_ALPHA:-1.0}"
 TTT_WRITE_COMMIT_EMA_BRANCH_MASK="${TTT_WRITE_COMMIT_EMA_BRANCH_MASK:-all}"
+TTT_WRITE_COMMIT_EMA_CHUNKS="${TTT_WRITE_COMMIT_EMA_CHUNKS:-}"
 TTT_WRITE_NATIVE_DELTA_GATE_MODE="${TTT_WRITE_NATIVE_DELTA_GATE_MODE:-none}"
 TTT_WRITE_NATIVE_DELTA_GATE_MIN_COS="${TTT_WRITE_NATIVE_DELTA_GATE_MIN_COS:-0.0}"
 TTT_WRITE_NATIVE_DELTA_GATE_FALLBACK="${TTT_WRITE_NATIVE_DELTA_GATE_FALLBACK:-0.0}"
@@ -129,6 +160,13 @@ TTT_WRITE_COMMIT_FILTER_MIN="${TTT_WRITE_COMMIT_FILTER_MIN:-0.0}"
 TTT_WRITE_COMMIT_FILTER_MAX="${TTT_WRITE_COMMIT_FILTER_MAX:-1.0}"
 TTT_WRITE_COMMIT_FILTER_BRANCH_MASK="${TTT_WRITE_COMMIT_FILTER_BRANCH_MASK:-0}"
 TTT_WRITE_COMMIT_FILTER_CHUNKS="${TTT_WRITE_COMMIT_FILTER_CHUNKS:-}"
+TTT_WRITE_SCALE_STATE_MODE="${TTT_WRITE_SCALE_STATE_MODE:-none}"
+TTT_WRITE_SCALE_STATE_PROXY="${TTT_WRITE_SCALE_STATE_PROXY:-pose_step_ema}"
+TTT_WRITE_SCALE_STATE_CARRIER="${TTT_WRITE_SCALE_STATE_CARRIER:-all}"
+TTT_WRITE_SCALE_STATE_ALPHA="${TTT_WRITE_SCALE_STATE_ALPHA:-0.0}"
+TTT_WRITE_SCALE_STATE_BRANCH_MASK="${TTT_WRITE_SCALE_STATE_BRANCH_MASK:-0}"
+TTT_WRITE_SCALE_STATE_CHUNKS="${TTT_WRITE_SCALE_STATE_CHUNKS:-}"
+TTT_WRITE_SCALE_STATE_SAMPLE_TOKENS="${TTT_WRITE_SCALE_STATE_SAMPLE_TOKENS:-0}"
 ENABLE_SWA_WRITE_CONTROL="${ENABLE_SWA_WRITE_CONTROL:-0}"
 SWA_WRITE_MODE="${SWA_WRITE_MODE:-none}"
 SWA_WRITE_RHO="${SWA_WRITE_RHO:-0.0}"
@@ -161,10 +199,61 @@ SWA_OVERLAP_SOURCE_REPLACE_MODE="${SWA_OVERLAP_SOURCE_REPLACE_MODE:-union}"
 SWA_OVERLAP_SOURCE_REPLACE_TARGET="${SWA_OVERLAP_SOURCE_REPLACE_TARGET:-kv}"
 SWA_OVERLAP_SOURCE_REPLACE_LAYER_MODE="${SWA_OVERLAP_SOURCE_REPLACE_LAYER_MODE:-last}"
 SWA_OVERLAP_SOURCE_REPLACE_SINGLE_LAYER="${SWA_OVERLAP_SOURCE_REPLACE_SINGLE_LAYER:-}"
+ENABLE_CONTEXT_SOURCE_SKIP="${ENABLE_CONTEXT_SOURCE_SKIP:-0}"
+CONTEXT_SOURCE_SKIP_IMPL="${CONTEXT_SOURCE_SKIP_IMPL:-bias}"
+CONTEXT_SOURCE_SKIP_SCOPE="${CONTEXT_SOURCE_SKIP_SCOPE:-frame}"
+CONTEXT_SOURCE_SKIP_MODE="${CONTEXT_SOURCE_SKIP_MODE:-hard}"
+CONTEXT_SOURCE_SKIP_MASK="${CONTEXT_SOURCE_SKIP_MASK:-dg_q90}"
+CONTEXT_SOURCE_SKIP_LAYER_MODE="${CONTEXT_SOURCE_SKIP_LAYER_MODE:-early}"
+CONTEXT_SOURCE_SKIP_SINGLE_LAYER="${CONTEXT_SOURCE_SKIP_SINGLE_LAYER:-}"
+CONTEXT_SOURCE_SKIP_SOFT_RHO="${CONTEXT_SOURCE_SKIP_SOFT_RHO:-0.5}"
+CONTEXT_SOURCE_SKIP_SOFT_MIN_KEEP="${CONTEXT_SOURCE_SKIP_SOFT_MIN_KEEP:-0.5}"
+CONTEXT_SOURCE_SKIP_RECORD_ATTENTION_MASS="${CONTEXT_SOURCE_SKIP_RECORD_ATTENTION_MASS:-0}"
+CONTEXT_SOURCE_SKIP_ATTENTION_MASS_MAX_QUERIES="${CONTEXT_SOURCE_SKIP_ATTENTION_MASS_MAX_QUERIES:-512}"
+SEMANTIC_ANCHOR_MODE="${SEMANTIC_ANCHOR_MODE:-semantic}"
+SEMANTIC_ANCHOR_TARGET_RATIO="${SEMANTIC_ANCHOR_TARGET_RATIO:-0.12}"
+SEMANTIC_ANCHOR_MIN_RATIO="${SEMANTIC_ANCHOR_MIN_RATIO:-0.03}"
+SEMANTIC_ANCHOR_MAX_RATIO="${SEMANTIC_ANCHOR_MAX_RATIO:-0.30}"
+SEMANTIC_ANCHOR_MIN_SCORE="${SEMANTIC_ANCHOR_MIN_SCORE:-0.02}"
+SEMANTIC_ANCHOR_GRID_ROWS="${SEMANTIC_ANCHOR_GRID_ROWS:-4}"
+SEMANTIC_ANCHOR_GRID_COLS="${SEMANTIC_ANCHOR_GRID_COLS:-4}"
+ENABLE_SEMANTIC_ANCHOR_TTT_FLOOR="${ENABLE_SEMANTIC_ANCHOR_TTT_FLOOR:-0}"
+SEMANTIC_ROLE_POLICY="${SEMANTIC_ROLE_POLICY:-none}"
+SEMANTIC_MEMORY_PATHS="${SEMANTIC_MEMORY_PATHS:-}"
+SEMANTIC_ROLE_HIGHD_QUANTILE="${SEMANTIC_ROLE_HIGHD_QUANTILE:-0.80}"
+SEMANTIC_ROLE_LOW_TRUST="${SEMANTIC_ROLE_LOW_TRUST:-0.20}"
+SEMANTIC_ROLE_POSITIVE_SCALE="${SEMANTIC_ROLE_POSITIVE_SCALE:-1.05}"
+SEMANTIC_ROLE_NEUTRAL_SCALE="${SEMANTIC_ROLE_NEUTRAL_SCALE:-0.85}"
+SEMANTIC_ROLE_NEGATIVE_SCALE="${SEMANTIC_ROLE_NEGATIVE_SCALE:-0.65}"
+SEMANTIC_ROLE_SWA_NEGATIVE_SCALE="${SEMANTIC_ROLE_SWA_NEGATIVE_SCALE:-1.0}"
+V29C_MASKLET_ALIGNMENT_CSV="${V29C_MASKLET_ALIGNMENT_CSV:-}"
+V29C_MASKLET_INTERVENTION_POLICY="${V29C_MASKLET_INTERVENTION_POLICY:-none}"
+V29C_MASKLET_INTERVENTION_CHUNK="${V29C_MASKLET_INTERVENTION_CHUNK:--1}"
+V29C_MASKLET_INTERVENTION_ID="${V29C_MASKLET_INTERVENTION_ID:--1}"
+V29C_MASKLET_INTERVENTION_PATH="${V29C_MASKLET_INTERVENTION_PATH:-ttt}"
+V29C_MASKLET_INTERVENTION_ACTION="${V29C_MASKLET_INTERVENTION_ACTION:-ttt_neutral}"
+V29C_MASKLET_INTERVENTION_PATCH_THRESHOLD="${V29C_MASKLET_INTERVENTION_PATCH_THRESHOLD:-0.20}"
+V36_SYNTHETIC_MASK="${V36_SYNTHETIC_MASK:-none}"
+V36_SYNTHETIC_PATH="${V36_SYNTHETIC_PATH:-frame}"
+V36_SYNTHETIC_ACTION="${V36_SYNTHETIC_ACTION:-source_skip}"
 TTT_WRITE_TOKEN_SCOPE="${TTT_WRITE_TOKEN_SCOPE:-all}"
 TTT_WRITE_TOKEN_SCOPE_FLOOR="${TTT_WRITE_TOKEN_SCOPE_FLOOR:-0.0}"
 TTT_FREEZE_CHUNKS="${TTT_FREEZE_CHUNKS:-}"
 TTT_SEMANTIC_WRITE_SCALE_CHUNKS="${TTT_SEMANTIC_WRITE_SCALE_CHUNKS:-}"
+V11_PROJECTION_TRACE_DIR="${V11_PROJECTION_TRACE_DIR:-}"
+V11_PROJECTION_GT_PATH="${V11_PROJECTION_GT_PATH:-$POSES/$SEQ.txt}"
+V11_PROJECTION_ACTION_MODE="${V11_PROJECTION_ACTION_MODE:-none}"
+V11_PROJECTION_ACTION_CHUNKS="${V11_PROJECTION_ACTION_CHUNKS:-}"
+V11_PROJECTION_ACTION_STRENGTH="${V11_PROJECTION_ACTION_STRENGTH:-1.0}"
+V11_PROJECTION_ACTION_DEADBAND="${V11_PROJECTION_ACTION_DEADBAND:-0.0}"
+ONLINE_SCALE_STATE_MODE="${ONLINE_SCALE_STATE_MODE:-none}"
+ONLINE_SCALE_STATE_MIN="${ONLINE_SCALE_STATE_MIN:-0.80}"
+ONLINE_SCALE_STATE_MAX="${ONLINE_SCALE_STATE_MAX:-1.25}"
+PROBE_CACHE_DIR="${PROBE_CACHE_DIR:-}"
+PROBE_CACHE_MODE="${PROBE_CACHE_MODE:-off}"
+PROBE_CACHE_PAYLOAD="${PROBE_CACHE_PAYLOAD:-read_path_min}"
+PROBE_CACHE_REQUIRE_HIT="${PROBE_CACHE_REQUIRE_HIT:-0}"
+EMPTY_CUDA_CACHE_EACH_CHUNK="${EMPTY_CUDA_CACHE_EACH_CHUNK:-1}"
 
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"
@@ -176,17 +265,32 @@ echo "[$(date '+%F %T')] START $RUN_NAME gpu=$GPU seq=$SEQ mode=$MODE cue=$CUE b
 
 COMMON_ARGS=(
   --input "$DATA"
-  --checkpoint "$ROOT/ckpts/LoGeR/latest.pt"
-  --config "$ROOT/ckpts/LoGeR/original_config.yaml"
+  --checkpoint "$CHECKPOINT"
+  --config "$CONFIG"
   --geometry_edge_rtol 0.0
   --chunk_size 32 --chunk_overlap 3
   --window_size 32 --overlap_size 3
   --reset_every "$RESET_EVERY"
   --ttt_freeze_chunks "$TTT_FREEZE_CHUNKS"
   --ttt_semantic_write_scale_chunks "$TTT_SEMANTIC_WRITE_SCALE_CHUNKS"
+  --start_frame "$START_FRAME"
   --end_frame "$END_FRAME"
+  --output_video "$OUTPUT_VIDEO"
   --output_txt "$OUT/$SEQ.txt"
   --hybrid_debug_jsonl "$OUT/hmc_state_hash.jsonl"
+  --v11_projection_trace_dir "$V11_PROJECTION_TRACE_DIR"
+  --v11_projection_gt_path "$V11_PROJECTION_GT_PATH"
+  --v11_projection_action_mode "$V11_PROJECTION_ACTION_MODE"
+  --v11_projection_action_chunks "$V11_PROJECTION_ACTION_CHUNKS"
+  --v11_projection_action_strength "$V11_PROJECTION_ACTION_STRENGTH"
+  --v11_projection_action_deadband "$V11_PROJECTION_ACTION_DEADBAND"
+  --online_scale_state_mode "$ONLINE_SCALE_STATE_MODE"
+  --online_scale_state_min "$ONLINE_SCALE_STATE_MIN"
+  --online_scale_state_max "$ONLINE_SCALE_STATE_MAX"
+  --probe_cache_mode "$PROBE_CACHE_MODE"
+  --probe_cache_payload "$PROBE_CACHE_PAYLOAD"
+  --probe_cache_require_hit "$PROBE_CACHE_REQUIRE_HIT"
+  --empty_cuda_cache_each_chunk "$EMPTY_CUDA_CACHE_EACH_CHUNK"
 )
 
 if [ -n "$OUTPUT_PT" ]; then
@@ -194,6 +298,45 @@ if [ -n "$OUTPUT_PT" ]; then
 fi
 if [ -n "$PER_CHUNK_GEOMETRY_DIR" ]; then
   COMMON_ARGS+=(--per_chunk_geometry_dir "$PER_CHUNK_GEOMETRY_DIR")
+fi
+
+if [ -n "$PROBE_CACHE_DIR" ]; then
+  COMMON_ARGS+=(--probe_cache_dir "$PROBE_CACHE_DIR")
+fi
+
+if [ -n "$GLOBAL_CHUNK_OFFSET" ]; then
+  COMMON_ARGS+=(--global_chunk_offset "$GLOBAL_CHUNK_OFFSET")
+fi
+
+if [ -n "$SAVE_HMC_STATES" ]; then
+  COMMON_ARGS+=(--save_hmc_states "$SAVE_HMC_STATES")
+fi
+if [ -n "$SAVE_HMC_STATE_CHUNKS" ]; then
+  COMMON_ARGS+=(--save_hmc_state_chunks "$SAVE_HMC_STATE_CHUNKS")
+fi
+if [ -n "$SAVE_HMC_STATE_KINDS" ]; then
+  COMMON_ARGS+=(--save_hmc_state_kinds "$SAVE_HMC_STATE_KINDS")
+fi
+if [ -n "$LOAD_HMC_STATE_AT_CHUNK" ]; then
+  COMMON_ARGS+=(--load_hmc_state_at_chunk "$LOAD_HMC_STATE_AT_CHUNK")
+fi
+if [ -n "$LOAD_HMC_STATE_AT_CHUNK_INDEX" ]; then
+  COMMON_ARGS+=(--load_hmc_state_at_chunk_index "$LOAD_HMC_STATE_AT_CHUNK_INDEX")
+fi
+if [ -n "$SAVE_MERGE_STATES" ]; then
+  COMMON_ARGS+=(--save_merge_states "$SAVE_MERGE_STATES")
+fi
+if [ -n "$SAVE_MERGE_STATE_CHUNKS" ]; then
+  COMMON_ARGS+=(--save_merge_state_chunks "$SAVE_MERGE_STATE_CHUNKS")
+fi
+if [ -n "$SAVE_MERGE_STATE_KINDS" ]; then
+  COMMON_ARGS+=(--save_merge_state_kinds "$SAVE_MERGE_STATE_KINDS")
+fi
+if [ -n "$LOAD_MERGE_STATE_AT_CHUNK" ]; then
+  COMMON_ARGS+=(--load_merge_state_at_chunk "$LOAD_MERGE_STATE_AT_CHUNK")
+fi
+if [ -n "$LOAD_MERGE_STATE_AT_CHUNK_INDEX" ]; then
+  COMMON_ARGS+=(--load_merge_state_at_chunk_index "$LOAD_MERGE_STATE_AT_CHUNK_INDEX")
 fi
 
 STAGE_B_ARGS=(
@@ -230,15 +373,40 @@ STAGE_B_ARGS=(
   --prior_layer_branch_policy "$PRIOR_LAYER_BRANCH_POLICY"
   --read_path "$READ_PATH"
   --read_cue_source "$CUE"
+  --v32_semantic_cue_active_chunks "${V32_SEMANTIC_CUE_ACTIVE_CHUNKS:-}"
+  --v32_semantic_cue_trigger_mode "${V32_SEMANTIC_CUE_TRIGGER_MODE:-off}"
+  --v32_semantic_cue_trigger_high_threshold "${V32_SEMANTIC_CUE_TRIGGER_HIGH_THRESHOLD:-0.80}"
+  --v32_semantic_cue_trigger_k "${V32_SEMANTIC_CUE_TRIGGER_K:-1.5}"
+  --v32_semantic_cue_trigger_min_mass "${V32_SEMANTIC_CUE_TRIGGER_MIN_MASS:-0.05}"
+  --v32_semantic_cue_trigger_warmup "${V32_SEMANTIC_CUE_TRIGGER_WARMUP:-3}"
+  --v32_semantic_cue_trigger_ema_alpha "${V32_SEMANTIC_CUE_TRIGGER_EMA_ALPHA:-0.25}"
   --frame_bias_mode "$FRAME_BIAS"
   --beta_swa "$BETA_SWA"
   --swa_gate_min "$SWA_GATE_MIN"
   --read_layer_mode "$READ_LAYER_MODE"
+  --read_beta_frame_chunks "$READ_BETA_FRAME_CHUNKS"
   --read_topk_frac "$READ_TOPK_FRAC"
   --read_calib_mode "$READ_CALIB_MODE"
   --read_target_mass "$READ_TARGET_MASS"
   --read_calib_tau "$READ_CALIB_TAU"
   --read_blend_lambda "$READ_BLEND_LAMBDA"
+  --read_quality_mass_min "$READ_QUALITY_MASS_MIN"
+  --read_quality_mass_max "$READ_QUALITY_MASS_MAX"
+  --read_quality_anchor_max "$READ_QUALITY_ANCHOR_MAX"
+  --read_quality_frag_max "$READ_QUALITY_FRAG_MAX"
+  --gram_layer_groups "$GRAM_LAYER_GROUPS"
+  --beta_policy "$BETA_POLICY"
+  --beta_energy_target "$BETA_ENERGY_TARGET"
+  --beta_min "$BETA_MIN"
+  --beta_max "$BETA_MAX"
+  --semantic_anchor_mode "$SEMANTIC_ANCHOR_MODE"
+  --semantic_anchor_target_ratio "$SEMANTIC_ANCHOR_TARGET_RATIO"
+  --semantic_anchor_min_ratio "$SEMANTIC_ANCHOR_MIN_RATIO"
+  --semantic_anchor_max_ratio "$SEMANTIC_ANCHOR_MAX_RATIO"
+  --semantic_anchor_min_score "$SEMANTIC_ANCHOR_MIN_SCORE"
+  --semantic_anchor_grid_rows "$SEMANTIC_ANCHOR_GRID_ROWS"
+  --semantic_anchor_grid_cols "$SEMANTIC_ANCHOR_GRID_COLS"
+  --enable_semantic_anchor_ttt_floor "$ENABLE_SEMANTIC_ANCHOR_TTT_FLOOR"
   --beta_frame "$BETA"
   --prior_debug_jsonl "$OUT/prior_debug.jsonl"
 )
@@ -258,6 +426,44 @@ if [ "$FAST_CUE_EVAL" = "1" ]; then
   STAGE_B_ARGS+=(--fast_cue_eval 1)
 fi
 
+CONTEXT_SOURCE_SKIP_ARGS=(
+  --enable_context_source_skip "$ENABLE_CONTEXT_SOURCE_SKIP"
+  --context_source_skip_impl "$CONTEXT_SOURCE_SKIP_IMPL"
+  --context_source_skip_scope "$CONTEXT_SOURCE_SKIP_SCOPE"
+  --context_source_skip_mode "$CONTEXT_SOURCE_SKIP_MODE"
+  --context_source_skip_mask "$CONTEXT_SOURCE_SKIP_MASK"
+  --context_source_skip_layer_mode "$CONTEXT_SOURCE_SKIP_LAYER_MODE"
+  --context_source_skip_soft_rho "$CONTEXT_SOURCE_SKIP_SOFT_RHO"
+  --context_source_skip_soft_min_keep "$CONTEXT_SOURCE_SKIP_SOFT_MIN_KEEP"
+  --context_source_skip_record_attention_mass "$CONTEXT_SOURCE_SKIP_RECORD_ATTENTION_MASS"
+  --context_source_skip_attention_mass_max_queries "$CONTEXT_SOURCE_SKIP_ATTENTION_MASS_MAX_QUERIES"
+)
+if [ -n "$CONTEXT_SOURCE_SKIP_SINGLE_LAYER" ]; then
+  CONTEXT_SOURCE_SKIP_ARGS+=(--context_source_skip_single_layer "$CONTEXT_SOURCE_SKIP_SINGLE_LAYER")
+fi
+SEMANTIC_ROLE_ARGS=(
+  --semantic_role_policy "$SEMANTIC_ROLE_POLICY"
+  --semantic_memory_paths "$SEMANTIC_MEMORY_PATHS"
+  --semantic_action_active_chunks "$SEMANTIC_ACTION_ACTIVE_CHUNKS"
+  --semantic_action_inactive_read_cue_source "$SEMANTIC_ACTION_INACTIVE_READ_CUE_SOURCE"
+  --semantic_role_highd_quantile "$SEMANTIC_ROLE_HIGHD_QUANTILE"
+  --semantic_role_low_trust "$SEMANTIC_ROLE_LOW_TRUST"
+  --semantic_role_positive_scale "$SEMANTIC_ROLE_POSITIVE_SCALE"
+  --semantic_role_neutral_scale "$SEMANTIC_ROLE_NEUTRAL_SCALE"
+  --semantic_role_negative_scale "$SEMANTIC_ROLE_NEGATIVE_SCALE"
+  --semantic_role_swa_negative_scale "$SEMANTIC_ROLE_SWA_NEGATIVE_SCALE"
+  --v29c_masklet_alignment_csv "$V29C_MASKLET_ALIGNMENT_CSV"
+  --v29c_masklet_intervention_policy "$V29C_MASKLET_INTERVENTION_POLICY"
+  --v29c_masklet_intervention_chunk "$V29C_MASKLET_INTERVENTION_CHUNK"
+  --v29c_masklet_intervention_id "$V29C_MASKLET_INTERVENTION_ID"
+  --v29c_masklet_intervention_path "$V29C_MASKLET_INTERVENTION_PATH"
+  --v29c_masklet_intervention_action "$V29C_MASKLET_INTERVENTION_ACTION"
+  --v29c_masklet_intervention_patch_threshold "$V29C_MASKLET_INTERVENTION_PATCH_THRESHOLD"
+  --v36_synthetic_mask "$V36_SYNTHETIC_MASK"
+  --v36_synthetic_path "$V36_SYNTHETIC_PATH"
+  --v36_synthetic_action "$V36_SYNTHETIC_ACTION"
+)
+
 case "$MODE" in
   native|identity_hooks)
     RUN_ARGS=(
@@ -270,7 +476,29 @@ case "$MODE" in
     RUN_ARGS=(
       "${COMMON_ARGS[@]}"
       "${STAGE_B_ARGS[@]}"
+      "${CONTEXT_SOURCE_SKIP_ARGS[@]}"
+      "${SEMANTIC_ROLE_ARGS[@]}"
       --hybrid_memory_mode read_path_only
+      --hmc_commit_mode probe_native
+    )
+    ;;
+  probe_only)
+    RUN_ARGS=(
+      "${COMMON_ARGS[@]}"
+      "${STAGE_B_ARGS[@]}"
+      "${CONTEXT_SOURCE_SKIP_ARGS[@]}"
+      "${SEMANTIC_ROLE_ARGS[@]}"
+      --hybrid_memory_mode probe_only
+      --hmc_commit_mode probe_native
+    )
+    ;;
+  controlled_probe_only)
+    RUN_ARGS=(
+      "${COMMON_ARGS[@]}"
+      "${STAGE_B_ARGS[@]}"
+      "${CONTEXT_SOURCE_SKIP_ARGS[@]}"
+      "${SEMANTIC_ROLE_ARGS[@]}"
+      --hybrid_memory_mode controlled_probe_only
       --hmc_commit_mode probe_native
     )
     ;;
@@ -279,13 +507,14 @@ case "$MODE" in
       "${COMMON_ARGS[@]}"
       "${STAGE_B_ARGS[@]}"
       --hybrid_memory_mode hybrid
-      --hmc_commit_mode probe_ttt_write
+      --hmc_commit_mode "${HMC_COMMIT_MODE:-probe_ttt_write}"
       --hmc_write_score_source "$WRITE_SCORE"
       --hmc_write_sparse_ratio "$WRITE_SPARSE_RATIO"
       --hmc_write_sparse_mode "$WRITE_SPARSE_MODE"
       --ttt_write_delta_scale "$TTT_WRITE_DELTA_SCALE"
       --ttt_write_delta_scales "$TTT_WRITE_DELTA_SCALES"
       --ttt_write_native_mix_scales "$TTT_WRITE_NATIVE_MIX_SCALES"
+      --ttt_write_native_mix_chunks "$TTT_WRITE_NATIVE_MIX_CHUNKS"
       --ttt_write_prior_transform_mode "$TTT_WRITE_PRIOR_TRANSFORM_MODE"
       --ttt_write_prior_anti_scale "$TTT_WRITE_PRIOR_ANTI_SCALE"
       --ttt_write_prior_gamma "$TTT_WRITE_PRIOR_GAMMA"
@@ -305,10 +534,12 @@ case "$MODE" in
       --ttt_write_tri_replay_positive_frac "$TTT_WRITE_TRI_REPLAY_POSITIVE_FRAC"
       --ttt_write_tri_replay_negative_frac "$TTT_WRITE_TRI_REPLAY_NEGATIVE_FRAC"
       --ttt_write_tri_replay_neutral_lambda "$TTT_WRITE_TRI_REPLAY_NEUTRAL_LAMBDA"
+      --ttt_write_tri_replay_role_mode "$TTT_WRITE_TRI_REPLAY_ROLE_MODE"
       --ttt_write_tri_replay_chunk_params "$TTT_WRITE_TRI_REPLAY_CHUNK_PARAMS"
       --ttt_write_gradient_reversal_transient_mode "$TTT_WRITE_GRADIENT_REVERSAL_TRANSIENT_MODE"
       --ttt_write_gradient_reversal_transient_branch_mask "$TTT_WRITE_GRADIENT_REVERSAL_TRANSIENT_BRANCH_MASK"
       --ttt_write_gradient_reversal_transient_long_scale "$TTT_WRITE_GRADIENT_REVERSAL_TRANSIENT_LONG_SCALE"
+      --ttt_write_gradient_reversal_transient_apply_scale "$TTT_WRITE_GRADIENT_REVERSAL_TRANSIENT_APPLY_SCALE"
       --ttt_write_replay_feature_gate_mode "$TTT_WRITE_REPLAY_FEATURE_GATE_MODE"
       --ttt_write_replay_feature_gate_rho "$TTT_WRITE_REPLAY_FEATURE_GATE_RHO"
       --ttt_write_replay_feature_gate_min "$TTT_WRITE_REPLAY_FEATURE_GATE_MIN"
@@ -325,6 +556,7 @@ case "$MODE" in
       --ttt_write_transient_delta_ttl "$TTT_WRITE_TRANSIENT_DELTA_TTL"
       --ttt_write_commit_ema_alpha "$TTT_WRITE_COMMIT_EMA_ALPHA"
       --ttt_write_commit_ema_branch_mask "$TTT_WRITE_COMMIT_EMA_BRANCH_MASK"
+      --ttt_write_commit_ema_chunks "$TTT_WRITE_COMMIT_EMA_CHUNKS"
       --ttt_write_native_delta_gate_mode "$TTT_WRITE_NATIVE_DELTA_GATE_MODE"
       --ttt_write_native_delta_gate_min_cos "$TTT_WRITE_NATIVE_DELTA_GATE_MIN_COS"
       --ttt_write_native_delta_gate_fallback "$TTT_WRITE_NATIVE_DELTA_GATE_FALLBACK"
@@ -340,6 +572,13 @@ case "$MODE" in
       --ttt_write_commit_filter_max "$TTT_WRITE_COMMIT_FILTER_MAX"
       --ttt_write_commit_filter_branch_mask "$TTT_WRITE_COMMIT_FILTER_BRANCH_MASK"
       --ttt_write_commit_filter_chunks "$TTT_WRITE_COMMIT_FILTER_CHUNKS"
+      --ttt_write_scale_state_mode "$TTT_WRITE_SCALE_STATE_MODE"
+      --ttt_write_scale_state_proxy "$TTT_WRITE_SCALE_STATE_PROXY"
+      --ttt_write_scale_state_carrier "$TTT_WRITE_SCALE_STATE_CARRIER"
+      --ttt_write_scale_state_alpha "$TTT_WRITE_SCALE_STATE_ALPHA"
+      --ttt_write_scale_state_branch_mask "$TTT_WRITE_SCALE_STATE_BRANCH_MASK"
+      --ttt_write_scale_state_chunks "$TTT_WRITE_SCALE_STATE_CHUNKS"
+      --ttt_write_scale_state_sample_tokens "$TTT_WRITE_SCALE_STATE_SAMPLE_TOKENS"
       --enable_swa_write_control "$ENABLE_SWA_WRITE_CONTROL"
       --swa_write_mode "$SWA_WRITE_MODE"
       --swa_write_rho "$SWA_WRITE_RHO"
@@ -368,6 +607,8 @@ case "$MODE" in
       --swa_overlap_source_replace_mode "$SWA_OVERLAP_SOURCE_REPLACE_MODE"
       --swa_overlap_source_replace_target "$SWA_OVERLAP_SOURCE_REPLACE_TARGET"
       --swa_overlap_source_replace_layer_mode "$SWA_OVERLAP_SOURCE_REPLACE_LAYER_MODE"
+      "${CONTEXT_SOURCE_SKIP_ARGS[@]}"
+      "${SEMANTIC_ROLE_ARGS[@]}"
       --ttt_write_token_scope "$TTT_WRITE_TOKEN_SCOPE"
       --ttt_write_token_scope_floor "$TTT_WRITE_TOKEN_SCOPE_FLOOR"
   )
@@ -391,11 +632,46 @@ case "$MODE" in
     ;;
 esac
 
-if PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES="$GPU" "$PY" "$ROOT/run_pipeline_abc_v2.py" "${RUN_ARGS[@]}" > "$OUT/01.log" 2>&1; then
+WALL_START_EPOCH="$(date +%s)"
+WALL_START_ISO="$(date -Is)"
+if PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}" PYTHONFAULTHANDLER="${PYTHONFAULTHANDLER:-1}" PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True CUDA_VISIBLE_DEVICES="$GPU" "$PY" "$ROOT/run_pipeline_abc_v2.py" "${RUN_ARGS[@]}" > "$OUT/01.log" 2>&1; then
   (cd "$ROOT/eval/long_eval_script" && ./kitti_benchmark "$POSES" "$OUT" --plot) > "$OUT/kitti_benchmark.log" 2>&1
+  WALL_END_EPOCH="$(date +%s)"
+  WALL_END_ISO="$(date -Is)"
+  WALL_SECONDS=$((WALL_END_EPOCH - WALL_START_EPOCH))
+  cat > "$OUT/wall_time_summary.json" <<EOF
+{
+  "run_name": "$RUN_NAME",
+  "start_time": "$WALL_START_ISO",
+  "end_time": "$WALL_END_ISO",
+  "wall_seconds": $WALL_SECONDS,
+  "gpu": "$GPU",
+  "probe_cache_mode": "$PROBE_CACHE_MODE",
+  "probe_cache_payload": "$PROBE_CACHE_PAYLOAD",
+  "probe_cache_dir": "$PROBE_CACHE_DIR",
+  "empty_cuda_cache_each_chunk": "$EMPTY_CUDA_CACHE_EACH_CHUNK"
+}
+EOF
   echo "[$(date '+%F %T')] DONE $RUN_NAME" | tee -a "$OUT/run_status.txt"
 else
   rc=$?
+  WALL_END_EPOCH="$(date +%s)"
+  WALL_END_ISO="$(date -Is)"
+  WALL_SECONDS=$((WALL_END_EPOCH - WALL_START_EPOCH))
+  cat > "$OUT/wall_time_summary.json" <<EOF
+{
+  "run_name": "$RUN_NAME",
+  "start_time": "$WALL_START_ISO",
+  "end_time": "$WALL_END_ISO",
+  "wall_seconds": $WALL_SECONDS,
+  "gpu": "$GPU",
+  "probe_cache_mode": "$PROBE_CACHE_MODE",
+  "probe_cache_payload": "$PROBE_CACHE_PAYLOAD",
+  "probe_cache_dir": "$PROBE_CACHE_DIR",
+  "empty_cuda_cache_each_chunk": "$EMPTY_CUDA_CACHE_EACH_CHUNK",
+  "return_code": $rc
+}
+EOF
   echo "[$(date '+%F %T')] FAIL $RUN_NAME rc=$rc" | tee -a "$OUT/run_status.txt"
   exit "$rc"
 fi

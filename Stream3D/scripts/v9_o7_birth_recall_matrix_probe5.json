@@ -1,0 +1,114 @@
+[
+  {
+    "method": "P0 Stream3D on S0",
+    "prediction_config": "scannet",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_p0_on_s0_scannet_probe5",
+    "eval_policy": "stream3d_self_probe5",
+    "split": "probe5"
+  },
+  {
+    "method": "B1 own S2",
+    "prediction_config": "stream4d_v8_b1_surfacelet_singlemask_probe5",
+    "pre_points_config": "stream4d_v8_b1_surfacelet_singlemask_probe5",
+    "output_config": "stream4d_v8_b1_surfacelet_singlemask_probe5",
+    "eval_policy": "own_recompute_paper_style",
+    "split": "probe5"
+  },
+  {
+    "method": "O7 birth recall min8 own",
+    "prediction_config": "stream4d_v9_o7_b1_recall_mc08_probe5",
+    "pre_points_config": "stream4d_v9_o7_b1_recall_mc08_probe5",
+    "output_config": "stream4d_v9_o7_b1_recall_mc08_probe5",
+    "eval_policy": "own_recompute_birth_recall_mc08",
+    "split": "probe5"
+  },
+  {
+    "method": "P0 Stream3D on O7 min8",
+    "prediction_config": "scannet",
+    "pre_points_config": "stream4d_v9_o7_b1_recall_mc08_probe5",
+    "output_config": "stream4d_v9_p0_on_o7_b1_recall_mc08_probe5",
+    "eval_policy": "stream3d_on_birth_recall_mc08_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O7 min8 on S0",
+    "prediction_config": "stream4d_v9_o7_b1_recall_mc08_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o7_b1_recall_mc08_on_s0_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O7 min8 on S1",
+    "prediction_config": "stream4d_v9_o7_b1_recall_mc08_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_o7_b1_recall_mc08_on_s1_probe5",
+    "eval_policy": "method_on_32f_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O7 birth recall min4 own",
+    "prediction_config": "stream4d_v9_o7_b1_recall_mc04_probe5",
+    "pre_points_config": "stream4d_v9_o7_b1_recall_mc04_probe5",
+    "output_config": "stream4d_v9_o7_b1_recall_mc04_probe5",
+    "eval_policy": "own_recompute_birth_recall_mc04",
+    "split": "probe5"
+  },
+  {
+    "method": "P0 Stream3D on O7 min4",
+    "prediction_config": "scannet",
+    "pre_points_config": "stream4d_v9_o7_b1_recall_mc04_probe5",
+    "output_config": "stream4d_v9_p0_on_o7_b1_recall_mc04_probe5",
+    "eval_policy": "stream3d_on_birth_recall_mc04_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O7 min4 on S0",
+    "prediction_config": "stream4d_v9_o7_b1_recall_mc04_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o7_b1_recall_mc04_on_s0_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O7 min4 on S1",
+    "prediction_config": "stream4d_v9_o7_b1_recall_mc04_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_o7_b1_recall_mc04_on_s1_probe5",
+    "eval_policy": "method_on_32f_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O7 birth recall min2 own",
+    "prediction_config": "stream4d_v9_o7_b1_recall_mc02_probe5",
+    "pre_points_config": "stream4d_v9_o7_b1_recall_mc02_probe5",
+    "output_config": "stream4d_v9_o7_b1_recall_mc02_probe5",
+    "eval_policy": "own_recompute_birth_recall_mc02",
+    "split": "probe5"
+  },
+  {
+    "method": "P0 Stream3D on O7 min2",
+    "prediction_config": "scannet",
+    "pre_points_config": "stream4d_v9_o7_b1_recall_mc02_probe5",
+    "output_config": "stream4d_v9_p0_on_o7_b1_recall_mc02_probe5",
+    "eval_policy": "stream3d_on_birth_recall_mc02_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O7 min2 on S0",
+    "prediction_config": "stream4d_v9_o7_b1_recall_mc02_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o7_b1_recall_mc02_on_s0_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O7 min2 on S1",
+    "prediction_config": "stream4d_v9_o7_b1_recall_mc02_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_o7_b1_recall_mc02_on_s1_probe5",
+    "eval_policy": "method_on_32f_support",
+    "split": "probe5"
+  }
+]

@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$#" -lt 3 ]; then
+  echo "Usage: $0 GPU RUN_NAME CANDIDATE_ID" >&2
+  echo "CANDIDATE_ID: F0_C9_REFERENCE | F1_R1_HIGH_INFLUENCE_READ | F2_R2_SKY_APP_READ | F3_R3_STATIC_RESCUE_READ | F4_R3_EPISODE_FOLLOW_READ | F5_H9_R1_DIAG" >&2
+  exit 2
+fi
+
+GPU="$1"
+RUN_NAME="$2"
+CANDIDATE_ID="$3"
+
+ROOT="${LOGER_ROOT:-/mnt/data/users/chengshun.wang/pjs/LoGeR}"
+BASE="$ROOT/results/kitti01_hmc_v2/acl2_v42_c9_healthgated_read_semantic_target30/phase3_full_online/rollouts"
+OUT="$BASE/$RUN_NAME"
+C9_CUE="acl2.gg.qq.low.g2_3.past_only.headmean.robustq"
+ACTIVE_CHUNKS="${SEMANTIC_ACTION_ACTIVE_CHUNKS:-}"
+
+if [ -f "$OUT/run_status.txt" ] && grep -q "DONE $RUN_NAME" "$OUT/run_status.txt" && [ -s "$OUT/01.txt" ]; then
+  echo "[$(date '+%F %T')] SKIP existing DONE $RUN_NAME"
+  exit 0
+fi
+
+require_active_chunks() {
+  if [ -z "$ACTIVE_CHUNKS" ]; then
+    echo "SEMANTIC_ACTION_ACTIVE_CHUNKS must be set for $CANDIDATE_ID" >&2
+    exit 2
+  fi
+}
+
+MODE="hybrid"
+CUE="$C9_CUE"
+BETA="4.75"
+WRITE_SCORE="stage_d_x_dg_inv_sqrt"
+
+export ATTN_CUE_BASE="$BASE"
+export START_FRAME="${START_FRAME:-0}"
+export END_FRAME="${END_FRAME:-10000}"
+export RESET_EVERY="${RESET_EVERY:-5}"
+export FAST_CUE_EVAL="${FAST_CUE_EVAL:-1}"
+export READ_PATH="${READ_PATH:-frame}"
+export READ_LAYER_MODE="${READ_LAYER_MODE:-all}"
+export READ_BETA_FRAME_CHUNKS="${READ_BETA_FRAME_CHUNKS:-5:4.85,6:4.85,7:4.85,8:4.85,9:4.85,10:4.25,11:4.25,12:4.25,16:4.25}"
+export WRITE_ALPHA="${WRITE_ALPHA:-0.1}"
+export WRITE_MIN="${WRITE_MIN:-0.8}"
+export WRITE_MAX="${WRITE_MAX:-1.2}"
+export MP_SCORE_SOURCE="${MP_SCORE_SOURCE:-dyn}"
+export HMC_COMMIT_MODE="${HMC_COMMIT_MODE:-probe_ttt_write}"
+export ENABLE_SWA_WRITE_CONTROL="${ENABLE_SWA_WRITE_CONTROL:-1}"
+export SWA_WRITE_MODE="${SWA_WRITE_MODE:-none}"
+export SWA_WRITE_LAYER_MODE="${SWA_WRITE_LAYER_MODE:-last}"
+export SWA_WRITE_KEEP_SCOPE="${SWA_WRITE_KEEP_SCOPE:-both_overlap}"
+export ENABLE_SWA_OVERLAP_SOURCE_REPLACE="${ENABLE_SWA_OVERLAP_SOURCE_REPLACE:-1}"
+export SWA_OVERLAP_SOURCE_REPLACE_ALPHA="${SWA_OVERLAP_SOURCE_REPLACE_ALPHA:-0.5}"
+export SWA_OVERLAP_SOURCE_REPLACE_MODE="${SWA_OVERLAP_SOURCE_REPLACE_MODE:-source}"
+export SWA_OVERLAP_SOURCE_REPLACE_TARGET="${SWA_OVERLAP_SOURCE_REPLACE_TARGET:-kv}"
+export SWA_OVERLAP_SOURCE_REPLACE_LAYER_MODE="${SWA_OVERLAP_SOURCE_REPLACE_LAYER_MODE:-last}"
+export TTT_WRITE_GRADIENT_REVERSAL_MODE="${TTT_WRITE_GRADIENT_REVERSAL_MODE:-tri_replay}"
+export TTT_WRITE_GRADIENT_REVERSAL_CHUNK_GAMMAS="${TTT_WRITE_GRADIENT_REVERSAL_CHUNK_GAMMAS:-5:0.005,6:0.005,7:0.005,8:0.005,9:0.005,10:0.003,11:0.003,12:0.003,16:0.0003}"
+export TTT_WRITE_GRADIENT_REVERSAL_RISK_SOURCE="${TTT_WRITE_GRADIENT_REVERSAL_RISK_SOURCE:-update_conflict_energy}"
+export TTT_WRITE_TRI_REPLAY_POSITIVE_FRAC="${TTT_WRITE_TRI_REPLAY_POSITIVE_FRAC:-0.35}"
+export TTT_WRITE_TRI_REPLAY_NEGATIVE_FRAC="${TTT_WRITE_TRI_REPLAY_NEGATIVE_FRAC:-0.12}"
+export TTT_WRITE_TRI_REPLAY_NEUTRAL_LAMBDA="${TTT_WRITE_TRI_REPLAY_NEUTRAL_LAMBDA:-0.85}"
+export TTT_WRITE_TRI_REPLAY_CHUNK_PARAMS="${TTT_WRITE_TRI_REPLAY_CHUNK_PARAMS:-5:0.35/0.12/0.85,6:0.35/0.12/0.85,7:0.35/0.12/0.85,8:0.35/0.12/0.85,9:0.35/0.12/0.85,10:0.35/0.12/0.85,11:0.35/0.12/0.85,12:0.35/0.12/0.85,16:0.35/0.08/0.85}"
+export TTT_WRITE_COMMIT_EMA_ALPHA="${TTT_WRITE_COMMIT_EMA_ALPHA:-0.5}"
+export TTT_WRITE_COMMIT_EMA_BRANCH_MASK="${TTT_WRITE_COMMIT_EMA_BRANCH_MASK:-0}"
+export TTT_WRITE_COMMIT_EMA_CHUNKS="${TTT_WRITE_COMMIT_EMA_CHUNKS:-5,6}"
+export TTT_WRITE_NATIVE_MIX_SCALES="${TTT_WRITE_NATIVE_MIX_SCALES:-1.10,1.00,1.00}"
+
+# F0 must remain an exact C9 no-op by default. Semantic cache is enabled only
+# inside semantic READ candidates below.
+export STAGE_C_MODE="${STAGE_C_MODE:-none}"
+export STAGE_C_CACHE_DIR="${STAGE_C_CACHE_DIR:-}"
+export STAGE_C_CACHE_MODE="${STAGE_C_CACHE_MODE:-off}"
+export STAGE_C_CACHE_REQUIRE_HIT="${STAGE_C_CACHE_REQUIRE_HIT:-0}"
+export STAGE_C_CACHE_VALIDATE="${STAGE_C_CACHE_VALIDATE:-0}"
+export SEMANTIC_PRIOR_MODE="${SEMANTIC_PRIOR_MODE:-spg_v2}"
+export HMC_IGNORE_SEMANTIC_PRIOR="${HMC_IGNORE_SEMANTIC_PRIOR:-0}"
+
+export ENABLE_CONTEXT_SOURCE_SKIP=0
+export CONTEXT_SOURCE_SKIP_IMPL="bias"
+export CONTEXT_SOURCE_SKIP_SCOPE="frame"
+export CONTEXT_SOURCE_SKIP_MODE="hard"
+export CONTEXT_SOURCE_SKIP_MASK="semantic_role_negative"
+export CONTEXT_SOURCE_SKIP_LAYER_MODE="early"
+export CONTEXT_SOURCE_SKIP_RECORD_ATTENTION_MASS="${CONTEXT_SOURCE_SKIP_RECORD_ATTENTION_MASS:-1}"
+export CONTEXT_SOURCE_SKIP_ATTENTION_MASS_MAX_QUERIES="${CONTEXT_SOURCE_SKIP_ATTENTION_MASS_MAX_QUERIES:-128}"
+export SEMANTIC_ROLE_POLICY="none"
+export SEMANTIC_MEMORY_PATHS=""
+export SEMANTIC_ACTION_ACTIVE_CHUNKS=""
+export SEMANTIC_ACTION_INACTIVE_READ_CUE_SOURCE=""
+export READ_CALIB_MODE="${READ_CALIB_MODE:-none}"
+export READ_TARGET_MASS="${READ_TARGET_MASS:-0.06}"
+export READ_BLEND_LAMBDA="${READ_BLEND_LAMBDA:-0.25}"
+
+case "$CANDIDATE_ID" in
+  F0_C9_REFERENCE)
+    ;;
+  F1_R1_HIGH_INFLUENCE_READ)
+    require_active_chunks
+    CUE="old_dyn_switch_flow_sem_veto"
+    export STAGE_C_MODE="${STAGE_C_MODE_OVERRIDE:-reference}"
+    export STAGE_C_CACHE_DIR="${STAGE_C_CACHE_DIR_OVERRIDE:-$ROOT/results/kitti01_hmc_v2/acl2_v6_stage_c_cache_mask2former_cityscapes_full}"
+    export STAGE_C_CACHE_MODE="${STAGE_C_CACHE_MODE_OVERRIDE:-read}"
+    export STAGE_C_CACHE_REQUIRE_HIT="${STAGE_C_CACHE_REQUIRE_HIT_OVERRIDE:-1}"
+    export READ_CALIB_MODE="${READ_CALIB_MODE_OVERRIDE:-per_frame_quantile}"
+    export READ_TARGET_MASS="${READ_TARGET_MASS_OVERRIDE:-0.06}"
+    export SEMANTIC_ROLE_POLICY="causal_fg_semantic_risk_skip"
+    export SEMANTIC_MEMORY_PATHS="frame,global"
+    export ENABLE_CONTEXT_SOURCE_SKIP=1
+    export CONTEXT_SOURCE_SKIP_IMPL="compact_kv"
+    export CONTEXT_SOURCE_SKIP_SCOPE="both"
+    export CONTEXT_SOURCE_SKIP_MODE="hard"
+    export CONTEXT_SOURCE_SKIP_MASK="semantic_role_negative"
+    export CONTEXT_SOURCE_SKIP_LAYER_MODE="early"
+    export SEMANTIC_ACTION_ACTIVE_CHUNKS="$ACTIVE_CHUNKS"
+    export SEMANTIC_ACTION_INACTIVE_READ_CUE_SOURCE="$C9_CUE"
+    ;;
+  F2_R2_SKY_APP_READ)
+    require_active_chunks
+    CUE="old_dyn_switch_flow_sem_veto"
+    export STAGE_C_MODE="${STAGE_C_MODE_OVERRIDE:-reference}"
+    export STAGE_C_CACHE_DIR="${STAGE_C_CACHE_DIR_OVERRIDE:-$ROOT/results/kitti01_hmc_v2/acl2_v6_stage_c_cache_mask2former_cityscapes_full}"
+    export STAGE_C_CACHE_MODE="${STAGE_C_CACHE_MODE_OVERRIDE:-read}"
+    export STAGE_C_CACHE_REQUIRE_HIT="${STAGE_C_CACHE_REQUIRE_HIT_OVERRIDE:-1}"
+    export READ_CALIB_MODE="${READ_CALIB_MODE_OVERRIDE:-per_frame_quantile}"
+    export READ_TARGET_MASS="${READ_TARGET_MASS_OVERRIDE:-0.05}"
+    export SEMANTIC_ROLE_POLICY="causal_fg_soft_skip"
+    export SEMANTIC_MEMORY_PATHS="frame,global"
+    export ENABLE_CONTEXT_SOURCE_SKIP=1
+    export CONTEXT_SOURCE_SKIP_IMPL="bias"
+    export CONTEXT_SOURCE_SKIP_SCOPE="both"
+    export CONTEXT_SOURCE_SKIP_MODE="soft"
+    export CONTEXT_SOURCE_SKIP_MASK="semantic_role_negative"
+    export CONTEXT_SOURCE_SKIP_LAYER_MODE="early"
+    export CONTEXT_SOURCE_SKIP_SOFT_RHO="${CONTEXT_SOURCE_SKIP_SOFT_RHO:-0.20}"
+    export CONTEXT_SOURCE_SKIP_SOFT_MIN_KEEP="${CONTEXT_SOURCE_SKIP_SOFT_MIN_KEEP:-0.85}"
+    export SEMANTIC_ACTION_ACTIVE_CHUNKS="$ACTIVE_CHUNKS"
+    export SEMANTIC_ACTION_INACTIVE_READ_CUE_SOURCE="$C9_CUE"
+    ;;
+  F3_R3_STATIC_RESCUE_READ|F4_R3_EPISODE_FOLLOW_READ)
+    require_active_chunks
+    CUE="old_dyn_key_static_rescue"
+    export STAGE_C_MODE="${STAGE_C_MODE_OVERRIDE:-reference}"
+    export STAGE_C_CACHE_DIR="${STAGE_C_CACHE_DIR_OVERRIDE:-$ROOT/results/kitti01_hmc_v2/acl2_v6_stage_c_cache_mask2former_cityscapes_full}"
+    export STAGE_C_CACHE_MODE="${STAGE_C_CACHE_MODE_OVERRIDE:-read}"
+    export STAGE_C_CACHE_REQUIRE_HIT="${STAGE_C_CACHE_REQUIRE_HIT_OVERRIDE:-1}"
+    export READ_CALIB_MODE="${READ_CALIB_MODE_OVERRIDE:-per_frame_quantile}"
+    export READ_TARGET_MASS="${READ_TARGET_MASS_OVERRIDE:-0.06}"
+    export SEMANTIC_ROLE_POLICY="causal_fg_semantic_risk_skip"
+    export SEMANTIC_MEMORY_PATHS="frame,global"
+    export ENABLE_CONTEXT_SOURCE_SKIP=1
+    export CONTEXT_SOURCE_SKIP_IMPL="compact_kv"
+    export CONTEXT_SOURCE_SKIP_SCOPE="both"
+    export CONTEXT_SOURCE_SKIP_MODE="hard"
+    export CONTEXT_SOURCE_SKIP_MASK="semantic_role_negative"
+    export CONTEXT_SOURCE_SKIP_LAYER_MODE="early"
+    export SEMANTIC_ACTION_ACTIVE_CHUNKS="$ACTIVE_CHUNKS"
+    export SEMANTIC_ACTION_INACTIVE_READ_CUE_SOURCE="$C9_CUE"
+    ;;
+  F5_H9_R1_DIAG)
+    require_active_chunks
+    CUE="old_dyn_switch_flow_sem_veto"
+    export STAGE_C_MODE="${STAGE_C_MODE_OVERRIDE:-reference}"
+    export STAGE_C_CACHE_DIR="${STAGE_C_CACHE_DIR_OVERRIDE:-$ROOT/results/kitti01_hmc_v2/acl2_v6_stage_c_cache_mask2former_cityscapes_full}"
+    export STAGE_C_CACHE_MODE="${STAGE_C_CACHE_MODE_OVERRIDE:-read}"
+    export STAGE_C_CACHE_REQUIRE_HIT="${STAGE_C_CACHE_REQUIRE_HIT_OVERRIDE:-1}"
+    export WRITE_ALPHA="${H9_WRITE_ALPHA:-0.125}"
+    export READ_CALIB_MODE="${READ_CALIB_MODE_OVERRIDE:-per_frame_quantile}"
+    export READ_TARGET_MASS="${READ_TARGET_MASS_OVERRIDE:-0.06}"
+    export SEMANTIC_ROLE_POLICY="causal_fg_semantic_risk_skip"
+    export SEMANTIC_MEMORY_PATHS="frame,global"
+    export ENABLE_CONTEXT_SOURCE_SKIP=1
+    export CONTEXT_SOURCE_SKIP_IMPL="compact_kv"
+    export CONTEXT_SOURCE_SKIP_SCOPE="both"
+    export CONTEXT_SOURCE_SKIP_MODE="hard"
+    export CONTEXT_SOURCE_SKIP_MASK="semantic_role_negative"
+    export CONTEXT_SOURCE_SKIP_LAYER_MODE="early"
+    export SEMANTIC_ACTION_ACTIVE_CHUNKS="$ACTIVE_CHUNKS"
+    export SEMANTIC_ACTION_INACTIVE_READ_CUE_SOURCE="$C9_CUE"
+    ;;
+  *)
+    echo "Unsupported v42 CANDIDATE_ID: $CANDIDATE_ID" >&2
+    exit 2
+    ;;
+esac
+
+echo "[$(date '+%F %T')] v42 launch gpu=$GPU run=$RUN_NAME candidate=$CANDIDATE_ID active_chunks=${SEMANTIC_ACTION_ACTIVE_CHUNKS:-none} cue=$CUE"
+"$ROOT/tools/run_attention_cue_experiment.sh" "$GPU" "$RUN_NAME" "$MODE" "$CUE" "$BETA" "$WRITE_SCORE"

@@ -32,7 +32,91 @@ from .video_masklet_frontend import (
     SEMANTIC_GROUP_STATIC_THING,
     SEMANTIC_GROUP_STRUCTURE_ANCHOR,
     SEMANTIC_GROUP_UNCERTAIN_REGION,
+    canonicalize_label,
 )
+
+SEMANTIC_ROLE_FALLBACK = 0
+SEMANTIC_ROLE_POSITIVE_LONG = 1
+SEMANTIC_ROLE_NEUTRAL_KEEP = 2
+SEMANTIC_ROLE_NEGATIVE_SHORT = 3
+SEMANTIC_ROLE_PROTECT_NEUTRAL = 4
+
+SEMANTIC_ROLE_NAMES = {
+    SEMANTIC_ROLE_FALLBACK: "FALLBACK",
+    SEMANTIC_ROLE_POSITIVE_LONG: "POSITIVE_LONG",
+    SEMANTIC_ROLE_NEUTRAL_KEEP: "NEUTRAL_KEEP",
+    SEMANTIC_ROLE_NEGATIVE_SHORT: "NEGATIVE_SHORT",
+    SEMANTIC_ROLE_PROTECT_NEUTRAL: "PROTECT_NEUTRAL",
+}
+
+SEMANTIC_FINE_LABEL_UNKNOWN = 0
+SEMANTIC_FINE_LABEL_TO_ID = {
+    "unknown": SEMANTIC_FINE_LABEL_UNKNOWN,
+    "road": 1,
+    "sidewalk": 2,
+    "building": 3,
+    "wall": 4,
+    "fence": 5,
+    "bridge": 6,
+    "railing": 7,
+    "floor": 8,
+    "stair": 9,
+    "sky": 20,
+    "vegetation": 21,
+    "grass": 22,
+    "tree": 23,
+    "plant": 24,
+    "water": 25,
+    "cloud": 26,
+    "person": 40,
+    "people": 40,
+    "rider": 41,
+    "car": 42,
+    "bus": 43,
+    "truck": 44,
+    "bicycle": 45,
+    "motorcycle": 46,
+    "animal": 47,
+}
+SEMANTIC_FINE_ID_TO_LABEL = {
+    int(v): str(k)
+    for k, v in SEMANTIC_FINE_LABEL_TO_ID.items()
+    if int(v) not in {40} or str(k) == "person"
+}
+
+SEMANTIC_FINE_STRUCTURE_IDS = {
+    SEMANTIC_FINE_LABEL_TO_ID[k]
+    for k in ("road", "sidewalk", "building", "wall", "fence", "bridge", "railing", "floor", "stair")
+}
+SEMANTIC_FINE_SKY_IDS = {SEMANTIC_FINE_LABEL_TO_ID["sky"], SEMANTIC_FINE_LABEL_TO_ID["cloud"]}
+SEMANTIC_FINE_VEGETATION_IDS = {
+    SEMANTIC_FINE_LABEL_TO_ID[k]
+    for k in ("vegetation", "grass", "tree", "plant")
+}
+SEMANTIC_FINE_MOVABLE_IDS = {
+    SEMANTIC_FINE_LABEL_TO_ID[k]
+    for k in ("person", "rider", "car", "bus", "truck", "bicycle", "motorcycle", "animal")
+}
+
+
+def semantic_fine_label_id(label: str) -> int:
+    """Return a stable integer id for a Stage-C canonical fine label."""
+
+    try:
+        canonical = canonicalize_label(str(label))
+    except Exception:
+        canonical = str(label).strip().lower()
+    return int(SEMANTIC_FINE_LABEL_TO_ID.get(canonical, SEMANTIC_FINE_LABEL_UNKNOWN))
+
+
+def semantic_fine_label_name(label_id: int) -> str:
+    return SEMANTIC_FINE_ID_TO_LABEL.get(int(label_id), "unknown")
+
+
+def semantic_fine_label_ids_from_masklets(mo: MaskletOutput) -> torch.Tensor:
+    labels = list(getattr(mo, "L_sem", []) or [])
+    ids = [semantic_fine_label_id(labels[j]) if j < len(labels) else SEMANTIC_FINE_LABEL_UNKNOWN for j in range(int(mo.num_masklets))]
+    return torch.tensor(ids, dtype=torch.long)
 
 
 @dataclass
@@ -49,11 +133,262 @@ class PriorOutput:
     E_patch_flat: torch.Tensor
     V_sem_patch_flat: Optional[torch.Tensor] = None
     R_mask_patch_flat: Optional[torch.Tensor] = None
+    G_sem_patch_flat: Optional[torch.Tensor] = None
+    Q_sem_patch_flat: Optional[torch.Tensor] = None
+    L_sem_patch_flat: Optional[torch.Tensor] = None
+    R_sem_patch_flat: Optional[torch.Tensor] = None
+    R_frame_patch_flat: Optional[torch.Tensor] = None
+    R_global_patch_flat: Optional[torch.Tensor] = None
+    R_swa_patch_flat: Optional[torch.Tensor] = None
+    R_ttt_patch_flat: Optional[torch.Tensor] = None
+    G_sem_tok: Optional[torch.Tensor] = None
+    Q_sem_tok: Optional[torch.Tensor] = None
+    L_sem_tok: Optional[torch.Tensor] = None
+    V_sem_tok: Optional[torch.Tensor] = None
+    R_sem_tok: Optional[torch.Tensor] = None
+    R_frame_tok: Optional[torch.Tensor] = None
+    R_global_tok: Optional[torch.Tensor] = None
+    R_swa_tok: Optional[torch.Tensor] = None
+    R_ttt_tok: Optional[torch.Tensor] = None
 
     B_chunk_geo: float = 0.0
     A_special: float = 1.0
 
     debug: Dict[str, Any] = field(default_factory=dict)
+
+
+def project_masklet_semantic_groups(
+    mo: MaskletOutput,
+    geo: GeometryOutput,
+    *,
+    num_frames: int,
+    pixel_resolution: Tuple[int, int],
+    patch_grid: Tuple[int, int],
+) -> Dict[str, torch.Tensor]:
+    """Project exact Stage-C masklet semantic IDs to patch and token layouts.
+
+    This is intentionally discrete: it carries ``MaskletOutput.G_sem`` through
+    as group IDs and ``MaskletOutput.L_sem`` as stable fine label IDs instead
+    of inferring semantic roles from the scalar semantic value prior.
+    """
+
+    T = int(num_frames)
+    H_p, W_p = int(pixel_resolution[0]), int(pixel_resolution[1])
+    H_tok, W_tok = int(patch_grid[0]), int(patch_grid[1])
+    if H_tok <= 0 or W_tok <= 0:
+        raise ValueError(f"Invalid patch grid: {(H_tok, W_tok)}")
+
+    group_patch = torch.full(
+        (T, H_tok, W_tok),
+        int(SEMANTIC_GROUP_UNCERTAIN_REGION),
+        dtype=torch.long,
+    )
+    quality_patch = torch.zeros((T, H_tok, W_tok), dtype=torch.float32)
+    label_patch = torch.full((T, H_tok, W_tok), -1, dtype=torch.long)
+    best_score = torch.zeros((T, H_tok, W_tok), dtype=torch.float32)
+
+    J = int(mo.num_masklets)
+    T_use = min(T, int(mo.num_frames))
+    if J > 0 and T_use > 0:
+        H_mask, W_mask = int(mo.frame_height), int(mo.frame_width)
+        groups = mo.G_sem.detach().cpu().long().reshape(-1)
+        label_ids = semantic_fine_label_ids_from_masklets(mo)
+        trust = (mo.V_mask.detach().cpu().float() * mo.Q_mask.detach().cpu().float()).clamp(0.0, 1.0)
+        for j in range(J):
+            group_id = int(groups[j].item()) if j < int(groups.numel()) else int(SEMANTIC_GROUP_UNCERTAIN_REGION)
+            label_id = int(label_ids[j].item()) if j < int(label_ids.numel()) else int(SEMANTIC_FINE_LABEL_UNKNOWN)
+            for t in range(T_use):
+                if not bool(mo.V_mask[j, t]):
+                    continue
+                mask_t = mo.M_mask[j, t].detach().cpu().float()
+                if not bool(mask_t.bool().any()):
+                    continue
+                if (H_mask, W_mask) != (H_p, W_p):
+                    mask_t = F.interpolate(
+                        mask_t.unsqueeze(0).unsqueeze(0),
+                        size=(H_p, W_p),
+                        mode="bilinear",
+                        align_corners=False,
+                    ).squeeze(0).squeeze(0)
+                mask_patch = F.interpolate(
+                    mask_t.unsqueeze(0).unsqueeze(0),
+                    size=(H_tok, W_tok),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0).squeeze(0).clamp(0.0, 1.0)
+                q = float(trust[j, t].item()) if j < trust.shape[0] and t < trust.shape[1] else 0.0
+                score = mask_patch * q
+                update = score > best_score[t]
+                best_score[t] = torch.where(update, score, best_score[t])
+                group_patch[t] = torch.where(update, torch.full_like(group_patch[t], group_id), group_patch[t])
+                quality_patch[t] = torch.where(update, torch.full_like(quality_patch[t], q), quality_patch[t])
+                label_patch[t] = torch.where(update, torch.full_like(label_patch[t], label_id), label_patch[t])
+
+    G_patch_flat = group_patch.reshape(-1).long()
+    Q_patch_flat = quality_patch.reshape(-1).float().clamp(0.0, 1.0)
+    L_patch_flat = label_patch.reshape(-1).long()
+    R_patch_flat = semantic_roles_from_groups(G_patch_flat, Q_patch_flat)
+    path_roles = semantic_path_role_priors_from_fine_labels(L_patch_flat, G_patch_flat, Q_patch_flat)
+
+    token_type = geo.token_type.detach().cpu().long()
+    L_tok = int(token_type.numel())
+    G_tok = torch.full((L_tok,), int(SEMANTIC_GROUP_UNCERTAIN_REGION), dtype=torch.long)
+    Q_tok = torch.zeros((L_tok,), dtype=torch.float32)
+    L_label_tok = torch.full((L_tok,), -1, dtype=torch.long)
+    R_tok = torch.full((L_tok,), int(SEMANTIC_ROLE_FALLBACK), dtype=torch.long)
+    R_frame_tok = torch.full((L_tok,), int(SEMANTIC_ROLE_FALLBACK), dtype=torch.long)
+    R_global_tok = torch.full((L_tok,), int(SEMANTIC_ROLE_FALLBACK), dtype=torch.long)
+    R_swa_tok = torch.full((L_tok,), int(SEMANTIC_ROLE_FALLBACK), dtype=torch.long)
+    R_ttt_tok = torch.full((L_tok,), int(SEMANTIC_ROLE_FALLBACK), dtype=torch.long)
+    patch_idx = 0
+    for i in range(L_tok):
+        if int(token_type[i].item()) == TOKEN_TYPE_PATCH:
+            if patch_idx < int(G_patch_flat.numel()):
+                G_tok[i] = G_patch_flat[patch_idx]
+                Q_tok[i] = Q_patch_flat[patch_idx]
+                L_label_tok[i] = L_patch_flat[patch_idx]
+                R_tok[i] = R_patch_flat[patch_idx]
+                R_frame_tok[i] = path_roles["R_frame_patch_flat"][patch_idx]
+                R_global_tok[i] = path_roles["R_global_patch_flat"][patch_idx]
+                R_swa_tok[i] = path_roles["R_swa_patch_flat"][patch_idx]
+                R_ttt_tok[i] = path_roles["R_ttt_patch_flat"][patch_idx]
+            patch_idx += 1
+
+    return {
+        "G_sem_patch_flat": G_patch_flat,
+        "Q_sem_patch_flat": Q_patch_flat,
+        "L_sem_patch_flat": L_patch_flat,
+        "R_sem_patch_flat": R_patch_flat,
+        "R_frame_patch_flat": path_roles["R_frame_patch_flat"],
+        "R_global_patch_flat": path_roles["R_global_patch_flat"],
+        "R_swa_patch_flat": path_roles["R_swa_patch_flat"],
+        "R_ttt_patch_flat": path_roles["R_ttt_patch_flat"],
+        "G_sem_tok": G_tok,
+        "Q_sem_tok": Q_tok,
+        "L_sem_tok": L_label_tok,
+        "R_sem_tok": R_tok,
+        "R_frame_tok": R_frame_tok,
+        "R_global_tok": R_global_tok,
+        "R_swa_tok": R_swa_tok,
+        "R_ttt_tok": R_ttt_tok,
+    }
+
+
+def semantic_values_from_groups(groups: torch.Tensor) -> torch.Tensor:
+    """Default coarse semantic value used for role diagnostics.
+
+    Runtime experiments may override the scalar value branch, but the fixed
+    map here keeps v23 role logging auditable even in pass-through smoke runs.
+    """
+
+    G = groups.detach().cpu().long()
+    out = torch.full_like(G, 0.4, dtype=torch.float32)
+    out[G == SEMANTIC_GROUP_STRUCTURE_ANCHOR] = 1.0
+    out[G == SEMANTIC_GROUP_STATIC_THING] = 0.7
+    out[G == SEMANTIC_GROUP_LOW_VALUE_STUFF] = 0.4
+    out[G == SEMANTIC_GROUP_MOVABLE_THING] = 0.1
+    out[G == SEMANTIC_GROUP_UNCERTAIN_REGION] = 0.4
+    return out.clamp(0.0, 1.0)
+
+
+def semantic_roles_from_groups(groups: torch.Tensor, trust: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """Coarse fallback role table before geometry-conditioned refinement.
+
+    HMC refines these roles with dynamic/attention risk.  This helper provides
+    a non-empty, token-aligned role stream for no-op and debug-only v23 audits.
+    """
+
+    G = groups.detach().cpu().long()
+    R = torch.full_like(G, int(SEMANTIC_ROLE_FALLBACK), dtype=torch.long)
+    R[G == SEMANTIC_GROUP_STRUCTURE_ANCHOR] = int(SEMANTIC_ROLE_PROTECT_NEUTRAL)
+    R[G == SEMANTIC_GROUP_STATIC_THING] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+    R[G == SEMANTIC_GROUP_LOW_VALUE_STUFF] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+    R[G == SEMANTIC_GROUP_MOVABLE_THING] = int(SEMANTIC_ROLE_NEGATIVE_SHORT)
+    R[G == SEMANTIC_GROUP_UNCERTAIN_REGION] = int(SEMANTIC_ROLE_FALLBACK)
+    if trust is not None:
+        Q = trust.detach().cpu().float().reshape(-1)
+        if Q.numel() == R.numel():
+            R[Q < 0.05] = int(SEMANTIC_ROLE_FALLBACK)
+    return R
+
+
+def semantic_path_role_priors_from_fine_labels(
+    labels: torch.Tensor,
+    groups: torch.Tensor,
+    trust: Optional[torch.Tensor] = None,
+) -> Dict[str, torch.Tensor]:
+    """Fine-label role priors before HMC adds D/conflict/scale conditions."""
+
+    L = labels.detach().cpu().long().reshape(-1)
+    G = groups.detach().cpu().long().reshape(-1)
+    R_frame = torch.full_like(L, int(SEMANTIC_ROLE_FALLBACK), dtype=torch.long)
+    R_global = torch.full_like(L, int(SEMANTIC_ROLE_FALLBACK), dtype=torch.long)
+    R_swa = torch.full_like(L, int(SEMANTIC_ROLE_FALLBACK), dtype=torch.long)
+    R_ttt = torch.full_like(L, int(SEMANTIC_ROLE_FALLBACK), dtype=torch.long)
+
+    known = L >= 0
+    structure = torch.zeros_like(known, dtype=torch.bool)
+    sky = torch.zeros_like(known, dtype=torch.bool)
+    vegetation = torch.zeros_like(known, dtype=torch.bool)
+    movable = torch.zeros_like(known, dtype=torch.bool)
+    for label_id in SEMANTIC_FINE_STRUCTURE_IDS:
+        structure |= L == int(label_id)
+    for label_id in SEMANTIC_FINE_SKY_IDS:
+        sky |= L == int(label_id)
+    for label_id in SEMANTIC_FINE_VEGETATION_IDS:
+        vegetation |= L == int(label_id)
+    for label_id in SEMANTIC_FINE_MOVABLE_IDS:
+        movable |= L == int(label_id)
+
+    # Coarse fallback keeps legacy behavior auditable for labels not in the
+    # explicit fine taxonomy.
+    coarse_structure = G == int(SEMANTIC_GROUP_STRUCTURE_ANCHOR)
+    coarse_lowstuff = G == int(SEMANTIC_GROUP_LOW_VALUE_STUFF)
+    coarse_movable = G == int(SEMANTIC_GROUP_MOVABLE_THING)
+    structure |= coarse_structure & ~sky & ~vegetation
+    vegetation |= coarse_lowstuff & ~sky
+    movable |= coarse_movable
+
+    R_frame[structure] = int(SEMANTIC_ROLE_PROTECT_NEUTRAL)
+    R_global[structure] = int(SEMANTIC_ROLE_PROTECT_NEUTRAL)
+    R_swa[structure] = int(SEMANTIC_ROLE_PROTECT_NEUTRAL)
+    R_ttt[structure] = int(SEMANTIC_ROLE_POSITIVE_LONG)
+
+    R_frame[sky] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+    R_global[sky] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+    R_swa[sky] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+    R_ttt[sky] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+
+    weak_context = vegetation & ~sky
+    R_frame[weak_context] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+    R_global[weak_context] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+    R_swa[weak_context] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+    R_ttt[weak_context] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+
+    R_frame[movable] = int(SEMANTIC_ROLE_NEGATIVE_SHORT)
+    R_global[movable] = int(SEMANTIC_ROLE_NEGATIVE_SHORT)
+    R_swa[movable] = int(SEMANTIC_ROLE_NEGATIVE_SHORT)
+    R_ttt[movable] = int(SEMANTIC_ROLE_NEGATIVE_SHORT)
+
+    if trust is not None:
+        Q = trust.detach().cpu().float().reshape(-1)
+        if Q.numel() == L.numel():
+            low_trust = Q < 0.05
+            R_frame[low_trust] = int(SEMANTIC_ROLE_FALLBACK)
+            R_global[low_trust] = int(SEMANTIC_ROLE_FALLBACK)
+            R_swa[low_trust] = int(SEMANTIC_ROLE_FALLBACK)
+            R_ttt[low_trust] = int(SEMANTIC_ROLE_FALLBACK)
+    unknown = (~known) | (L == int(SEMANTIC_FINE_LABEL_UNKNOWN))
+    R_frame[unknown] = int(SEMANTIC_ROLE_FALLBACK)
+    R_global[unknown] = int(SEMANTIC_ROLE_FALLBACK)
+    R_swa[unknown] = int(SEMANTIC_ROLE_FALLBACK)
+    R_ttt[unknown] = int(SEMANTIC_ROLE_FALLBACK)
+    return {
+        "R_frame_patch_flat": R_frame,
+        "R_global_patch_flat": R_global,
+        "R_swa_patch_flat": R_swa,
+        "R_ttt_patch_flat": R_ttt,
+    }
 
 
 class SemanticPriorGenerator:
@@ -132,6 +467,22 @@ class SemanticPriorGenerator:
         )
         V_sem_patch_flat = self._pool_to_patch(V_sem_pix, H_tok, W_tok).reshape(-1).float().clamp(0.0, 1.0)
         R_mask_patch_flat = self._pool_to_patch(R_mask_pix, H_tok, W_tok).reshape(-1).float().clamp(0.0, 1.0)
+        group_projection = project_masklet_semantic_groups(
+            masklet,
+            geo,
+            num_frames=T,
+            pixel_resolution=(H_p, W_p),
+            patch_grid=(H_tok, W_tok),
+        )
+        V_sem_tok = torch.full((int(geo.token_type.numel()),), 1.0, dtype=torch.float32)
+        token_type = geo.token_type.detach().cpu().long()
+        patch_mask = token_type == TOKEN_TYPE_PATCH
+        n_patch = int(patch_mask.sum().item())
+        if n_patch > 0:
+            vals = V_sem_patch_flat.detach().cpu().float().reshape(-1)
+            padded = torch.ones((n_patch,), dtype=torch.float32)
+            padded[: min(n_patch, int(vals.numel()))] = vals[:n_patch]
+            V_sem_tok[patch_mask] = padded
 
         return PriorOutput(
             A_mask=A_mask,
@@ -143,6 +494,23 @@ class SemanticPriorGenerator:
             E_patch_flat=E_patch_flat,
             V_sem_patch_flat=V_sem_patch_flat,
             R_mask_patch_flat=R_mask_patch_flat,
+            G_sem_patch_flat=group_projection["G_sem_patch_flat"],
+            Q_sem_patch_flat=group_projection["Q_sem_patch_flat"],
+            L_sem_patch_flat=group_projection["L_sem_patch_flat"],
+            R_sem_patch_flat=group_projection["R_sem_patch_flat"],
+            R_frame_patch_flat=group_projection["R_frame_patch_flat"],
+            R_global_patch_flat=group_projection["R_global_patch_flat"],
+            R_swa_patch_flat=group_projection["R_swa_patch_flat"],
+            R_ttt_patch_flat=group_projection["R_ttt_patch_flat"],
+            G_sem_tok=group_projection["G_sem_tok"],
+            Q_sem_tok=group_projection["Q_sem_tok"],
+            L_sem_tok=group_projection["L_sem_tok"],
+            V_sem_tok=V_sem_tok.clamp(0.0, 1.0),
+            R_sem_tok=group_projection["R_sem_tok"],
+            R_frame_tok=group_projection["R_frame_tok"],
+            R_global_tok=group_projection["R_global_tok"],
+            R_swa_tok=group_projection["R_swa_tok"],
+            R_ttt_tok=group_projection["R_ttt_tok"],
             B_chunk_geo=B_chunk_geo,
             A_special=A_special,
             debug={
@@ -154,6 +522,13 @@ class SemanticPriorGenerator:
                 "mean_r_mask": float(r_mask.mean().item()) if r_mask.numel() > 0 else 0.0,
                 "mean_v_sem_patch": float(V_sem_patch_flat.mean().item()) if V_sem_patch_flat.numel() > 0 else 1.0,
                 "mean_r_mask_patch": float(R_mask_patch_flat.mean().item()) if R_mask_patch_flat.numel() > 0 else 0.0,
+                "semantic_group_taxonomy": "stage_c_coarse_5_groups",
+                "semantic_fine_label_available": True,
+                "semantic_fine_label_exact_source": "MaskletOutput.L_sem",
+                "semantic_group_exact_source": "MaskletOutput.G_sem",
+                "semantic_group_token_count": int(group_projection["G_sem_tok"].numel()),
+                "semantic_role_token_count": int(group_projection["R_sem_tok"].numel()),
+                "semantic_role_policy": "fine_label_path_prior",
                 "a_token_floor": self.a_token_floor,
             },
         )

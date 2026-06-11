@@ -1,0 +1,58 @@
+[
+  {
+    "method": "P0 Stream3D on S0",
+    "prediction_config": "scannet",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_p0_on_s0_scannet_probe5",
+    "eval_policy": "stream3d_self_probe5",
+    "split": "probe5"
+  },
+  {
+    "method": "O21 ws50 merge 0.50 logarea on S0",
+    "prediction_config": "stream4d_v9_o21_o20_ws50_merge_mioc050_logarea_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o21_o20_ws50_merge_mioc050_logarea_on_s0_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O21 ws50 merge 0.50 logarea on S1",
+    "prediction_config": "stream4d_v9_o21_o20_ws50_merge_mioc050_logarea_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_o21_o20_ws50_merge_mioc050_logarea_on_s1_probe5",
+    "eval_policy": "method_on_32f_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O22 ws25 raw own",
+    "prediction_config": "stream4d_v9_o22_b1_fullspan_grid8_ws25_probe5",
+    "pre_points_config": "stream4d_v9_o22_b1_fullspan_grid8_ws25_probe5",
+    "output_config": "stream4d_v9_o22_b1_fullspan_grid8_ws25_probe5",
+    "eval_policy": "own_recompute_d4rt_fullspan_grid8_ws25",
+    "split": "probe5"
+  },
+  {
+    "method": "O22 ws25 merge 0.50 logarea own",
+    "prediction_config": "stream4d_v9_o22_fullspan_grid8_ws25_merge_mioc050_logarea_probe5",
+    "pre_points_config": "stream4d_v9_o22_fullspan_grid8_ws25_merge_mioc050_logarea_probe5",
+    "output_config": "stream4d_v9_o22_fullspan_grid8_ws25_merge_mioc050_logarea_probe5",
+    "eval_policy": "own_recompute_score_calibration_o22_ws25_mioc050_logarea",
+    "split": "probe5"
+  },
+  {
+    "method": "O22 ws25 merge 0.50 logarea on S0",
+    "prediction_config": "stream4d_v9_o22_fullspan_grid8_ws25_merge_mioc050_logarea_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o22_fullspan_grid8_ws25_merge_mioc050_logarea_on_s0_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O22 ws25 merge 0.50 logarea on S1",
+    "prediction_config": "stream4d_v9_o22_fullspan_grid8_ws25_merge_mioc050_logarea_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_o22_fullspan_grid8_ws25_merge_mioc050_logarea_on_s1_probe5",
+    "eval_policy": "method_on_32f_support",
+    "split": "probe5"
+  }
+]

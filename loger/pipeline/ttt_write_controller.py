@@ -73,6 +73,7 @@ class TTTWriteController:
         update_delta_scale: float = 1.0,
         update_delta_scales: Optional[str] = None,
         update_native_mix_scales: Optional[str] = None,
+        update_native_mix_chunks: Optional[str] = None,
         prior_transform_mode: str = "none",
         prior_anti_scale: float = 0.0,
         prior_gamma: float = 1.0,
@@ -90,9 +91,11 @@ class TTTWriteController:
         tri_replay_positive_frac: float = 0.35,
         tri_replay_negative_frac: float = 0.15,
         tri_replay_neutral_lambda: float = 1.0,
+        tri_replay_role_mode: str = "fixed",
         gradient_reversal_transient_mode: str = "none",
         gradient_reversal_transient_branch_mask: str = "",
         gradient_reversal_transient_long_scale: float = 0.0,
+        gradient_reversal_transient_apply_scale: float = 1.0,
         update_token_scope: str = "all",
         update_token_scope_floor: float = 0.0,
         replay_feature_gate_mode: str = "none",
@@ -111,6 +114,7 @@ class TTTWriteController:
         transient_delta_ttl: int = 1,
         commit_ema_alpha: float = 1.0,
         commit_ema_branch_mask: str = "all",
+        commit_ema_chunks: Optional[str] = None,
         native_delta_gate_mode: str = "none",
         native_delta_gate_min_cos: float = 0.0,
         native_delta_gate_fallback: float = 0.0,
@@ -125,6 +129,13 @@ class TTTWriteController:
         commit_filter_min: float = 0.0,
         commit_filter_max: float = 1.0,
         commit_filter_branch_mask: str = "0",
+        scale_state_mode: str = "none",
+        scale_state_proxy: str = "pose_step_ema",
+        scale_state_carrier: str = "all",
+        scale_state_alpha: float = 0.0,
+        scale_state_branch_mask: str = "0",
+        scale_state_chunks: Optional[str] = None,
+        scale_state_sample_tokens: int = 0,
     ):
         self.lambda_min = lambda_min
         self.lambda_max = lambda_max
@@ -146,6 +157,7 @@ class TTTWriteController:
             update_native_mix_scales,
             default=1.0,
         )
+        self.update_native_mix_chunks = self._parse_chunk_mask(update_native_mix_chunks)
         self.prior_transform_mode = str(prior_transform_mode or "none").strip().lower()
         self.prior_anti_scale = float(prior_anti_scale)
         self.prior_gamma = float(prior_gamma)
@@ -163,8 +175,10 @@ class TTTWriteController:
         self.tri_replay_positive_frac = float(tri_replay_positive_frac)
         self.tri_replay_negative_frac = float(tri_replay_negative_frac)
         self.tri_replay_neutral_lambda = float(tri_replay_neutral_lambda)
+        self.tri_replay_role_mode = str(tri_replay_role_mode or "fixed").strip().lower()
         self.gradient_reversal_transient_mode = str(gradient_reversal_transient_mode or "none").strip().lower()
         self.gradient_reversal_transient_long_scale = float(gradient_reversal_transient_long_scale)
+        self.gradient_reversal_transient_apply_scale = float(gradient_reversal_transient_apply_scale)
         gr_transient_mask_text = str(gradient_reversal_transient_branch_mask or "").strip().lower()
         self.gradient_reversal_transient_branch_mask = (
             ()
@@ -189,6 +203,7 @@ class TTTWriteController:
         self.transient_delta_ttl = max(int(transient_delta_ttl), 1)
         self.commit_ema_alpha = float(commit_ema_alpha)
         self.commit_ema_branch_mask = self._parse_branch_mask(commit_ema_branch_mask)
+        self.commit_ema_chunks = self._parse_chunk_mask(commit_ema_chunks)
         self.native_delta_gate_mode = str(native_delta_gate_mode or "none").strip().lower()
         self.native_delta_gate_min_cos = float(native_delta_gate_min_cos)
         self.native_delta_gate_fallback = float(native_delta_gate_fallback)
@@ -203,6 +218,38 @@ class TTTWriteController:
         self.commit_filter_min = float(commit_filter_min)
         self.commit_filter_max = float(commit_filter_max)
         self.commit_filter_branch_mask = self._parse_branch_mask(commit_filter_branch_mask)
+        self.scale_state_mode = str(scale_state_mode or "none").strip().lower()
+        self.scale_state_proxy = str(scale_state_proxy or "pose_step_ema").strip().lower()
+        self.scale_state_carrier = str(scale_state_carrier or "all").strip().lower()
+        self.scale_state_alpha = float(scale_state_alpha)
+        self.scale_state_branch_mask = self._parse_branch_mask(scale_state_branch_mask)
+        self.scale_state_chunks = self._parse_chunk_mask(scale_state_chunks)
+        self.scale_state_sample_tokens = max(int(scale_state_sample_tokens), 0)
+        self.scale_state_active = False
+        self.scale_state_chunk_idx = -1
+        self.scale_state_log_ratio = 0.0
+        self.scale_state_reason = "not_configured"
+        self.scale_state_payload: Dict[str, Any] = {}
+        self.v11_projection_action_mode = "none"
+        self.v11_projection_action_active = False
+        self.v11_projection_chunk_idx = -1
+        self.current_chunk_idx = -1
+        self.v11_projection_scale_log_ratio = 0.0
+        self.v11_projection_action_strength = 1.0
+        self.v11_projection_action_deadband = 0.0
+        self.v11_projection_action_reason = ""
+        self.state_energy_ema_alpha = 0.25
+        self.state_energy_gamma_gain_min = 0.25
+        self.state_energy_gamma_gain_max = 4.0
+        self.state_energy_gamma_min = 1e-4
+        self.state_energy_gamma_max = 2e-2
+        self.state_energy_role_k = 0.5
+        self.state_energy_commit_tau_c = 0.0
+        self.state_energy_commit_u_max = 2.0
+        self.state_energy_target_ema: Dict[str, float] = {}
+        self.tail_state_energy_ema: Dict[str, float] = {}
+        self.tail_commit_energy_ema: Dict[str, float] = {}
+        self.tail_commit_risk_ema: Dict[str, float] = {}
 
     # -- public API --------------------------------------------------------
 
@@ -328,7 +375,7 @@ class TTTWriteController:
             mode_tag = str(self.gradient_reversal_transient_mode or "none").strip().lower()
             if mode_tag in {"dual_lifetime", "dual_fast_weight", "apply_short_delta", "short_apply_delta"}:
                 transient_delta_out["_mode"] = mode_tag
-                transient_delta_out["_apply_scale"] = 1.0
+                transient_delta_out["_apply_scale"] = float(self.gradient_reversal_transient_apply_scale)
                 transient_delta_out["_long_scale"] = float(self.gradient_reversal_transient_long_scale)
             else:
                 transient_delta_out["_mode"] = "subtract_delta"
@@ -498,6 +545,9 @@ class TTTWriteController:
             token_type=token_type,
             cache_l=int(l),
             effective_branch_gammas=layer_branch_gammas,
+            num_frames=num_frames,
+            overlap_frames=overlap_frames,
+            layer_idx=layer_idx,
         )
         debug.update(gradient_reversal_risk_debug)
         (
@@ -522,6 +572,7 @@ class TTTWriteController:
             k, v, prior_flat,
             token_type=token_type,
             num_frames=num_frames,
+            overlap_frames=overlap_frames,
         )
         debug.update(replay_feature_debug)
         replay_order_full = lc.ttt_op_order
@@ -861,6 +912,9 @@ class TTTWriteController:
                 token_filter_blend_debug["ttt_gradient_reversal_transient_applied"] = True
                 token_filter_blend_debug["ttt_gradient_reversal_transient_dual_lifetime"] = bool(dual_lifetime)
                 token_filter_blend_debug["ttt_gradient_reversal_transient_long_scale"] = float(long_scale)
+                token_filter_blend_debug["ttt_gradient_reversal_transient_apply_scale"] = float(
+                    self.gradient_reversal_transient_apply_scale
+                )
                 token_filter_blend_debug["ttt_gradient_reversal_transient_branch_mask"] = list(transient_mask)
                 token_filter_blend_debug["ttt_gradient_reversal_transient_native_mix_scales"] = [
                     float(x) for x in mix_scales
@@ -909,6 +963,601 @@ class TTTWriteController:
                             aligned[:n] = risk[:n]
                         risk = aligned
 
+                def quantile_role_masks(
+                    pos_frac_in: float,
+                    neg_frac_in: float,
+                ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, float]:
+                    pos_frac_out = min(max(float(pos_frac_in), 0.0), 1.0)
+                    neg_frac_out = min(max(float(neg_frac_in), 0.0), 1.0)
+                    if pos_frac_out <= 0.0:
+                        pos = torch.zeros_like(risk, dtype=torch.bool)
+                        pos_thr_out = torch.tensor(0.0, dtype=risk.dtype, device=risk.device)
+                    elif pos_frac_out >= 1.0:
+                        pos = torch.ones_like(risk, dtype=torch.bool)
+                        pos_thr_out = torch.tensor(1.0, dtype=risk.dtype, device=risk.device)
+                    else:
+                        pos_thr_out = torch.quantile(risk, pos_frac_out)
+                        pos = risk <= pos_thr_out
+                    if neg_frac_out <= 0.0:
+                        neg = torch.zeros_like(risk, dtype=torch.bool)
+                        neg_thr_out = torch.tensor(1.0, dtype=risk.dtype, device=risk.device)
+                    elif neg_frac_out >= 1.0:
+                        neg = torch.ones_like(risk, dtype=torch.bool)
+                        neg_thr_out = torch.tensor(0.0, dtype=risk.dtype, device=risk.device)
+                    else:
+                        neg_thr_out = torch.quantile(risk, 1.0 - neg_frac_out)
+                        neg = risk >= neg_thr_out
+                    pos = pos & (~neg)
+                    neu = ~(pos | neg)
+                    return pos, neu, neg, pos_thr_out, neg_thr_out, pos_frac_out, neg_frac_out
+
+                def capped_role_masks(
+                    pos: torch.Tensor,
+                    neg: torch.Tensor,
+                    *,
+                    source: str,
+                    min_pos: float = 0.20,
+                    max_pos: float = 0.60,
+                    min_neg: float = 0.03,
+                    max_neg: float = 0.25,
+                ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, float]:
+                    pos_mass_raw = float(pos.float().mean().item()) if pos.numel() else 0.0
+                    neg_mass_raw = float(neg.float().mean().item()) if neg.numel() else 0.0
+                    if pos_mass_raw <= 0.0 or neg_mass_raw <= 0.0:
+                        token_filter_blend_debug["ttt_tri_replay_role_fallback"] = "empty_role"
+                        token_filter_blend_debug["ttt_tri_replay_role_fallback_source"] = source
+                        return quantile_role_masks(self.tri_replay_positive_frac, self.tri_replay_negative_frac)
+                    pos_frac_cap = min(max(pos_mass_raw, min_pos), max_pos)
+                    neg_frac_cap = min(max(neg_mass_raw, min_neg), max_neg)
+                    if abs(pos_frac_cap - pos_mass_raw) > 1e-6 or abs(neg_frac_cap - neg_mass_raw) > 1e-6:
+                        token_filter_blend_debug["ttt_tri_replay_role_mass_capped"] = True
+                        token_filter_blend_debug["ttt_tri_replay_role_raw_pos_mass"] = pos_mass_raw
+                        token_filter_blend_debug["ttt_tri_replay_role_raw_neg_mass"] = neg_mass_raw
+                        return quantile_role_masks(pos_frac_cap, neg_frac_cap)
+                    pos = pos & (~neg)
+                    neu = ~(pos | neg)
+                    if not bool(pos.any()) or not bool(neg.any()):
+                        token_filter_blend_debug["ttt_tri_replay_role_fallback"] = "role_overlap_collapse"
+                        token_filter_blend_debug["ttt_tri_replay_role_fallback_source"] = source
+                        return quantile_role_masks(self.tri_replay_positive_frac, self.tri_replay_negative_frac)
+                    pos_thr_out = risk[pos].max()
+                    neg_thr_out = risk[neg].min()
+                    return pos, neu, neg, pos_thr_out, neg_thr_out, pos_mass_raw, neg_mass_raw
+
+                def uncapped_role_masks(
+                    pos: torch.Tensor,
+                    neg: torch.Tensor,
+                    *,
+                    source: str,
+                ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, float]:
+                    """Return role masks without converting them to fixed top percentages."""
+                    pos = pos.bool()
+                    neg = neg.bool()
+                    if pos.numel() != risk.numel() or neg.numel() != risk.numel():
+                        token_filter_blend_debug["ttt_tri_replay_role_fallback"] = "shape_mismatch"
+                        token_filter_blend_debug["ttt_tri_replay_role_fallback_source"] = source
+                        pos = torch.zeros_like(risk, dtype=torch.bool)
+                        neg = torch.zeros_like(risk, dtype=torch.bool)
+                    pos = pos & (~neg)
+                    if not bool(pos.any()) or not bool(neg.any()):
+                        vals = risk.detach().float()
+                        mean = vals.mean()
+                        std = vals.std(unbiased=False)
+                        if float(std.item()) > 1e-8:
+                            pos = vals <= (mean - 0.25 * std)
+                            neg = vals >= (mean + 0.25 * std)
+                    if not bool(pos.any()) and risk.numel() > 0:
+                        pos = risk <= risk.min()
+                    if not bool(neg.any()) and risk.numel() > 0:
+                        neg = risk >= risk.max()
+                    pos = pos & (~neg)
+                    neu = ~(pos | neg)
+                    if bool(pos.any()):
+                        pos_thr_out = risk[pos].max()
+                    else:
+                        pos_thr_out = risk.new_tensor(0.0)
+                    if bool(neg.any()):
+                        neg_thr_out = risk[neg].min()
+                    else:
+                        neg_thr_out = risk.new_tensor(1.0)
+                    pos_mass = float(pos.float().mean().item()) if pos.numel() else 0.0
+                    neg_mass = float(neg.float().mean().item()) if neg.numel() else 0.0
+                    token_filter_blend_debug["ttt_tri_replay_role_uncapped"] = True
+                    token_filter_blend_debug["ttt_tri_replay_role_source"] = source
+                    token_filter_blend_debug["ttt_tri_replay_role_uncapped_pos_mass"] = pos_mass
+                    token_filter_blend_debug["ttt_tri_replay_role_uncapped_neg_mass"] = neg_mass
+                    return pos, neu, neg, pos_thr_out, neg_thr_out, pos_mass, neg_mass
+
+                def kmeans3_role_masks() -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, float]:
+                    vals = risk.detach().float()
+                    if vals.numel() < 3 or float(vals.max().item() - vals.min().item()) < 1e-8:
+                        token_filter_blend_debug["ttt_tri_replay_role_fallback"] = "kmeans_degenerate_risk"
+                        return quantile_role_masks(self.tri_replay_positive_frac, self.tri_replay_negative_frac)
+                    centers = torch.quantile(vals, torch.tensor([0.2, 0.5, 0.8], device=vals.device, dtype=vals.dtype))
+                    labels = torch.zeros_like(vals, dtype=torch.long)
+                    for _ in range(12):
+                        dist = (vals[:, None] - centers[None, :]).abs()
+                        labels = torch.argmin(dist, dim=1)
+                        new_centers = centers.clone()
+                        for idx in range(3):
+                            mask = labels == idx
+                            if bool(mask.any()):
+                                new_centers[idx] = vals[mask].mean()
+                        if torch.allclose(new_centers, centers, atol=1e-6, rtol=0.0):
+                            centers = new_centers
+                            break
+                        centers = new_centers
+                    counts = [int((labels == idx).sum().item()) for idx in range(3)]
+                    if sum(1 for c in counts if c > 0) < 3:
+                        token_filter_blend_debug["ttt_tri_replay_role_fallback"] = "kmeans_cluster_collapse"
+                        token_filter_blend_debug["ttt_tri_replay_kmeans_counts"] = counts
+                        return quantile_role_masks(self.tri_replay_positive_frac, self.tri_replay_negative_frac)
+                    order = torch.argsort(centers)
+                    pos = labels == int(order[0].item())
+                    neg = labels == int(order[-1].item())
+                    token_filter_blend_debug["ttt_tri_replay_kmeans_centers"] = [
+                        float(x) for x in centers.detach().cpu().tolist()
+                    ]
+                    token_filter_blend_debug["ttt_tri_replay_kmeans_counts"] = counts
+                    return capped_role_masks(pos, neg, source="kmeans3")
+
+                def otsu3_role_masks() -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, float]:
+                    vals = risk.detach().float()
+                    if vals.numel() < 3 or float(vals.max().item() - vals.min().item()) < 1e-8:
+                        token_filter_blend_debug["ttt_tri_replay_role_fallback"] = "otsu_degenerate_risk"
+                        return quantile_role_masks(self.tri_replay_positive_frac, self.tri_replay_negative_frac)
+                    hist = torch.histc(vals, bins=64, min=0.0, max=1.0).float()
+                    prob = hist / hist.sum().clamp_min(1e-6)
+                    bins = (torch.arange(64, device=vals.device, dtype=vals.dtype) + 0.5) / 64.0
+                    total_mean = (prob * bins).sum()
+                    best_score = torch.tensor(-1.0, device=vals.device)
+                    best = (20, 44)
+                    for i in range(1, 63):
+                        w0 = prob[:i].sum()
+                        if float(w0.item()) <= 0.0:
+                            continue
+                        m0 = (prob[:i] * bins[:i]).sum() / w0
+                        for j in range(i + 1, 64):
+                            w1 = prob[i:j].sum()
+                            w2 = prob[j:].sum()
+                            if float(w1.item()) <= 0.0 or float(w2.item()) <= 0.0:
+                                continue
+                            m1 = (prob[i:j] * bins[i:j]).sum() / w1
+                            m2 = (prob[j:] * bins[j:]).sum() / w2
+                            score = w0 * (m0 - total_mean) ** 2 + w1 * (m1 - total_mean) ** 2 + w2 * (m2 - total_mean) ** 2
+                            if bool(score > best_score):
+                                best_score = score
+                                best = (i, j)
+                    thr0 = torch.tensor(float(best[0]) / 64.0, device=vals.device, dtype=vals.dtype)
+                    thr1 = torch.tensor(float(best[1]) / 64.0, device=vals.device, dtype=vals.dtype)
+                    pos = vals <= thr0
+                    neg = vals >= thr1
+                    token_filter_blend_debug["ttt_tri_replay_otsu_thresholds"] = [float(thr0.item()), float(thr1.item())]
+                    token_filter_blend_debug["ttt_tri_replay_otsu_score"] = float(best_score.item())
+                    return capped_role_masks(pos, neg, source="otsu3")
+
+                def mad_role_masks() -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, float]:
+                    vals = risk.detach().float()
+                    med = torch.median(vals)
+                    mad = torch.median((vals - med).abs())
+                    if float(mad.item()) < 1e-8:
+                        token_filter_blend_debug["ttt_tri_replay_role_fallback"] = "mad_zero"
+                        return quantile_role_masks(self.tri_replay_positive_frac, self.tri_replay_negative_frac)
+                    z = (vals - med) / mad.clamp_min(1e-6)
+                    pos = z <= -0.5
+                    neg = z >= 1.5
+                    token_filter_blend_debug["ttt_tri_replay_mad_median"] = float(med.item())
+                    token_filter_blend_debug["ttt_tri_replay_mad"] = float(mad.item())
+                    return capped_role_masks(pos, neg, source="mad", min_pos=0.0, max_pos=1.0, min_neg=0.0, max_neg=1.0)
+
+                def adaptive_quantile_role_masks() -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, float]:
+                    vals = risk.detach().float()
+                    q10 = torch.quantile(vals, 0.10)
+                    q90 = torch.quantile(vals, 0.90)
+                    spread = float((q90 - q10).item())
+                    if spread < 0.15:
+                        neg_frac_adapt = 0.05
+                    elif spread < 0.30:
+                        neg_frac_adapt = 0.12
+                    else:
+                        neg_frac_adapt = 0.18
+                    token_filter_blend_debug["ttt_tri_replay_adaptive_spread"] = spread
+                    token_filter_blend_debug["ttt_tri_replay_adaptive_neg_frac"] = float(neg_frac_adapt)
+                    return quantile_role_masks(0.35, neg_frac_adapt)
+
+                def adaptive_writer_role_masks() -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, float]:
+                    vals = risk.detach().float()
+                    if vals.numel() < 3 or float(vals.max().item() - vals.min().item()) < 1e-8:
+                        token_filter_blend_debug["ttt_tri_replay_role_fallback"] = "adaptive_writer_degenerate_risk"
+                        return uncapped_role_masks(vals <= vals.mean(), vals >= vals.mean(), source="adaptive_writer_mean")
+                    hist = torch.histc(vals, bins=64, min=0.0, max=1.0).float()
+                    prob = hist / hist.sum().clamp_min(1e-6)
+                    bins = (torch.arange(64, device=vals.device, dtype=vals.dtype) + 0.5) / 64.0
+                    total_mean = (prob * bins).sum()
+                    best_score = torch.tensor(-1.0, device=vals.device)
+                    best = (16, 48)
+                    for i in range(1, 63):
+                        w0 = prob[:i].sum()
+                        if float(w0.item()) <= 0.0:
+                            continue
+                        m0 = (prob[:i] * bins[:i]).sum() / w0
+                        for j in range(i + 1, 64):
+                            w1 = prob[i:j].sum()
+                            w2 = prob[j:].sum()
+                            if float(w1.item()) <= 0.0 or float(w2.item()) <= 0.0:
+                                continue
+                            m1 = (prob[i:j] * bins[i:j]).sum() / w1
+                            m2 = (prob[j:] * bins[j:]).sum() / w2
+                            score = w0 * (m0 - total_mean) ** 2 + w1 * (m1 - total_mean) ** 2 + w2 * (m2 - total_mean) ** 2
+                            if bool(score > best_score):
+                                best_score = score
+                                best = (i, j)
+                    thr0 = torch.tensor(float(best[0]) / 64.0, device=vals.device, dtype=vals.dtype)
+                    thr1 = torch.tensor(float(best[1]) / 64.0, device=vals.device, dtype=vals.dtype)
+                    token_filter_blend_debug["ttt_tri_replay_adaptive_writer_thresholds"] = [
+                        float(thr0.item()),
+                        float(thr1.item()),
+                    ]
+                    token_filter_blend_debug["ttt_tri_replay_adaptive_writer_otsu_score"] = float(best_score.item())
+                    return uncapped_role_masks(vals <= thr0, vals >= thr1, source="adaptive_writer_otsu3")
+
+                def adaptive_writer_sc_gamma_role_masks() -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, float]:
+                    """State-conditioned split roles without percentage fallback.
+
+                    v53 replaces fixed positive/negative percentages with a
+                    per-chunk robust margin over write-prior safety and risk
+                    danger.  If the current chunk collapses to an empty role,
+                    keep the collapse visible in debug and let the branch replay
+                    use zero mass instead of silently substituting a quantile.
+                    """
+                    vals = risk.detach().float()
+                    pp = p.detach().float()
+                    if vals.numel() < 3 or pp.numel() != vals.numel():
+                        token_filter_blend_debug["ttt_tri_replay_role_collapsed"] = True
+                        token_filter_blend_debug["ttt_tri_replay_role_fallback"] = "sc_gamma_shape"
+                        pos = torch.zeros_like(vals, dtype=torch.bool)
+                        neg = torch.zeros_like(vals, dtype=torch.bool)
+                        neu = torch.ones_like(vals, dtype=torch.bool)
+                        zero = vals.new_tensor(0.0)
+                        one = vals.new_tensor(1.0)
+                        return pos, neu, neg, zero, one, 0.0, 0.0
+
+                    p_min_local = pp.min()
+                    p_max_local = pp.max()
+                    p_norm = ((pp - p_min_local) / (p_max_local - p_min_local).clamp_min(1e-6)).clamp(0.0, 1.0)
+                    safety = (p_norm * (1.0 - vals)).clamp(0.0, 1.0)
+                    danger = (vals * (1.0 - p_norm)).clamp(0.0, 1.0)
+
+                    def robust_z(x: torch.Tensor, name: str) -> torch.Tensor:
+                        med = torch.median(x)
+                        mad = torch.median((x - med).abs())
+                        token_filter_blend_debug[f"ttt_tri_replay_sc_gamma_{name}_median"] = float(med.item())
+                        token_filter_blend_debug[f"ttt_tri_replay_sc_gamma_{name}_mad"] = float(mad.item())
+                        return (x - med) / mad.clamp_min(1e-6)
+
+                    margin = robust_z(safety, "safety") - robust_z(danger, "danger")
+                    margin_med = torch.median(margin)
+                    margin_mad = torch.median((margin - margin_med).abs())
+                    if float(margin_mad.item()) <= 1e-8:
+                        token_filter_blend_debug["ttt_tri_replay_role_collapsed"] = True
+                        token_filter_blend_debug["ttt_tri_replay_role_fallback"] = "sc_gamma_margin_mad_zero"
+                        pos = torch.zeros_like(vals, dtype=torch.bool)
+                        neg = torch.zeros_like(vals, dtype=torch.bool)
+                    else:
+                        pos_thr = margin_med + 0.5 * margin_mad
+                        neg_thr = margin_med - 0.5 * margin_mad
+                        pos = margin > pos_thr
+                        neg = margin < neg_thr
+                        pos = pos & (~neg)
+                        token_filter_blend_debug["ttt_tri_replay_sc_gamma_margin_median"] = float(margin_med.item())
+                        token_filter_blend_debug["ttt_tri_replay_sc_gamma_margin_mad"] = float(margin_mad.item())
+                        token_filter_blend_debug["ttt_tri_replay_sc_gamma_pos_margin_threshold"] = float(pos_thr.item())
+                        token_filter_blend_debug["ttt_tri_replay_sc_gamma_neg_margin_threshold"] = float(neg_thr.item())
+
+                    pos_mass = float(pos.float().mean().item()) if pos.numel() else 0.0
+                    neg_mass = float(neg.float().mean().item()) if neg.numel() else 0.0
+                    collapsed = pos_mass <= 0.0 or neg_mass <= 0.0
+                    token_filter_blend_debug["ttt_tri_replay_role_collapsed"] = bool(collapsed)
+                    token_filter_blend_debug["ttt_tri_replay_role_source"] = "adaptive_writer_sc_gamma"
+                    token_filter_blend_debug["ttt_tri_replay_role_uncapped"] = True
+                    token_filter_blend_debug["ttt_tri_replay_sc_gamma_prior_std"] = float(pp.std(unbiased=False).item())
+                    token_filter_blend_debug["ttt_tri_replay_sc_gamma_risk_std"] = float(vals.std(unbiased=False).item())
+                    neu = ~(pos | neg)
+                    pos_thr_out = vals[pos].max() if bool(pos.any()) else vals.new_tensor(0.0)
+                    neg_thr_out = vals[neg].min() if bool(neg.any()) else vals.new_tensor(1.0)
+                    return pos, neu, neg, pos_thr_out, neg_thr_out, pos_mass, neg_mass
+
+                def adaptive_writer_state_energy_role_masks() -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, float]:
+                    """v54 state-conditioned split roles without mass targets.
+
+                    Roles are derived only from current write-prior/risk state:
+                    safety = norm(p) * (1 - risk), danger = risk * (2 - norm(p)).
+                    Median + k*MAD thresholds keep role mass emergent rather
+                    than configured as a fixed percentage.
+                    """
+                    vals = risk.detach().float().clamp(0.0, 1.0)
+                    pp = p.detach().float()
+                    if vals.numel() < 3 or pp.numel() != vals.numel():
+                        token_filter_blend_debug["ttt_tri_replay_role_collapsed"] = True
+                        token_filter_blend_debug["ttt_tri_replay_role_fallback"] = "state_energy_shape"
+                        pos = torch.zeros_like(vals, dtype=torch.bool)
+                        neg = torch.zeros_like(vals, dtype=torch.bool)
+                        neu = torch.ones_like(vals, dtype=torch.bool)
+                        zero = vals.new_tensor(0.0)
+                        one = vals.new_tensor(1.0)
+                        return pos, neu, neg, zero, one, 0.0, 0.0
+
+                    p_min_local = pp.min()
+                    p_max_local = pp.max()
+                    p_norm = ((pp - p_min_local) / (p_max_local - p_min_local).clamp_min(1e-6)).clamp(0.0, 1.0)
+                    safety = (p_norm * (1.0 - vals)).clamp(0.0, 1.0)
+                    danger = (vals * (2.0 - p_norm)).clamp(0.0, 2.0)
+                    k = float(self.state_energy_role_k)
+
+                    def high_threshold(x: torch.Tensor, prefix: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+                        med = torch.median(x)
+                        mad = torch.median((x - med).abs())
+                        thr = med + k * mad
+                        token_filter_blend_debug[f"ttt_tri_replay_state_energy_{prefix}_median"] = float(med.item())
+                        token_filter_blend_debug[f"ttt_tri_replay_state_energy_{prefix}_mad"] = float(mad.item())
+                        token_filter_blend_debug[f"ttt_tri_replay_state_energy_{prefix}_threshold"] = float(thr.item())
+                        return thr, med, mad
+
+                    safety_thr, _safety_med, safety_mad = high_threshold(safety, "safety")
+                    danger_thr, _danger_med, danger_mad = high_threshold(danger, "danger")
+                    pos = safety > safety_thr
+                    neg = danger > danger_thr
+                    both = pos & neg
+                    if bool(both.any()):
+                        prefer_pos = safety >= danger
+                        pos = pos & ((~both) | prefer_pos)
+                        neg = neg & ((~both) | (~prefer_pos))
+
+                    pos_mass = float(pos.float().mean().item()) if pos.numel() else 0.0
+                    neg_mass = float(neg.float().mean().item()) if neg.numel() else 0.0
+                    collapsed = pos_mass <= 0.0 or neg_mass <= 0.0
+                    token_filter_blend_debug["ttt_tri_replay_role_collapsed"] = bool(collapsed)
+                    if float(safety_mad.item()) <= 1e-8 or float(danger_mad.item()) <= 1e-8:
+                        token_filter_blend_debug["ttt_tri_replay_state_energy_mad_zero"] = True
+                    token_filter_blend_debug["ttt_tri_replay_role_source"] = "adaptive_writer_state_energy"
+                    token_filter_blend_debug["ttt_tri_replay_role_uncapped"] = True
+                    token_filter_blend_debug["ttt_tri_replay_state_energy_k"] = float(k)
+                    token_filter_blend_debug["ttt_tri_replay_state_energy_prior_std"] = float(pp.std(unbiased=False).item())
+                    token_filter_blend_debug["ttt_tri_replay_state_energy_risk_std"] = float(vals.std(unbiased=False).item())
+                    token_filter_blend_debug["ttt_tri_replay_state_energy_overlap_mass"] = float(both.float().mean().item())
+                    neu = ~(pos | neg)
+                    return pos, neu, neg, safety_thr, danger_thr, pos_mass, neg_mass
+
+                def adaptive_writer_binary_write_role_masks(
+                    variant: str,
+                ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, float]:
+                    """v56 binary write roles without top percentage targets.
+
+                    `binary_anchor` tests stable-anchor-only long writes.  Tokens
+                    that are not stable anchors are left out of the long write by
+                    setting their neutral long-write lambda to zero later in the
+                    split branch.  `risk_veto` lets non-risk tokens commit while
+                    risk tokens remain current-chunk evidence only.
+                    """
+                    vals = risk.detach().float().clamp(0.0, 1.0)
+                    pp = p.detach().float()
+                    zero = vals.new_tensor(0.0)
+                    one = vals.new_tensor(1.0)
+                    if vals.numel() < 3 or pp.numel() != vals.numel():
+                        token_filter_blend_debug["ttt_tri_replay_role_collapsed"] = True
+                        token_filter_blend_debug["ttt_tri_replay_role_fallback"] = f"{variant}_shape"
+                        pos = torch.zeros_like(vals, dtype=torch.bool)
+                        neg = torch.zeros_like(vals, dtype=torch.bool)
+                        neu = torch.ones_like(vals, dtype=torch.bool)
+                        return pos, neu, neg, zero, one, 0.0, 0.0
+
+                    p_min_local = pp.min()
+                    p_max_local = pp.max()
+                    p_norm = ((pp - p_min_local) / (p_max_local - p_min_local).clamp_min(1e-6)).clamp(0.0, 1.0)
+
+                    def otsu2_threshold(score: torch.Tensor, prefix: str) -> torch.Tensor:
+                        s = score.detach().float().clamp(0.0, 1.0)
+                        if s.numel() < 3 or float((s.max() - s.min()).item()) <= 1e-8:
+                            med = torch.median(s) if s.numel() else s.new_tensor(0.5)
+                            token_filter_blend_debug[f"ttt_tri_replay_{prefix}_threshold_mode"] = "median_degenerate"
+                            token_filter_blend_debug[f"ttt_tri_replay_{prefix}_threshold"] = float(med.item())
+                            return med
+                        hist = torch.histc(s, bins=64, min=0.0, max=1.0).float()
+                        prob = hist / hist.sum().clamp_min(1e-6)
+                        bins = (torch.arange(64, device=s.device, dtype=s.dtype) + 0.5) / 64.0
+                        total_mean = (prob * bins).sum()
+                        best_score = s.new_tensor(-1.0)
+                        best = 32
+                        for idx in range(1, 64):
+                            w0 = prob[:idx].sum()
+                            w1 = prob[idx:].sum()
+                            if float(w0.item()) <= 0.0 or float(w1.item()) <= 0.0:
+                                continue
+                            m0 = (prob[:idx] * bins[:idx]).sum() / w0
+                            m1 = (prob[idx:] * bins[idx:]).sum() / w1
+                            between = w0 * (m0 - total_mean) ** 2 + w1 * (m1 - total_mean) ** 2
+                            if bool(between > best_score):
+                                best_score = between
+                                best = idx
+                        thr = s.new_tensor(float(best) / 64.0)
+                        token_filter_blend_debug[f"ttt_tri_replay_{prefix}_threshold_mode"] = "otsu2"
+                        token_filter_blend_debug[f"ttt_tri_replay_{prefix}_threshold"] = float(thr.item())
+                        token_filter_blend_debug[f"ttt_tri_replay_{prefix}_otsu_score"] = float(best_score.item())
+                        return thr
+
+                    if variant == "binary_anchor":
+                        # risk_source normally folds C23 D_g into residual risk
+                        # for v56 (`ttt_residual_x_dg`).  There is no separate
+                        # D token in this controller path, so record the boundary
+                        # explicitly instead of pretending an independent D_i was
+                        # available here.
+                        stable_score = (p_norm * (1.0 - vals)).clamp(0.0, 1.0)
+                        thr = otsu2_threshold(stable_score, "binary_anchor")
+                        pos = stable_score >= thr
+                        neu = ~pos
+                        token_filter_blend_debug["ttt_tri_replay_binary_anchor_score_mean"] = float(stable_score.mean().item())
+                        token_filter_blend_debug["ttt_tri_replay_binary_anchor_score_p90"] = float(torch.quantile(stable_score, 0.90).item())
+                        token_filter_blend_debug["ttt_tri_replay_binary_anchor_d_folded_into_risk"] = True
+                    elif variant == "risk_veto":
+                        eps = vals.new_tensor(1e-3)
+                        veto_score = (vals * (1.0 - p_norm + eps)).clamp(0.0, 1.0)
+                        thr = otsu2_threshold(veto_score, "risk_veto")
+                        risk_tokens = veto_score >= thr
+                        pos = ~risk_tokens
+                        neu = risk_tokens
+                        token_filter_blend_debug["ttt_tri_replay_risk_veto_score_mean"] = float(veto_score.mean().item())
+                        token_filter_blend_debug["ttt_tri_replay_risk_veto_score_p90"] = float(torch.quantile(veto_score, 0.90).item())
+                    else:
+                        raise ValueError(f"Unsupported v56 binary write variant: {variant}")
+
+                    neg = torch.zeros_like(vals, dtype=torch.bool)
+                    pos_mass = float(pos.float().mean().item()) if pos.numel() else 0.0
+                    neu_mass = float(neu.float().mean().item()) if neu.numel() else 0.0
+                    token_filter_blend_debug["ttt_tri_replay_role_source"] = f"v56_{variant}"
+                    token_filter_blend_debug["ttt_tri_replay_role_uncapped"] = True
+                    token_filter_blend_debug["ttt_tri_replay_no_negative_branch"] = True
+                    token_filter_blend_debug["ttt_tri_replay_stable_anchor_token_mass"] = float(pos_mass)
+                    token_filter_blend_debug["ttt_tri_replay_no_long_write_token_mass"] = float(neu_mass)
+                    token_filter_blend_debug["ttt_tri_replay_risk_token_mass"] = float(neu_mass if variant == "risk_veto" else 0.0)
+                    token_filter_blend_debug["ttt_tri_replay_role_collapsed"] = bool(pos_mass <= 0.0 or neu_mass <= 0.0)
+                    return pos, neu, neg, thr, one, pos_mass, 0.0
+
+                def adaptive_writer_robust_role_masks() -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, float]:
+                    """Risk/prior-shaped adaptive roles without fixed top percentages.
+
+                    The Otsu-only writer tended to classify the large zero-risk
+                    plateau as positive evidence.  This variant asks for both
+                    low risk and high write prior for positive replay, while
+                    negative replay is driven by high risk and low write prior.
+                    Thresholds are derived from robust per-chunk distribution
+                    scale, not from a configured mass.
+                    """
+                    vals = risk.detach().float()
+                    pp = p.detach().float()
+                    if vals.numel() < 3 or pp.numel() != vals.numel():
+                        token_filter_blend_debug["ttt_tri_replay_role_fallback"] = "adaptive_writer_robust_shape"
+                        return adaptive_writer_role_masks()
+                    p_min_local = pp.min()
+                    p_max_local = pp.max()
+                    p_norm = ((pp - p_min_local) / (p_max_local - p_min_local).clamp_min(1e-6)).clamp(0.0, 1.0)
+                    safety = (p_norm * (1.0 - vals)).clamp(0.0, 1.0)
+                    danger = (vals * (1.0 + (1.0 - p_norm))).clamp(0.0, 2.0)
+
+                    def high_threshold(x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, float]]:
+                        x = x.detach().float().reshape(-1)
+                        med = torch.median(x)
+                        mad = torch.median((x - med).abs())
+                        mean = x.mean()
+                        std = x.std(unbiased=False)
+                        if float(mad.item()) > 1e-8:
+                            thr = med + mad
+                            mode = "median_plus_mad"
+                        elif float(std.item()) > 1e-8:
+                            thr = mean + std
+                            mode = "mean_plus_std"
+                        else:
+                            thr = x.max()
+                            mode = "max_degenerate"
+                        return thr, {
+                            "median": float(med.item()),
+                            "mad": float(mad.item()),
+                            "mean": float(mean.item()),
+                            "std": float(std.item()),
+                            "threshold": float(thr.item()),
+                            "mode": mode,
+                        }
+
+                    safety_thr, safety_debug = high_threshold(safety)
+                    danger_thr, danger_debug = high_threshold(danger)
+                    pos = safety >= safety_thr
+                    neg = danger >= danger_thr
+                    pos = pos & (~neg)
+
+                    if not bool(pos.any()) or not bool(neg.any()):
+                        token_filter_blend_debug["ttt_tri_replay_role_fallback"] = "adaptive_writer_robust_empty"
+                        token_filter_blend_debug["ttt_tri_replay_role_fallback_pos_any"] = bool(pos.any())
+                        token_filter_blend_debug["ttt_tri_replay_role_fallback_neg_any"] = bool(neg.any())
+                        return adaptive_writer_role_masks()
+
+                    token_filter_blend_debug["ttt_tri_replay_robust_safety"] = safety_debug
+                    token_filter_blend_debug["ttt_tri_replay_robust_danger"] = danger_debug
+                    token_filter_blend_debug["ttt_tri_replay_robust_prior_std"] = float(pp.std(unbiased=False).item())
+                    token_filter_blend_debug["ttt_tri_replay_robust_risk_std"] = float(vals.std(unbiased=False).item())
+                    return uncapped_role_masks(pos, neg, source="adaptive_writer_robust")
+
+                def adaptive_writer_cluster3d_role_masks() -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, float, float]:
+                    vals = risk.detach().float().reshape(-1)
+                    pp = p.detach().float().reshape(-1)
+                    if vals.numel() < 3 or pp.numel() != vals.numel():
+                        token_filter_blend_debug["ttt_tri_replay_role_fallback"] = "adaptive_writer_cluster3d_shape"
+                        return adaptive_writer_robust_role_masks()
+                    p_min_local = pp.min()
+                    p_max_local = pp.max()
+                    p_norm = ((pp - p_min_local) / (p_max_local - p_min_local).clamp_min(1e-6)).clamp(0.0, 1.0)
+
+                    update_norm = vals.new_zeros(vals.numel())
+                    try:
+                        kf = k_native_full.detach().float()
+                        vf = v_native_full.detach().float()
+                        lr = lr0.detach().float().abs().squeeze(-1)
+                        if lr.ndim == 2:
+                            lr_tok = lr.mean(dim=0)
+                        else:
+                            lr_tok = lr.reshape(-1)
+                        n = min(int(vals.numel()), int(kf.shape[1]), int(vf.shape[1]), int(lr_tok.numel()))
+                        if n > 0:
+                            k_norm = kf[:, :n, :].norm(dim=-1).mean(dim=0)
+                            v_norm = vf[:, :n, :].norm(dim=-1).mean(dim=0)
+                            upd = (k_norm * v_norm * lr_tok[:n]).detach().float()
+                            update_norm[:n] = self._normalize01_vec(upd)
+                    except RuntimeError as exc:
+                        token_filter_blend_debug["ttt_tri_replay_cluster3d_update_proxy_error"] = str(exc)
+                        update_norm = vals.clone()
+
+                    x = torch.stack([vals, (1.0 - p_norm).clamp(0.0, 1.0), update_norm.clamp(0.0, 1.0)], dim=1)
+                    pos_score = x[:, 0] + x[:, 1] + 0.5 * x[:, 2]
+                    neg_score = x[:, 0] + x[:, 1] + x[:, 2]
+                    init_idx = [
+                        int(torch.argmin(pos_score).item()),
+                        int(torch.argmin((neg_score - torch.median(neg_score)).abs()).item()),
+                        int(torch.argmax(neg_score).item()),
+                    ]
+                    centers = x[torch.tensor(init_idx, device=x.device, dtype=torch.long)].clone()
+                    labels = torch.zeros(x.shape[0], device=x.device, dtype=torch.long)
+                    for _ in range(8):
+                        dist = torch.cdist(x, centers, p=2.0)
+                        labels = torch.argmin(dist, dim=1)
+                        new_centers = centers.clone()
+                        for ci in range(3):
+                            mask = labels == ci
+                            if bool(mask.any()):
+                                new_centers[ci] = x[mask].mean(dim=0)
+                        if torch.allclose(new_centers, centers, atol=1e-5, rtol=1e-4):
+                            centers = new_centers
+                            break
+                        centers = new_centers
+
+                    cluster_pos_score = centers[:, 0] + centers[:, 1] + 0.5 * centers[:, 2]
+                    cluster_neg_score = centers[:, 0] + centers[:, 1] + centers[:, 2]
+                    pos_cluster = int(torch.argmin(cluster_pos_score).item())
+                    neg_cluster = int(torch.argmax(cluster_neg_score).item())
+                    if pos_cluster == neg_cluster:
+                        token_filter_blend_debug["ttt_tri_replay_role_fallback"] = "adaptive_writer_cluster3d_degenerate"
+                        return adaptive_writer_robust_role_masks()
+                    pos = labels == pos_cluster
+                    neg = labels == neg_cluster
+                    pos = pos & (~neg)
+                    if not bool(pos.any()) or not bool(neg.any()):
+                        token_filter_blend_debug["ttt_tri_replay_role_fallback"] = "adaptive_writer_cluster3d_empty"
+                        return adaptive_writer_robust_role_masks()
+                    token_filter_blend_debug["ttt_tri_replay_cluster3d_centers"] = [
+                        [float(v) for v in row]
+                        for row in centers.detach().cpu().tolist()
+                    ]
+                    token_filter_blend_debug["ttt_tri_replay_cluster3d_pos_cluster"] = int(pos_cluster)
+                    token_filter_blend_debug["ttt_tri_replay_cluster3d_neg_cluster"] = int(neg_cluster)
+                    return uncapped_role_masks(pos, neg, source="adaptive_writer_cluster3d")
+
                 if gr_mode in tri_modes:
                     p = prior_flat.detach().float().reshape(-1)
                     if p.numel() != int(l):
@@ -917,31 +1566,98 @@ class TTTWriteController:
                         if n > 0:
                             p_aligned[:n] = p[:n]
                         p = p_aligned
-                    pos_frac = min(max(float(self.tri_replay_positive_frac), 0.0), 1.0)
                     neg_frac_cfg = float(self.tri_replay_negative_frac)
                     if neg_frac_cfg <= 0.0:
                         neg_frac_cfg = float(self.gradient_reversal_negative_frac)
-                    neg_frac = min(max(float(neg_frac_cfg), 0.0), 1.0)
-                    if pos_frac <= 0.0:
-                        pos_mask = torch.zeros_like(risk, dtype=torch.bool)
-                        pos_thr = torch.tensor(0.0, dtype=risk.dtype, device=risk.device)
-                    elif pos_frac >= 1.0:
-                        pos_mask = torch.ones_like(risk, dtype=torch.bool)
-                        pos_thr = torch.tensor(1.0, dtype=risk.dtype, device=risk.device)
+                    role_mode = str(self.tri_replay_role_mode or "fixed").strip().lower()
+                    token_filter_blend_debug["ttt_tri_replay_role_mode"] = role_mode
+                    if role_mode in {"", "fixed", "quantile", "fixed_quantile"}:
+                        pos_mask, neu_mask, neg_mask, pos_thr, neg_thr, pos_frac, neg_frac = quantile_role_masks(
+                            self.tri_replay_positive_frac,
+                            neg_frac_cfg,
+                        )
+                    elif role_mode in {"kmeans3", "kmeans", "1d_kmeans3"}:
+                        pos_mask, neu_mask, neg_mask, pos_thr, neg_thr, pos_frac, neg_frac = kmeans3_role_masks()
+                    elif role_mode in {"otsu3", "otsu", "otsu_hist"}:
+                        pos_mask, neu_mask, neg_mask, pos_thr, neg_thr, pos_frac, neg_frac = otsu3_role_masks()
+                    elif role_mode in {"mad", "robust_mad"}:
+                        pos_mask, neu_mask, neg_mask, pos_thr, neg_thr, pos_frac, neg_frac = mad_role_masks()
+                    elif role_mode in {"adaptive_quantile", "adaptive", "spread_quantile"}:
+                        pos_mask, neu_mask, neg_mask, pos_thr, neg_thr, pos_frac, neg_frac = adaptive_quantile_role_masks()
+                    elif role_mode in {
+                        "adaptive_writer",
+                        "adaptive_writer_fused",
+                        "adaptive_otsu_writer",
+                        "adaptive_otsu_fused",
+                        "no_percentage",
+                        "no_percentage_fused",
+                    }:
+                        pos_mask, neu_mask, neg_mask, pos_thr, neg_thr, pos_frac, neg_frac = adaptive_writer_role_masks()
+                    elif role_mode in {
+                        "adaptive_writer_robust",
+                        "adaptive_writer_robust_fused",
+                        "adaptive_writer_robust_split",
+                        "robust_adaptive_writer",
+                        "robust_adaptive_writer_fused",
+                        "robust_adaptive_writer_split",
+                        "no_percentage_robust",
+                        "no_percentage_robust_fused",
+                        "no_percentage_robust_split",
+                        "adaptive_writer_conflictlite_split",
+                        "conflictlite_adaptive_writer_split",
+                        "no_percentage_conflictlite_split",
+                        "adaptive_writer_energy_matched_split",
+                        "energy_matched_adaptive_writer_split",
+                        "no_percentage_energy_matched_split",
+                    }:
+                        pos_mask, neu_mask, neg_mask, pos_thr, neg_thr, pos_frac, neg_frac = adaptive_writer_robust_role_masks()
+                    elif role_mode in {
+                        "adaptive_writer_sc_gamma_split",
+                        "sc_gamma_split",
+                        "no_percentage_sc_gamma_split",
+                        "adaptive_writer_sc_gamma_commit_split",
+                        "sc_gamma_commit_split",
+                        "no_percentage_sc_gamma_commit_split",
+                    }:
+                        pos_mask, neu_mask, neg_mask, pos_thr, neg_thr, pos_frac, neg_frac = adaptive_writer_sc_gamma_role_masks()
+                    elif role_mode in {
+                        "adaptive_writer_state_energy_matched_split",
+                        "state_energy_matched_split",
+                        "no_percentage_state_energy_matched_split",
+                        "adaptive_writer_state_energy_commit_split",
+                        "adaptive_writer_state_energy_directional_commit_split",
+                        "state_energy_directional_commit_split",
+                        "no_percentage_state_energy_directional_commit_split",
+                        "adaptive_writer_tail_state_continuity_guard",
+                        "tail_state_continuity_guard",
+                        "adaptive_writer_tail_state_continuity_guard_selective_commit",
+                        "tail_state_continuity_guard_selective_commit",
+                    }:
+                        pos_mask, neu_mask, neg_mask, pos_thr, neg_thr, pos_frac, neg_frac = adaptive_writer_state_energy_role_masks()
+                    elif role_mode in {
+                        "adaptive_writer_binary_anchor_split",
+                        "binary_stable_anchor_split",
+                        "stable_anchor_binary_split",
+                    }:
+                        pos_mask, neu_mask, neg_mask, pos_thr, neg_thr, pos_frac, neg_frac = adaptive_writer_binary_write_role_masks(
+                            "binary_anchor"
+                        )
+                    elif role_mode in {
+                        "adaptive_writer_risk_veto_split",
+                        "risk_veto_binary_split",
+                        "no_long_write_risk_veto_split",
+                    }:
+                        pos_mask, neu_mask, neg_mask, pos_thr, neg_thr, pos_frac, neg_frac = adaptive_writer_binary_write_role_masks(
+                            "risk_veto"
+                        )
+                    elif role_mode in {
+                        "adaptive_writer_cluster3d_split",
+                        "cluster3d_adaptive_writer_split",
+                        "no_percentage_cluster3d_split",
+                    }:
+                        pos_mask, neu_mask, neg_mask, pos_thr, neg_thr, pos_frac, neg_frac = adaptive_writer_cluster3d_role_masks()
                     else:
-                        pos_thr = torch.quantile(risk, pos_frac)
-                        pos_mask = risk <= pos_thr
-                    if neg_frac <= 0.0:
-                        neg_mask = torch.zeros_like(risk, dtype=torch.bool)
-                        neg_thr = torch.tensor(1.0, dtype=risk.dtype, device=risk.device)
-                    elif neg_frac >= 1.0:
-                        neg_mask = torch.ones_like(risk, dtype=torch.bool)
-                        neg_thr = torch.tensor(0.0, dtype=risk.dtype, device=risk.device)
-                    else:
-                        neg_thr = torch.quantile(risk, 1.0 - neg_frac)
-                        neg_mask = risk >= neg_thr
-                    pos_mask = pos_mask & (~neg_mask)
-                    neu_mask = ~(pos_mask | neg_mask)
+                        raise ValueError(f"Unsupported tri replay role mode: {self.tri_replay_role_mode}")
 
                     def replay_group(group_vec: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
                         group_prior = group_vec.to(device=device, dtype=token_prior0.dtype).view(1, -1, 1)
@@ -959,19 +1675,236 @@ class TTTWriteController:
                             momentum,
                         )
 
+                    adaptive_writer_fused = role_mode in {
+                        "adaptive_writer",
+                        "adaptive_writer_fused",
+                        "adaptive_otsu_writer",
+                        "adaptive_otsu_fused",
+                        "no_percentage",
+                        "no_percentage_fused",
+                        "adaptive_writer_robust",
+                        "adaptive_writer_robust_fused",
+                        "robust_adaptive_writer",
+                        "robust_adaptive_writer_fused",
+                        "no_percentage_robust",
+                        "no_percentage_robust_fused",
+                    }
+                    if adaptive_writer_fused:
+                        token_count = max(float(risk.numel()), 1.0)
+                        pos_risk_mean = risk[pos_mask].mean() if bool(pos_mask.any()) else risk.mean()
+                        neg_risk_mean = risk[neg_mask].mean() if bool(neg_mask.any()) else risk.mean()
+                        neg_mass = neg_mask.float().mean()
+                        risk_gap = (neg_risk_mean - pos_risk_mean).clamp_min(0.0)
+                        prior_scale = p.std(unbiased=False).to(device=risk.device, dtype=risk.dtype).clamp_min(1e-4)
+                        if role_mode in {
+                            "adaptive_writer_robust",
+                            "adaptive_writer_robust_fused",
+                            "robust_adaptive_writer",
+                            "robust_adaptive_writer_fused",
+                            "no_percentage_robust",
+                            "no_percentage_robust_fused",
+                        }:
+                            gamma_eff_t = (risk_gap * neg_mass * prior_scale).clamp(1e-4, 2e-2)
+                        else:
+                            gamma_eff_t = (risk_gap * neg_mass / torch.sqrt(risk.new_tensor(token_count))).clamp(1e-4, 2e-2)
+                        if bool(neu_mask.any()):
+                            neu_lambda_t = (1.0 - risk[neu_mask].mean()).clamp(0.20, 1.0)
+                        else:
+                            neu_lambda_t = risk.new_tensor(0.0)
+                        signed_vec = (
+                            p * pos_mask.float()
+                            + neu_lambda_t * p * neu_mask.float()
+                            - gamma_eff_t * risk * neg_mask.float()
+                        )
+                        fused_w0, fused_w1, fused_w2 = replay_group(signed_vec)
+                        token_filter_blend_debug["ttt_tri_replay_adaptive_writer_fused"] = True
+                        token_filter_blend_debug["ttt_tri_replay_adaptive_gamma"] = float(gamma_eff_t.item())
+                        token_filter_blend_debug["ttt_tri_replay_adaptive_neutral_lambda"] = float(neu_lambda_t.item())
+                        token_filter_blend_debug["ttt_tri_replay_adaptive_risk_gap"] = float(risk_gap.item())
+                        token_filter_blend_debug["ttt_tri_replay_adaptive_prior_scale"] = float(prior_scale.item())
+                        token_filter_blend_debug["ttt_tri_replay_adaptive_token_count"] = int(risk.numel())
+                        token_filter_blend_debug["ttt_two_replay_applied"] = False
+                        token_filter_blend_debug["ttt_two_replay_debug_note"] = "tri_replay_path; use ttt_tri_replay_applied"
+                        token_filter_blend_debug["ttt_tri_replay_applied"] = True
+                        token_filter_blend_debug["ttt_tri_replay_active_branches"] = list(active)
+                        token_filter_blend_debug["ttt_tri_replay_positive_frac"] = float(pos_frac)
+                        token_filter_blend_debug["ttt_tri_replay_negative_frac"] = float(neg_frac)
+                        token_filter_blend_debug["ttt_tri_replay_neutral_lambda"] = float(neu_lambda_t.item())
+                        token_filter_blend_debug["ttt_tri_replay_pos_threshold"] = float(pos_thr.item())
+                        token_filter_blend_debug["ttt_tri_replay_neg_threshold"] = float(neg_thr.item())
+                        token_filter_blend_debug["ttt_tri_replay_pos_mass"] = float(pos_mask.float().mean().item())
+                        token_filter_blend_debug["ttt_tri_replay_neu_mass"] = float(neu_mask.float().mean().item())
+                        token_filter_blend_debug["ttt_tri_replay_neg_mass"] = float(neg_mask.float().mean().item())
+                        token_filter_blend_debug["ttt_two_replay_active_branches"] = list(active)
+                        token_filter_blend_debug["ttt_two_replay_risk_mean"] = float(risk.detach().float().mean().item())
+                        token_filter_blend_debug["ttt_two_replay_risk_p90"] = float(torch.quantile(risk.detach().float(), 0.90).item())
+                        return fused_w0, fused_w1, fused_w2
+
                     pos_vec = (p * pos_mask.float()).clamp_min(0.0)
                     neu_vec = (p * neu_mask.float()).clamp_min(0.0)
                     neg_vec = (risk * neg_mask.float()).clamp_min(0.0)
                     pos_w0, pos_w1, pos_w2 = replay_group(pos_vec)
                     neu_w0, neu_w1, neu_w2 = replay_group(neu_vec)
                     neg_w0, neg_w1, neg_w2 = replay_group(neg_vec)
+                else:
+                    risk_prior = risk.to(device=device, dtype=token_prior0.dtype).view(1, -1, 1)
+                    neg_prior0 = risk_prior if 0 in active else token_prior0_pre_gr
+                    neg_prior1 = risk_prior if 1 in active else token_prior1_pre_gr
+                    neg_prior2 = risk_prior if 2 in active else token_prior2_pre_gr
+                    neg_w0, neg_w1, neg_w2 = replay_with_feature_select(
+                        k_native_full, v_native_full, k_gate_full, v_gate_full,
+                        lr0, lr1, lr2,
+                        risk_prior,
+                        neg_prior0,
+                        neg_prior1,
+                        neg_prior2,
+                        replay_order_full,
+                        momentum,
+                    )
+
+                    branch_gammas = {
+                        str(k): float(v)
+                        for k, v in gradient_reversal_debug.get(
+                            "ttt_gradient_reversal_active_branch_gammas", {}
+                        ).items()
+                    }
+
+                    def apply_branch(
+                        branch_idx: int,
+                        name: str,
+                        pos: torch.Tensor,
+                        neg: torch.Tensor,
+                        old: torch.Tensor,
+                    ) -> torch.Tensor:
+                        if branch_idx not in active:
+                            return pos
+                        gamma = float(branch_gammas.get(str(branch_idx), self.gradient_reversal_gamma))
+                        candidate = pos.float() - gamma * (neg.float() - old.float())
+                        delta_norm = (neg.float() - old.float()).detach().norm(dim=1)
+                        token_filter_blend_debug[f"ttt_two_replay_{name}_gamma"] = float(gamma)
+                        token_filter_blend_debug[f"ttt_two_replay_{name}_neg_delta_norm_mean"] = float(
+                            delta_norm.mean().item()
+                        ) if delta_norm.numel() else 0.0
+                        return renorm_like(pos, candidate)
+
+                    out_w0 = apply_branch(0, "w0", candidate_w0, neg_w0, w0_old)
+                    out_w1 = apply_branch(1, "w1", candidate_w1, neg_w1, w1_old)
+                    out_w2 = apply_branch(2, "w2", candidate_w2, neg_w2, w2_old)
+                    risk_cpu = risk.detach().float().cpu()
+                    token_filter_blend_debug["ttt_two_replay_applied"] = True
+                    token_filter_blend_debug["ttt_two_replay_active_branches"] = list(active)
+                    token_filter_blend_debug["ttt_two_replay_risk_mean"] = float(risk_cpu.mean().item())
+                    token_filter_blend_debug["ttt_two_replay_risk_p90"] = float(torch.quantile(risk_cpu, 0.90).item())
+                    return out_w0, out_w1, out_w2
                 branch_gammas = {
                     str(k): float(v)
                     for k, v in gradient_reversal_debug.get(
                         "ttt_gradient_reversal_active_branch_gammas", {}
                     ).items()
                 }
-                neu_lambda = float(self.tri_replay_neutral_lambda)
+                adaptive_writer_split = role_mode in {
+                    "adaptive_writer_robust_split",
+                    "robust_adaptive_writer_split",
+                    "no_percentage_robust_split",
+                    "adaptive_writer_conflictlite_split",
+                    "conflictlite_adaptive_writer_split",
+                    "no_percentage_conflictlite_split",
+                    "adaptive_writer_energy_matched_split",
+                    "energy_matched_adaptive_writer_split",
+                    "no_percentage_energy_matched_split",
+                    "adaptive_writer_sc_gamma_split",
+                    "sc_gamma_split",
+                    "no_percentage_sc_gamma_split",
+                    "adaptive_writer_sc_gamma_commit_split",
+                    "sc_gamma_commit_split",
+                    "no_percentage_sc_gamma_commit_split",
+                    "adaptive_writer_state_energy_matched_split",
+                    "state_energy_matched_split",
+                    "no_percentage_state_energy_matched_split",
+                    "adaptive_writer_state_energy_commit_split",
+                    "adaptive_writer_state_energy_directional_commit_split",
+                    "state_energy_directional_commit_split",
+                    "no_percentage_state_energy_directional_commit_split",
+                    "adaptive_writer_tail_state_continuity_guard",
+                    "tail_state_continuity_guard",
+                    "adaptive_writer_tail_state_continuity_guard_selective_commit",
+                    "tail_state_continuity_guard_selective_commit",
+                    "adaptive_writer_binary_anchor_split",
+                    "binary_stable_anchor_split",
+                    "stable_anchor_binary_split",
+                    "adaptive_writer_risk_veto_split",
+                    "risk_veto_binary_split",
+                    "no_long_write_risk_veto_split",
+                    "adaptive_writer_cluster3d_split",
+                    "cluster3d_adaptive_writer_split",
+                    "no_percentage_cluster3d_split",
+                }
+                adaptive_writer_energy_matched_split = role_mode in {
+                    "adaptive_writer_energy_matched_split",
+                    "energy_matched_adaptive_writer_split",
+                    "no_percentage_energy_matched_split",
+                }
+                adaptive_writer_sc_gamma_split = role_mode in {
+                    "adaptive_writer_sc_gamma_split",
+                    "sc_gamma_split",
+                    "no_percentage_sc_gamma_split",
+                    "adaptive_writer_sc_gamma_commit_split",
+                    "sc_gamma_commit_split",
+                    "no_percentage_sc_gamma_commit_split",
+                }
+                adaptive_writer_state_energy_matched_split = role_mode in {
+                    "adaptive_writer_state_energy_matched_split",
+                    "state_energy_matched_split",
+                    "no_percentage_state_energy_matched_split",
+                    "adaptive_writer_state_energy_commit_split",
+                    "adaptive_writer_state_energy_directional_commit_split",
+                    "state_energy_directional_commit_split",
+                    "no_percentage_state_energy_directional_commit_split",
+                }
+                adaptive_writer_tail_state_continuity_guard = role_mode in {
+                    "adaptive_writer_tail_state_continuity_guard",
+                    "tail_state_continuity_guard",
+                    "adaptive_writer_tail_state_continuity_guard_selective_commit",
+                    "tail_state_continuity_guard_selective_commit",
+                }
+                adaptive_writer_binary_no_long_write = role_mode in {
+                    "adaptive_writer_binary_anchor_split",
+                    "binary_stable_anchor_split",
+                    "stable_anchor_binary_split",
+                    "adaptive_writer_risk_veto_split",
+                    "risk_veto_binary_split",
+                    "no_long_write_risk_veto_split",
+                }
+                adaptive_split_gamma: Optional[float] = None
+                if adaptive_writer_split:
+                    pos_risk_mean = risk[pos_mask].mean() if bool(pos_mask.any()) else risk.mean()
+                    neg_risk_mean = risk[neg_mask].mean() if bool(neg_mask.any()) else risk.mean()
+                    neg_mass = neg_mask.float().mean()
+                    risk_gap = (neg_risk_mean - pos_risk_mean).clamp_min(0.0)
+                    prior_scale = p.std(unbiased=False).to(device=risk.device, dtype=risk.dtype).clamp_min(1e-4)
+                    gamma_eff_t = (risk_gap * neg_mass * prior_scale).clamp(1e-4, 2e-2)
+                    if bool(neu_mask.any()):
+                        neu_lambda_t = (1.0 - risk[neu_mask].mean()).clamp(0.20, 1.0)
+                    else:
+                        neu_lambda_t = risk.new_tensor(0.0)
+                    adaptive_split_gamma = float(gamma_eff_t.item())
+                    neu_lambda = float(neu_lambda_t.item())
+                    token_filter_blend_debug["ttt_tri_replay_adaptive_writer_split"] = True
+                    token_filter_blend_debug["ttt_tri_replay_adaptive_writer_energy_matched_split"] = bool(
+                        adaptive_writer_energy_matched_split
+                    )
+                    token_filter_blend_debug["ttt_tri_replay_adaptive_writer_state_energy_matched_split"] = bool(
+                        adaptive_writer_state_energy_matched_split
+                    )
+                    token_filter_blend_debug["ttt_tri_replay_adaptive_gamma"] = float(gamma_eff_t.item())
+                    token_filter_blend_debug["ttt_tri_replay_adaptive_neutral_lambda"] = float(neu_lambda_t.item())
+                    token_filter_blend_debug["ttt_tri_replay_adaptive_risk_gap"] = float(risk_gap.item())
+                    token_filter_blend_debug["ttt_tri_replay_adaptive_prior_scale"] = float(prior_scale.item())
+                    token_filter_blend_debug["ttt_tri_replay_adaptive_token_count"] = int(risk.numel())
+                else:
+                    neu_lambda = float(self.tri_replay_neutral_lambda)
+                energy_matched_gammas: List[float] = []
+                energy_matched_lambdas: List[float] = []
 
                 def maybe_route_heads(
                     branch_idx: int,
@@ -1010,27 +1943,214 @@ class TTTWriteController:
                 ) -> torch.Tensor:
                     if branch_idx not in active:
                         return full_pos
-                    gamma = float(branch_gammas.get(str(branch_idx), self.gradient_reversal_gamma))
+                    pos_delta = pos.float() - old.float()
+                    neu_delta = neu.float() - old.float()
+                    neg_delta = neg.float() - old.float()
+                    pos_norm = pos_delta.detach().norm(dim=1)
+                    neu_norm = neu_delta.detach().norm(dim=1)
+                    neg_norm = neg_delta.detach().norm(dim=1)
+                    if adaptive_writer_binary_no_long_write:
+                        gamma = 0.0
+                        neu_lambda_branch = 0.0
+                        token_filter_blend_debug[f"ttt_tri_replay_{name}_v56_binary_no_long_write"] = True
+                        token_filter_blend_debug[f"ttt_tri_replay_{name}_v56_binary_gamma"] = float(gamma)
+                        token_filter_blend_debug[f"ttt_tri_replay_{name}_v56_binary_neutral_lambda"] = float(
+                            neu_lambda_branch
+                        )
+                    elif adaptive_writer_energy_matched_split:
+                        pos_rms = pos_norm.square().mean().sqrt()
+                        neu_rms = neu_norm.square().mean().sqrt()
+                        neg_rms = neg_norm.square().mean().sqrt()
+                        pos_risk_mean = risk[pos_mask].mean() if bool(pos_mask.any()) else risk.mean()
+                        neg_risk_mean = risk[neg_mask].mean() if bool(neg_mask.any()) else risk.mean()
+                        sep = (neg_risk_mean - pos_risk_mean).clamp(0.0, 1.0)
+                        gamma_t = (pos_rms / neg_rms.clamp_min(1e-6) * sep).clamp(1e-4, 2e-2)
+                        if bool(neu_mask.any()):
+                            neu_risk_mean = risk[neu_mask].mean()
+                            neu_lambda_t = (pos_rms / neu_rms.clamp_min(1e-6) * (1.0 - neu_risk_mean)).clamp(0.20, 1.0)
+                        else:
+                            neu_lambda_t = risk.new_tensor(0.0)
+                        gamma = float(gamma_t.item())
+                        neu_lambda_branch = float(neu_lambda_t.item())
+                        energy_matched_gammas.append(float(gamma))
+                        energy_matched_lambdas.append(float(neu_lambda_branch))
+                        token_filter_blend_debug[f"ttt_tri_replay_{name}_energy_matched_pos_rms"] = float(pos_rms.item())
+                        token_filter_blend_debug[f"ttt_tri_replay_{name}_energy_matched_neu_rms"] = float(neu_rms.item())
+                        token_filter_blend_debug[f"ttt_tri_replay_{name}_energy_matched_neg_rms"] = float(neg_rms.item())
+                        token_filter_blend_debug[f"ttt_tri_replay_{name}_energy_matched_risk_sep"] = float(sep.item())
+                        token_filter_blend_debug[f"ttt_tri_replay_{name}_energy_matched_neutral_lambda"] = float(neu_lambda_branch)
+                    elif adaptive_writer_state_energy_matched_split or adaptive_writer_tail_state_continuity_guard:
+                        native_delta = full_pos.float() - old.float()
+                        native_norm = native_delta.detach().norm(dim=1)
+                        native_rms = native_norm.square().mean().sqrt()
+                        configured_gamma0 = float(branch_gammas.get(str(branch_idx), 0.0))
+                        gamma0 = configured_gamma0
+                        gamma0_source = "branch_or_layer_gamma"
+                        if gamma0 <= 0.0:
+                            gamma0 = float(self.gradient_reversal_gamma)
+                            gamma0_source = "global_gradient_reversal_gamma"
+                        if gamma0 <= 0.0:
+                            gamma0 = 0.0075
+                            gamma0_source = "v54_default_gamma0"
+                        if bool(neu_mask.any()):
+                            neu_lambda_t = (1.0 - risk[neu_mask].mean()).clamp(0.20, 1.0)
+                        else:
+                            neu_lambda_t = risk.new_tensor(0.0)
+                        pre_raw = (
+                            old.float()
+                            + pos_delta
+                            + float(neu_lambda_t.item()) * neu_delta
+                            - float(gamma0) * neg_delta
+                        )
+                        pre_controlled = renorm_like(full_pos, pre_raw)
+                        candidate_delta = pre_controlled.float() - old.float()
+                        candidate_norm = candidate_delta.detach().norm(dim=1)
+                        candidate_rms = candidate_norm.square().mean().sqrt()
+                        ema_key = f"layer_{int(layer_idx)}_branch_{int(branch_idx)}"
+                        ema_prev = self.state_energy_target_ema.get(ema_key)
+                        if ema_prev is None:
+                            target_energy = native_rms.detach()
+                            ema_source = "bootstrap_current_native"
+                        else:
+                            target_energy = native_rms.new_tensor(float(ema_prev))
+                            ema_source = "causal_ema_previous"
+                        g_energy = (
+                            target_energy / candidate_rms.clamp_min(1e-6)
+                        ).clamp(self.state_energy_gamma_gain_min, self.state_energy_gamma_gain_max)
+                        risk_med = torch.median(risk.detach().float())
+                        risk_mad = torch.median((risk.detach().float() - risk_med).abs())
+                        neg_mass = neg_mask.float().mean()
+                        g_risk = (risk_mad * neg_mass).clamp(0.0, 1.0)
+                        gamma_t = (
+                            float(gamma0) * g_energy * (1.0 + g_risk)
+                        ).clamp(self.state_energy_gamma_min, self.state_energy_gamma_max)
+                        neu_lambda_branch = float(neu_lambda_t.item())
+                        if adaptive_writer_tail_state_continuity_guard:
+                            flat_c = candidate_delta.detach().float().reshape(-1)
+                            flat_n = native_delta.detach().float().reshape(-1)
+                            cos_den = (flat_c.norm() * flat_n.norm()).clamp_min(1e-12)
+                            cand_native_cos = ((flat_c @ flat_n) / cos_den).clamp(-1.0, 1.0)
+                            energy_ref = target_energy.detach().clamp_min(1e-6)
+                            overshoot = (candidate_rms.detach() / energy_ref).clamp(0.0, 10.0)
+                            neutral_risk = risk[neu_mask].mean() if bool(neu_mask.any()) else risk.mean()
+                            p_med = torch.median(p.detach().float())
+                            p_mad = torch.median((p.detach().float() - p_med).abs())
+                            static_anchor = ((p.detach().float() >= p_med + p_mad) & (risk.detach().float() <= risk_med)).float().mean()
+                            chunk_idx = int(getattr(self, "current_chunk_idx", getattr(self, "v11_projection_chunk_idx", -1)))
+                            reset_age = float(chunk_idx % 5) if chunk_idx >= 0 else 0.0
+                            reset_age_factor = risk.new_tensor(reset_age / 4.0)
+                            cos_risk = ((risk.new_tensor(0.88) - cand_native_cos) / 0.38).clamp(0.0, 1.0)
+                            overshoot_risk = ((overshoot - 1.05) / 0.80).clamp(0.0, 1.0)
+                            neutral_risk_term = neutral_risk.clamp(0.0, 1.0)
+                            static_risk = (1.0 - static_anchor).clamp(0.0, 1.0)
+                            tail_risk = (
+                                0.35 * overshoot_risk
+                                + 0.30 * cos_risk
+                                + 0.15 * neutral_risk_term
+                                + 0.10 * static_risk
+                                + 0.10 * reset_age_factor
+                            ).clamp(0.0, 1.0)
+                            gamma_shrink = (1.0 - 0.65 * tail_risk).clamp(0.25, 1.0)
+                            lambda_boost = (0.45 + 0.50 * tail_risk).clamp(0.45, 0.95)
+                            gamma_t = (gamma_t * gamma_shrink).clamp(self.state_energy_gamma_min, self.state_energy_gamma_max)
+                            neu_lambda_branch = float(max(float(neu_lambda_branch), float(lambda_boost.item())))
+                            tail_key = f"layer_{int(layer_idx)}_branch_{int(branch_idx)}"
+                            prev_tail = self.tail_state_energy_ema.get(tail_key)
+                            ema_in = float(candidate_rms.detach().item())
+                            self.tail_state_energy_ema[tail_key] = (
+                                ema_in if prev_tail is None else 0.75 * float(prev_tail) + 0.25 * ema_in
+                            )
+                            token_filter_blend_debug[f"ttt_tri_replay_{name}_tail_guard_reset_age_mod5"] = float(reset_age)
+                            token_filter_blend_debug[f"ttt_tri_replay_{name}_tail_guard_candidate_native_cos"] = float(cand_native_cos.item())
+                            token_filter_blend_debug[f"ttt_tri_replay_{name}_tail_guard_overshoot"] = float(overshoot.item())
+                            token_filter_blend_debug[f"ttt_tri_replay_{name}_tail_guard_neutral_risk"] = float(neutral_risk.item())
+                            token_filter_blend_debug[f"ttt_tri_replay_{name}_tail_guard_static_anchor_mass"] = float(static_anchor.item())
+                            token_filter_blend_debug[f"ttt_tri_replay_{name}_tail_guard_risk"] = float(tail_risk.item())
+                            token_filter_blend_debug[f"ttt_tri_replay_{name}_tail_guard_gamma_shrink"] = float(gamma_shrink.item())
+                            token_filter_blend_debug[f"ttt_tri_replay_{name}_tail_guard_lambda_boost"] = float(lambda_boost.item())
+                            token_filter_blend_debug[f"ttt_tri_replay_{name}_tail_guard_energy_ema_next"] = float(self.tail_state_energy_ema[tail_key])
+                        gamma = float(gamma_t.item())
+                        updated_target = (
+                            (1.0 - float(self.state_energy_ema_alpha)) * float(target_energy.item())
+                            + float(self.state_energy_ema_alpha) * float(native_rms.item())
+                        )
+                        self.state_energy_target_ema[ema_key] = float(updated_target)
+                        energy_matched_gammas.append(float(gamma))
+                        energy_matched_lambdas.append(float(neu_lambda_branch))
+                        token_filter_blend_debug[f"ttt_tri_replay_{name}_state_energy_gamma0"] = float(gamma0)
+                        token_filter_blend_debug[f"ttt_tri_replay_{name}_state_energy_gamma0_source"] = gamma0_source
+                        token_filter_blend_debug[f"ttt_tri_replay_{name}_state_energy_native_rms"] = float(native_rms.item())
+                        token_filter_blend_debug[f"ttt_tri_replay_{name}_state_energy_candidate_rms"] = float(candidate_rms.item())
+                        token_filter_blend_debug[f"ttt_tri_replay_{name}_state_energy_target_rms"] = float(target_energy.item())
+                        token_filter_blend_debug[f"ttt_tri_replay_{name}_state_energy_target_source"] = ema_source
+                        token_filter_blend_debug[f"ttt_tri_replay_{name}_state_energy_target_ema_next"] = float(updated_target)
+                        token_filter_blend_debug[f"ttt_tri_replay_{name}_state_energy_g_energy"] = float(g_energy.item())
+                        token_filter_blend_debug[f"ttt_tri_replay_{name}_state_energy_risk_mad"] = float(risk_mad.item())
+                        token_filter_blend_debug[f"ttt_tri_replay_{name}_state_energy_neg_mass"] = float(neg_mass.item())
+                        token_filter_blend_debug[f"ttt_tri_replay_{name}_state_energy_g_risk"] = float(g_risk.item())
+                        token_filter_blend_debug[f"ttt_tri_replay_{name}_state_energy_neutral_lambda"] = float(neu_lambda_branch)
+                        token_filter_blend_debug[f"ttt_tri_replay_{name}_tail_state_continuity_guard"] = bool(
+                            adaptive_writer_tail_state_continuity_guard
+                        )
+                    elif adaptive_writer_sc_gamma_split:
+                        native_delta = full_pos.float() - old.float()
+                        native_norm = native_delta.detach().norm(dim=1)
+                        native_rms = native_norm.square().mean().sqrt()
+                        neg_rms = neg_norm.square().mean().sqrt()
+                        risk_var = risk.detach().float().var(unbiased=False)
+                        p_var = p.detach().float().var(unbiased=False)
+                        var_ratio = torch.sqrt(risk_var / p_var.clamp_min(1e-6))
+                        configured_rho = float(branch_gammas.get(str(branch_idx), 0.0))
+                        rho = configured_rho if configured_rho > 0.0 else 0.005
+                        gamma_t = (rho * native_rms / neg_rms.clamp_min(1e-6) * var_ratio).clamp(1e-4, 2e-2)
+                        if bool(neu_mask.any()):
+                            neu_lambda_t = (1.0 - risk[neu_mask].mean()).clamp(0.20, 1.0)
+                        else:
+                            neu_lambda_t = risk.new_tensor(0.0)
+                        gamma = float(gamma_t.item())
+                        neu_lambda_branch = float(neu_lambda_t.item())
+                        energy_matched_gammas.append(float(gamma))
+                        energy_matched_lambdas.append(float(neu_lambda_branch))
+                        token_filter_blend_debug[f"ttt_tri_replay_{name}_sc_gamma_rho"] = float(rho)
+                        token_filter_blend_debug[f"ttt_tri_replay_{name}_sc_gamma_configured_rho"] = float(configured_rho)
+                        token_filter_blend_debug[f"ttt_tri_replay_{name}_sc_gamma_rho_source"] = (
+                            "layer_or_branch_gamma" if configured_rho > 0.0 else "default"
+                        )
+                        token_filter_blend_debug[f"ttt_tri_replay_{name}_sc_gamma_native_rms"] = float(native_rms.item())
+                        token_filter_blend_debug[f"ttt_tri_replay_{name}_sc_gamma_neg_rms"] = float(neg_rms.item())
+                        token_filter_blend_debug[f"ttt_tri_replay_{name}_sc_gamma_risk_var"] = float(risk_var.item())
+                        token_filter_blend_debug[f"ttt_tri_replay_{name}_sc_gamma_prior_var"] = float(p_var.item())
+                        token_filter_blend_debug[f"ttt_tri_replay_{name}_sc_gamma_var_ratio"] = float(var_ratio.item())
+                        token_filter_blend_debug[f"ttt_tri_replay_{name}_sc_gamma_neutral_lambda"] = float(neu_lambda_branch)
+                    else:
+                        gamma = (
+                            float(adaptive_split_gamma)
+                            if adaptive_writer_split and adaptive_split_gamma is not None
+                            else float(branch_gammas.get(str(branch_idx), self.gradient_reversal_gamma))
+                        )
+                        neu_lambda_branch = float(neu_lambda)
                     raw = (
                         old.float()
-                        + (pos.float() - old.float())
-                        + neu_lambda * (neu.float() - old.float())
-                        - gamma * (neg.float() - old.float())
+                        + pos_delta
+                        + neu_lambda_branch * neu_delta
+                        - gamma * neg_delta
                     )
                     token_filter_blend_debug[f"ttt_tri_replay_{name}_gamma"] = float(gamma)
                     token_filter_blend_debug[f"ttt_tri_replay_{name}_pos_delta_norm_mean"] = float(
-                        (pos.float() - old.float()).detach().norm(dim=1).mean().item()
+                        pos_norm.mean().item()
                     )
                     token_filter_blend_debug[f"ttt_tri_replay_{name}_neu_delta_norm_mean"] = float(
-                        (neu.float() - old.float()).detach().norm(dim=1).mean().item()
+                        neu_norm.mean().item()
                     )
                     token_filter_blend_debug[f"ttt_tri_replay_{name}_neg_delta_norm_mean"] = float(
-                        (neg.float() - old.float()).detach().norm(dim=1).mean().item()
+                        neg_norm.mean().item()
                     )
                     controlled = renorm_like(full_pos, raw)
                     route_base = full_pos
                     base_gamma = float(
-                        self.gradient_reversal_branch_gammas.get(
+                        adaptive_split_gamma
+                        if adaptive_writer_split and adaptive_split_gamma is not None
+                        else self.gradient_reversal_branch_gammas.get(
                             int(branch_idx),
                             self.gradient_reversal_gamma,
                         )
@@ -1049,8 +2169,32 @@ class TTTWriteController:
                 out_w0 = apply_tri_branch(0, "w0", candidate_w0, pos_w0, neu_w0, neg_w0, w0_old)
                 out_w1 = apply_tri_branch(1, "w1", candidate_w1, pos_w1, neu_w1, neg_w1, w1_old)
                 out_w2 = apply_tri_branch(2, "w2", candidate_w2, pos_w2, neu_w2, neg_w2, w2_old)
+                if (
+                    adaptive_writer_energy_matched_split
+                    or adaptive_writer_sc_gamma_split
+                    or adaptive_writer_state_energy_matched_split
+                    or adaptive_writer_tail_state_continuity_guard
+                    or adaptive_writer_binary_no_long_write
+                ) and energy_matched_gammas:
+                    gamma_mean = float(sum(energy_matched_gammas) / len(energy_matched_gammas))
+                    lambda_mean = float(sum(energy_matched_lambdas) / len(energy_matched_lambdas))
+                    token_filter_blend_debug["ttt_tri_replay_adaptive_gamma"] = gamma_mean
+                    token_filter_blend_debug["ttt_tri_replay_adaptive_neutral_lambda"] = lambda_mean
+                    if adaptive_writer_energy_matched_split:
+                        token_filter_blend_debug["ttt_tri_replay_energy_matched_gamma_mean"] = gamma_mean
+                        token_filter_blend_debug["ttt_tri_replay_energy_matched_neutral_lambda_mean"] = lambda_mean
+                    if adaptive_writer_sc_gamma_split:
+                        token_filter_blend_debug["ttt_tri_replay_sc_gamma_gamma_mean"] = gamma_mean
+                        token_filter_blend_debug["ttt_tri_replay_sc_gamma_neutral_lambda_mean"] = lambda_mean
+                    if adaptive_writer_state_energy_matched_split:
+                        token_filter_blend_debug["ttt_tri_replay_state_energy_gamma_mean"] = gamma_mean
+                        token_filter_blend_debug["ttt_tri_replay_state_energy_neutral_lambda_mean"] = lambda_mean
+                    if adaptive_writer_tail_state_continuity_guard:
+                        token_filter_blend_debug["ttt_tri_replay_tail_state_gamma_mean"] = gamma_mean
+                        token_filter_blend_debug["ttt_tri_replay_tail_state_neutral_lambda_mean"] = lambda_mean
                 risk_cpu = risk.detach().float().cpu()
-                token_filter_blend_debug["ttt_two_replay_applied"] = True
+                token_filter_blend_debug["ttt_two_replay_applied"] = False
+                token_filter_blend_debug["ttt_two_replay_debug_note"] = "tri_replay_path; use ttt_tri_replay_applied"
                 token_filter_blend_debug["ttt_tri_replay_applied"] = True
                 token_filter_blend_debug["ttt_tri_replay_active_branches"] = list(active)
                 token_filter_blend_debug["ttt_tri_replay_positive_frac"] = float(pos_frac)
@@ -1061,56 +2205,6 @@ class TTTWriteController:
                 token_filter_blend_debug["ttt_tri_replay_pos_mass"] = float(pos_mask.float().mean().item())
                 token_filter_blend_debug["ttt_tri_replay_neu_mass"] = float(neu_mask.float().mean().item())
                 token_filter_blend_debug["ttt_tri_replay_neg_mass"] = float(neg_mask.float().mean().item())
-                token_filter_blend_debug["ttt_two_replay_active_branches"] = list(active)
-                token_filter_blend_debug["ttt_two_replay_risk_mean"] = float(risk_cpu.mean().item())
-                token_filter_blend_debug["ttt_two_replay_risk_p90"] = float(torch.quantile(risk_cpu, 0.90).item())
-                return out_w0, out_w1, out_w2
-
-                risk_prior = risk.to(device=device, dtype=token_prior0.dtype).view(1, -1, 1)
-                neg_prior0 = risk_prior if 0 in active else token_prior0_pre_gr
-                neg_prior1 = risk_prior if 1 in active else token_prior1_pre_gr
-                neg_prior2 = risk_prior if 2 in active else token_prior2_pre_gr
-                neg_w0, neg_w1, neg_w2 = replay_with_feature_select(
-                    k_native_full, v_native_full, k_gate_full, v_gate_full,
-                    lr0, lr1, lr2,
-                    risk_prior,
-                    neg_prior0,
-                    neg_prior1,
-                    neg_prior2,
-                    replay_order_full,
-                    momentum,
-                )
-
-                branch_gammas = {
-                    str(k): float(v)
-                    for k, v in gradient_reversal_debug.get(
-                        "ttt_gradient_reversal_active_branch_gammas", {}
-                    ).items()
-                }
-
-                def apply_branch(
-                    branch_idx: int,
-                    name: str,
-                    pos: torch.Tensor,
-                    neg: torch.Tensor,
-                    old: torch.Tensor,
-                ) -> torch.Tensor:
-                    if branch_idx not in active:
-                        return pos
-                    gamma = float(branch_gammas.get(str(branch_idx), self.gradient_reversal_gamma))
-                    candidate = pos.float() - gamma * (neg.float() - old.float())
-                    delta_norm = (neg.float() - old.float()).detach().norm(dim=1)
-                    token_filter_blend_debug[f"ttt_two_replay_{name}_gamma"] = float(gamma)
-                    token_filter_blend_debug[f"ttt_two_replay_{name}_neg_delta_norm_mean"] = float(
-                        delta_norm.mean().item()
-                    ) if delta_norm.numel() else 0.0
-                    return renorm_like(pos, candidate)
-
-                out_w0 = apply_branch(0, "w0", candidate_w0, neg_w0, w0_old)
-                out_w1 = apply_branch(1, "w1", candidate_w1, neg_w1, w1_old)
-                out_w2 = apply_branch(2, "w2", candidate_w2, neg_w2, w2_old)
-                risk_cpu = risk.detach().float().cpu()
-                token_filter_blend_debug["ttt_two_replay_applied"] = True
                 token_filter_blend_debug["ttt_two_replay_active_branches"] = list(active)
                 token_filter_blend_debug["ttt_two_replay_risk_mean"] = float(risk_cpu.mean().item())
                 token_filter_blend_debug["ttt_two_replay_risk_p90"] = float(torch.quantile(risk_cpu, 0.90).item())
@@ -1428,14 +2522,14 @@ class TTTWriteController:
             return None
         if y.shape != v.shape or y.ndim < 2:
             return None
-        y_cpu = y.detach().cpu().float()
-        v_cpu = v.detach().cpu().float()
-        res = (y_cpu - v_cpu).norm(dim=-1) / v_cpu.norm(dim=-1).clamp_min(1e-6)
+        y_dev = y.detach().float()
+        v_dev = v.detach().float()
+        res = (y_dev - v_dev).norm(dim=-1) / v_dev.norm(dim=-1).clamp_min(1e-6)
         if res.ndim == 1:
             per_tok = res
         else:
             per_tok = res.reshape(-1, res.shape[-1]).mean(dim=0)
-        out = torch.zeros(int(cache_l), dtype=torch.float32)
+        out = torch.zeros(int(cache_l), dtype=torch.float32, device=per_tok.device)
         n = min(int(per_tok.numel()), int(cache_l))
         if n <= 0:
             return None
@@ -1451,6 +2545,9 @@ class TTTWriteController:
         token_type: Optional[torch.Tensor],
         cache_l: int,
         effective_branch_gammas: Optional[Dict[int, float]] = None,
+        num_frames: Optional[int] = None,
+        overlap_frames: int = 0,
+        layer_idx: int = -1,
     ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
         """Build an optional TTT-internal risk map for gradient reversal.
 
@@ -1474,7 +2571,62 @@ class TTTWriteController:
             }
         )
         max_gamma = max(branch_gamma_map.values(), default=max(float(self.gradient_reversal_gamma), 0.0))
-        if gr_mode in {"", "none", "off"} or max_gamma <= 0.0:
+        adaptive_writer_role = str(self.tri_replay_role_mode or "").strip().lower() in {
+            "adaptive_writer",
+            "adaptive_writer_fused",
+            "adaptive_otsu_writer",
+            "adaptive_otsu_fused",
+            "no_percentage",
+            "no_percentage_fused",
+            "adaptive_writer_robust",
+            "adaptive_writer_robust_fused",
+            "adaptive_writer_robust_split",
+            "robust_adaptive_writer",
+            "robust_adaptive_writer_fused",
+            "robust_adaptive_writer_split",
+            "no_percentage_robust",
+            "no_percentage_robust_fused",
+            "no_percentage_robust_split",
+            "adaptive_writer_conflictlite_split",
+            "conflictlite_adaptive_writer_split",
+            "no_percentage_conflictlite_split",
+            "adaptive_writer_energy_matched_split",
+            "energy_matched_adaptive_writer_split",
+            "no_percentage_energy_matched_split",
+            "adaptive_writer_sc_gamma_split",
+            "sc_gamma_split",
+            "no_percentage_sc_gamma_split",
+            "adaptive_writer_sc_gamma_commit_split",
+            "sc_gamma_commit_split",
+            "no_percentage_sc_gamma_commit_split",
+            "adaptive_writer_state_energy_matched_split",
+            "state_energy_matched_split",
+            "no_percentage_state_energy_matched_split",
+            "adaptive_writer_state_energy_commit_split",
+            "adaptive_writer_state_energy_directional_commit_split",
+            "state_energy_directional_commit_split",
+            "no_percentage_state_energy_directional_commit_split",
+            "adaptive_writer_tail_state_continuity_guard",
+            "tail_state_continuity_guard",
+            "adaptive_writer_tail_state_continuity_guard_selective_commit",
+            "tail_state_continuity_guard_selective_commit",
+            "adaptive_writer_binary_anchor_split",
+            "binary_stable_anchor_split",
+            "stable_anchor_binary_split",
+            "adaptive_writer_risk_veto_split",
+            "risk_veto_binary_split",
+            "no_long_write_risk_veto_split",
+            "adaptive_writer_cluster3d_split",
+            "cluster3d_adaptive_writer_split",
+            "no_percentage_cluster3d_split",
+        }
+        tri_mode_active = gr_mode in {
+            "tri_replay",
+            "three_replay",
+            "pos_neu_neg_replay",
+            "pos_neg_neu_replay",
+        }
+        if gr_mode in {"", "none", "off"} or (max_gamma <= 0.0 and not (tri_mode_active and adaptive_writer_role)):
             debug["ttt_gradient_reversal_risk_source_skip"] = "gradient_reversal_off"
             return None, debug
         if source in {"", "prior", "write_prior", "low_prior", "none", "off"}:
@@ -1489,6 +2641,19 @@ class TTTWriteController:
             "ttt_residual_x_dg",
             "residual_x_dg",
             "ttt_residual_times_dg",
+            "conflict_lite_selected_layers",
+            "conflictlite_selected_layers",
+            "selected_layer_conflict_lite",
+            "conflict_lite_layer0",
+            "conflictlite_layer0",
+            "conflict_lite_layer8",
+            "conflictlite_layer8",
+            "conflict_lite_layer17",
+            "conflictlite_layer17",
+            "conflict_lite_layer0_sample2048",
+            "conflictlite_layer0_sample2048",
+            "conflict_lite_layer17_sample2048",
+            "conflictlite_layer17_sample2048",
         }:
             residual_risk = self._ttt_layer_residual_risk(lc, cache_l)
             if residual_risk is None:
@@ -1497,6 +2662,45 @@ class TTTWriteController:
 
         if source in {"ttt_residual", "residual", "ttt_self_residual", "self_residual"}:
             risk = residual_risk
+        elif source in {
+            "v11_projection",
+            "projection",
+            "v11_gt_projection",
+            "gt_projection",
+            "v11_gt_scale_projection",
+            "gt_scale_projection",
+            "scale_projection",
+            "oracle_scale_projection",
+        }:
+            risk, projection_debug = self._ttt_layer_v11_gt_scale_projection_risk(
+                lc,
+                cache_l=cache_l,
+                prior_flat=prior_flat,
+            )
+            debug.update(projection_debug)
+            if risk is None:
+                debug["ttt_gradient_reversal_risk_source_missing_v11_projection"] = True
+                return None, debug
+        elif source in {
+            "v19_scale_state",
+            "scale_state",
+            "online_scale_state",
+            "nogt_scale_state",
+            "trajectory_scale_state",
+        }:
+            risk, scale_debug = self._ttt_layer_v19_scale_state_projection_risk(
+                lc,
+                cache_l=cache_l,
+                prior_flat=prior_flat,
+                risk_tok=risk_tok,
+                token_type=token_type,
+                num_frames=num_frames,
+                overlap_frames=overlap_frames,
+            )
+            debug.update(scale_debug)
+            if risk is None:
+                debug["ttt_gradient_reversal_risk_source_missing_v19_scale_state"] = True
+                return None, debug
         elif source in {
             "ttt_w0_conflict",
             "w0_conflict",
@@ -1525,6 +2729,70 @@ class TTTWriteController:
             if risk is None:
                 debug["ttt_gradient_reversal_risk_source_missing_update_conflict"] = True
                 return None, debug
+        elif source in {
+            "conflict_lite_selected_layers",
+            "conflictlite_selected_layers",
+            "selected_layer_conflict_lite",
+            "conflict_lite_layer0",
+            "conflictlite_layer0",
+            "conflict_lite_layer8",
+            "conflictlite_layer8",
+            "conflict_lite_layer17",
+            "conflictlite_layer17",
+            "conflict_lite_layer0_sample2048",
+            "conflictlite_layer0_sample2048",
+            "conflict_lite_layer17_sample2048",
+            "conflictlite_layer17_sample2048",
+        }:
+            sample_tokens = 0
+            if source in {"conflict_lite_layer0", "conflictlite_layer0"}:
+                selected_layers = {0}
+            elif source in {"conflict_lite_layer0_sample2048", "conflictlite_layer0_sample2048"}:
+                selected_layers = {0}
+                sample_tokens = 2048
+            elif source in {"conflict_lite_layer8", "conflictlite_layer8"}:
+                selected_layers = {8}
+            elif source in {"conflict_lite_layer17", "conflictlite_layer17"}:
+                selected_layers = {17}
+            elif source in {"conflict_lite_layer17_sample2048", "conflictlite_layer17_sample2048"}:
+                selected_layers = {17}
+                sample_tokens = 2048
+            else:
+                selected_layers = {0, 8, 17}
+            selected = int(layer_idx) in selected_layers
+            debug["ttt_conflictlite_selected_layers"] = sorted(selected_layers)
+            debug["ttt_conflictlite_layer_idx"] = int(layer_idx)
+            debug["ttt_conflictlite_selected_layer"] = bool(selected)
+            debug["ttt_conflictlite_sample_tokens"] = int(sample_tokens)
+            if selected:
+                conflict_risk, conflict_debug = self._ttt_layer_w0_update_risk(
+                    lc,
+                    cache_l=cache_l,
+                    prior_flat=prior_flat,
+                    mode="update_conflict_energy",
+                    sample_tokens=sample_tokens,
+                )
+                debug.update(conflict_debug)
+                if conflict_risk is not None:
+                    risk = conflict_risk
+                else:
+                    risk = residual_risk
+                    debug["ttt_conflictlite_fallback"] = "residual"
+            elif risk_tok is not None:
+                ext, align_debug = self._align_prior_to_replay_tokens(
+                    risk_tok,
+                    token_type=token_type,
+                    cache_l=cache_l,
+                )
+                debug.update({
+                    "ttt_gradient_reversal_risk_alignment_mode": align_debug.get("ttt_prior_alignment_mode"),
+                    "ttt_gradient_reversal_risk_alignment_full_tokens": align_debug.get("ttt_prior_alignment_full_tokens"),
+                    "ttt_conflictlite_fallback": "residual_x_dg_nonselected_layer",
+                })
+                risk = self._normalize01_vec(residual_risk * ext.detach().float().reshape(-1).clamp(0.0, 1.0))
+            else:
+                risk = residual_risk
+                debug["ttt_conflictlite_fallback"] = "residual_nonselected_layer"
         elif source in {"d_tok", "control", "control_prior", "external_d", "dg", "d_g"}:
             if risk_tok is None:
                 debug["ttt_gradient_reversal_risk_source_missing_external"] = True
@@ -1564,13 +2832,20 @@ class TTTWriteController:
             n = min(int(risk.numel()), int(out.numel()))
             out[:n] = risk[:n]
             risk = out
-        prior_cpu = prior_flat.detach().float().reshape(-1)
+        prior_vec = prior_flat.detach().to(device=risk.device, dtype=torch.float32).reshape(-1)
         debug.update({
             "ttt_gradient_reversal_risk_source_applied": True,
             "ttt_gradient_reversal_risk_source_mean": float(risk.mean().item()),
             "ttt_gradient_reversal_risk_source_p90": float(torch.quantile(risk, 0.90).item()),
-            "ttt_gradient_reversal_risk_source_corr_prior": self._corr_1d(risk, prior_cpu),
+            "ttt_gradient_reversal_risk_source_corr_prior": self._corr_1d(risk, prior_vec),
+            "_ttt_gradient_reversal_risk_source_vector_count": int(risk.numel()),
         })
+        if not adaptive_writer_role:
+            # Legacy diagnostics can consume this vector for token-level
+            # causal conditions.  Adaptive writer full runs skip it because
+            # the writer already receives `risk` directly and the CPU clone +
+            # log printing dominates runtime for 40k-token chunks.
+            debug["_ttt_gradient_reversal_risk_source_vector"] = risk.detach().cpu().float().clone()
         return risk, debug
 
     def _ttt_layer_w0_update_risk(
@@ -1580,6 +2855,7 @@ class TTTWriteController:
         cache_l: int,
         prior_flat: torch.Tensor,
         mode: str,
+        sample_tokens: int = 0,
     ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
         """Estimate token risk from the TTT w0 update geometry itself.
 
@@ -1605,19 +2881,31 @@ class TTTWriteController:
             if int(k.shape[1]) <= 0:
                 return None, debug
 
-            kf = k.detach().cpu().float()
-            vf = v.detach().cpu().float()
-            lr = lr0.detach().cpu().float()
-            w0f = w0.detach().cpu().float()
-            w1f = w1.detach().cpu().float()
-            w2f = w2.detach().cpu().float()
+            device = k.device
+            kf = k.detach().to(device=device, dtype=torch.float32)
+            vf = v.detach().to(device=device, dtype=torch.float32)
+            lr = lr0.detach().to(device=device, dtype=torch.float32)
+            w0f = w0.detach().to(device=device, dtype=torch.float32)
+            w1f = w1.detach().to(device=device, dtype=torch.float32)
+            w2f = w2.detach().to(device=device, dtype=torch.float32)
             l = min(int(kf.shape[1]), int(cache_l), int(prior_flat.numel()))
             if l <= 0:
                 return None, debug
-            kf = kf[:, :l, :]
-            vf = vf[:, :l, :]
-            lr = lr[:, :l, :]
-            p = prior_flat.detach().cpu().float().reshape(-1)[:l].view(1, l, 1)
+            sample_count = int(sample_tokens or 0)
+            sample_idx: Optional[torch.Tensor] = None
+            if sample_count > 0 and l > sample_count:
+                sample_idx = torch.linspace(0, l - 1, steps=sample_count, device=device).round().long().unique()
+                l_eff = int(sample_idx.numel())
+                kf = kf.index_select(1, sample_idx)
+                vf = vf.index_select(1, sample_idx)
+                lr = lr.index_select(1, sample_idx)
+                p_base = prior_flat.detach().to(device=device, dtype=torch.float32).reshape(-1)[:l]
+                p = p_base.index_select(0, sample_idx).view(1, l_eff, 1)
+            else:
+                kf = kf[:, :l, :]
+                vf = vf[:, :l, :]
+                lr = lr[:, :l, :]
+                p = prior_flat.detach().to(device=device, dtype=torch.float32).reshape(-1)[:l].view(1, l, 1)
             lr_eff = lr * p
 
             gate = torch.bmm(kf, w0f)
@@ -1653,8 +2941,17 @@ class TTTWriteController:
                 risk_b_l = ((1.0 - cos) * 0.5).clamp(0.0, 1.0)
 
             per_tok = risk_b_l.mean(dim=0)
-            out = torch.zeros(int(cache_l), dtype=torch.float32)
-            out[:l] = per_tok.detach().float()
+            out = torch.zeros(int(cache_l), dtype=torch.float32, device=device)
+            if sample_idx is not None:
+                full_pos = torch.arange(l, dtype=torch.float32, device=device)
+                nearest = torch.clamp(
+                    (full_pos / max(float(l - 1), 1.0) * max(int(per_tok.numel()) - 1, 0)).round().long(),
+                    min=0,
+                    max=max(int(per_tok.numel()) - 1, 0),
+                )
+                out[:l] = per_tok.detach().float().index_select(0, nearest)
+            else:
+                out[:l] = per_tok.detach().float()
             cos_flat = cos.detach().float().reshape(-1)
             energy_flat = energy.detach().float().reshape(-1)
             risk_head = risk_b_l.detach().float().mean(dim=1)
@@ -1670,6 +2967,9 @@ class TTTWriteController:
                 top_vals = top_idx = top_energy = top_cos = torch.empty(0)
             debug.update({
                 "ttt_update_conflict_mode": mode_text,
+                "ttt_update_conflict_sample_tokens_requested": int(sample_tokens or 0),
+                "ttt_update_conflict_sample_tokens_used": int(per_tok.numel()),
+                "ttt_update_conflict_sampled": bool(sample_idx is not None),
                 "ttt_update_conflict_cos_mean": float(cos_flat.mean().item()),
                 "ttt_update_conflict_cos_p10": float(torch.quantile(cos_flat, 0.10).item()),
                 "ttt_update_conflict_cos_p90": float(torch.quantile(cos_flat, 0.90).item()),
@@ -1690,6 +2990,408 @@ class TTTWriteController:
             return self._normalize01_vec(out), debug
         except RuntimeError as exc:
             debug["ttt_update_conflict_error"] = str(exc)
+            return None, debug
+
+    def _v19_scale_state_carrier_mask(
+        self,
+        *,
+        cache_l: int,
+        prior_flat: torch.Tensor,
+        risk_tok: Optional[torch.Tensor],
+        token_type: Optional[torch.Tensor],
+        num_frames: Optional[int],
+        overlap_frames: int,
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        carrier = str(self.scale_state_carrier or "all").strip().lower()
+        mask = torch.ones(int(cache_l), dtype=torch.bool)
+        debug: Dict[str, Any] = {
+            "v19_scale_state_carrier": carrier,
+            "v19_scale_state_carrier_valid": True,
+        }
+        if carrier in {"", "all", "full", "token"}:
+            debug["v19_scale_state_carrier_mass"] = 1.0
+            return mask, debug
+
+        if carrier in {"special", "special_token", "special_tokens", "register", "registers"}:
+            if token_type is None:
+                debug["v19_scale_state_carrier_valid"] = False
+                debug["v19_scale_state_carrier_skip"] = "missing_token_type"
+                return torch.zeros(int(cache_l), dtype=torch.bool), debug
+            tt = token_type.detach().cpu().long().reshape(-1)
+            if tt.numel() == cache_l:
+                mask = tt != TOKEN_TYPE_PATCH
+            else:
+                debug["v19_scale_state_carrier_valid"] = False
+                debug["v19_scale_state_carrier_skip"] = "token_type_not_replay_aligned"
+                return torch.zeros(int(cache_l), dtype=torch.bool), debug
+        elif carrier in {"structure_lowdg", "lowdg", "low_dg", "static_lowdg", "structure"}:
+            if risk_tok is not None:
+                aligned, align_debug = self._align_prior_to_replay_tokens(
+                    risk_tok,
+                    token_type=token_type,
+                    cache_l=cache_l,
+                )
+                debug["v19_scale_state_carrier_risk_alignment"] = align_debug.get("ttt_prior_alignment_mode")
+                risk = aligned.detach().float().reshape(-1)
+            else:
+                risk = (1.0 - prior_flat.detach().float().reshape(-1)).clamp(0.0, 1.0)
+                debug["v19_scale_state_carrier_risk_alignment"] = "fallback_1_minus_prior"
+            if risk.numel() != cache_l:
+                tmp = torch.ones(int(cache_l), dtype=torch.float32)
+                n = min(int(risk.numel()), int(cache_l))
+                if n > 0:
+                    tmp[:n] = risk[:n]
+                risk = tmp
+            thr = torch.quantile(risk, 0.20)
+            mask = risk <= thr
+            debug["v19_scale_state_carrier_risk_q20"] = float(thr.item())
+        elif carrier in {
+            "overlap_static",
+            "overlap_static_anchor",
+            "static_anchor_overlap",
+            "overlap_anchor",
+        }:
+            scope_mask, scope_debug = self._replay_token_filter_scope_mask(
+                cache_l=int(cache_l),
+                num_frames=num_frames,
+                overlap_frames=overlap_frames,
+                scope="both_overlap",
+            )
+            debug.update({
+                "v19_scale_state_carrier_scope_valid": scope_debug.get("ttt_replay_token_filter_scope_valid"),
+                "v19_scale_state_carrier_scope_mass": scope_debug.get("ttt_replay_token_filter_scope_mass"),
+            })
+            if not bool(scope_debug.get("ttt_replay_token_filter_scope_valid", True)):
+                debug["v19_scale_state_carrier_valid"] = False
+                debug["v19_scale_state_carrier_skip"] = "invalid_overlap_scope"
+                return torch.zeros(int(cache_l), dtype=torch.bool), debug
+            if risk_tok is not None:
+                aligned, align_debug = self._align_prior_to_replay_tokens(
+                    risk_tok,
+                    token_type=token_type,
+                    cache_l=cache_l,
+                )
+                debug["v19_scale_state_carrier_risk_alignment"] = align_debug.get("ttt_prior_alignment_mode")
+                risk = aligned.detach().float().reshape(-1)
+            else:
+                risk = (1.0 - prior_flat.detach().float().reshape(-1)).clamp(0.0, 1.0)
+                debug["v19_scale_state_carrier_risk_alignment"] = "fallback_1_minus_prior"
+            if risk.numel() != cache_l:
+                tmp = torch.ones(int(cache_l), dtype=torch.float32)
+                n = min(int(risk.numel()), int(cache_l))
+                if n > 0:
+                    tmp[:n] = risk[:n]
+                risk = tmp
+            scoped_risk = risk[scope_mask]
+            if scoped_risk.numel() == 0:
+                debug["v19_scale_state_carrier_valid"] = False
+                debug["v19_scale_state_carrier_skip"] = "empty_overlap_scope"
+                return torch.zeros(int(cache_l), dtype=torch.bool), debug
+            thr = torch.quantile(scoped_risk, 0.35)
+            mask = scope_mask & (risk <= thr)
+            debug["v19_scale_state_carrier_risk_q35_scoped"] = float(thr.item())
+        else:
+            raise ValueError(f"Unsupported v19 scale-state carrier: {self.scale_state_carrier}")
+
+        debug["v19_scale_state_carrier_tokens"] = int(mask.sum().item())
+        debug["v19_scale_state_carrier_mass"] = float(mask.float().mean().item()) if mask.numel() else 0.0
+        return mask, debug
+
+    def _ttt_layer_v19_scale_state_projection_risk(
+        self,
+        lc: TTTLayerCache,
+        *,
+        cache_l: int,
+        prior_flat: torch.Tensor,
+        risk_tok: Optional[torch.Tensor],
+        token_type: Optional[torch.Tensor],
+        num_frames: Optional[int],
+        overlap_frames: int,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
+        """Route replay roles from a no-GT online trajectory-scale proxy."""
+        mode_text = str(getattr(self, "scale_state_mode", "none") or "none").strip().lower()
+        active = bool(getattr(self, "scale_state_active", False))
+        scale_log = float(getattr(self, "scale_state_log_ratio", 0.0) or 0.0)
+        alpha = max(float(getattr(self, "scale_state_alpha", 0.0) or 0.0), 0.0)
+        debug: Dict[str, Any] = {
+            "v19_scale_state_mode": mode_text,
+            "v19_scale_state_proxy": str(getattr(self, "scale_state_proxy", "")),
+            "v19_scale_state_active": active,
+            "v19_scale_state_chunk_idx": int(getattr(self, "scale_state_chunk_idx", -1)),
+            "v19_scale_state_log_ratio": scale_log,
+            "v19_scale_state_alpha": alpha,
+            "v19_scale_state_reason": str(getattr(self, "scale_state_reason", "")),
+            "v19_scale_state_risk_method": "raw_w0_token_outer_mean_x_nogt_scale_proxy",
+            "v19_scale_state_risk_applied": False,
+            "v19_scale_state_branch_mask": list(self.scale_state_branch_mask),
+            "v19_scale_state_chunks": [int(x) for x in self.scale_state_chunks],
+            "v19_scale_state_sample_tokens_requested": int(getattr(self, "scale_state_sample_tokens", 0) or 0),
+            "v19_scale_state_sampled": False,
+            "v19_scale_state_sample_tokens_used": 0,
+        }
+        if mode_text in {"", "none", "off"}:
+            debug["v19_scale_state_risk_skip"] = "mode_off"
+            return None, debug
+        if not active:
+            debug["v19_scale_state_risk_skip"] = "inactive"
+            return None, debug
+        if alpha <= 0.0:
+            debug["v19_scale_state_risk_skip"] = "alpha_zero"
+            return None, debug
+        if abs(scale_log) <= 1e-8:
+            debug["v19_scale_state_risk_skip"] = "proxy_zero"
+            return None, debug
+
+        carrier_mask, carrier_debug = self._v19_scale_state_carrier_mask(
+            cache_l=cache_l,
+            prior_flat=prior_flat,
+            risk_tok=risk_tok,
+            token_type=token_type,
+            num_frames=num_frames,
+            overlap_frames=overlap_frames,
+        )
+        debug.update(carrier_debug)
+        if carrier_mask.numel() != int(cache_l) or int(carrier_mask.sum().item()) == 0:
+            debug["v19_scale_state_risk_skip"] = "empty_carrier"
+            return None, debug
+
+        try:
+            k = getattr(lc, "k", None)
+            v = getattr(lc, "v", None)
+            lr0 = getattr(lc, "lr0", None)
+            w0 = getattr(lc, "w0_old", None)
+            w1 = getattr(lc, "w1_old", None)
+            w2 = getattr(lc, "w2_old", None)
+            if any(x is None for x in (k, v, lr0, w0, w1, w2)):
+                return None, debug
+            if k.ndim != 3 or v.ndim != 3 or lr0.ndim != 3:
+                return None, debug
+            l = min(int(k.shape[1]), int(cache_l), int(prior_flat.numel()))
+            if l <= 0:
+                return None, debug
+
+            device = k.device
+            sample_tokens = int(getattr(self, "scale_state_sample_tokens", 0) or 0)
+            sample_idx: Optional[torch.Tensor] = None
+            if sample_tokens > 0 and l > sample_tokens:
+                sample_idx = torch.linspace(
+                    0,
+                    l - 1,
+                    steps=sample_tokens,
+                    device=device,
+                    dtype=torch.float32,
+                ).round().long().unique(sorted=True)
+
+            if sample_idx is not None:
+                kf = k.detach().to(device=device, dtype=torch.float32).index_select(1, sample_idx)
+                vf = v.detach().to(device=device, dtype=torch.float32).index_select(1, sample_idx)
+                lr = lr0.detach().to(device=device, dtype=torch.float32).index_select(1, sample_idx)
+                p = prior_flat.detach().to(device=device, dtype=torch.float32).reshape(-1)[:l].index_select(0, sample_idx).view(1, -1, 1)
+            else:
+                kf = k.detach().to(device=device, dtype=torch.float32)[:, :l, :]
+                vf = v.detach().to(device=device, dtype=torch.float32)[:, :l, :]
+                lr = lr0.detach().to(device=device, dtype=torch.float32)[:, :l, :]
+                p = prior_flat.detach().to(device=device, dtype=torch.float32).reshape(-1)[:l].view(1, l, 1)
+            w0f = w0.detach().to(device=device, dtype=torch.float32)
+            w1f = w1.detach().to(device=device, dtype=torch.float32)
+            w2f = w2.detach().to(device=device, dtype=torch.float32)
+            lr_eff = lr * p
+
+            gate = torch.bmm(kf, w0f)
+            hidden_before_mul = torch.bmm(kf, w2f)
+            dhidden = torch.bmm(vf, w1f.transpose(1, 2))
+            dgate = dhidden * hidden_before_mul
+            sigma = torch.sigmoid(gate)
+            dgate_before_act = dgate * sigma * (1.0 + gate * (1.0 - sigma))
+
+            token_outer_mean = (
+                lr_eff.squeeze(-1)
+                * kf.mean(dim=-1)
+                * dgate_before_act.mean(dim=-1)
+            )
+            scale_sign = 1.0 if scale_log >= 0.0 else -1.0
+            orientation = -1.0 if any(tag in mode_text for tag in ("inverse", "flip")) else 1.0
+            signed_projection = token_outer_mean * float(scale_sign * orientation)
+            per_tok_projection = signed_projection.mean(dim=0)
+
+            k_norm = kf.norm(dim=-1)
+            d_norm = dgate_before_act.norm(dim=-1)
+            energy = (lr_eff.squeeze(-1).abs() * k_norm * d_norm).detach().float()
+            per_tok_energy = energy.mean(dim=0)
+            energy_risk = self._normalize01_vec(per_tok_energy)
+
+            proj_abs = signed_projection.detach().float().reshape(-1).abs()
+            proj_scale = torch.quantile(proj_abs, 0.90).clamp_min(1e-12) if proj_abs.numel() else torch.tensor(1.0)
+            projection_norm = (per_tok_projection / proj_scale).clamp(-1.0, 1.0)
+            directional_risk = ((projection_norm + 1.0) * 0.5).clamp(0.0, 1.0)
+            raw_risk = (directional_risk * (0.25 + 0.75 * energy_risk)).clamp(0.0, 1.0)
+            strength = max(alpha * abs(scale_log), 0.0)
+            risk = (0.5 + strength * (raw_risk - 0.5)).clamp(0.0, 1.0)
+            carrier_full = carrier_mask[:l].detach().to(device=device).bool()
+            carrier = carrier_full.index_select(0, sample_idx) if sample_idx is not None else carrier_full
+            risk = torch.where(carrier, risk, torch.full_like(risk, 0.5))
+
+            out = torch.full((int(cache_l),), 0.5, dtype=torch.float32, device=device)
+            if sample_idx is not None:
+                full_positions = torch.arange(l, device=device)
+                nearest = torch.bucketize(full_positions, sample_idx)
+                nearest = nearest.clamp(max=sample_idx.numel() - 1)
+                prev_nearest = (nearest - 1).clamp(min=0)
+                dist_next = (sample_idx.index_select(0, nearest) - full_positions).abs()
+                dist_prev = (full_positions - sample_idx.index_select(0, prev_nearest)).abs()
+                chosen = torch.where(dist_prev <= dist_next, prev_nearest, nearest)
+                out[:l] = risk.detach().float().index_select(0, chosen)
+            else:
+                out[:l] = risk.detach().float()
+            proj_flat = signed_projection.detach().float().reshape(-1)
+            risk_flat = risk.detach().float().reshape(-1)
+            energy_flat = energy.detach().float().reshape(-1)
+            debug.update({
+                "v19_scale_state_risk_applied": True,
+                "v19_scale_state_scale_sign": float(scale_sign),
+                "v19_scale_state_orientation": float(orientation),
+                "v19_scale_state_token_count": int(l),
+                "v19_scale_state_carrier_count_aligned": int(carrier.sum().item()),
+                "v19_scale_state_sampled": bool(sample_idx is not None),
+                "v19_scale_state_sample_tokens_used": int(sample_idx.numel()) if sample_idx is not None else int(l),
+                "v19_scale_state_projection_mean": float(proj_flat.mean().item()) if proj_flat.numel() else 0.0,
+                "v19_scale_state_projection_p10": float(torch.quantile(proj_flat, 0.10).item()) if proj_flat.numel() else 0.0,
+                "v19_scale_state_projection_p90": float(torch.quantile(proj_flat, 0.90).item()) if proj_flat.numel() else 0.0,
+                "v19_scale_state_projection_scale_p90abs": float(proj_scale.item()),
+                "v19_scale_state_helpful_token_mass": float((per_tok_projection < 0.0).float().mean().item()),
+                "v19_scale_state_harmful_token_mass": float((per_tok_projection > 0.0).float().mean().item()),
+                "v19_scale_state_energy_mean": float(energy_flat.mean().item()) if energy_flat.numel() else 0.0,
+                "v19_scale_state_energy_p90": float(torch.quantile(energy_flat, 0.90).item()) if energy_flat.numel() else 0.0,
+                "v19_scale_state_risk_mean": float(risk_flat.mean().item()) if risk_flat.numel() else 0.0,
+                "v19_scale_state_risk_p90": float(torch.quantile(risk_flat, 0.90).item()) if risk_flat.numel() else 0.0,
+            })
+            return out, debug
+        except RuntimeError as exc:
+            debug["v19_scale_state_risk_error"] = str(exc)
+            return None, debug
+
+    def _ttt_layer_v11_gt_scale_projection_risk(
+        self,
+        lc: TTTLayerCache,
+        *,
+        cache_l: int,
+        prior_flat: torch.Tensor,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
+        """Route tri-replay roles by an oracle window-scale projection proxy.
+
+        v11's oracle action keeps the trajectory untouched, but lets the TTT
+        write controller use the current chunk's GT scale residual to decide
+        which replay-token contributions look corrective vs harmful.  The
+        first implementation uses a cheap raw-w0 contribution scalar as the
+        TTT-space projection proxy: the signed mean of each token's pre-muon
+        outer-product update, oriented by the GT step-scale residual.
+        """
+        mode_text = str(getattr(self, "v11_projection_action_mode", "none") or "none").strip().lower()
+        active = bool(getattr(self, "v11_projection_action_active", False))
+        scale_log = float(getattr(self, "v11_projection_scale_log_ratio", 0.0) or 0.0)
+        deadband = max(float(getattr(self, "v11_projection_action_deadband", 0.0) or 0.0), 0.0)
+        debug: Dict[str, Any] = {
+            "v11_projection_action_mode": mode_text,
+            "v11_projection_action_active": active,
+            "v11_projection_action_chunk_idx": int(getattr(self, "v11_projection_chunk_idx", -1)),
+            "v11_projection_scale_log_ratio": scale_log,
+            "v11_projection_action_strength": float(
+                getattr(self, "v11_projection_action_strength", 1.0) or 1.0
+            ),
+            "v11_projection_action_deadband": deadband,
+            "v11_projection_action_reason": str(getattr(self, "v11_projection_action_reason", "")),
+            "v11_projection_risk_method": "raw_w0_token_outer_mean_x_gt_scale_residual",
+            "v11_projection_risk_applied": False,
+        }
+        if not active or mode_text in {"", "none", "off"}:
+            debug["v11_projection_risk_skip"] = "action_inactive"
+            return None, debug
+        if abs(scale_log) <= deadband:
+            debug["v11_projection_risk_skip"] = "scale_deadband"
+            return None, debug
+
+        try:
+            k = getattr(lc, "k", None)
+            v = getattr(lc, "v", None)
+            lr0 = getattr(lc, "lr0", None)
+            w0 = getattr(lc, "w0_old", None)
+            w1 = getattr(lc, "w1_old", None)
+            w2 = getattr(lc, "w2_old", None)
+            if any(x is None for x in (k, v, lr0, w0, w1, w2)):
+                return None, debug
+            if k.ndim != 3 or v.ndim != 3 or lr0.ndim != 3:
+                return None, debug
+            l = min(int(k.shape[1]), int(cache_l), int(prior_flat.numel()))
+            if l <= 0:
+                return None, debug
+
+            kf = k.detach().cpu().float()[:, :l, :]
+            vf = v.detach().cpu().float()[:, :l, :]
+            lr = lr0.detach().cpu().float()[:, :l, :]
+            w0f = w0.detach().cpu().float()
+            w1f = w1.detach().cpu().float()
+            w2f = w2.detach().cpu().float()
+            p = prior_flat.detach().cpu().float().reshape(-1)[:l].view(1, l, 1)
+            lr_eff = lr * p
+
+            gate = torch.bmm(kf, w0f)
+            hidden_before_mul = torch.bmm(kf, w2f)
+            dhidden = torch.bmm(vf, w1f.transpose(1, 2))
+            dgate = dhidden * hidden_before_mul
+            sigma = torch.sigmoid(gate)
+            dgate_before_act = dgate * sigma * (1.0 + gate * (1.0 - sigma))
+
+            token_outer_mean = (
+                lr_eff.squeeze(-1)
+                * kf.mean(dim=-1)
+                * dgate_before_act.mean(dim=-1)
+            )
+            scale_sign = 1.0 if scale_log >= 0.0 else -1.0
+            orientation = -1.0 if any(tag in mode_text for tag in ("inverse", "flip")) else 1.0
+            signed_projection = token_outer_mean * float(scale_sign * orientation)
+            per_tok_projection = signed_projection.mean(dim=0)
+
+            k_norm = kf.norm(dim=-1)
+            d_norm = dgate_before_act.norm(dim=-1)
+            energy = (lr_eff.squeeze(-1).abs() * k_norm * d_norm).detach().float()
+            per_tok_energy = energy.mean(dim=0)
+            energy_risk = self._normalize01_vec(per_tok_energy)
+
+            proj_abs = signed_projection.detach().float().reshape(-1).abs()
+            proj_scale = torch.quantile(proj_abs, 0.90).clamp_min(1e-12) if proj_abs.numel() else torch.tensor(1.0)
+            projection_norm = (per_tok_projection / proj_scale).clamp(-1.0, 1.0)
+            # Positive means same-sign with the drift residual proxy and is
+            # routed as harmful; negative is routed as corrective.
+            directional_risk = ((projection_norm + 1.0) * 0.5).clamp(0.0, 1.0)
+            risk = (directional_risk * (0.25 + 0.75 * energy_risk)).clamp(0.0, 1.0)
+            strength = max(float(getattr(self, "v11_projection_action_strength", 1.0) or 1.0), 0.0)
+            if strength != 1.0:
+                risk = (0.5 + strength * (risk - 0.5)).clamp(0.0, 1.0)
+
+            out = torch.zeros(int(cache_l), dtype=torch.float32)
+            out[:l] = risk.detach().float()
+            proj_flat = signed_projection.detach().float().reshape(-1)
+            risk_flat = risk.detach().float().reshape(-1)
+            energy_flat = energy.detach().float().reshape(-1)
+            debug.update({
+                "v11_projection_risk_applied": True,
+                "v11_projection_scale_sign": float(scale_sign),
+                "v11_projection_orientation": float(orientation),
+                "v11_projection_token_count": int(l),
+                "v11_projection_projection_mean": float(proj_flat.mean().item()) if proj_flat.numel() else 0.0,
+                "v11_projection_projection_p10": float(torch.quantile(proj_flat, 0.10).item()) if proj_flat.numel() else 0.0,
+                "v11_projection_projection_p90": float(torch.quantile(proj_flat, 0.90).item()) if proj_flat.numel() else 0.0,
+                "v11_projection_projection_scale_p90abs": float(proj_scale.item()),
+                "v11_projection_helpful_token_mass": float((per_tok_projection < 0.0).float().mean().item()),
+                "v11_projection_harmful_token_mass": float((per_tok_projection > 0.0).float().mean().item()),
+                "v11_projection_energy_mean": float(energy_flat.mean().item()) if energy_flat.numel() else 0.0,
+                "v11_projection_energy_p90": float(torch.quantile(energy_flat, 0.90).item()) if energy_flat.numel() else 0.0,
+                "v11_projection_risk_mean": float(risk_flat.mean().item()) if risk_flat.numel() else 0.0,
+                "v11_projection_risk_p90": float(torch.quantile(risk_flat, 0.90).item()) if risk_flat.numel() else 0.0,
+            })
+            return out, debug
+        except RuntimeError as exc:
+            debug["v11_projection_risk_error"] = str(exc)
             return None, debug
 
     def _summarize_ttt_self_cues(self, debug_info: Dict[str, Any], n_layers: int) -> None:
@@ -1777,6 +3479,61 @@ class TTTWriteController:
         """
         mode = str(self.gradient_reversal_mode or "none").strip().lower()
         gamma = max(float(self.gradient_reversal_gamma), 0.0)
+        adaptive_writer_role = str(self.tri_replay_role_mode or "").strip().lower() in {
+            "adaptive_writer",
+            "adaptive_writer_fused",
+            "adaptive_otsu_writer",
+            "adaptive_otsu_fused",
+            "no_percentage",
+            "no_percentage_fused",
+            "adaptive_writer_robust",
+            "adaptive_writer_robust_fused",
+            "adaptive_writer_robust_split",
+            "robust_adaptive_writer",
+            "robust_adaptive_writer_fused",
+            "robust_adaptive_writer_split",
+            "no_percentage_robust",
+            "no_percentage_robust_fused",
+            "no_percentage_robust_split",
+            "adaptive_writer_conflictlite_split",
+            "conflictlite_adaptive_writer_split",
+            "no_percentage_conflictlite_split",
+            "adaptive_writer_energy_matched_split",
+            "energy_matched_adaptive_writer_split",
+            "no_percentage_energy_matched_split",
+            "adaptive_writer_sc_gamma_split",
+            "sc_gamma_split",
+            "no_percentage_sc_gamma_split",
+            "adaptive_writer_sc_gamma_commit_split",
+            "sc_gamma_commit_split",
+            "no_percentage_sc_gamma_commit_split",
+            "adaptive_writer_state_energy_matched_split",
+            "state_energy_matched_split",
+            "no_percentage_state_energy_matched_split",
+            "adaptive_writer_state_energy_commit_split",
+            "adaptive_writer_state_energy_directional_commit_split",
+            "state_energy_directional_commit_split",
+            "no_percentage_state_energy_directional_commit_split",
+            "adaptive_writer_tail_state_continuity_guard",
+            "tail_state_continuity_guard",
+            "adaptive_writer_tail_state_continuity_guard_selective_commit",
+            "tail_state_continuity_guard_selective_commit",
+            "adaptive_writer_binary_anchor_split",
+            "binary_stable_anchor_split",
+            "stable_anchor_binary_split",
+            "adaptive_writer_risk_veto_split",
+            "risk_veto_binary_split",
+            "no_long_write_risk_veto_split",
+            "adaptive_writer_cluster3d_split",
+            "cluster3d_adaptive_writer_split",
+            "no_percentage_cluster3d_split",
+        }
+        tri_mode_active = mode in {
+            "tri_replay",
+            "three_replay",
+            "pos_neu_neg_replay",
+            "pos_neg_neu_replay",
+        }
         branch_mask = tuple(self.gradient_reversal_branch_mask)
         branch_gamma_map = (
             {int(k): max(float(v), 0.0) for k, v in effective_branch_gammas.items() if 0 <= int(k) <= 2}
@@ -1817,12 +3574,18 @@ class TTTWriteController:
             "ttt_gradient_reversal_negative_frac": float(self.gradient_reversal_negative_frac),
             "ttt_gradient_reversal_applied": False,
         }
-        if mode in {"", "none", "off"} or max_gamma <= 0.0 or prior_flat.numel() == 0:
+        if (
+            mode in {"", "none", "off"}
+            or prior_flat.numel() == 0
+            or (max_gamma <= 0.0 and not (tri_mode_active and adaptive_writer_role))
+        ):
             return (token_prior0, token_prior1, token_prior2), debug
         active = tuple(
             int(i)
             for i, g in sorted(branch_gammas.items())
-            if g > 0.0 and 0 <= int(i) <= 2 and branch_enabled[int(i)]
+            if (g > 0.0 or (tri_mode_active and adaptive_writer_role))
+            and 0 <= int(i) <= 2
+            and branch_enabled[int(i)]
         )
         if len(active) == 0:
             debug["ttt_gradient_reversal_no_active_branch"] = True
@@ -1843,6 +3606,24 @@ class TTTWriteController:
             risk = r.clamp(0.0, 1.0)
             risk_source_effective = str(self.gradient_reversal_risk_source or "prior").strip().lower()
         else:
+            risk_source_text = str(self.gradient_reversal_risk_source or "prior").strip().lower()
+            if risk_source_text in {
+                "v11_projection",
+                "projection",
+                "v11_gt_projection",
+                "gt_projection",
+                "v11_gt_scale_projection",
+                "gt_scale_projection",
+                "scale_projection",
+                "oracle_scale_projection",
+                "v19_scale_state",
+                "scale_state",
+                "online_scale_state",
+                "nogt_scale_state",
+                "trajectory_scale_state",
+            }:
+                debug["ttt_gradient_reversal_projection_skip"] = "missing_projection_risk"
+                return (token_prior0, token_prior1, token_prior2), debug
             risk = ((p_max - p) / denom).clamp(0.0, 1.0)
             risk_source_effective = "prior_low"
 
@@ -2116,6 +3897,7 @@ class TTTWriteController:
         *,
         token_type: Optional[torch.Tensor] = None,
         num_frames: Optional[int] = None,
+        overlap_frames: int = 0,
     ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, Any]]:
         """Dampen low-prior token feature residuals before TTT replay.
 
@@ -2150,7 +3932,15 @@ class TTTWriteController:
             "v_centered", "value_centered",
             "kv_centered", "both_centered",
         }
-        if mode not in (global_center_modes | frame_static_modes):
+        overlap_pseudo_modes = {
+            "overlap_pseudo_replay_v",
+            "overlap_pseudo_v",
+            "tail_head_overlap_v",
+            "overlap_pseudo_replay_kv",
+            "overlap_pseudo_kv",
+            "tail_head_overlap_kv",
+        }
+        if mode not in (global_center_modes | frame_static_modes | overlap_pseudo_modes):
             raise ValueError(f"Unsupported TTT replay feature gate mode: {self.replay_feature_gate_mode}")
 
         prior = prior_flat.detach().float().view(-1)
@@ -2192,6 +3982,101 @@ class TTTWriteController:
                 out[:n] = tt[:n] == TOKEN_TYPE_PATCH
                 return out if bool(out.any().item()) else mask
             return mask
+
+        def _overlap_pseudo_replay(
+            x: torch.Tensor,
+            *,
+            target_name: str,
+        ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+            n_frames = int(num_frames or 0)
+            ov = max(int(overlap_frames), 0)
+            n_tokens = int(x.shape[1])
+            extra: Dict[str, Any] = {
+                "ttt_overlap_pseudo_replay_target": target_name,
+                "ttt_overlap_pseudo_replay_weight": float(min(max(rho, 0.0), 1.0)),
+                "ttt_overlap_pseudo_replay_overlap_frames": int(ov),
+                "ttt_overlap_pseudo_replay_applied": False,
+            }
+            if n_frames <= 0 or ov <= 0 or n_tokens <= 0 or n_tokens % n_frames != 0:
+                extra["ttt_overlap_pseudo_replay_invalid"] = True
+                return x, extra
+            if n_frames <= ov:
+                extra["ttt_overlap_pseudo_replay_invalid"] = True
+                extra["ttt_overlap_pseudo_replay_skip"] = "not_enough_frames"
+                return x, extra
+            tokens_per_frame = n_tokens // n_frames
+            patch_mask = _patch_mask_for_replay()
+            if patch_mask.numel() != n_tokens:
+                patch_mask = torch.ones(n_tokens, dtype=torch.bool)
+            local_patch = patch_mask[:tokens_per_frame].clone()
+            if not bool(local_patch.any().item()):
+                local_patch = torch.ones(tokens_per_frame, dtype=torch.bool)
+            local_idx = torch.nonzero(local_patch, as_tuple=False).reshape(-1)
+            if local_idx.numel() == 0:
+                extra["ttt_overlap_pseudo_replay_skip"] = "empty_local_tokens"
+                return x, extra
+            head_indices: List[torch.Tensor] = []
+            tail_indices: List[torch.Tensor] = []
+            for fi in range(ov):
+                head_base = fi * tokens_per_frame
+                tail_base = (n_frames - ov + fi) * tokens_per_frame
+                head_indices.append(local_idx + head_base)
+                tail_indices.append(local_idx + tail_base)
+            head_idx = torch.cat(head_indices, dim=0).to(device=x.device, dtype=torch.long)
+            tail_idx = torch.cat(tail_indices, dim=0).to(device=x.device, dtype=torch.long)
+            if head_idx.numel() == 0 or tail_idx.numel() == 0:
+                extra["ttt_overlap_pseudo_replay_skip"] = "empty_pair_tokens"
+                return x, extra
+            weight = min(max(float(rho), 0.0), 1.0)
+            x_f = x.float().clone()
+            head_vals = x_f.index_select(1, head_idx)
+            tail_vals = x_f.index_select(1, tail_idx)
+            mixed = tail_vals + weight * (head_vals - tail_vals)
+            x_f[:, tail_idx, :] = mixed
+            delta = (mixed - tail_vals).detach().float()
+            extra.update({
+                "ttt_overlap_pseudo_replay_applied": True,
+                "ttt_overlap_pseudo_replay_invalid": False,
+                "ttt_overlap_pseudo_replay_tokens": int(tail_idx.numel()),
+                "ttt_overlap_pseudo_replay_tokens_per_frame": int(tokens_per_frame),
+                "ttt_overlap_pseudo_replay_patch_tokens_per_frame": int(local_idx.numel()),
+                "ttt_overlap_pseudo_replay_weight_mean": float(weight),
+                "ttt_overlap_pseudo_replay_delta_norm_mean": float(delta.norm(dim=-1).mean().item())
+                if delta.numel() else 0.0,
+            })
+            return x_f.to(dtype=x.dtype), extra
+
+        if mode in overlap_pseudo_modes:
+            targets: List[str] = []
+            extra: Dict[str, Any] = {}
+            if mode in {"overlap_pseudo_replay_kv", "overlap_pseudo_kv", "tail_head_overlap_kv"}:
+                k, extra_k = _overlap_pseudo_replay(k, target_name="k")
+                v, extra_v = _overlap_pseudo_replay(v, target_name="v")
+                targets.extend(["k", "v"])
+                extra.update({f"k_{key}": val for key, val in extra_k.items()})
+                extra.update({f"v_{key}": val for key, val in extra_v.items()})
+                applied = bool(extra_k.get("ttt_overlap_pseudo_replay_applied", False)) or bool(
+                    extra_v.get("ttt_overlap_pseudo_replay_applied", False)
+                )
+                tokens = int(extra_v.get("ttt_overlap_pseudo_replay_tokens", 0) or 0)
+                weight_mean = float(extra_v.get("ttt_overlap_pseudo_replay_weight_mean", min(max(rho, 0.0), 1.0)) or 0.0)
+            else:
+                v, extra_v = _overlap_pseudo_replay(v, target_name="v")
+                targets.append("v")
+                extra.update(extra_v)
+                applied = bool(extra_v.get("ttt_overlap_pseudo_replay_applied", False))
+                tokens = int(extra_v.get("ttt_overlap_pseudo_replay_tokens", 0) or 0)
+                weight_mean = float(extra_v.get("ttt_overlap_pseudo_replay_weight_mean", min(max(rho, 0.0), 1.0)) or 0.0)
+            debug.update({
+                "ttt_replay_feature_gate_applied": applied,
+                "ttt_replay_feature_gate_targets": targets,
+                "ttt_replay_feature_gate_overlap_pseudo_replay": True,
+                "overlap_replay_token_count": tokens,
+                "overlap_replay_weight_mean": weight_mean,
+                "ttt_replay_feature_gate_frame_static": False,
+            })
+            debug.update(extra)
+            return k, v, debug
 
         def _frame_static_gate(x: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, Any]]:
             n_frames = int(num_frames or 0)
@@ -2316,6 +4201,15 @@ class TTTWriteController:
         correction.  A scale of 1.0 is current behavior; 0.0 is native write.
         """
         s0, s1, s2 = self.update_native_mix_scales
+        mix_chunks = tuple(self.update_native_mix_chunks)
+        current_chunk = int(getattr(self, "current_chunk_idx", getattr(self, "v11_projection_chunk_idx", -1)))
+        debug_info["ttt_write_native_mix_chunks"] = list(mix_chunks)
+        debug_info["ttt_write_native_mix_current_chunk"] = current_chunk
+        if mix_chunks and current_chunk not in mix_chunks:
+            debug_info["ttt_write_native_mix_applied"] = False
+            debug_info["ttt_write_native_mix_scales"] = [s0, s1, s2]
+            debug_info["ttt_write_native_mix_chunk_gate_active"] = False
+            return
         if s0 == 1.0 and s1 == 1.0 and s2 == 1.0:
             debug_info["ttt_write_native_mix_applied"] = False
             debug_info["ttt_write_native_mix_scales"] = [s0, s1, s2]
@@ -2341,6 +4235,7 @@ class TTTWriteController:
                 applied += 1
 
         debug_info["ttt_write_native_mix_applied"] = True
+        debug_info["ttt_write_native_mix_chunk_gate_active"] = True
         debug_info["ttt_write_native_mix_scales"] = [s0, s1, s2]
         debug_info["ttt_write_native_mix_num_tensors"] = int(applied)
 
@@ -2375,8 +4270,312 @@ class TTTWriteController:
             "native2candidate_by_risk",
             "native_to_semantic_by_risk",
             "old_decay_by_risk",
+            "native_distance_adaptive_ema",
+            "candidate_native_distance_ema",
+            "state_conditioned_commit",
+            "state_energy_directional_commit",
+            "directional_commit_guard",
+            "state_energy_directional_commit_guard",
+            "tail_state_selective_commit",
+            "selective_commit_ema",
+            "tail_state_continuity_selective_commit",
         }:
             raise ValueError(f"Unsupported TTT commit filter mode: {self.commit_filter_mode}")
+
+        branch_mask = tuple(self.commit_filter_branch_mask)
+        if len(branch_mask) == 0:
+            debug_info.update({
+                "ttt_write_commit_filter_applied": False,
+                "ttt_write_commit_filter_branch_mask": [],
+            })
+            return
+
+        lo = min(float(self.commit_filter_min), float(self.commit_filter_max))
+        hi = max(float(self.commit_filter_min), float(self.commit_filter_max))
+
+        if mode in {
+            "state_energy_directional_commit",
+            "directional_commit_guard",
+            "state_energy_directional_commit_guard",
+            "tail_state_selective_commit",
+            "selective_commit_ema",
+            "tail_state_continuity_selective_commit",
+        }:
+            branches = (
+                ("w0", 0, w0_new, write_cache.w0_provisional, "w0_old"),
+                ("w1", 1, w1_new, write_cache.w1_provisional, "w1_old"),
+                ("w2", 2, w2_new, write_cache.w2_provisional, "w2_old"),
+            )
+            records: List[
+                Tuple[
+                    int,
+                    str,
+                    int,
+                    List[Optional[torch.Tensor]],
+                    torch.Tensor,
+                    torch.Tensor,
+                    float,
+                    float,
+                    float,
+                    float,
+                ]
+            ] = []
+            n_layers = len(write_cache.layer_caches)
+            for li, lc in enumerate(write_cache.layer_caches):
+                if not self._layer_prior_enabled(li, n_layers):
+                    continue
+                for name, branch_idx, values, native_list, old_attr in branches:
+                    if branch_idx not in branch_mask or li >= len(values) or li >= len(native_list):
+                        continue
+                    candidate = values[li]
+                    native = native_list[li]
+                    old = getattr(lc, old_attr, None)
+                    if candidate is None or native is None or old is None:
+                        continue
+                    native_t = native.to(device=candidate.device, dtype=candidate.dtype)
+                    old_t = old.to(device=candidate.device, dtype=candidate.dtype)
+                    candidate_delta = candidate.float() - old_t.float()
+                    native_delta = native_t.float() - old_t.float()
+                    candidate_norm = candidate_delta.norm().clamp_min(1e-12)
+                    native_norm = native_delta.norm().clamp_min(1e-12)
+                    den = (candidate_norm * native_norm).clamp_min(1e-12)
+                    cos = float(((candidate_delta.reshape(-1) @ native_delta.reshape(-1)) / den).clamp(-1.0, 1.0).item())
+                    energy_ratio = float((candidate_norm / native_norm).item())
+                    records.append((
+                        li,
+                        name,
+                        branch_idx,
+                        values,
+                        native_t,
+                        candidate,
+                        float(cos),
+                        float(energy_ratio),
+                        float(candidate_norm.item()),
+                        float(native_norm.item()),
+                    ))
+
+            tau_c = float(self.state_energy_commit_tau_c)
+            tau_c = max(min(tau_c, 0.999), -1.0)
+            u_max = max(float(self.state_energy_commit_u_max), 1.000001)
+            tail_selective = mode in {
+                "tail_state_selective_commit",
+                "selective_commit_ema",
+                "tail_state_continuity_selective_commit",
+            }
+            risk_mean = 0.0
+            risk_mad = 0.0
+            risk_high_mass = 0.0
+            risk_high = False
+            anchor_mass = 1.0
+            if tail_selective:
+                if risk_tok is not None:
+                    risk_flat = risk_tok.detach().float().reshape(-1)
+                    risk_flat = risk_flat[torch.isfinite(risk_flat)]
+                    if risk_flat.numel() > 0:
+                        risk_mean = float(risk_flat.mean().item())
+                        risk_med_t = torch.median(risk_flat)
+                        risk_mad_t = torch.median((risk_flat - risk_med_t).abs())
+                        risk_mad = float(risk_mad_t.item())
+                        risk_thr = risk_med_t + risk_mad_t
+                        risk_high_mass = float((risk_flat > risk_thr).float().mean().item())
+                prev_risk = self.tail_commit_risk_ema.get("global")
+                risk_high = bool(
+                    risk_high_mass >= 0.15
+                    or (prev_risk is not None and risk_mean > float(prev_risk) + 0.25 * max(risk_mad, 1e-6))
+                )
+                self.tail_commit_risk_ema["global"] = (
+                    risk_mean if prev_risk is None else 0.75 * float(prev_risk) + 0.25 * risk_mean
+                )
+                if A_tok is not None:
+                    a_flat = A_tok.detach().float().reshape(-1)
+                    a_flat = a_flat[torch.isfinite(a_flat)]
+                    if a_flat.numel() > 0:
+                        a_med = torch.median(a_flat)
+                        a_mad = torch.median((a_flat - a_med).abs())
+                        anchor_mass = float((a_flat >= a_med + a_mad).float().mean().item())
+            applied = 0
+            alpha_values: List[float] = []
+            cos_values: List[float] = []
+            energy_ratios: List[float] = []
+            for li, name, _branch_idx, values, native_t, candidate, cos, energy_ratio, cand_norm, nat_norm in records:
+                if tail_selective:
+                    ema_key = f"layer_{int(li)}_{name}"
+                    prev_energy = self.tail_commit_energy_ema.get(ema_key)
+                    envelope = float(prev_energy) if prev_energy is not None else float(energy_ratio)
+                    overshoot = bool(energy_ratio > max(1.05, 1.10 * envelope))
+                    low_cos = bool(cos < 0.88)
+                    anchor_ok = bool(anchor_mass > 0.02)
+                    risk_norm = max(0.0, min(1.0, risk_mean + risk_high_mass))
+                    overshoot_norm = max(0.0, min(1.0, (energy_ratio - 1.0) / 1.25))
+                    cos_norm = max(0.0, min(1.0, (0.88 - cos) / 0.88))
+                    r_risk = max(0.0, min(1.0, 0.45 * overshoot_norm + 0.35 * cos_norm + 0.20 * risk_norm))
+                    triggered = bool(low_cos and overshoot and risk_high and anchor_ok)
+                    alpha = max(lo, min(hi, 1.0 - r_risk)) if triggered else 1.0
+                    self.tail_commit_energy_ema[ema_key] = (
+                        float(energy_ratio)
+                        if prev_energy is None
+                        else 0.75 * float(prev_energy) + 0.25 * float(energy_ratio)
+                    )
+                    a_cos = 1.0 - cos_norm
+                    a_energy = 1.0 - overshoot_norm
+                else:
+                    a_cos = (cos - tau_c) / max(1.0 - tau_c, 1e-6)
+                    a_cos = max(0.0, min(1.0, float(a_cos)))
+                    a_energy = (u_max - energy_ratio) / max(u_max - 1.0, 1e-6)
+                    a_energy = max(0.0, min(1.0, float(a_energy)))
+                    alpha = max(lo, min(hi, float(a_cos * a_energy)))
+                    triggered = alpha < 0.999999
+                triggered = alpha < 0.999999
+                if triggered:
+                    values[li] = self._scale_delta_and_renorm(native_t, candidate, alpha).cpu()
+                    applied += 1
+                alpha_values.append(float(alpha))
+                cos_values.append(float(cos))
+                energy_ratios.append(float(energy_ratio))
+                layer_debug = debug_info.get(f"layer_{li}")
+                if isinstance(layer_debug, dict):
+                    layer_debug[f"ttt_write_commit_filter_{name}_cosine"] = float(cos)
+                    layer_debug[f"ttt_write_commit_filter_{name}_energy_ratio"] = float(energy_ratio)
+                    layer_debug[f"ttt_write_commit_filter_{name}_a_cos"] = float(a_cos)
+                    layer_debug[f"ttt_write_commit_filter_{name}_a_energy"] = float(a_energy)
+                    layer_debug[f"ttt_write_commit_filter_{name}_alpha"] = float(alpha)
+                    layer_debug[f"ttt_write_commit_filter_{name}_candidate_delta_norm"] = float(cand_norm)
+                    layer_debug[f"ttt_write_commit_filter_{name}_native_delta_norm"] = float(nat_norm)
+                    layer_debug[f"ttt_write_commit_filter_{name}_triggered"] = bool(triggered)
+                    if tail_selective:
+                        layer_debug[f"ttt_write_commit_filter_{name}_tail_selective"] = True
+                        layer_debug[f"ttt_write_commit_filter_{name}_tail_risk_mean"] = float(risk_mean)
+                        layer_debug[f"ttt_write_commit_filter_{name}_tail_risk_high_mass"] = float(risk_high_mass)
+                        layer_debug[f"ttt_write_commit_filter_{name}_tail_risk_high"] = bool(risk_high)
+                        layer_debug[f"ttt_write_commit_filter_{name}_tail_anchor_mass"] = float(anchor_mass)
+
+            debug_info.update({
+                "ttt_write_commit_filter_applied": bool(applied),
+                "ttt_write_commit_filter_mode": mode,
+                "ttt_write_commit_filter_branch_mask": list(branch_mask),
+                "ttt_write_commit_filter_num_tensors": int(applied),
+                "ttt_write_commit_filter_min": lo,
+                "ttt_write_commit_filter_max": hi,
+                "ttt_write_commit_filter_state_energy_tau_c": float(tau_c),
+                "ttt_write_commit_filter_state_energy_u_max": float(u_max),
+                "ttt_write_commit_filter_state_energy_cos_mean": (
+                    float(sum(cos_values) / len(cos_values)) if cos_values else 0.0
+                ),
+                "ttt_write_commit_filter_state_energy_ratio_mean": (
+                    float(sum(energy_ratios) / len(energy_ratios)) if energy_ratios else 0.0
+                ),
+                "ttt_write_commit_filter_scale_mean": (
+                    float(sum(alpha_values) / len(alpha_values)) if alpha_values else 1.0
+                ),
+                "ttt_write_commit_filter_activation_rate": (
+                    float(sum(1 for x in alpha_values if x < 0.999999) / len(alpha_values)) if alpha_values else 0.0
+                ),
+            })
+            if tail_selective:
+                debug_info.update({
+                    "ttt_write_commit_filter_tail_selective": True,
+                    "ttt_write_commit_filter_tail_risk_mean": float(risk_mean),
+                    "ttt_write_commit_filter_tail_risk_mad": float(risk_mad),
+                    "ttt_write_commit_filter_tail_risk_high_mass": float(risk_high_mass),
+                    "ttt_write_commit_filter_tail_risk_high": bool(risk_high),
+                    "ttt_write_commit_filter_tail_anchor_mass": float(anchor_mass),
+                })
+            return
+
+        if mode in {
+            "native_distance_adaptive_ema",
+            "candidate_native_distance_ema",
+            "state_conditioned_commit",
+        }:
+            branches = (
+                ("w0", 0, w0_new, write_cache.w0_provisional, "w0_old"),
+                ("w1", 1, w1_new, write_cache.w1_provisional, "w1_old"),
+                ("w2", 2, w2_new, write_cache.w2_provisional, "w2_old"),
+            )
+            records: List[Tuple[int, str, int, List[Optional[torch.Tensor]], torch.Tensor, torch.Tensor, float, float]] = []
+            q_values: List[float] = []
+            c_values: List[float] = []
+            n_layers = len(write_cache.layer_caches)
+            for li, lc in enumerate(write_cache.layer_caches):
+                if not self._layer_prior_enabled(li, n_layers):
+                    continue
+                for name, branch_idx, values, native_list, old_attr in branches:
+                    if branch_idx not in branch_mask or li >= len(values) or li >= len(native_list):
+                        continue
+                    candidate = values[li]
+                    native = native_list[li]
+                    old = getattr(lc, old_attr, None)
+                    if candidate is None or native is None or old is None:
+                        continue
+                    native_t = native.to(device=candidate.device, dtype=candidate.dtype)
+                    old_t = old.to(device=candidate.device, dtype=candidate.dtype)
+                    candidate_delta = candidate.float() - old_t.float()
+                    native_delta = native_t.float() - old_t.float()
+                    diff = candidate.float() - native_t.float()
+                    native_norm = native_delta.norm().clamp_min(1e-12)
+                    q = float((diff.norm() / native_norm).item())
+                    den = (candidate_delta.norm() * native_delta.norm()).clamp_min(1e-12)
+                    cos = float(((candidate_delta.reshape(-1) @ native_delta.reshape(-1)) / den).clamp(-1.0, 1.0).item())
+                    c = float(max(0.0, 1.0 - cos))
+                    records.append((li, name, branch_idx, values, native_t, candidate, q, c))
+                    q_values.append(q)
+                    c_values.append(c)
+
+            def robust_threshold(values: List[float]) -> float:
+                if not values:
+                    return float("inf")
+                vals = torch.tensor(values, dtype=torch.float32)
+                med = torch.median(vals)
+                mad = torch.median((vals - med).abs())
+                if float(mad.item()) <= 1e-8:
+                    return float((med + vals.std(unbiased=False)).item())
+                return float((med + mad).item())
+
+            q_threshold = robust_threshold(q_values)
+            c_threshold = robust_threshold(c_values)
+            applied = 0
+            alpha_values: List[float] = []
+            trigger_values: List[bool] = []
+            for li, name, _branch_idx, values, native_t, candidate, q, c in records:
+                triggered = bool(q > q_threshold or c > c_threshold)
+                alpha = 1.0
+                if triggered:
+                    alpha = 1.0 - (q / (q + 1.0))
+                    alpha = max(lo, min(hi, float(alpha)))
+                    values[li] = self._scale_delta_and_renorm(native_t, candidate, alpha).cpu()
+                    applied += 1
+                alpha_values.append(float(alpha))
+                trigger_values.append(triggered)
+                layer_debug = debug_info.get(f"layer_{li}")
+                if isinstance(layer_debug, dict):
+                    layer_debug[f"ttt_write_commit_filter_{name}_q"] = float(q)
+                    layer_debug[f"ttt_write_commit_filter_{name}_cosine_distance"] = float(c)
+                    layer_debug[f"ttt_write_commit_filter_{name}_alpha"] = float(alpha)
+                    layer_debug[f"ttt_write_commit_filter_{name}_triggered"] = bool(triggered)
+
+            debug_info.update({
+                "ttt_write_commit_filter_applied": bool(applied),
+                "ttt_write_commit_filter_mode": mode,
+                "ttt_write_commit_filter_branch_mask": list(branch_mask),
+                "ttt_write_commit_filter_num_tensors": int(applied),
+                "ttt_write_commit_filter_min": lo,
+                "ttt_write_commit_filter_max": hi,
+                "ttt_write_commit_filter_state_q_threshold": float(q_threshold),
+                "ttt_write_commit_filter_state_c_threshold": float(c_threshold),
+                "ttt_write_commit_filter_state_q_mean": (
+                    float(sum(q_values) / len(q_values)) if q_values else 0.0
+                ),
+                "ttt_write_commit_filter_state_c_mean": (
+                    float(sum(c_values) / len(c_values)) if c_values else 0.0
+                ),
+                "ttt_write_commit_filter_scale_mean": (
+                    float(sum(alpha_values) / len(alpha_values)) if alpha_values else 1.0
+                ),
+                "ttt_write_commit_filter_activation_rate": (
+                    float(sum(1 for x in trigger_values if x) / len(trigger_values)) if trigger_values else 0.0
+                ),
+            })
+            return
 
         risk_source = str(self.commit_filter_risk_source or "d_tok").strip().lower()
         if risk_source in {"d", "dyn", "dynamic"}:
@@ -2440,18 +4639,8 @@ class TTTWriteController:
             })
             return
 
-        branch_mask = tuple(self.commit_filter_branch_mask)
-        if len(branch_mask) == 0:
-            debug_info.update({
-                "ttt_write_commit_filter_applied": False,
-                "ttt_write_commit_filter_branch_mask": [],
-            })
-            return
-
         base = float(self.commit_filter_base)
         gain = float(self.commit_filter_gain)
-        lo = min(float(self.commit_filter_min), float(self.commit_filter_max))
-        hi = max(float(self.commit_filter_min), float(self.commit_filter_max))
         scope = str(self.commit_filter_scope or "tail_overlap").strip().lower()
         stat_name = str(self.commit_filter_stat or "mean").strip().lower()
 
@@ -2718,7 +4907,16 @@ class TTTWriteController:
         """
         alpha = float(self.commit_ema_alpha)
         branch_mask = tuple(self.commit_ema_branch_mask)
+        ema_chunks = tuple(self.commit_ema_chunks)
+        current_chunk = int(getattr(self, "current_chunk_idx", getattr(self, "v11_projection_chunk_idx", -1)))
         debug_info["ttt_write_commit_ema_branch_mask"] = list(branch_mask)
+        debug_info["ttt_write_commit_ema_chunks"] = list(ema_chunks)
+        debug_info["ttt_write_commit_ema_current_chunk"] = current_chunk
+        if ema_chunks and current_chunk not in ema_chunks:
+            debug_info["ttt_write_commit_ema_applied"] = False
+            debug_info["ttt_write_commit_ema_alpha"] = alpha
+            debug_info["ttt_write_commit_ema_chunk_gate_active"] = False
+            return
         if alpha == 1.0:
             debug_info["ttt_write_commit_ema_applied"] = False
             debug_info["ttt_write_commit_ema_alpha"] = alpha
@@ -2754,6 +4952,7 @@ class TTTWriteController:
                 applied += 1
         debug_info["ttt_write_commit_ema_applied"] = bool(applied)
         debug_info["ttt_write_commit_ema_alpha"] = alpha
+        debug_info["ttt_write_commit_ema_chunk_gate_active"] = True
         debug_info["ttt_write_commit_ema_num_tensors"] = int(applied)
 
     @staticmethod
@@ -2880,11 +5079,12 @@ class TTTWriteController:
             debug_info["ttt_write_native_delta_gate_applied"] = False
             debug_info["ttt_write_native_delta_gate_mode"] = mode
             return
-        if mode not in {"cosine", "cosine_soft", "cap", "cosine_cap"}:
+        if mode not in {"cosine", "cosine_soft", "cap", "cosine_cap", "orthogonal_suppress"}:
             raise ValueError(f"Unsupported native delta gate mode: {self.native_delta_gate_mode}")
 
         min_cos = float(self.native_delta_gate_min_cos)
         fallback = min(max(float(self.native_delta_gate_fallback), 0.0), 1.0)
+        orthogonal_rho = fallback
         cap_ratio = max(float(self.native_delta_gate_cap_ratio), 0.0)
         branch_mask = tuple(self.native_delta_gate_branch_mask)
         branches = (
@@ -2929,24 +5129,38 @@ class TTTWriteController:
                 cosine = (dot / (semantic_norm * native_norm)).clamp(-1.0, 1.0)
                 scale = torch.ones_like(cosine)
 
-                if mode in {"cosine", "cosine_cap"}:
+                if mode == "orthogonal_suppress":
+                    coeff = dot / native_norm.square().clamp_min(eps)
+                    view_shape = [coeff.shape[0]] + [1] * (semantic_f.ndim - 1)
+                    parallel = coeff.view(*view_shape) * native_delta
+                    perpendicular = semantic_delta - parallel
+                    routed_delta = parallel + orthogonal_rho * perpendicular
+                    gated = old_f + routed_delta
+                    scale = torch.full_like(cosine, orthogonal_rho)
+                elif mode in {"cosine", "cosine_cap"}:
                     scale = torch.where(cosine >= min_cos, scale, torch.full_like(scale, fallback))
                 elif mode == "cosine_soft":
                     denom = max(1.0 - min_cos, eps)
                     soft = ((cosine - min_cos) / denom).clamp(0.0, 1.0)
                     scale = fallback + (1.0 - fallback) * soft
 
-                if mode in {"cap", "cosine_cap"} and cap_ratio > 0.0:
+                if mode != "orthogonal_suppress" and mode in {"cap", "cosine_cap"} and cap_ratio > 0.0:
                     cap = cap_ratio * native_norm
                     cap_scale = (cap / correction_norm).clamp(max=1.0)
                     scale = torch.minimum(scale, cap_scale)
                 elif mode == "cap" and cap_ratio <= 0.0:
                     scale = torch.zeros_like(scale)
 
-                view_shape = [scale.shape[0]] + [1] * (semantic_f.ndim - 1)
-                gated = native_f + scale.view(*view_shape) * correction
+                if mode != "orthogonal_suppress":
+                    view_shape = [scale.shape[0]] + [1] * (semantic_f.ndim - 1)
+                    gated = native_f + scale.view(*view_shape) * correction
+                pre_delta_norm = semantic_norm.detach()
                 old_norm = old_f.norm(dim=1, keepdim=True)
                 gated = gated / (gated.norm(dim=1, keepdim=True) + 1e-5) * old_norm
+                post_delta = gated - old_f
+                post_delta_norm = torch.linalg.vector_norm(post_delta, dim=reduce_dims).clamp_min(eps)
+                pre_post_dot = (semantic_delta * post_delta).sum(dim=reduce_dims)
+                pre_post_cos = (pre_post_dot / (pre_delta_norm * post_delta_norm)).clamp(-1.0, 1.0)
                 semantic_list[li] = gated.to(dtype=semantic.dtype).cpu()
 
                 layer_debug = debug_info.get(f"layer_{li}")
@@ -2957,6 +5171,13 @@ class TTTWriteController:
                     layer_debug[f"ttt_write_native_delta_gate_{name}_cos_mean"] = float(cosine.mean().item())
                     layer_debug[f"ttt_write_native_delta_gate_{name}_cos_min"] = float(cosine.min().item())
                     layer_debug[f"ttt_write_native_delta_gate_{name}_cap_ratio"] = float(cap_ratio)
+                    layer_debug[f"ttt_write_native_delta_gate_{name}_orthogonal_rho"] = float(orthogonal_rho)
+                    layer_debug[f"ttt_write_native_delta_gate_{name}_pre_delta_norm_mean"] = float(pre_delta_norm.mean().item())
+                    layer_debug[f"ttt_write_native_delta_gate_{name}_post_delta_norm_mean"] = float(post_delta_norm.mean().item())
+                    layer_debug[f"ttt_write_native_delta_gate_{name}_pre_post_cos_mean"] = float(pre_post_cos.mean().item())
+                    layer_debug[f"ttt_write_native_delta_gate_{name}_norm_restore_ratio_mean"] = float(
+                        (post_delta_norm / pre_delta_norm).mean().item()
+                    )
                 applied += 1
                 scale_means.append(float(scale.mean().item()))
                 cosine_means.append(float(cosine.mean().item()))
@@ -2966,6 +5187,7 @@ class TTTWriteController:
         debug_info["ttt_write_native_delta_gate_branch_mask"] = list(branch_mask)
         debug_info["ttt_write_native_delta_gate_min_cos"] = min_cos
         debug_info["ttt_write_native_delta_gate_fallback"] = fallback
+        debug_info["ttt_write_native_delta_gate_orthogonal_rho"] = orthogonal_rho
         debug_info["ttt_write_native_delta_gate_cap_ratio"] = cap_ratio
         debug_info["ttt_write_native_delta_gate_num_tensors"] = int(applied)
         debug_info["ttt_write_native_delta_gate_scale_mean"] = (
@@ -3150,6 +5372,31 @@ class TTTWriteController:
             if idx not in branches:
                 branches.append(idx)
         return tuple(branches)
+
+    @staticmethod
+    def _parse_chunk_mask(text: Optional[str]) -> Tuple[int, ...]:
+        if text is None:
+            return ()
+        raw = str(text).strip().lower()
+        if raw in {"", "all", "none", "off"}:
+            return ()
+        chunks: List[int] = []
+        for part in raw.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if "-" in part:
+                start_s, end_s = part.split("-", 1)
+                start, end = int(start_s), int(end_s)
+                lo, hi = min(start, end), max(start, end)
+                for idx in range(lo, hi + 1):
+                    if idx not in chunks:
+                        chunks.append(idx)
+            else:
+                idx = int(part)
+                if idx not in chunks:
+                    chunks.append(idx)
+        return tuple(chunks)
 
     @staticmethod
     def _parse_branch_gamma_map(text: Optional[str]) -> Dict[int, float]:

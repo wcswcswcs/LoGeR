@@ -1,0 +1,58 @@
+[
+  {
+    "method": "P0 Stream3D on S0",
+    "prediction_config": "scannet",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_p0_on_s0_scannet_probe5",
+    "eval_policy": "stream3d_self_probe5",
+    "split": "probe5"
+  },
+  {
+    "method": "O12 fused overlap 0.50 own",
+    "prediction_config": "stream4d_v9_o12_o10_o11_union_overlap_mioc050_probe5",
+    "pre_points_config": "stream4d_v9_o12_o10_o11_union_overlap_mioc050_probe5",
+    "output_config": "stream4d_v9_o12_o10_o11_union_overlap_mioc050_probe5",
+    "eval_policy": "own_recompute_o10_o11_union_overlap_mioc050",
+    "split": "probe5"
+  },
+  {
+    "method": "O14 full-span grid8 raw own",
+    "prediction_config": "stream4d_v9_o14_b1_fullspan_grid8_ws100_probe5",
+    "pre_points_config": "stream4d_v9_o14_b1_fullspan_grid8_ws100_probe5",
+    "output_config": "stream4d_v9_o14_b1_fullspan_grid8_ws100_probe5",
+    "eval_policy": "own_recompute_d4rt_fullspan_grid8_ws100",
+    "split": "probe5"
+  },
+  {
+    "method": "O14 full-span grid8 overlap 0.50 own",
+    "prediction_config": "stream4d_v9_o14_b1_fullspan_grid8_ws100_overlap_mioc050_probe5",
+    "pre_points_config": "stream4d_v9_o14_b1_fullspan_grid8_ws100_overlap_mioc050_probe5",
+    "output_config": "stream4d_v9_o14_b1_fullspan_grid8_ws100_overlap_mioc050_probe5",
+    "eval_policy": "own_recompute_d4rt_fullspan_grid8_ws100_overlap_mioc050",
+    "split": "probe5"
+  },
+  {
+    "method": "P0 Stream3D on O14 overlap",
+    "prediction_config": "scannet",
+    "pre_points_config": "stream4d_v9_o14_b1_fullspan_grid8_ws100_overlap_mioc050_probe5",
+    "output_config": "stream4d_v9_p0_on_o14_fullspan_grid8_overlap_mioc050_probe5",
+    "eval_policy": "stream3d_on_o14_fullspan_grid8_overlap_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O14 overlap on S0",
+    "prediction_config": "stream4d_v9_o14_b1_fullspan_grid8_ws100_overlap_mioc050_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o14_fullspan_grid8_overlap_mioc050_on_s0_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O14 overlap on S1",
+    "prediction_config": "stream4d_v9_o14_b1_fullspan_grid8_ws100_overlap_mioc050_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_o14_fullspan_grid8_overlap_mioc050_on_s1_probe5",
+    "eval_policy": "method_on_32f_support",
+    "split": "probe5"
+  }
+]

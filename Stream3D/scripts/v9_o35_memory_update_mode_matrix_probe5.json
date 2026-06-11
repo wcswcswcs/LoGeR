@@ -1,0 +1,66 @@
+[
+  {
+    "method": "P0 Stream3D on S0",
+    "prediction_config": "scannet",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_p0_on_s0_scannet_probe5",
+    "eval_policy": "stream3d_self_probe5",
+    "split": "probe5"
+  },
+  {
+    "method": "O34 O33 inside035 logarea on S0",
+    "prediction_config": "stream4d_v9_o34_o33_inside035_logarea_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o34_o33_inside035_logarea_probe5_on_s0_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O35 memory keep-slot own",
+    "prediction_config": "stream4d_v9_o35_o22_memory_c065_keep_probe5",
+    "pre_points_config": "stream4d_v9_o35_o22_memory_c065_keep_probe5",
+    "output_config": "stream4d_v9_o35_o22_memory_c065_keep_probe5",
+    "eval_policy": "own_scene_object_memory_c065_keep_slot",
+    "split": "probe5"
+  },
+  {
+    "method": "O35 memory keep-slot on S0",
+    "prediction_config": "stream4d_v9_o35_o22_memory_c065_keep_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o35_o22_memory_c065_keep_probe5_on_s0_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O35 memory keep-slot on S1",
+    "prediction_config": "stream4d_v9_o35_o22_memory_c065_keep_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_o35_o22_memory_c065_keep_probe5_on_s1_probe5",
+    "eval_policy": "method_on_32f_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O35 memory new-points-only own",
+    "prediction_config": "stream4d_v9_o35_o22_memory_c065_newpts_probe5",
+    "pre_points_config": "stream4d_v9_o35_o22_memory_c065_newpts_probe5",
+    "output_config": "stream4d_v9_o35_o22_memory_c065_newpts_probe5",
+    "eval_policy": "own_scene_object_memory_c065_new_points_only",
+    "split": "probe5"
+  },
+  {
+    "method": "O35 memory new-points-only on S0",
+    "prediction_config": "stream4d_v9_o35_o22_memory_c065_newpts_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o35_o22_memory_c065_newpts_probe5_on_s0_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O35 memory new-points-only on S1",
+    "prediction_config": "stream4d_v9_o35_o22_memory_c065_newpts_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_o35_o22_memory_c065_newpts_probe5_on_s1_probe5",
+    "eval_policy": "method_on_32f_support",
+    "split": "probe5"
+  }
+]

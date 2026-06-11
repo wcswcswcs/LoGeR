@@ -1,0 +1,178 @@
+[
+  {
+    "method": "P0 Stream3D on S0",
+    "prediction_config": "scannet",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_p0_on_s0_scannet_probe5",
+    "eval_policy": "stream3d_self_probe5",
+    "split": "probe5"
+  },
+  {
+    "method": "P0 Stream3D on S1",
+    "prediction_config": "scannet",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_p0_on_s1_32f_probe5",
+    "eval_policy": "cross_fixed_32f_support",
+    "split": "probe5"
+  },
+  {
+    "method": "P0 Stream3D on S2",
+    "prediction_config": "scannet",
+    "pre_points_config": "stream4d_v8_b1_surfacelet_singlemask_probe5",
+    "output_config": "stream4d_v9_p0_on_s2_b1_probe5",
+    "eval_policy": "cross_fixed_b1_support",
+    "split": "probe5"
+  },
+  {
+    "method": "P2 B1 on S2",
+    "prediction_config": "stream4d_v8_b1_surfacelet_singlemask_probe5",
+    "pre_points_config": "stream4d_v8_b1_surfacelet_singlemask_probe5",
+    "output_config": "stream4d_v8_b1_surfacelet_singlemask_probe5",
+    "eval_policy": "own_recompute_paper_style",
+    "split": "probe5"
+  },
+  {
+    "method": "P2 B1 on S0",
+    "prediction_config": "stream4d_v8_b1_surfacelet_singlemask_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_p2_b1_on_s0_scannet_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "P2 B1 on S1",
+    "prediction_config": "stream4d_v8_b1_surfacelet_singlemask_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_p2_b1_on_s1_32f_probe5",
+    "eval_policy": "method_on_32f_support",
+    "split": "probe5"
+  },
+  {
+    "method": "P1 v6 compact on S1",
+    "prediction_config": "stream4d_v6_e4_probe5_objcomp_m650_g101_compact_only_preserve",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_p1_v6compact_on_s1_32f_probe5",
+    "eval_policy": "v6_compact_on_32f_support",
+    "split": "probe5"
+  },
+  {
+    "method": "C0 B1 no-track own",
+    "prediction_config": "stream4d_v9_b1_no_track_probe5",
+    "pre_points_config": "stream4d_v9_b1_no_track_probe5",
+    "output_config": "stream4d_v9_b1_no_track_probe5",
+    "eval_policy": "own_recompute_control",
+    "split": "probe5"
+  },
+  {
+    "method": "P0 on no-track support",
+    "prediction_config": "scannet",
+    "pre_points_config": "stream4d_v9_b1_no_track_probe5",
+    "output_config": "stream4d_v9_p0_on_b1_no_track_support_probe5",
+    "eval_policy": "stream3d_on_control_support",
+    "split": "probe5"
+  },
+  {
+    "method": "C0 B1 no-track on S0",
+    "prediction_config": "stream4d_v9_b1_no_track_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_b1_no_track_on_s0_scannet_probe5",
+    "eval_policy": "control_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "C1 B1 shuffle own",
+    "prediction_config": "stream4d_v9_b1_shuffle_probe5",
+    "pre_points_config": "stream4d_v9_b1_shuffle_probe5",
+    "output_config": "stream4d_v9_b1_shuffle_probe5",
+    "eval_policy": "own_recompute_control",
+    "split": "probe5"
+  },
+  {
+    "method": "P0 on shuffle support",
+    "prediction_config": "scannet",
+    "pre_points_config": "stream4d_v9_b1_shuffle_probe5",
+    "output_config": "stream4d_v9_p0_on_b1_shuffle_support_probe5",
+    "eval_policy": "stream3d_on_control_support",
+    "split": "probe5"
+  },
+  {
+    "method": "C1 B1 shuffle on S0",
+    "prediction_config": "stream4d_v9_b1_shuffle_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_b1_shuffle_on_s0_scannet_probe5",
+    "eval_policy": "control_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "C2 B1 random own",
+    "prediction_config": "stream4d_v9_b1_random_same_count_s0_probe5",
+    "pre_points_config": "stream4d_v9_b1_random_same_count_s0_probe5",
+    "output_config": "stream4d_v9_b1_random_same_count_s0_probe5",
+    "eval_policy": "own_recompute_control",
+    "split": "probe5"
+  },
+  {
+    "method": "P0 on random support",
+    "prediction_config": "scannet",
+    "pre_points_config": "stream4d_v9_b1_random_same_count_s0_probe5",
+    "output_config": "stream4d_v9_p0_on_b1_random_support_probe5",
+    "eval_policy": "stream3d_on_control_support",
+    "split": "probe5"
+  },
+  {
+    "method": "C2 B1 random on S0",
+    "prediction_config": "stream4d_v9_b1_random_same_count_s0_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_b1_random_on_s0_scannet_probe5",
+    "eval_policy": "control_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "C3 B1 area own",
+    "prediction_config": "stream4d_v9_b1_area_same_count_probe5",
+    "pre_points_config": "stream4d_v9_b1_area_same_count_probe5",
+    "output_config": "stream4d_v9_b1_area_same_count_probe5",
+    "eval_policy": "own_recompute_control",
+    "split": "probe5"
+  },
+  {
+    "method": "P0 on area support",
+    "prediction_config": "scannet",
+    "pre_points_config": "stream4d_v9_b1_area_same_count_probe5",
+    "output_config": "stream4d_v9_p0_on_b1_area_support_probe5",
+    "eval_policy": "stream3d_on_control_support",
+    "split": "probe5"
+  },
+  {
+    "method": "C3 B1 area on S0",
+    "prediction_config": "stream4d_v9_b1_area_same_count_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_b1_area_on_s0_scannet_probe5",
+    "eval_policy": "control_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "C4 B1 maskcount own",
+    "prediction_config": "stream4d_v9_b1_maskcount_same_count_probe5",
+    "pre_points_config": "stream4d_v9_b1_maskcount_same_count_probe5",
+    "output_config": "stream4d_v9_b1_maskcount_same_count_probe5",
+    "eval_policy": "own_recompute_control",
+    "split": "probe5"
+  },
+  {
+    "method": "P0 on maskcount support",
+    "prediction_config": "scannet",
+    "pre_points_config": "stream4d_v9_b1_maskcount_same_count_probe5",
+    "output_config": "stream4d_v9_p0_on_b1_maskcount_support_probe5",
+    "eval_policy": "stream3d_on_control_support",
+    "split": "probe5"
+  },
+  {
+    "method": "C4 B1 maskcount on S0",
+    "prediction_config": "stream4d_v9_b1_maskcount_same_count_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_b1_maskcount_on_s0_scannet_probe5",
+    "eval_policy": "control_on_stream3d_support",
+    "split": "probe5"
+  }
+]

@@ -2,8 +2,12 @@ import torch
 import numpy as np
 from tqdm import tqdm
 from utils.mask_backprojection import frame_backprojection
-from utils.MC_mask_backprojection import MC_frame_backprojection
 from graph.node import Node
+
+try:
+    from utils.MC_mask_backprojection import MC_frame_backprojection
+except ImportError:
+    MC_frame_backprojection = None
 
 def mask_graph_construction(args, scene_points, frame_list, dataset, flag=0, depth_max_pre=0.1):
     '''

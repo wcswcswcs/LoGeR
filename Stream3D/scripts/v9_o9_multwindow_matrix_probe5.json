@@ -1,0 +1,50 @@
+[
+  {
+    "method": "P0 Stream3D on S0",
+    "prediction_config": "scannet",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_p0_on_s0_scannet_probe5",
+    "eval_policy": "stream3d_self_probe5",
+    "split": "probe5"
+  },
+  {
+    "method": "B1 own S2 single window",
+    "prediction_config": "stream4d_v8_b1_surfacelet_singlemask_probe5",
+    "pre_points_config": "stream4d_v8_b1_surfacelet_singlemask_probe5",
+    "output_config": "stream4d_v8_b1_surfacelet_singlemask_probe5",
+    "eval_policy": "own_recompute_paper_style",
+    "split": "probe5"
+  },
+  {
+    "method": "O9 D4RT multi-window 96f grid16 own",
+    "prediction_config": "stream4d_v9_o9_b1_multwin96_grid16_mc08_probe5",
+    "pre_points_config": "stream4d_v9_o9_b1_multwin96_grid16_mc08_probe5",
+    "output_config": "stream4d_v9_o9_b1_multwin96_grid16_mc08_probe5",
+    "eval_policy": "own_recompute_d4rt_multwindow96_grid16_mc08",
+    "split": "probe5"
+  },
+  {
+    "method": "P0 Stream3D on O9",
+    "prediction_config": "scannet",
+    "pre_points_config": "stream4d_v9_o9_b1_multwin96_grid16_mc08_probe5",
+    "output_config": "stream4d_v9_p0_on_o9_b1_multwin96_grid16_mc08_probe5",
+    "eval_policy": "stream3d_on_d4rt_multwindow96_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O9 on S0",
+    "prediction_config": "stream4d_v9_o9_b1_multwin96_grid16_mc08_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o9_b1_multwin96_grid16_mc08_on_s0_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O9 on S1",
+    "prediction_config": "stream4d_v9_o9_b1_multwin96_grid16_mc08_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_o9_b1_multwin96_grid16_mc08_on_s1_probe5",
+    "eval_policy": "method_on_32f_support",
+    "split": "probe5"
+  }
+]

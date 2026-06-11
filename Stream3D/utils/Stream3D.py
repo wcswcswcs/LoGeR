@@ -207,12 +207,15 @@ def find_represent_mask(mask_info_list):
     return mask_info_list[:5]
 
 
-def export_class_agnostic_mask(args, class_agnostic_mask_list):
+def export_class_agnostic_mask(args, class_agnostic_mask_list, total_point_num):
     pred_dir = os.path.join('data/prediction', args.config)
     os.makedirs(pred_dir, exist_ok=True)
 
     num_instance = len(class_agnostic_mask_list)
-    pred_masks = np.stack(class_agnostic_mask_list, axis=1)
+    if num_instance == 0:
+        pred_masks = np.zeros((int(total_point_num), 0), dtype=bool)
+    else:
+        pred_masks = np.stack(class_agnostic_mask_list, axis=1)
     pred_dict = {
         "pred_masks": pred_masks, 
         "pred_score":  np.ones(num_instance),
@@ -222,6 +225,24 @@ def export_class_agnostic_mask(args, class_agnostic_mask_list):
     os.makedirs(class_agnostic_pred_dir, exist_ok=True)
     np.savez(os.path.join(class_agnostic_pred_dir, f'{args.seq_name}.npz'), **pred_dict)
     return
+
+
+def _scene_id_from_dataset(dataset):
+    scene_id = getattr(dataset, "seq_name", None)
+    if scene_id:
+        return str(scene_id)
+    import re
+    path = getattr(dataset, "object_dict_dir", "")
+    match = re.search(r"scene\d{4}_\d{2}", path)
+    if match:
+        return match.group()
+    match = re.search(r"scans/([^/]+)", path)
+    if match:
+        return match.group(1)
+    match = re.search(r"data/([^/]+)", path)
+    if match:
+        return match.group(1)
+    raise ValueError(f"Could not infer scene id from dataset object_dict_dir={path!r}")
 
 
 def export_new(dataset, total_point_ids_list, total_mask_list, detected_points, args):
@@ -246,29 +267,19 @@ def export_new(dataset, total_point_ids_list, total_mask_list, detected_points, 
         binary_mask[list(point_ids)] = True
         class_agnostic_mask_list.append(binary_mask)
 
-    export_class_agnostic_mask(args, class_agnostic_mask_list)
+    export_class_agnostic_mask(args, class_agnostic_mask_list, total_point_num)
 
     os.makedirs(os.path.join(dataset.object_dict_dir, args.config), exist_ok=True)
     # print(dataset.object_dict_dir, args.config)
     np.save(os.path.join(dataset.object_dict_dir, args.config, 'object_dict.npy'), object_dict, allow_pickle=True)
 
-    array = np.array(flat_unique)
-    title = '............/TMP/'
-    import re
-    path = dataset.object_dict_dir
-    # print(path)
-    if args.config == 'scannet':
-        match = re.search(r"scene\d{4}_\d{2}", path)
-        scene_id = match.group()
-    if args.config == 'scannetpp':
-        match = re.search(r"data/([^/]+)", path)
-        scene_id = match.group(1)
-    if args.config == 'matterport3d':
-        match = re.search(r"scans/([^/]+)", path)
-        scene_id = match.group(1)
+    array = np.array(flat_unique, dtype=np.int64)
+    title = 'data/TMP'
+    scene_id = _scene_id_from_dataset(dataset)
 
-    os.makedirs(os.path.join(title + args.config), exist_ok=True)
-    np.save(os.path.join(title + args.config + '/' + scene_id + '_pre_points.npy'), array)
+    tmp_dir = os.path.join(title, args.config)
+    os.makedirs(tmp_dir, exist_ok=True)
+    np.save(os.path.join(tmp_dir, scene_id + '_pre_points.npy'), array)
 
 def export(dataset, total_point_ids_list, total_mask_list, args):
     '''
@@ -289,7 +300,7 @@ def export(dataset, total_point_ids_list, total_mask_list, args):
         binary_mask[list(point_ids)] = True
         class_agnostic_mask_list.append(binary_mask)
 
-    export_class_agnostic_mask(args, class_agnostic_mask_list)
+    export_class_agnostic_mask(args, class_agnostic_mask_list, total_point_num)
 
     os.makedirs(os.path.join(dataset.object_dict_dir, args.config), exist_ok=True)
     np.save(os.path.join(dataset.object_dict_dir, args.config, 'object_dict.npy'), object_dict, allow_pickle=True)

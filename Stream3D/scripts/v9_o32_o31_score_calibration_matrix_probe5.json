@@ -1,0 +1,66 @@
+[
+  {
+    "method": "P0 Stream3D on S0",
+    "prediction_config": "scannet",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_p0_on_s0_scannet_probe5",
+    "eval_policy": "stream3d_self_probe5",
+    "split": "probe5"
+  },
+  {
+    "method": "O31 no-exclusive on S0",
+    "prediction_config": "stream4d_v9_o31_o22_memory_c065_noexcl_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o31_o22_memory_c065_noexcl_probe5_on_s0_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O32 O31 no-exclusive logarea own",
+    "prediction_config": "stream4d_v9_o32_o31_noexcl_logarea_probe5",
+    "pre_points_config": "stream4d_v9_o32_o31_noexcl_logarea_probe5",
+    "output_config": "stream4d_v9_o32_o31_noexcl_logarea_probe5",
+    "eval_policy": "own_score_calibration_o31_noexcl_logarea",
+    "split": "probe5"
+  },
+  {
+    "method": "O32 O31 no-exclusive logarea on S0",
+    "prediction_config": "stream4d_v9_o32_o31_noexcl_logarea_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o32_o31_noexcl_logarea_probe5_on_s0_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O32 O31 no-exclusive logarea on S1",
+    "prediction_config": "stream4d_v9_o32_o31_noexcl_logarea_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_o32_o31_noexcl_logarea_probe5_on_s1_probe5",
+    "eval_policy": "method_on_32f_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O32 O31 no-exclusive inverse-logarea own",
+    "prediction_config": "stream4d_v9_o32_o31_noexcl_invlogarea_probe5",
+    "pre_points_config": "stream4d_v9_o32_o31_noexcl_invlogarea_probe5",
+    "output_config": "stream4d_v9_o32_o31_noexcl_invlogarea_probe5",
+    "eval_policy": "own_score_calibration_o31_noexcl_invlogarea",
+    "split": "probe5"
+  },
+  {
+    "method": "O32 O31 no-exclusive inverse-logarea on S0",
+    "prediction_config": "stream4d_v9_o32_o31_noexcl_invlogarea_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o32_o31_noexcl_invlogarea_probe5_on_s0_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O32 O31 no-exclusive inverse-logarea on S1",
+    "prediction_config": "stream4d_v9_o32_o31_noexcl_invlogarea_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_o32_o31_noexcl_invlogarea_probe5_on_s1_probe5",
+    "eval_policy": "method_on_32f_support",
+    "split": "probe5"
+  }
+]

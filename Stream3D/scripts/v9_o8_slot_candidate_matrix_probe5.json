@@ -1,0 +1,98 @@
+[
+  {
+    "method": "P0 Stream3D on S0",
+    "prediction_config": "scannet",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_p0_on_s0_scannet_probe5",
+    "eval_policy": "stream3d_self_probe5",
+    "split": "probe5"
+  },
+  {
+    "method": "B1 own S2",
+    "prediction_config": "stream4d_v8_b1_surfacelet_singlemask_probe5",
+    "pre_points_config": "stream4d_v8_b1_surfacelet_singlemask_probe5",
+    "output_config": "stream4d_v8_b1_surfacelet_singlemask_probe5",
+    "eval_policy": "own_recompute_paper_style",
+    "split": "probe5"
+  },
+  {
+    "method": "O8 scannet slot upper own S0 diagnostic",
+    "prediction_config": "stream4d_v9_o8_scannet_slot_upper_probe5",
+    "pre_points_config": "stream4d_v9_o8_scannet_slot_upper_probe5",
+    "output_config": "stream4d_v9_o8_scannet_slot_upper_probe5",
+    "eval_policy": "diagnostic_scannet_candidate_slot_select_s0",
+    "split": "probe5"
+  },
+  {
+    "method": "O8 scannet slot upper on S1 diagnostic",
+    "prediction_config": "stream4d_v9_o8_scannet_slot_upper_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_o8_scannet_slot_upper_on_s1_probe5",
+    "eval_policy": "diagnostic_scannet_candidate_slot_select_on_s1",
+    "split": "probe5"
+  },
+  {
+    "method": "O8 obs-bank slot-only own",
+    "prediction_config": "stream4d_v9_o8_obsbank_slot_only_probe5",
+    "pre_points_config": "stream4d_v9_o8_obsbank_slot_only_probe5",
+    "output_config": "stream4d_v9_o8_obsbank_slot_only_probe5",
+    "eval_policy": "own_obsbank_slot_only_candidate_select",
+    "split": "probe5"
+  },
+  {
+    "method": "P0 Stream3D on O8 obs-bank slot-only",
+    "prediction_config": "scannet",
+    "pre_points_config": "stream4d_v9_o8_obsbank_slot_only_probe5",
+    "output_config": "stream4d_v9_p0_on_o8_obsbank_slot_only_probe5",
+    "eval_policy": "stream3d_on_obsbank_slot_only_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O8 obs-bank slot-only on S0",
+    "prediction_config": "stream4d_v9_o8_obsbank_slot_only_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o8_obsbank_slot_only_on_s0_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O8 obs-bank slot-only on S1",
+    "prediction_config": "stream4d_v9_o8_obsbank_slot_only_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_o8_obsbank_slot_only_on_s1_probe5",
+    "eval_policy": "method_on_32f_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O8 obs-bank slot+top80 own",
+    "prediction_config": "stream4d_v9_o8_obsbank_slot_top80_probe5",
+    "pre_points_config": "stream4d_v9_o8_obsbank_slot_top80_probe5",
+    "output_config": "stream4d_v9_o8_obsbank_slot_top80_probe5",
+    "eval_policy": "own_obsbank_slot_top80_candidate_select",
+    "split": "probe5"
+  },
+  {
+    "method": "P0 Stream3D on O8 obs-bank slot+top80",
+    "prediction_config": "scannet",
+    "pre_points_config": "stream4d_v9_o8_obsbank_slot_top80_probe5",
+    "output_config": "stream4d_v9_p0_on_o8_obsbank_slot_top80_probe5",
+    "eval_policy": "stream3d_on_obsbank_slot_top80_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O8 obs-bank slot+top80 on S0",
+    "prediction_config": "stream4d_v9_o8_obsbank_slot_top80_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o8_obsbank_slot_top80_on_s0_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O8 obs-bank slot+top80 on S1",
+    "prediction_config": "stream4d_v9_o8_obsbank_slot_top80_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_o8_obsbank_slot_top80_on_s1_probe5",
+    "eval_policy": "method_on_32f_support",
+    "split": "probe5"
+  }
+]

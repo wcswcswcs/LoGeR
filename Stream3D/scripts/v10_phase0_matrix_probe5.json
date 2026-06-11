@@ -1,0 +1,182 @@
+[
+  {
+    "method": "P0 Stream3D on S0",
+    "prediction_config": "scannet",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v10_p0_on_s0_probe5",
+    "eval_policy": "own_recompute_paper_style",
+    "support_source": "stream3d_s0",
+    "geometry_source": "rgbd_eval_bridge",
+    "split": "probe5"
+  },
+  {
+    "method": "P0 Stream3D on S1",
+    "prediction_config": "scannet",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v10_p0_on_s1_probe5",
+    "eval_policy": "cross_fixed_support",
+    "support_source": "stream4d_s1",
+    "geometry_source": "rgbd_eval_bridge",
+    "split": "probe5"
+  },
+  {
+    "method": "P0 Stream3D on S2 B1",
+    "prediction_config": "scannet",
+    "pre_points_config": "stream4d_v8_b1_surfacelet_singlemask_probe5",
+    "output_config": "stream4d_v10_p0_on_s2_b1_probe5",
+    "eval_policy": "cross_fixed_support",
+    "support_source": "named_config",
+    "geometry_source": "rgbd_eval_bridge",
+    "split": "probe5"
+  },
+  {
+    "method": "P0 Stream3D on S5 v6 compact",
+    "prediction_config": "scannet",
+    "pre_points_config": "stream4d_v6_e4_probe5_objcomp_m650_g101_compact_only_preserve",
+    "output_config": "stream4d_v10_p0_on_s5_v6compact_probe5",
+    "eval_policy": "cross_fixed_support",
+    "support_source": "named_config",
+    "geometry_source": "rgbd_eval_bridge",
+    "split": "probe5"
+  },
+  {
+    "method": "P0 Stream3D on O1 support",
+    "prediction_config": "scannet",
+    "pre_points_config": "stream4d_v9_o1_b1_core_only_probe5",
+    "output_config": "stream4d_v10_p0_on_o1_probe5",
+    "eval_policy": "cross_fixed_support",
+    "support_source": "named_config",
+    "geometry_source": "rgbd_eval_bridge",
+    "split": "probe5"
+  },
+  {
+    "method": "P0 Stream3D on O38 c055 support",
+    "prediction_config": "scannet",
+    "pre_points_config": "stream4d_v9_o38_o22_memory_c055_newpts_logarea_probe5",
+    "output_config": "stream4d_v10_p0_on_o38_c055_probe5",
+    "eval_policy": "cross_fixed_support",
+    "support_source": "named_config",
+    "geometry_source": "rgbd_eval_bridge",
+    "split": "probe5"
+  },
+  {
+    "method": "P2 B1 own",
+    "prediction_config": "stream4d_v8_b1_surfacelet_singlemask_probe5",
+    "pre_points_config": "stream4d_v8_b1_surfacelet_singlemask_probe5",
+    "output_config": "stream4d_v8_b1_surfacelet_singlemask_probe5",
+    "eval_policy": "own_recompute_paper_style",
+    "support_source": "own",
+    "geometry_source": "mixed",
+    "split": "probe5"
+  },
+  {
+    "method": "P2 B1 on S0",
+    "prediction_config": "stream4d_v8_b1_surfacelet_singlemask_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v10_b1_on_s0_probe5",
+    "eval_policy": "cross_fixed_support",
+    "support_source": "stream3d_s0",
+    "geometry_source": "mixed",
+    "split": "probe5"
+  },
+  {
+    "method": "P2 B1 on S1",
+    "prediction_config": "stream4d_v8_b1_surfacelet_singlemask_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v10_b1_on_s1_probe5",
+    "eval_policy": "cross_fixed_support",
+    "support_source": "stream4d_s1",
+    "geometry_source": "mixed",
+    "split": "probe5"
+  },
+  {
+    "method": "P1 v6 compact on S5",
+    "prediction_config": "stream4d_v6_e4_probe5_objcomp_m650_g101_compact_only_preserve",
+    "pre_points_config": "stream4d_v6_e4_probe5_objcomp_m650_g101_compact_only_preserve",
+    "output_config": "stream4d_v6_e4_probe5_objcomp_m650_g101_compact_only_preserve",
+    "eval_policy": "own_recompute_paper_style",
+    "support_source": "own",
+    "geometry_source": "mixed",
+    "split": "probe5"
+  },
+  {
+    "method": "P1 v6 compact on S0",
+    "prediction_config": "stream4d_v6_e4_probe5_objcomp_m650_g101_compact_only_preserve",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v10_v6compact_on_s0_probe5",
+    "eval_policy": "cross_fixed_support",
+    "support_source": "stream3d_s0",
+    "geometry_source": "mixed",
+    "split": "probe5"
+  },
+  {
+    "method": "P1 v6 compact on S1",
+    "prediction_config": "stream4d_v6_e4_probe5_objcomp_m650_g101_compact_only_preserve",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v10_v6compact_on_s1_probe5",
+    "eval_policy": "cross_fixed_support",
+    "support_source": "stream4d_s1",
+    "geometry_source": "mixed",
+    "split": "probe5"
+  },
+  {
+    "method": "O1 core-only own",
+    "prediction_config": "stream4d_v9_o1_b1_core_only_probe5",
+    "pre_points_config": "stream4d_v9_o1_b1_core_only_probe5",
+    "output_config": "stream4d_v9_o1_b1_core_only_probe5",
+    "eval_policy": "own_recompute_paper_style",
+    "support_source": "own",
+    "geometry_source": "mixed",
+    "split": "probe5"
+  },
+  {
+    "method": "O1 core-only on S0",
+    "prediction_config": "stream4d_v9_o1_b1_core_only_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v10_o1_on_s0_probe5",
+    "eval_policy": "cross_fixed_support",
+    "support_source": "stream3d_s0",
+    "geometry_source": "mixed",
+    "split": "probe5"
+  },
+  {
+    "method": "O1 core-only on S1",
+    "prediction_config": "stream4d_v9_o1_b1_core_only_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v10_o1_on_s1_probe5",
+    "eval_policy": "cross_fixed_support",
+    "support_source": "stream4d_s1",
+    "geometry_source": "mixed",
+    "split": "probe5"
+  },
+  {
+    "method": "O38 c055 own",
+    "prediction_config": "stream4d_v9_o38_o22_memory_c055_newpts_logarea_probe5",
+    "pre_points_config": "stream4d_v9_o38_o22_memory_c055_newpts_logarea_probe5",
+    "output_config": "stream4d_v9_o38_o22_memory_c055_newpts_logarea_probe5",
+    "eval_policy": "own_recompute_paper_style",
+    "support_source": "own",
+    "geometry_source": "mixed",
+    "split": "probe5"
+  },
+  {
+    "method": "O38 c055 on S0",
+    "prediction_config": "stream4d_v9_o38_o22_memory_c055_newpts_logarea_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v10_o38_c055_on_s0_probe5",
+    "eval_policy": "cross_fixed_support",
+    "support_source": "stream3d_s0",
+    "geometry_source": "mixed",
+    "split": "probe5"
+  },
+  {
+    "method": "O38 c055 on S1",
+    "prediction_config": "stream4d_v9_o38_o22_memory_c055_newpts_logarea_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v10_o38_c055_on_s1_probe5",
+    "eval_policy": "cross_fixed_support",
+    "support_source": "stream4d_s1",
+    "geometry_source": "mixed",
+    "split": "probe5"
+  }
+]

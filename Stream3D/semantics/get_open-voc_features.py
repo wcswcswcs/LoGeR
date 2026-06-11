@@ -104,8 +104,9 @@ class CroppedImageDataset(Dataset):
 
 def load_clip():
     print(f'[INFO] loading CLIP model...')
-    # model, _, preprocess = open_clip.create_model_and_transforms("ViT-H-14", pretrained="laion2b_s32b_b79k")
-    model, _, preprocess = open_clip.create_model_and_transforms("ViT-H-14", pretrained="./weights/open_clip_model.safetensors")
+    local_checkpoint = "./weights/open_clip_model.safetensors"
+    pretrained = local_checkpoint if os.path.exists(local_checkpoint) else "laion2b_s32b_b79k"
+    model, _, preprocess = open_clip.create_model_and_transforms("ViT-H-14", pretrained=pretrained)
     model.cuda()
     model.eval()
     print(f'[INFO]', ' finish loading CLIP model...')

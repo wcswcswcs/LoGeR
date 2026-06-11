@@ -1,0 +1,50 @@
+[
+  {
+    "method": "P0 Stream3D on S0",
+    "prediction_config": "scannet",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_p0_on_s0_scannet_probe5",
+    "eval_policy": "stream3d_self_probe5",
+    "split": "probe5"
+  },
+  {
+    "method": "O14 full-span grid8 suppression own",
+    "prediction_config": "stream4d_v9_o14_b1_fullspan_grid8_ws100_overlap_mioc050_probe5",
+    "pre_points_config": "stream4d_v9_o14_b1_fullspan_grid8_ws100_overlap_mioc050_probe5",
+    "output_config": "stream4d_v9_o14_b1_fullspan_grid8_ws100_overlap_mioc050_probe5",
+    "eval_policy": "own_recompute_d4rt_fullspan_grid8_ws100_overlap_mioc050",
+    "split": "probe5"
+  },
+  {
+    "method": "O15 O14 merge minIoC 0.50 own",
+    "prediction_config": "stream4d_v9_o15_o14_merge_mioc050_probe5",
+    "pre_points_config": "stream4d_v9_o15_o14_merge_mioc050_probe5",
+    "output_config": "stream4d_v9_o15_o14_merge_mioc050_probe5",
+    "eval_policy": "own_recompute_o14_overlap_merge_mioc050",
+    "split": "probe5"
+  },
+  {
+    "method": "P0 Stream3D on O15 0.50",
+    "prediction_config": "scannet",
+    "pre_points_config": "stream4d_v9_o15_o14_merge_mioc050_probe5",
+    "output_config": "stream4d_v9_p0_on_o15_o14_merge_mioc050_probe5",
+    "eval_policy": "stream3d_on_o15_o14_merge_mioc050_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O15 0.50 on S0",
+    "prediction_config": "stream4d_v9_o15_o14_merge_mioc050_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o15_o14_merge_mioc050_on_s0_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O15 0.50 on S1",
+    "prediction_config": "stream4d_v9_o15_o14_merge_mioc050_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_o15_o14_merge_mioc050_on_s1_probe5",
+    "eval_policy": "method_on_32f_support",
+    "split": "probe5"
+  }
+]

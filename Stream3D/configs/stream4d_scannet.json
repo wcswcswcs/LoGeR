@@ -1,0 +1,16 @@
+{
+  "dataset": "scannet",
+  "frame_stride": 10,
+  "window_size": 32,
+  "window_stride": 16,
+  "backbone": "Cropformer",
+  "max_points_per_mask": 32,
+  "min_points_per_mask": 4,
+  "rho_min": 0.35,
+  "local_ioc_threshold": 0.25,
+  "history_match_threshold": 0.30,
+  "lost_tolerance_windows": 3,
+  "export_mode": "rgbd_eval",
+  "export_nn_radius": 0.05,
+  "output_config": "stream4d_scannet"
+}

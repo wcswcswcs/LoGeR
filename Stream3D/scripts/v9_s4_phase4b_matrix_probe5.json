@@ -1,0 +1,154 @@
+[
+  {
+    "method": "P0 Stream3D on S0",
+    "prediction_config": "scannet",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_p0_on_s0_scannet_probe5",
+    "eval_policy": "stream3d_self_probe5",
+    "split": "probe5"
+  },
+  {
+    "method": "P0 Stream3D on S2 B1",
+    "prediction_config": "scannet",
+    "pre_points_config": "stream4d_v8_b1_surfacelet_singlemask_probe5",
+    "output_config": "stream4d_v9_p0_on_s2_b1_probe5",
+    "eval_policy": "cross_fixed_b1_support",
+    "split": "probe5"
+  },
+  {
+    "method": "B1 own S2",
+    "prediction_config": "stream4d_v8_b1_surfacelet_singlemask_probe5",
+    "pre_points_config": "stream4d_v8_b1_surfacelet_singlemask_probe5",
+    "output_config": "stream4d_v8_b1_surfacelet_singlemask_probe5",
+    "eval_policy": "own_recompute_paper_style",
+    "split": "probe5"
+  },
+  {
+    "method": "P0 Stream3D on S4 union",
+    "prediction_config": "scannet",
+    "pre_points_config": "stream4d_v9_s4_union_s0_b1_probe5",
+    "output_config": "stream4d_v9_p0_on_s4_union_probe5",
+    "eval_policy": "stream3d_on_union_s0_b1_support",
+    "split": "probe5"
+  },
+  {
+    "method": "B1 on S4 union",
+    "prediction_config": "stream4d_v8_b1_surfacelet_singlemask_probe5",
+    "pre_points_config": "stream4d_v9_s4_union_s0_b1_probe5",
+    "output_config": "stream4d_v9_b1_on_s4_union_probe5",
+    "eval_policy": "method_on_union_s0_b1_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O1 core-only own",
+    "prediction_config": "stream4d_v9_o1_b1_core_only_probe5",
+    "pre_points_config": "stream4d_v9_o1_b1_core_only_probe5",
+    "output_config": "stream4d_v9_o1_b1_core_only_probe5",
+    "eval_policy": "own_recompute_core_only",
+    "split": "probe5"
+  },
+  {
+    "method": "O1 core-only on S4 union",
+    "prediction_config": "stream4d_v9_o1_b1_core_only_probe5",
+    "pre_points_config": "stream4d_v9_s4_union_s0_b1_probe5",
+    "output_config": "stream4d_v9_o1_core_on_s4_union_probe5",
+    "eval_policy": "method_on_union_s0_b1_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O3 WTA-negative own",
+    "prediction_config": "stream4d_v9_o3_b1_wta_negative_fringe_probe5",
+    "pre_points_config": "stream4d_v9_o3_b1_wta_negative_fringe_probe5",
+    "output_config": "stream4d_v9_o3_b1_wta_negative_fringe_probe5",
+    "eval_policy": "own_recompute_wta_negative_fringe",
+    "split": "probe5"
+  },
+  {
+    "method": "O3 WTA-negative on S4 union",
+    "prediction_config": "stream4d_v9_o3_b1_wta_negative_fringe_probe5",
+    "pre_points_config": "stream4d_v9_s4_union_s0_b1_probe5",
+    "output_config": "stream4d_v9_o3_negative_on_s4_union_probe5",
+    "eval_policy": "method_on_union_s0_b1_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O4 scene fringe r0.02 own",
+    "prediction_config": "stream4d_v9_o4_b1_scene_fringe_r002_probe5",
+    "pre_points_config": "stream4d_v9_o4_b1_scene_fringe_r002_probe5",
+    "output_config": "stream4d_v9_o4_b1_scene_fringe_r002_probe5",
+    "eval_policy": "own_recompute_core_scene_fringe_r002",
+    "split": "probe5"
+  },
+  {
+    "method": "P0 Stream3D on O4 r0.02",
+    "prediction_config": "scannet",
+    "pre_points_config": "stream4d_v9_o4_b1_scene_fringe_r002_probe5",
+    "output_config": "stream4d_v9_p0_on_o4_scene_fringe_r002_probe5",
+    "eval_policy": "stream3d_on_o4_scene_fringe_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O4 scene fringe r0.02 on S0",
+    "prediction_config": "stream4d_v9_o4_b1_scene_fringe_r002_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o4_scene_fringe_r002_on_s0_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O4 scene fringe r0.02 on S1",
+    "prediction_config": "stream4d_v9_o4_b1_scene_fringe_r002_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_o4_scene_fringe_r002_on_s1_probe5",
+    "eval_policy": "method_on_32f_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O4 scene fringe r0.02 on S4 union",
+    "prediction_config": "stream4d_v9_o4_b1_scene_fringe_r002_probe5",
+    "pre_points_config": "stream4d_v9_s4_union_s0_b1_probe5",
+    "output_config": "stream4d_v9_o4_scene_fringe_r002_on_s4_probe5",
+    "eval_policy": "method_on_union_s0_b1_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O4 scene fringe r0.05 own",
+    "prediction_config": "stream4d_v9_o4_b1_scene_fringe_r005_probe5",
+    "pre_points_config": "stream4d_v9_o4_b1_scene_fringe_r005_probe5",
+    "output_config": "stream4d_v9_o4_b1_scene_fringe_r005_probe5",
+    "eval_policy": "own_recompute_core_scene_fringe_r005",
+    "split": "probe5"
+  },
+  {
+    "method": "P0 Stream3D on O4 r0.05",
+    "prediction_config": "scannet",
+    "pre_points_config": "stream4d_v9_o4_b1_scene_fringe_r005_probe5",
+    "output_config": "stream4d_v9_p0_on_o4_scene_fringe_r005_probe5",
+    "eval_policy": "stream3d_on_o4_scene_fringe_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O4 scene fringe r0.05 on S0",
+    "prediction_config": "stream4d_v9_o4_b1_scene_fringe_r005_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o4_scene_fringe_r005_on_s0_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O4 scene fringe r0.05 on S1",
+    "prediction_config": "stream4d_v9_o4_b1_scene_fringe_r005_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_o4_scene_fringe_r005_on_s1_probe5",
+    "eval_policy": "method_on_32f_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O4 scene fringe r0.05 on S4 union",
+    "prediction_config": "stream4d_v9_o4_b1_scene_fringe_r005_probe5",
+    "pre_points_config": "stream4d_v9_s4_union_s0_b1_probe5",
+    "output_config": "stream4d_v9_o4_scene_fringe_r005_on_s4_probe5",
+    "eval_policy": "method_on_union_s0_b1_support",
+    "split": "probe5"
+  }
+]

@@ -1,0 +1,114 @@
+[
+  {
+    "method": "P0 Stream3D on S2 B1",
+    "prediction_config": "scannet",
+    "pre_points_config": "stream4d_v8_b1_surfacelet_singlemask_probe5",
+    "output_config": "stream4d_v9_p0_on_s2_b1_probe5",
+    "eval_policy": "cross_fixed_b1_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O0 B1 full-mask own",
+    "prediction_config": "stream4d_v8_b1_surfacelet_singlemask_probe5",
+    "pre_points_config": "stream4d_v8_b1_surfacelet_singlemask_probe5",
+    "output_config": "stream4d_v8_b1_surfacelet_singlemask_probe5",
+    "eval_policy": "own_recompute_paper_style",
+    "split": "probe5"
+  },
+  {
+    "method": "P0 Stream3D on O1",
+    "prediction_config": "scannet",
+    "pre_points_config": "stream4d_v9_o1_b1_core_only_probe5",
+    "output_config": "stream4d_v9_p0_on_o1_core_support_probe5",
+    "eval_policy": "stream3d_on_o1_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O1 core-only own",
+    "prediction_config": "stream4d_v9_o1_b1_core_only_probe5",
+    "pre_points_config": "stream4d_v9_o1_b1_core_only_probe5",
+    "output_config": "stream4d_v9_o1_b1_core_only_probe5",
+    "eval_policy": "own_recompute_core_only",
+    "split": "probe5"
+  },
+  {
+    "method": "O1 core-only on S0",
+    "prediction_config": "stream4d_v9_o1_b1_core_only_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o1_core_on_s0_scannet_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O1 core-only on S1",
+    "prediction_config": "stream4d_v9_o1_b1_core_only_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_o1_core_on_s1_32f_probe5",
+    "eval_policy": "method_on_32f_support",
+    "split": "probe5"
+  },
+  {
+    "method": "P0 Stream3D on O2",
+    "prediction_config": "scannet",
+    "pre_points_config": "stream4d_v9_o2_b1_core_radius_fringe_probe5",
+    "output_config": "stream4d_v9_p0_on_o2_fringe_support_probe5",
+    "eval_policy": "stream3d_on_o2_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O2 core+radius fringe own",
+    "prediction_config": "stream4d_v9_o2_b1_core_radius_fringe_probe5",
+    "pre_points_config": "stream4d_v9_o2_b1_core_radius_fringe_probe5",
+    "output_config": "stream4d_v9_o2_b1_core_radius_fringe_probe5",
+    "eval_policy": "own_recompute_core_radius_fringe",
+    "split": "probe5"
+  },
+  {
+    "method": "O2 core+radius fringe on S0",
+    "prediction_config": "stream4d_v9_o2_b1_core_radius_fringe_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o2_fringe_on_s0_scannet_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O2 core+radius fringe on S1",
+    "prediction_config": "stream4d_v9_o2_b1_core_radius_fringe_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_o2_fringe_on_s1_32f_probe5",
+    "eval_policy": "method_on_32f_support",
+    "split": "probe5"
+  },
+  {
+    "method": "P0 Stream3D on O3",
+    "prediction_config": "scannet",
+    "pre_points_config": "stream4d_v9_o3_b1_wta_negative_fringe_probe5",
+    "output_config": "stream4d_v9_p0_on_o3_negative_support_probe5",
+    "eval_policy": "stream3d_on_o3_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O3 WTA-negative fringe own",
+    "prediction_config": "stream4d_v9_o3_b1_wta_negative_fringe_probe5",
+    "pre_points_config": "stream4d_v9_o3_b1_wta_negative_fringe_probe5",
+    "output_config": "stream4d_v9_o3_b1_wta_negative_fringe_probe5",
+    "eval_policy": "own_recompute_wta_negative_fringe",
+    "split": "probe5"
+  },
+  {
+    "method": "O3 WTA-negative fringe on S0",
+    "prediction_config": "stream4d_v9_o3_b1_wta_negative_fringe_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o3_negative_on_s0_scannet_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O3 WTA-negative fringe on S1",
+    "prediction_config": "stream4d_v9_o3_b1_wta_negative_fringe_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_o3_negative_on_s1_32f_probe5",
+    "eval_policy": "method_on_32f_support",
+    "split": "probe5"
+  }
+]

@@ -171,6 +171,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--se3", action="store_true", default=None)
     p.add_argument("--geometry_edge_rtol", type=float, default=0.03)
     p.add_argument("--stage_memory_swap", type=int, default=1)
+    p.add_argument("--empty_cuda_cache_each_chunk", type=int, default=0,
+                   help="Compatibility flag from experiment launchers; 0 keeps the historical behavior.")
+    p.add_argument("--v11_projection_trace_dir", default=None,
+                   help="Compatibility/debug trace directory for projection experiments.")
+    p.add_argument("--v11_projection_gt_path", default=None,
+                   help="Compatibility GT path for projection diagnostics; unused unless projection hooks are enabled.")
+    p.add_argument("--v11_projection_action_mode", default="none")
+    p.add_argument("--v11_projection_action_chunks", default="")
+    p.add_argument("--v11_projection_action_strength", type=float, default=1.0)
+    p.add_argument("--v11_projection_action_deadband", type=float, default=0.0)
+    p.add_argument("--online_scale_state_mode", default="none",
+                   choices=("none", "off", "overlap_step", "overlap_tight", "scale_state"))
+    p.add_argument("--online_scale_state_min", type=float, default=0.80)
+    p.add_argument("--online_scale_state_max", type=float, default=1.25)
+    p.add_argument("--probe_cache_dir", default=None)
+    p.add_argument("--probe_cache_mode",
+                   choices=("off", "read", "write", "readwrite", "refresh"),
+                   default="off")
+    p.add_argument("--probe_cache_payload", default="read_path_min")
+    p.add_argument("--probe_cache_require_hit", type=int, default=0)
 
     # -- Stage B ----------------------------------------------------------
     p.add_argument("--k_intra", type=int, default=3)
@@ -300,6 +320,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Optional branch-wise post-replay delta scales as w0,w1,w2. Overrides the global scale per branch.")
     p.add_argument("--ttt_write_native_mix_scales", default=None,
                    help="Optional branch-wise semantic-vs-native replay mix as w0,w1,w2; 1 keeps semantic replay, 0 keeps native write.")
+    p.add_argument("--ttt_write_native_mix_chunks", default="",
+                   help="Optional chunks where native mix scales apply. Empty means all chunks.")
     p.add_argument("--ttt_write_prior_transform_mode",
                    choices=("none", "focal_static", "static_focal", "pow", "anti_dynamic", "dynamic_anti", "signed_center", "center_signed", "signed_focal", "focal_signed", "anti_dynamic_norm", "dynamic_anti_norm", "signed_center_norm", "center_signed_norm", "signed_focal_norm", "focal_signed_norm"),
                    default="none",
@@ -347,6 +369,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="For tri_replay mode, fraction of highest-risk tokens assigned to negative replay.")
     p.add_argument("--ttt_write_tri_replay_neutral_lambda", type=float, default=1.0,
                    help="For tri_replay mode, scale for neutral replay delta.")
+    p.add_argument("--ttt_write_tri_replay_role_mode", default="fixed",
+                   help="Role assignment policy for tri_replay/adaptive writer modes.")
     p.add_argument(
         "--ttt_write_tri_replay_chunk_params",
         default="",
@@ -363,6 +387,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Branches whose gradient-reversal delta should be transient. Empty/same means active GR branches.")
     p.add_argument("--ttt_write_gradient_reversal_transient_long_scale", type=float, default=0.0,
                    help="For dual_lifetime transient mode, fraction of GR delta retained in long-term TTT fast weights; the residual is stored as short apply-only delta.")
+    p.add_argument("--ttt_write_gradient_reversal_transient_apply_scale", type=float, default=1.0,
+                   help="Scale for apply-only transient gradient-reversal delta.")
     p.add_argument("--ttt_write_replay_feature_gate_mode",
                    choices=(
                        "none",
@@ -421,8 +447,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Final committed TTT fast-weight EMA alpha against W_m, after all replay/mix/gate steps.")
     p.add_argument("--ttt_write_commit_ema_branch_mask", default="all",
                    help="Apply commit EMA only to these TTT branches; other branches keep their candidate update.")
+    p.add_argument("--ttt_write_commit_ema_chunks", default="",
+                   help="Optional comma-separated chunk indices where commit EMA is enabled. Empty means all chunks.")
     p.add_argument("--ttt_write_native_delta_gate_mode",
-                   choices=("none", "cosine", "cosine_soft", "cap", "cosine_cap"),
+                   choices=("none", "cosine", "cosine_soft", "cap", "cosine_cap", "orthogonal_suppress"),
                    default="none",
                    help="Post-replay gate for semantic correction relative to native TTT replay continuity.")
     p.add_argument("--ttt_write_native_delta_gate_min_cos", type=float, default=0.0)
@@ -431,7 +459,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ttt_write_native_delta_gate_branch_mask", default="all",
                    help="Branches affected by post-replay native delta gate.")
     p.add_argument("--ttt_write_commit_filter_mode",
-                   choices=("none", "native_to_candidate_by_risk", "old_decay_by_risk"),
+                   choices=("none", "native_to_candidate_by_risk", "native2candidate_by_risk",
+                            "native_to_semantic_by_risk", "old_decay_by_risk",
+                            "native_distance_adaptive_ema", "candidate_native_distance_ema",
+                            "state_conditioned_commit",
+                            "state_energy_directional_commit", "directional_commit_guard",
+                            "state_energy_directional_commit_guard",
+                            "tail_state_selective_commit", "selective_commit_ema",
+                            "tail_state_continuity_selective_commit"),
                    default="none",
                    help="Post-replay commit-only TTT propagation filter; does not change current-chunk controlled output.")
     p.add_argument("--ttt_write_commit_filter_risk_source",
@@ -464,6 +499,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="Branches affected by commit risk filter; default branch 0.")
     p.add_argument("--ttt_write_commit_filter_chunks", default="",
                    help="Optional comma-separated chunk indices where commit filter is enabled. Empty means all chunks.")
+    p.add_argument("--ttt_write_scale_state_mode", default="none",
+                   help="No-GT scale-state projection mode used by adaptive writer risk sources.")
+    p.add_argument("--ttt_write_scale_state_proxy", default="pose_step_ema")
+    p.add_argument("--ttt_write_scale_state_carrier", default="all")
+    p.add_argument("--ttt_write_scale_state_alpha", type=float, default=0.0)
+    p.add_argument("--ttt_write_scale_state_branch_mask", default="0")
+    p.add_argument("--ttt_write_scale_state_chunks", default="")
+    p.add_argument("--ttt_write_scale_state_sample_tokens", type=int, default=0)
     p.add_argument("--debug_prior_mode",
                    choices=["none", "patch_only", "special_only", "frame_ramp",
                             "reverse_frame_ramp", "checkerboard", "roll"],
@@ -472,6 +515,53 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--prior_debug_jsonl", default=None)
     p.add_argument("--hybrid_debug_jsonl", default=None,
                    help="Optional JSONL for per-chunk v2 probe/control state/debug records.")
+    p.add_argument("--v32_semantic_cue_active_chunks", default="")
+    p.add_argument("--v32_semantic_cue_trigger_mode", default="off")
+    p.add_argument("--v32_semantic_cue_trigger_high_threshold", type=float, default=0.80)
+    p.add_argument("--v32_semantic_cue_trigger_k", type=float, default=1.5)
+    p.add_argument("--v32_semantic_cue_trigger_min_mass", type=float, default=0.05)
+    p.add_argument("--v32_semantic_cue_trigger_warmup", type=int, default=3)
+    p.add_argument("--v32_semantic_cue_trigger_ema_alpha", type=float, default=0.25)
+    p.add_argument("--read_beta_frame_chunks", default="")
+    p.add_argument("--enable_context_source_skip", type=int, default=0)
+    p.add_argument("--context_source_skip_impl", default="bias")
+    p.add_argument("--context_source_skip_scope", default="frame")
+    p.add_argument("--context_source_skip_mode", default="hard")
+    p.add_argument("--context_source_skip_mask", default="dg_q90")
+    p.add_argument("--context_source_skip_layer_mode", default="early")
+    p.add_argument("--context_source_skip_single_layer", type=int, default=-1)
+    p.add_argument("--context_source_skip_soft_rho", type=float, default=0.5)
+    p.add_argument("--context_source_skip_soft_min_keep", type=float, default=0.5)
+    p.add_argument("--context_source_skip_record_attention_mass", type=int, default=0)
+    p.add_argument("--context_source_skip_attention_mass_max_queries", type=int, default=512)
+    p.add_argument("--semantic_anchor_mode", default="semantic")
+    p.add_argument("--semantic_anchor_target_ratio", type=float, default=0.12)
+    p.add_argument("--semantic_anchor_min_ratio", type=float, default=0.03)
+    p.add_argument("--semantic_anchor_max_ratio", type=float, default=0.30)
+    p.add_argument("--semantic_anchor_min_score", type=float, default=0.02)
+    p.add_argument("--semantic_anchor_grid_rows", type=int, default=4)
+    p.add_argument("--semantic_anchor_grid_cols", type=int, default=4)
+    p.add_argument("--enable_semantic_anchor_ttt_floor", type=int, default=0)
+    p.add_argument("--semantic_role_policy", default="none")
+    p.add_argument("--semantic_memory_paths", default="")
+    p.add_argument("--semantic_action_active_chunks", default="")
+    p.add_argument("--semantic_action_inactive_read_cue_source", default="")
+    p.add_argument("--semantic_role_highd_quantile", type=float, default=0.80)
+    p.add_argument("--semantic_role_low_trust", type=float, default=0.20)
+    p.add_argument("--semantic_role_positive_scale", type=float, default=1.05)
+    p.add_argument("--semantic_role_neutral_scale", type=float, default=0.85)
+    p.add_argument("--semantic_role_negative_scale", type=float, default=0.65)
+    p.add_argument("--semantic_role_swa_negative_scale", type=float, default=1.0)
+    p.add_argument("--v29c_masklet_alignment_csv", default="")
+    p.add_argument("--v29c_masklet_intervention_policy", default="none")
+    p.add_argument("--v29c_masklet_intervention_chunk", type=int, default=-1)
+    p.add_argument("--v29c_masklet_intervention_id", type=int, default=-1)
+    p.add_argument("--v29c_masklet_intervention_path", default="ttt")
+    p.add_argument("--v29c_masklet_intervention_action", default="ttt_neutral")
+    p.add_argument("--v29c_masklet_intervention_patch_threshold", type=float, default=0.20)
+    p.add_argument("--v36_synthetic_mask", default="none")
+    p.add_argument("--v36_synthetic_path", default="frame")
+    p.add_argument("--v36_synthetic_action", default="source_skip")
     p.add_argument("--rho_sem", type=float, default=0.6)
     p.add_argument("--spg_use_g_write_geo", type=int, default=1)
     p.add_argument("--spg_value_structure", type=float, default=1.0)
@@ -844,6 +934,55 @@ def _masklet_from_cache_dict(data: Dict[str, Any]) -> MaskletOutput:
     )
 
 
+def _slice_masklet_output(mo: MaskletOutput, num_frames: int) -> MaskletOutput:
+    """Return a time-prefix view of a cached masklet for short tail chunks."""
+    T = max(0, min(int(num_frames), int(mo.num_frames)))
+    return MaskletOutput(
+        M_mask=mo.M_mask[:, :T].cpu(),
+        V_mask=mo.V_mask[:, :T].cpu(),
+        B_mask=mo.B_mask[:, :T].cpu(),
+        Q_mask=mo.Q_mask[:, :T].cpu(),
+        L_sem=list(mo.L_sem),
+        G_sem=mo.G_sem.cpu(),
+        W_sem=mo.W_sem.cpu(),
+        A_ratio=mo.A_ratio[:, :T].cpu(),
+        num_masklets=int(mo.num_masklets),
+        num_frames=T,
+        frame_height=int(mo.frame_height),
+        frame_width=int(mo.frame_width),
+        source_type=list(mo.source_type),
+        birth_frame=list(mo.birth_frame),
+        seed_global_track_idx=list(mo.seed_global_track_idx),
+        debug=dict(mo.debug),
+    )
+
+
+def _stage_c_cache_superset_path(
+    cache_root: Path,
+    *,
+    chunk_idx: int,
+    start: int,
+    end: int,
+) -> Optional[Path]:
+    prefix = f"chunk_{int(chunk_idx):03d}_{int(start):06d}_"
+    best: Optional[Tuple[int, Path]] = None
+    for chunk_dir in cache_root.glob(prefix + "*"):
+        if not chunk_dir.is_dir():
+            continue
+        parts = chunk_dir.name.split("_")
+        if len(parts) != 4:
+            continue
+        try:
+            cached_end = int(parts[3])
+        except ValueError:
+            continue
+        cache_path = chunk_dir / "masklet.pt"
+        if cached_end >= int(end) and cache_path.is_file():
+            if best is None or cached_end < best[0]:
+                best = (cached_end, cache_path)
+    return best[1] if best is not None else None
+
+
 def _stage_c_cache_manifest(
     args: argparse.Namespace,
     *,
@@ -888,6 +1027,8 @@ def _run_stage_c_cached(
     chunk_dir = cache_root / f"chunk_{chunk_idx:03d}_{int(start):06d}_{int(end):06d}"
     cache_path = chunk_dir / "masklet.pt"
     manifest_path = chunk_dir / "manifest.json"
+    cache_path_used = cache_path
+    superset_cache_hit = False
     want_read = mode in {"read", "readwrite"}
     want_write = mode in {"write", "readwrite", "refresh"}
     manifest = _stage_c_cache_manifest(
@@ -900,8 +1041,19 @@ def _run_stage_c_cached(
         frontend_kwargs=frontend_kwargs,
     )
 
-    if want_read and cache_path.is_file():
-        data = torch.load(cache_path, map_location="cpu")
+    if want_read and not cache_path.is_file() and not bool(args.stage_c_cache_validate):
+        superset = _stage_c_cache_superset_path(
+            cache_root,
+            chunk_idx=chunk_idx,
+            start=start,
+            end=end,
+        )
+        if superset is not None:
+            cache_path_used = superset
+            superset_cache_hit = True
+
+    if want_read and cache_path_used.is_file():
+        data = torch.load(cache_path_used, map_location="cpu")
         if bool(args.stage_c_cache_validate):
             cached_manifest = dict(data.get("manifest", {}))
             for key in ("schema_version", "chunk_idx", "start_frame", "end_frame", "chunk_shape", "stage_c_mode"):
@@ -911,11 +1063,15 @@ def _run_stage_c_cached(
                         f"{key} cached={cached_manifest.get(key)!r} expected={manifest.get(key)!r}"
                     )
         mo = _masklet_from_cache_dict(data)
+        if superset_cache_hit:
+            mo = _slice_masklet_output(mo, int(chunk_full.shape[0]))
         mo.debug = {
             **dict(mo.debug),
             "stage_c_cache_hit": True,
             "stage_c_cache_mode": mode,
-            "stage_c_cache_path": str(cache_path),
+            "stage_c_cache_path": str(cache_path_used),
+            "stage_c_cache_expected_path": str(cache_path),
+            "stage_c_cache_superset_hit": bool(superset_cache_hit),
         }
         return mo
 
@@ -1393,6 +1549,12 @@ def _append_hybrid_debug_jsonl(
             "beta_energy_target": float(args.beta_energy_target),
             "beta_min": float(args.beta_min),
             "beta_max": float(args.beta_max),
+            "semantic_anchor_mode": args.semantic_anchor_mode,
+            "semantic_anchor_target_ratio": float(args.semantic_anchor_target_ratio),
+            "semantic_anchor_min_ratio": float(args.semantic_anchor_min_ratio),
+            "semantic_anchor_max_ratio": float(args.semantic_anchor_max_ratio),
+            "semantic_anchor_min_score": float(args.semantic_anchor_min_score),
+            "enable_semantic_anchor_ttt_floor": bool(args.enable_semantic_anchor_ttt_floor),
             "read_protect_ref": bool(args.read_protect_ref),
             "read_protect_static": bool(args.read_protect_static),
             "read_protection_mode": args.read_protection_mode,
@@ -1480,6 +1642,66 @@ def _append_hybrid_debug_jsonl(
             "prior_ttt_write_present": control_prior.debug.get("ttt_write_prior_present"),
             "prior_ttt_write_mean": control_prior.debug.get("ttt_write_prior_mean"),
             "prior_read_path_control": control_prior.debug.get("read_path_control"),
+            "prior_semantic_anchor_mode": control_prior.debug.get("semantic_anchor_mode"),
+            "prior_semantic_anchor_bank_available": control_prior.debug.get("semantic_anchor_bank_available"),
+            "prior_semantic_anchor_reason": control_prior.debug.get("semantic_anchor_reason"),
+            "prior_semantic_anchor_token_count": control_prior.debug.get("semantic_anchor_token_count"),
+            "prior_semantic_anchor_token_ratio": control_prior.debug.get("semantic_anchor_token_ratio"),
+            "prior_semantic_anchor_patch_tokens": control_prior.debug.get("semantic_anchor_patch_tokens"),
+            "prior_semantic_anchor_target_tokens": control_prior.debug.get("semantic_anchor_target_tokens"),
+            "prior_semantic_anchor_eligible_tokens": control_prior.debug.get("semantic_anchor_eligible_tokens"),
+            "prior_semantic_anchor_spatial_entropy": control_prior.debug.get("semantic_anchor_spatial_entropy"),
+            "prior_semantic_anchor_spatial_cells_hit": control_prior.debug.get("semantic_anchor_spatial_cells_hit"),
+            "prior_semantic_anchor_spatial_cells_total": control_prior.debug.get("semantic_anchor_spatial_cells_total"),
+            "prior_semantic_anchor_static_semantic_ratio": control_prior.debug.get("semantic_anchor_static_semantic_ratio"),
+            "prior_semantic_anchor_dynamic_semantic_ratio": control_prior.debug.get("semantic_anchor_dynamic_semantic_ratio"),
+            "prior_semantic_anchor_score_mean": control_prior.debug.get("semantic_anchor_score_mean"),
+            "prior_semantic_anchor_raw_score_mean": control_prior.debug.get("semantic_anchor_raw_score_mean"),
+            "prior_semantic_anchor_geo_score_mean": control_prior.debug.get("semantic_anchor_geo_score_mean"),
+            "prior_semantic_anchor_sem_score_mean": control_prior.debug.get("semantic_anchor_sem_score_mean"),
+            "prior_semantic_anchor_source_score_mean": control_prior.debug.get("semantic_anchor_source_score_mean"),
+            "prior_semantic_anchor_stage_proxy_missing": control_prior.debug.get("semantic_anchor_stage_proxy_missing"),
+            "prior_semantic_anchor_conf_missing": control_prior.debug.get("semantic_anchor_conf_missing"),
+            "prior_semantic_anchor_source_attention_proxy_missing": control_prior.debug.get("semantic_anchor_source_attention_proxy_missing"),
+            "prior_semantic_anchor_write_floor_enabled": control_prior.debug.get("semantic_anchor_write_floor_enabled"),
+            "prior_semantic_anchor_write_floor_applied": control_prior.debug.get("semantic_anchor_write_floor_applied"),
+            "prior_semantic_anchor_write_floor_reason": control_prior.debug.get("semantic_anchor_write_floor_reason"),
+            "prior_semantic_anchor_write_floor_lambda": control_prior.debug.get("semantic_anchor_write_floor_lambda"),
+            "prior_semantic_anchor_write_floor_repair_mode": control_prior.debug.get("semantic_anchor_write_floor_repair_mode"),
+            "prior_anchor_write_floor_applied_count": control_prior.debug.get("anchor_write_floor_applied_count"),
+            "prior_anchor_write_mass_before": control_prior.debug.get("anchor_write_mass_before"),
+            "prior_anchor_write_mass": control_prior.debug.get("anchor_write_mass"),
+            "prior_anchor_write_mass_delta": control_prior.debug.get("anchor_write_mass_delta"),
+            "prior_non_anchor_write_mass_before": control_prior.debug.get("non_anchor_write_mass_before"),
+            "prior_non_anchor_write_mass": control_prior.debug.get("non_anchor_write_mass"),
+            "prior_non_anchor_write_mass_delta": control_prior.debug.get("non_anchor_write_mass_delta"),
+            "prior_semantic_anchor_rescue_applied": control_prior.debug.get("semantic_anchor_rescue_applied"),
+            "prior_semantic_anchor_rescue_reason": control_prior.debug.get("semantic_anchor_rescue_reason"),
+            "prior_semantic_anchor_rescue_alpha": control_prior.debug.get("semantic_anchor_rescue_alpha"),
+            "prior_semantic_anchor_rescue_score_mean": control_prior.debug.get("semantic_anchor_rescue_score_mean"),
+            "prior_semantic_anchor_rescue_score_q90": control_prior.debug.get("semantic_anchor_rescue_score_q90"),
+            "prior_semantic_anchor_rescue_base_mean": control_prior.debug.get("semantic_anchor_rescue_base_mean"),
+            "prior_semantic_anchor_rescue_after_mean": control_prior.debug.get("semantic_anchor_rescue_after_mean"),
+            "prior_semantic_anchor_rescue_delta_mean": control_prior.debug.get("semantic_anchor_rescue_delta_mean"),
+            "prior_semantic_role_policy": control_prior.debug.get("semantic_role_policy"),
+            "prior_semantic_memory_paths": control_prior.debug.get("semantic_memory_paths"),
+            "prior_semantic_role_consumed_any": control_prior.debug.get("semantic_role_consumed_any"),
+            "prior_semantic_role_reason": control_prior.debug.get("semantic_role_reason"),
+            "prior_semantic_role_highd_quantile": control_prior.debug.get("semantic_role_highd_quantile"),
+            "prior_semantic_role_highd_threshold": control_prior.debug.get("semantic_role_highd_threshold"),
+            "prior_semantic_role_low_trust": control_prior.debug.get("semantic_role_low_trust"),
+            "prior_semantic_role_counts": control_prior.debug.get("semantic_role_counts"),
+            "prior_R_frame_role_counts": control_prior.debug.get("R_frame_role_counts"),
+            "prior_R_global_role_counts": control_prior.debug.get("R_global_role_counts"),
+            "prior_R_swa_role_counts": control_prior.debug.get("R_swa_role_counts"),
+            "prior_R_ttt_role_counts": control_prior.debug.get("R_ttt_role_counts"),
+            "prior_semantic_group_role_metrics": control_prior.debug.get("semantic_group_role_metrics"),
+            "prior_fine_label_token_count": control_prior.debug.get("fine_label_token_count"),
+            "prior_fine_label_counts": control_prior.debug.get("fine_label_counts"),
+            "prior_fine_label_path_role_counts": control_prior.debug.get("fine_label_path_role_counts"),
+            "prior_frame_semantic_source_consumed": control_prior.debug.get("frame_semantic_source_consumed"),
+            "prior_chunk_global_semantic_source_consumed": control_prior.debug.get("chunk_global_semantic_source_consumed"),
+            "prior_path_specific_role_streams_available": control_prior.debug.get("path_specific_role_streams_available"),
         })
     if result is not None:
         rec.update({
@@ -1584,6 +1806,28 @@ def _append_hybrid_debug_jsonl(
                 "prior_hmc_write_sem_value_q10",
                 "prior_hmc_write_sem_value_q90",
                 "prior_hmc_write_corr_score_unc",
+                "prior_semantic_anchor_mode",
+                "prior_semantic_anchor_bank_available",
+                "prior_semantic_anchor_reason",
+                "prior_semantic_anchor_token_count",
+                "prior_semantic_anchor_token_ratio",
+                "prior_semantic_anchor_spatial_entropy",
+                "prior_semantic_anchor_spatial_cells_hit",
+                "prior_semantic_anchor_spatial_cells_total",
+                "prior_semantic_anchor_static_semantic_ratio",
+                "prior_semantic_anchor_dynamic_semantic_ratio",
+                "prior_semantic_anchor_score_mean",
+                "prior_semantic_anchor_write_floor_enabled",
+                "prior_semantic_anchor_write_floor_applied",
+                "prior_anchor_write_floor_applied_count",
+                "prior_anchor_write_mass_before",
+                "prior_anchor_write_mass",
+                "prior_anchor_write_mass_delta",
+                "prior_non_anchor_write_mass_delta",
+                "prior_semantic_anchor_rescue_applied",
+                "prior_semantic_anchor_rescue_reason",
+                "prior_semantic_anchor_rescue_score_mean",
+                "prior_semantic_anchor_rescue_delta_mean",
             )
         }
         with open(out_dir / "cue_quality_per_chunk.jsonl", "a", encoding="utf-8") as f:
@@ -1940,6 +2184,7 @@ def main() -> None:
         ttt_write_delta_scale=args.ttt_write_delta_scale,
         ttt_write_delta_scales=args.ttt_write_delta_scales,
         ttt_write_native_mix_scales=args.ttt_write_native_mix_scales,
+        ttt_write_native_mix_chunks=args.ttt_write_native_mix_chunks,
         ttt_write_prior_transform_mode=args.ttt_write_prior_transform_mode,
         ttt_write_prior_anti_scale=args.ttt_write_prior_anti_scale,
         ttt_write_prior_gamma=args.ttt_write_prior_gamma,
@@ -1957,9 +2202,11 @@ def main() -> None:
         ttt_write_tri_replay_positive_frac=args.ttt_write_tri_replay_positive_frac,
         ttt_write_tri_replay_negative_frac=args.ttt_write_tri_replay_negative_frac,
         ttt_write_tri_replay_neutral_lambda=args.ttt_write_tri_replay_neutral_lambda,
+        ttt_write_tri_replay_role_mode=args.ttt_write_tri_replay_role_mode,
         ttt_write_gradient_reversal_transient_mode=args.ttt_write_gradient_reversal_transient_mode,
         ttt_write_gradient_reversal_transient_branch_mask=args.ttt_write_gradient_reversal_transient_branch_mask,
         ttt_write_gradient_reversal_transient_long_scale=args.ttt_write_gradient_reversal_transient_long_scale,
+        ttt_write_gradient_reversal_transient_apply_scale=args.ttt_write_gradient_reversal_transient_apply_scale,
         ttt_write_replay_feature_gate_mode=args.ttt_write_replay_feature_gate_mode,
         ttt_write_replay_feature_gate_rho=args.ttt_write_replay_feature_gate_rho,
         ttt_write_replay_feature_gate_min=args.ttt_write_replay_feature_gate_min,
@@ -1976,6 +2223,7 @@ def main() -> None:
         ttt_write_transient_delta_ttl=args.ttt_write_transient_delta_ttl,
         ttt_write_commit_ema_alpha=args.ttt_write_commit_ema_alpha,
         ttt_write_commit_ema_branch_mask=args.ttt_write_commit_ema_branch_mask,
+        ttt_write_commit_ema_chunks=args.ttt_write_commit_ema_chunks,
         ttt_write_native_delta_gate_mode=args.ttt_write_native_delta_gate_mode,
         ttt_write_native_delta_gate_min_cos=args.ttt_write_native_delta_gate_min_cos,
         ttt_write_native_delta_gate_fallback=args.ttt_write_native_delta_gate_fallback,
@@ -1990,6 +2238,13 @@ def main() -> None:
         ttt_write_commit_filter_min=args.ttt_write_commit_filter_min,
         ttt_write_commit_filter_max=args.ttt_write_commit_filter_max,
         ttt_write_commit_filter_branch_mask=args.ttt_write_commit_filter_branch_mask,
+        ttt_write_scale_state_mode=args.ttt_write_scale_state_mode,
+        ttt_write_scale_state_proxy=args.ttt_write_scale_state_proxy,
+        ttt_write_scale_state_carrier=args.ttt_write_scale_state_carrier,
+        ttt_write_scale_state_alpha=args.ttt_write_scale_state_alpha,
+        ttt_write_scale_state_branch_mask=args.ttt_write_scale_state_branch_mask,
+        ttt_write_scale_state_chunks=args.ttt_write_scale_state_chunks,
+        ttt_write_scale_state_sample_tokens=args.ttt_write_scale_state_sample_tokens,
         enable_frame_read_control=bool(args.enable_frame_read_control),
         enable_swa_read_control=bool(args.enable_swa_read_control),
         enable_ttt_apply_control=bool(args.enable_ttt_apply_control),
@@ -2071,6 +2326,35 @@ def main() -> None:
         swa_write_cache_blend_alpha=args.swa_write_cache_blend_alpha,
         swa_write_cache_blend_mode=args.swa_write_cache_blend_mode,
         swa_write_cache_blend_target=args.swa_write_cache_blend_target,
+        enable_context_source_skip=bool(args.enable_context_source_skip),
+        context_source_skip_impl=args.context_source_skip_impl,
+        context_source_skip_scope=args.context_source_skip_scope,
+        context_source_skip_mode=args.context_source_skip_mode,
+        context_source_skip_mask=args.context_source_skip_mask,
+        context_source_skip_layer_mode=args.context_source_skip_layer_mode,
+        context_source_skip_single_layer=args.context_source_skip_single_layer,
+        context_source_skip_soft_rho=args.context_source_skip_soft_rho,
+        context_source_skip_soft_min_keep=args.context_source_skip_soft_min_keep,
+        context_source_skip_record_attention_mass=bool(args.context_source_skip_record_attention_mass),
+        context_source_skip_attention_mass_max_queries=args.context_source_skip_attention_mass_max_queries,
+        semantic_anchor_mode=args.semantic_anchor_mode,
+        semantic_anchor_target_ratio=args.semantic_anchor_target_ratio,
+        semantic_anchor_min_ratio=args.semantic_anchor_min_ratio,
+        semantic_anchor_max_ratio=args.semantic_anchor_max_ratio,
+        semantic_anchor_min_score=args.semantic_anchor_min_score,
+        semantic_anchor_grid_rows=args.semantic_anchor_grid_rows,
+        semantic_anchor_grid_cols=args.semantic_anchor_grid_cols,
+        enable_semantic_anchor_ttt_floor=bool(args.enable_semantic_anchor_ttt_floor),
+        semantic_role_policy=args.semantic_role_policy,
+        semantic_memory_paths=args.semantic_memory_paths,
+        semantic_action_active_chunks=args.semantic_action_active_chunks,
+        semantic_action_inactive_read_cue_source=args.semantic_action_inactive_read_cue_source,
+        semantic_role_highd_quantile=args.semantic_role_highd_quantile,
+        semantic_role_low_trust=args.semantic_role_low_trust,
+        semantic_role_positive_scale=args.semantic_role_positive_scale,
+        semantic_role_neutral_scale=args.semantic_role_neutral_scale,
+        semantic_role_negative_scale=args.semantic_role_negative_scale,
+        semantic_role_swa_negative_scale=args.semantic_role_swa_negative_scale,
         ttt_write_token_scope=args.ttt_write_token_scope,
         ttt_write_token_scope_floor=args.ttt_write_token_scope_floor,
         fast_cue_eval=bool(args.fast_cue_eval),

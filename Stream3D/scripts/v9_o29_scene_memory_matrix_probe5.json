@@ -1,0 +1,122 @@
+[
+  {
+    "method": "P0 Stream3D on S0",
+    "prediction_config": "scannet",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_p0_on_s0_scannet_probe5",
+    "eval_policy": "stream3d_self_probe5",
+    "split": "probe5"
+  },
+  {
+    "method": "O25 refine inside050 on S0",
+    "prediction_config": "stream4d_v9_o25_o23_refine_inside050_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o25_o23_refine_inside050_probe5_on_s0_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O26 inside050 logarea on S0",
+    "prediction_config": "stream4d_v9_o26_o25_inside050_logarea_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o26_o25_inside050_logarea_probe5_on_s0_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O29 memory c050 own",
+    "prediction_config": "stream4d_v9_o29_o22_memory_c050_probe5",
+    "pre_points_config": "stream4d_v9_o29_o22_memory_c050_probe5",
+    "output_config": "stream4d_v9_o29_o22_memory_c050_probe5",
+    "eval_policy": "own_scene_object_memory_c050",
+    "split": "probe5"
+  },
+  {
+    "method": "O29 memory c050 on S0",
+    "prediction_config": "stream4d_v9_o29_o22_memory_c050_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o29_o22_memory_c050_probe5_on_s0_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O29 memory c050 on S1",
+    "prediction_config": "stream4d_v9_o29_o22_memory_c050_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_o29_o22_memory_c050_probe5_on_s1_probe5",
+    "eval_policy": "method_on_32f_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O29 memory c065 own",
+    "prediction_config": "stream4d_v9_o29_o22_memory_c065_probe5",
+    "pre_points_config": "stream4d_v9_o29_o22_memory_c065_probe5",
+    "output_config": "stream4d_v9_o29_o22_memory_c065_probe5",
+    "eval_policy": "own_scene_object_memory_c065",
+    "split": "probe5"
+  },
+  {
+    "method": "O29 memory c065 on S0",
+    "prediction_config": "stream4d_v9_o29_o22_memory_c065_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o29_o22_memory_c065_probe5_on_s0_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O29 memory c065 on S1",
+    "prediction_config": "stream4d_v9_o29_o22_memory_c065_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_o29_o22_memory_c065_probe5_on_s1_probe5",
+    "eval_policy": "method_on_32f_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O30 memory c050 refine own",
+    "prediction_config": "stream4d_v9_o30_o29_memory_c050_refine_inside050_probe5",
+    "pre_points_config": "stream4d_v9_o30_o29_memory_c050_refine_inside050_probe5",
+    "output_config": "stream4d_v9_o30_o29_memory_c050_refine_inside050_probe5",
+    "eval_policy": "own_scene_memory_boundary_refine_c050",
+    "split": "probe5"
+  },
+  {
+    "method": "O30 memory c050 refine on S0",
+    "prediction_config": "stream4d_v9_o30_o29_memory_c050_refine_inside050_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o30_o29_memory_c050_refine_inside050_probe5_on_s0_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O30 memory c050 refine on S1",
+    "prediction_config": "stream4d_v9_o30_o29_memory_c050_refine_inside050_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_o30_o29_memory_c050_refine_inside050_probe5_on_s1_probe5",
+    "eval_policy": "method_on_32f_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O30 memory c065 refine own",
+    "prediction_config": "stream4d_v9_o30_o29_memory_c065_refine_inside050_probe5",
+    "pre_points_config": "stream4d_v9_o30_o29_memory_c065_refine_inside050_probe5",
+    "output_config": "stream4d_v9_o30_o29_memory_c065_refine_inside050_probe5",
+    "eval_policy": "own_scene_memory_boundary_refine_c065",
+    "split": "probe5"
+  },
+  {
+    "method": "O30 memory c065 refine on S0",
+    "prediction_config": "stream4d_v9_o30_o29_memory_c065_refine_inside050_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o30_o29_memory_c065_refine_inside050_probe5_on_s0_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O30 memory c065 refine on S1",
+    "prediction_config": "stream4d_v9_o30_o29_memory_c065_refine_inside050_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_o30_o29_memory_c065_refine_inside050_probe5_on_s1_probe5",
+    "eval_policy": "method_on_32f_support",
+    "split": "probe5"
+  }
+]

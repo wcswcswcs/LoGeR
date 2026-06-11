@@ -1,0 +1,66 @@
+[
+  {
+    "method": "P0 Stream3D on S0",
+    "prediction_config": "scannet",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_p0_on_s0_scannet_probe5",
+    "eval_policy": "stream3d_self_probe5",
+    "split": "probe5"
+  },
+  {
+    "method": "O23 ws25 merge 0.40 logarea on S0",
+    "prediction_config": "stream4d_v9_o23_o22_ws25_merge_mioc040_logarea_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o23_o22_ws25_merge_mioc040_logarea_on_s0_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O25 refine inside050 own",
+    "prediction_config": "stream4d_v9_o25_o23_refine_inside050_probe5",
+    "pre_points_config": "stream4d_v9_o25_o23_refine_inside050_probe5",
+    "output_config": "stream4d_v9_o25_o23_refine_inside050_probe5",
+    "eval_policy": "own_recompute_boundary_refine_o23_inside050",
+    "split": "probe5"
+  },
+  {
+    "method": "O25 refine inside050 on S0",
+    "prediction_config": "stream4d_v9_o25_o23_refine_inside050_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o25_o23_refine_inside050_probe5_on_s0_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O25 refine inside050 on S1",
+    "prediction_config": "stream4d_v9_o25_o23_refine_inside050_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_o25_o23_refine_inside050_probe5_on_s1_probe5",
+    "eval_policy": "method_on_32f_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O25 refine inside070 interior010 own",
+    "prediction_config": "stream4d_v9_o25_o23_refine_inside070int010_probe5",
+    "pre_points_config": "stream4d_v9_o25_o23_refine_inside070int010_probe5",
+    "output_config": "stream4d_v9_o25_o23_refine_inside070int010_probe5",
+    "eval_policy": "own_recompute_boundary_refine_o23_inside070int010",
+    "split": "probe5"
+  },
+  {
+    "method": "O25 refine inside070 interior010 on S0",
+    "prediction_config": "stream4d_v9_o25_o23_refine_inside070int010_probe5",
+    "pre_points_config": "scannet",
+    "output_config": "stream4d_v9_o25_o23_refine_inside070int010_probe5_on_s0_probe5",
+    "eval_policy": "method_on_stream3d_support",
+    "split": "probe5"
+  },
+  {
+    "method": "O25 refine inside070 interior010 on S1",
+    "prediction_config": "stream4d_v9_o25_o23_refine_inside070int010_probe5",
+    "pre_points_config": "stream4d_32f_self_probe5",
+    "output_config": "stream4d_v9_o25_o23_refine_inside070int010_probe5_on_s1_probe5",
+    "eval_policy": "method_on_32f_support",
+    "split": "probe5"
+  }
+]

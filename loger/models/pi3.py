@@ -864,10 +864,21 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         if not hmc_control or hmc_control.get("identity_hooks", False):
             return False
         mode = str(hmc_control.get("read_layer_mode", "all"))
+        single_layer = int(hmc_control.get("read_single_layer", -1))
+        return Pi3._hmc_layer_mode_enabled(mode, single_layer, layer=layer, total_layers=total_layers)
+
+    @staticmethod
+    def _hmc_layer_mode_enabled(
+        mode: str,
+        single_layer: int,
+        *,
+        layer: int,
+        total_layers: int,
+    ) -> bool:
         if mode == "all":
             return True
         if mode == "single":
-            return int(layer) == int(hmc_control.get("read_single_layer", -1))
+            return int(layer) == int(single_layer)
         if mode == "early_quarter":
             return int(layer) < max(1, int(total_layers) // 4)
         if mode == "early_half":
@@ -880,6 +891,21 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         if mode == "middle":
             return span <= int(layer) < int(total_layers) - span
         return True
+
+    @staticmethod
+    def _hmc_context_source_skip_layer_enabled(
+        hmc_control: Optional[Dict[str, Any]],
+        *,
+        layer: int,
+        total_layers: int,
+    ) -> bool:
+        if not hmc_control or hmc_control.get("identity_hooks", False):
+            return False
+        if not hmc_control.get("enable_context_source_skip", False):
+            return False
+        mode = str(hmc_control.get("context_source_skip_layer_mode", "early"))
+        single_layer = int(hmc_control.get("context_source_skip_single_layer", -1))
+        return Pi3._hmc_layer_mode_enabled(mode, single_layer, layer=layer, total_layers=total_layers)
 
     def _make_frame_attention_bias(
         self,
@@ -955,6 +981,442 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             D = D * (1.0 - ref.clamp(0.0, 1.0))
         gate = (1.0 - beta * D).clamp(0.0, 1.0)
         return gate.reshape(batch_size * frame_num, tokens_per_frame, 1).to(dtype=dtype)
+
+    def _make_context_source_skip_bias(
+        self,
+        hmc_control: Optional[Dict[str, Any]],
+        *,
+        path: str,
+        batch_size: int,
+        frame_num: int,
+        tokens_per_frame: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
+        """Build a source-column mask for VGGT4D-style context-source skip.
+
+        Query rows are preserved.  Selected patch tokens are prevented from
+        acting as Key/Value sources by adding a large negative logit bias to
+        their source columns.  This keeps tensor shapes unchanged while matching
+        source-removal attention semantics.
+        """
+
+        empty_stats: Dict[str, Any] = {
+            "context_source_skip_applied": False,
+            "context_source_skip_impl": str(hmc_control.get("context_source_skip_impl", "bias")) if hmc_control else "bias",
+            "source_skip_tokens": 0,
+            "source_tokens_before": 0,
+            "source_tokens_after": 0,
+            "source_keep_ratio": 1.0,
+            "special_token_keep_ratio": 1.0,
+            "empty_source_events": 0,
+        }
+        if not hmc_control or hmc_control.get("identity_hooks", False):
+            return None, empty_stats
+        if not hmc_control.get("enable_context_source_skip", False):
+            return None, empty_stats
+        scope = str(hmc_control.get("context_source_skip_scope", "frame"))
+        if path == "frame_attention" and scope not in {"frame", "both"}:
+            return None, empty_stats
+        if path == "chunk_attention" and scope not in {"chunk", "both"}:
+            return None, empty_stats
+        D_tok = hmc_control.get("D_tok")
+        if D_tok is None:
+            return None, empty_stats
+
+        D = D_tok.to(device=device, dtype=torch.float32).reshape(batch_size, frame_num, tokens_per_frame)
+        P_ref = hmc_control.get("P_ref")
+        if P_ref is None:
+            protected = torch.zeros_like(D, dtype=torch.bool)
+        else:
+            protected = (
+                P_ref.to(device=device, dtype=torch.float32)
+                .reshape(batch_size, frame_num, tokens_per_frame)
+                .clamp(0.0, 1.0)
+                > 0.5
+            )
+        eligible = ~protected
+        mask_name = str(hmc_control.get("context_source_skip_mask", "dg_q90")).lower()
+        anchor_boost_mask = mask_name in {
+            "semantic_anchor",
+            "semantic_anchor_boost",
+            "semantic_geometry_anchor",
+            "semantic_anchor_bank",
+            "anchor_bank",
+        }
+        random_same_mass = mask_name in {
+            "random_same_mass_semantic_role_negative",
+            "random_same_mass_semrole_negative",
+            "random_same_mass",
+        }
+        sem_z_dg_soft = mask_name in {
+            "sem_z_dg_soft_resid",
+            "semantic_z_dg_soft_resid",
+            "semantic_conditioned_dg_soft_resid",
+        }
+        base_mask_name = "semantic_role_negative" if random_same_mass else mask_name
+        if anchor_boost_mask:
+            quantile = 0.0
+        elif base_mask_name in {"dg_q80", "dg_high", "highd_q80"}:
+            quantile = 0.80
+        elif base_mask_name in {"dg_q85", "dg_high_q85", "highd_q85"}:
+            quantile = 0.85
+        elif base_mask_name in {"dg_q90", "dg_high_strict", "highd_q90"}:
+            quantile = 0.90
+        elif base_mask_name in {"lowstuff_highd", "semantic_lowstuff_highd", "sem_lowstuff_highd"}:
+            quantile = 0.90
+        elif base_mask_name in {"sem_structure_rescue_dg_q80", "structure_rescue_dg_q80"}:
+            quantile = 0.80
+        elif base_mask_name in {
+            "semantic_role_negative",
+            "semantic_role_source_skip",
+            "semrole_negative",
+            "v36_synthetic_role_negative",
+            "sem_z_dg_soft_resid",
+            "semantic_z_dg_soft_resid",
+            "semantic_conditioned_dg_soft_resid",
+        }:
+            quantile = 0.80
+        else:
+            quantile = 0.90
+
+        eligible_scores = D[eligible]
+        if eligible_scores.numel() == 0:
+            stats = dict(empty_stats)
+            stats.update({
+                "context_source_skip_mask": mask_name,
+                "context_source_skip_reason": "no_eligible_patch_tokens",
+            })
+            return None, stats
+        thr = torch.quantile(eligible_scores.float(), float(quantile))
+        skip = (D > thr) & eligible
+
+        source_control_score = None
+        if anchor_boost_mask:
+            A_anchor_tok = hmc_control.get("A_anchor_tok")
+            M_anchor_tok = hmc_control.get("A_anchor_mask_tok")
+            if A_anchor_tok is None:
+                skip = torch.zeros_like(skip, dtype=torch.bool)
+                source_control_score = torch.zeros_like(D, dtype=torch.float32)
+                semantic_reason = "semantic_anchor_missing"
+            else:
+                A = A_anchor_tok.to(device=device, dtype=torch.float32).reshape(batch_size, frame_num, tokens_per_frame).clamp(0.0, 1.0)
+                if M_anchor_tok is None:
+                    M = A > 0.0
+                else:
+                    M = (
+                        M_anchor_tok.to(device=device, dtype=torch.float32)
+                        .reshape(batch_size, frame_num, tokens_per_frame)
+                        .clamp(0.0, 1.0)
+                        > 0.0
+                    )
+                skip = M & eligible
+                source_control_score = torch.where(skip, A, torch.zeros_like(A))
+                semantic_reason = f"semantic_anchor_bank:{hmc_control.get('semantic_anchor_mode', 'semantic')}"
+        elif base_mask_name in {"lowstuff_highd", "semantic_lowstuff_highd"}:
+            S_tok = hmc_control.get("S_tok")
+            if S_tok is None:
+                skip = torch.zeros_like(skip, dtype=torch.bool)
+                semantic_reason = "semantic_value_missing"
+            else:
+                S = S_tok.to(device=device, dtype=torch.float32).reshape(batch_size, frame_num, tokens_per_frame)
+                skip = skip & (S <= 0.45)
+                semantic_reason = "semantic_value_le_045_and_highD"
+        elif base_mask_name in {"sem_lowstuff_highd", "sem_structure_rescue_dg_q80", "structure_rescue_dg_q80"}:
+            G_sem_tok = hmc_control.get("G_sem_tok")
+            if G_sem_tok is None:
+                skip = torch.zeros_like(skip, dtype=torch.bool)
+                semantic_reason = "semantic_group_missing"
+            else:
+                G = G_sem_tok.to(device=device, dtype=torch.long).reshape(batch_size, frame_num, tokens_per_frame)
+                lowstuff = G == 3
+                structure = G == 0
+                if base_mask_name in {"sem_lowstuff_highd"}:
+                    skip = skip & lowstuff
+                    semantic_reason = "exact_semantic_lowstuff_and_highD"
+                else:
+                    skip = skip & (~structure)
+                    protected = protected | structure
+                    semantic_reason = "exact_semantic_structure_rescue_and_highD"
+        elif base_mask_name in {
+            "semantic_role_negative",
+            "semantic_role_source_skip",
+            "semrole_negative",
+            "v36_synthetic_role_negative",
+            "sem_z_dg_soft_resid",
+            "semantic_z_dg_soft_resid",
+            "semantic_conditioned_dg_soft_resid",
+        }:
+            if path == "frame_attention":
+                R_sem_tok = hmc_control.get("R_frame_tok")
+                role_stream_name = "R_frame_tok"
+                if R_sem_tok is None:
+                    R_sem_tok = hmc_control.get("R_sem_tok")
+                    role_stream_name = "R_sem_tok"
+            elif path == "chunk_attention":
+                R_sem_tok = hmc_control.get("R_global_tok")
+                role_stream_name = "R_global_tok"
+                if R_sem_tok is None:
+                    R_sem_tok = hmc_control.get("R_sem_tok")
+                    role_stream_name = "R_sem_tok"
+            else:
+                R_sem_tok = hmc_control.get("R_sem_tok")
+                role_stream_name = "R_sem_tok"
+            if R_sem_tok is None:
+                skip = torch.zeros_like(skip, dtype=torch.bool)
+                semantic_reason = "semantic_role_missing"
+            else:
+                R = R_sem_tok.to(device=device, dtype=torch.long).reshape(batch_size, frame_num, tokens_per_frame)
+                negative_short = R == 3
+                positive_long = R == 1
+                protected_neutral = R == 4
+                if base_mask_name == "v36_synthetic_role_negative":
+                    skip = negative_short & eligible
+                elif sem_z_dg_soft:
+                    G_sem_tok = hmc_control.get("G_sem_tok")
+                    if G_sem_tok is None:
+                        skip = torch.zeros_like(skip, dtype=torch.bool)
+                        source_control_score = torch.zeros_like(D, dtype=torch.float32)
+                        semantic_reason = f"semantic_z_dg_group_missing:{role_stream_name}"
+                    else:
+                        G = G_sem_tok.to(device=device, dtype=torch.long).reshape(batch_size, frame_num, tokens_per_frame)
+                        structure = G == 0
+                        protected = protected | structure | positive_long | protected_neutral
+                        risk = torch.zeros_like(D, dtype=torch.float32)
+                        group_ids = torch.unique(G[eligible])
+                        for gid in group_ids:
+                            gm = (G == gid) & eligible & (~protected)
+                            if int(gm.sum().item()) <= 1:
+                                continue
+                            vals = D[gm].float()
+                            center = vals.mean()
+                            high = torch.quantile(vals, 0.90)
+                            denom = (high - center).clamp_min(1e-4)
+                            risk[gm] = ((D[gm] - center) / denom).clamp(0.0, 1.0)
+                        risk = risk * negative_short.float() * eligible.float()
+                        source_control_score = risk.clamp(0.0, 1.0)
+                        skip = source_control_score > 0.05
+                        semantic_reason = f"semantic_z_dg_soft_risk:{role_stream_name}"
+                else:
+                    skip = skip & negative_short
+                protected = protected | positive_long | protected_neutral
+                if not sem_z_dg_soft:
+                    semantic_reason = f"semantic_role_negative_short_and_highD:{role_stream_name}"
+                if sem_z_dg_soft and R_sem_tok is not None and hmc_control.get("G_sem_tok") is not None:
+                    semantic_reason = f"semantic_z_dg_soft_risk:{role_stream_name}"
+                if base_mask_name == "v36_synthetic_role_negative":
+                    semantic_reason = f"v36_synthetic_role_negative_without_D_filter:{role_stream_name}"
+        else:
+            semantic_reason = "not_semantic_mask"
+
+        if random_same_mass:
+            base_selected = int(skip.sum().item())
+            flat_eligible = eligible.reshape(-1)
+            skip_flat = torch.zeros_like(flat_eligible, dtype=torch.bool)
+            if base_selected > 0 and int(flat_eligible.sum().item()) > 0:
+                idx = torch.nonzero(flat_eligible, as_tuple=False).reshape(-1)
+                token_idx = torch.arange(int(flat_eligible.numel()), device=device, dtype=torch.float32)
+                chunk = float(hmc_control.get("semantic_action_chunk_idx", -1) if hmc_control else -1)
+                path_offset = 17.0 if path == "chunk_attention" else 3.0
+                scores = torch.frac(torch.sin((token_idx + 1.0 + chunk * 97.0 + path_offset) * 12.9898) * 43758.5453)
+                k_select = min(base_selected, int(idx.numel()))
+                top = torch.topk(scores[idx], k_select).indices
+                skip_flat[idx[top]] = True
+            skip = skip_flat.reshape_as(skip)
+            semantic_reason = f"random_same_mass_control_from_semantic_role_negative:n={base_selected}"
+
+        if source_control_score is None:
+            source_control_score = skip.float()
+
+        source_tokens_before = int(eligible.sum().item())
+        source_skip_tokens = int(skip.sum().item())
+        total_special = int(protected.sum().item())
+        kept_special = int((protected & ~skip).sum().item())
+        special_keep = float(kept_special / max(total_special, 1))
+        if source_skip_tokens <= 0:
+            source_tokens_after = source_tokens_before
+            stats = dict(empty_stats)
+            stats.update({
+                "context_source_skip_mask": mask_name,
+                "context_source_skip_mode": str(hmc_control.get("context_source_skip_mode", "hard")),
+                "context_source_skip_threshold": float(thr.item()),
+                "context_source_skip_quantile": float(quantile),
+                "context_source_skip_reason": "no_tokens_selected",
+                "context_source_skip_semantic_reason": semantic_reason,
+                "source_tokens_before": source_tokens_before,
+                "source_tokens_after": source_tokens_after,
+                "special_token_keep_ratio": special_keep,
+            })
+            return None, stats
+
+        mode = str(hmc_control.get("context_source_skip_mode", "hard")).lower()
+        impl = str(hmc_control.get("context_source_skip_impl", "bias")).lower()
+        boost_action = mode in {"boost", "soft_boost", "anchor_boost"} or impl in {
+            "boost",
+            "bias_boost",
+            "source_boost",
+            "anchor_boost",
+        }
+        soft_action = boost_action or mode == "soft" or impl in {"v_only", "vonly", "value", "value_only"}
+        source_keep_tensor = None
+        source_bias_values = None
+        source_weights = None
+        attention_mass_metric = "anchor_boost_attention_mass" if boost_action else "soft_attention_bias_mass"
+        if boost_action:
+            rho = float(hmc_control.get("context_source_skip_soft_rho", 0.2))
+            source_keep_tensor = torch.ones_like(D, dtype=torch.float32)
+            source_bias_values = torch.log1p((rho * source_control_score.float()).clamp_min(0.0))
+            source_weights = None
+        elif soft_action and mode != "soft":
+            rho = float(hmc_control.get("context_source_skip_soft_rho", 0.5))
+            min_keep = float(hmc_control.get("context_source_skip_soft_min_keep", 0.5))
+            source_keep_tensor = (1.0 - rho * source_control_score.float()).clamp(min_keep, 1.0)
+            source_weights = source_keep_tensor
+        if impl == "compact_kv":
+            keep = ((~skip) | protected).detach()
+            if path == "frame_attention":
+                source_keep_mask = keep.reshape(batch_size * frame_num, tokens_per_frame)
+            else:
+                source_keep_mask = keep.reshape(batch_size, frame_num * tokens_per_frame)
+            source_bias_values = None
+            source_weights = None
+        elif boost_action:
+            pass
+        elif mode == "soft":
+            rho = float(hmc_control.get("context_source_skip_soft_rho", 0.5))
+            min_keep = float(hmc_control.get("context_source_skip_soft_min_keep", 0.5))
+            source_keep_tensor = (1.0 - rho * source_control_score.float()).clamp(min_keep, 1.0)
+            source_bias_values = torch.log(source_keep_tensor.clamp_min(1e-4))
+            source_weights = source_keep_tensor
+        else:
+            source_bias_values = torch.zeros_like(D, dtype=torch.float32)
+            source_bias_values = source_bias_values.masked_fill(skip, -1.0e4)
+            source_weights = None
+
+        if impl == "compact_kv":
+            bias = {
+                "type": "compact_kv",
+                "source_keep_mask": source_keep_mask,
+            }
+            if bool(hmc_control.get("context_source_skip_record_attention_mass", False)):
+                bias["attention_mass_stats"] = []
+                bias["attention_mass_max_queries"] = int(
+                    hmc_control.get("context_source_skip_attention_mass_max_queries", 512) or 512
+                )
+            per_frame_keep = ((~skip) | protected).float().mean(dim=-1)
+            empty_events = int((per_frame_keep <= 0.0).sum().item())
+        elif impl in {"v_only", "vonly", "value", "value_only"}:
+            if path == "frame_attention":
+                affected_mask = skip.reshape(batch_size * frame_num, tokens_per_frame)
+                source_weights_out = source_weights.reshape(batch_size * frame_num, tokens_per_frame)
+            else:
+                affected_mask = skip.reshape(batch_size, frame_num * tokens_per_frame)
+                source_weights_out = source_weights.reshape(batch_size, frame_num * tokens_per_frame)
+            bias = {
+                "type": "source_soft",
+                "mode": "v_only",
+                "affected_mask": affected_mask.detach(),
+                "source_weights": source_weights_out.detach(),
+                "attention_mass_metric": "v_only_effective_value_mass",
+            }
+            if bool(hmc_control.get("context_source_skip_record_attention_mass", False)):
+                bias["attention_mass_stats"] = []
+                bias["attention_mass_max_queries"] = int(
+                    hmc_control.get("context_source_skip_attention_mass_max_queries", 512) or 512
+                )
+            per_frame_keep = torch.ones_like(D[..., 0])
+            empty_events = 0
+        else:
+            if path == "frame_attention":
+                source_bias = source_bias_values.reshape(batch_size * frame_num, tokens_per_frame)
+                if soft_action and bool(hmc_control.get("context_source_skip_record_attention_mass", False)):
+                    bias = {
+                        "type": "source_soft",
+                        "mode": "bias",
+                        "affected_mask": skip.reshape(batch_size * frame_num, tokens_per_frame).detach(),
+                        "source_bias_values": source_bias.detach(),
+                        "attention_mass_metric": attention_mass_metric,
+                    }
+                    bias["attention_mass_stats"] = []
+                    bias["attention_mass_max_queries"] = int(
+                        hmc_control.get("context_source_skip_attention_mass_max_queries", 512) or 512
+                    )
+                else:
+                    bias = source_bias[:, None, None, :].expand(-1, 1, tokens_per_frame, -1)
+                per_frame_keep = (
+                    source_keep_tensor.mean(dim=-1)
+                    if source_keep_tensor is not None else ((~skip) | protected).float().mean(dim=-1)
+                )
+                empty_events = 0 if soft_action else int((per_frame_keep <= 0.0).sum().item())
+            else:
+                source_bias = source_bias_values.reshape(batch_size, frame_num * tokens_per_frame)
+                seq_len = int(frame_num * tokens_per_frame)
+                if soft_action and bool(hmc_control.get("context_source_skip_record_attention_mass", False)):
+                    bias = {
+                        "type": "source_soft",
+                        "mode": "bias",
+                        "affected_mask": skip.reshape(batch_size, frame_num * tokens_per_frame).detach(),
+                        "source_bias_values": source_bias.detach(),
+                        "attention_mass_metric": attention_mass_metric,
+                    }
+                    bias["attention_mass_stats"] = []
+                    bias["attention_mass_max_queries"] = int(
+                        hmc_control.get("context_source_skip_attention_mass_max_queries", 512) or 512
+                    )
+                else:
+                    bias = source_bias[:, None, None, :].expand(-1, 1, seq_len, -1)
+                per_frame_keep = (
+                    source_keep_tensor.mean(dim=-1)
+                    if source_keep_tensor is not None else ((~skip) | protected).float().mean(dim=-1)
+                )
+                empty_events = 0 if soft_action else int((((~skip) | protected).reshape(batch_size, seq_len).sum(dim=-1) <= 0).sum().item())
+
+        if source_keep_tensor is not None and bool(eligible.any()):
+            keep_ratio = float(source_keep_tensor[eligible].mean().item())
+        else:
+            keep_ratio = float((source_tokens_before - source_skip_tokens) / max(source_tokens_before, 1))
+        source_tokens_after = source_tokens_before if soft_action else source_tokens_before - source_skip_tokens
+        stats = {
+            "context_source_skip_applied": True,
+            "context_source_skip_path": path,
+            "context_source_skip_scope": scope,
+            "context_source_skip_mode": mode,
+            "context_source_skip_impl": impl,
+            "context_source_skip_mask": mask_name,
+            "context_source_skip_threshold": float(thr.item()),
+            "context_source_skip_quantile": float(quantile),
+            "context_source_skip_semantic_reason": semantic_reason,
+            "context_source_skip_soft_action": bool(soft_action),
+            "context_source_boost_action": bool(boost_action),
+            "source_skip_tokens": 0 if boost_action else source_skip_tokens,
+            "source_control_tokens": source_skip_tokens,
+            "source_boost_tokens": source_skip_tokens if boost_action else 0,
+            "source_tokens_before": source_tokens_before,
+            "source_tokens_after": source_tokens_after,
+            "source_keep_ratio": keep_ratio,
+            "source_skip_fraction": 0.0 if boost_action else float(source_skip_tokens / max(source_tokens_before, 1)),
+            "source_control_fraction": float(source_skip_tokens / max(source_tokens_before, 1)),
+            "source_boost_fraction": float(source_skip_tokens / max(source_tokens_before, 1)) if boost_action else 0.0,
+            "semantic_anchor_boost_applied": bool(boost_action),
+            "attention_mass_metric": attention_mass_metric if soft_action else None,
+            "attention_mass_requested": bool(hmc_control.get("context_source_skip_record_attention_mass", False))
+            and (impl == "compact_kv" or isinstance(bias, dict)),
+            "source_control_score_mean": float(source_control_score[eligible].mean().item()) if bool(eligible.any()) else 0.0,
+            "source_control_score_max": float(source_control_score.max().item()) if source_control_score.numel() else 0.0,
+            "source_weight_mean": float(source_keep_tensor[eligible].mean().item())
+            if source_keep_tensor is not None and bool(eligible.any()) else None,
+            "source_weight_min": float(source_keep_tensor[eligible].min().item())
+            if source_keep_tensor is not None and bool(eligible.any()) else None,
+            "per_frame_source_keep_ratio_min": float(per_frame_keep.min().item()) if per_frame_keep.numel() else 1.0,
+            "per_frame_source_keep_ratio_mean": float(per_frame_keep.mean().item()) if per_frame_keep.numel() else 1.0,
+            "special_token_kept_count": kept_special,
+            "special_token_total_count": total_special,
+            "special_token_keep_ratio": special_keep,
+            "empty_source_events": empty_events,
+        }
+        if isinstance(bias, dict):
+            return bias, stats
+        return bias.to(dtype=dtype), stats
 
     def _make_ttt_apply_gate(
         self,
@@ -1542,6 +2004,12 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
 
             attn_mask = None
             frame_query_gate = None
+            context_skip_stats: Dict[str, Any] = {
+                "context_source_skip_applied": False,
+                "source_keep_ratio": 1.0,
+                "source_skip_tokens": 0,
+                "empty_source_events": 0,
+            }
             if hmc_attn_path == "frame_attention":
                 layer_enabled = self._hmc_read_layer_enabled(hmc_control, layer=i, total_layers=total_decoder_layers)
                 if layer_enabled:
@@ -1569,6 +2037,37 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 layer_enabled = self._hmc_read_layer_enabled(hmc_control, layer=i, total_layers=total_decoder_layers)
                 hook_key = "enable_chunk_read_control"
 
+            context_skip_layer_enabled = self._hmc_context_source_skip_layer_enabled(
+                hmc_control,
+                layer=i,
+                total_layers=total_decoder_layers,
+            )
+            if context_skip_layer_enabled:
+                context_skip_bias, context_skip_stats = self._make_context_source_skip_bias(
+                    hmc_control,
+                    path=hmc_attn_path,
+                    batch_size=B,
+                    frame_num=N,
+                    tokens_per_frame=hw,
+                    device=hidden_for_block.device,
+                    dtype=hidden_for_block.dtype,
+                )
+                if context_skip_bias is not None:
+                    if isinstance(context_skip_bias, dict):
+                        if attn_mask is None:
+                            attn_mask = context_skip_bias
+                        elif (
+                            torch.is_tensor(attn_mask)
+                            and context_skip_bias.get("type") == "source_soft"
+                        ):
+                            context_skip_bias = dict(context_skip_bias)
+                            context_skip_bias["base_attn_mask"] = attn_mask
+                            attn_mask = context_skip_bias
+                        else:
+                            context_skip_stats["context_source_skip_compact_blocked_by_existing_mask"] = True
+                    else:
+                        attn_mask = context_skip_bias if attn_mask is None else attn_mask + context_skip_bias
+
             if self._hmc_hook_requested(hmc_control, hook_key):
                 mean_abs_bias = 0.0
                 max_abs_bias = 0.0
@@ -1576,27 +2075,53 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                     bias_abs = attn_mask.detach().float().abs()
                     mean_abs_bias = float(bias_abs.mean().item()) if bias_abs.numel() else 0.0
                     max_abs_bias = float(bias_abs.max().item()) if bias_abs.numel() else 0.0
+                elif isinstance(attn_mask, dict) and attn_mask.get("type") == "compact_kv":
+                    mean_abs_bias = 0.0
+                    max_abs_bias = 0.0
+                elif isinstance(attn_mask, dict) and attn_mask.get("type") == "source_soft":
+                    bias_values = attn_mask.get("source_bias_values")
+                    weights = attn_mask.get("source_weights")
+                    if torch.is_tensor(bias_values):
+                        bias_abs = bias_values.detach().float().abs()
+                        mean_abs_bias = float(bias_abs.mean().item()) if bias_abs.numel() else 0.0
+                        max_abs_bias = float(bias_abs.max().item()) if bias_abs.numel() else 0.0
+                    elif torch.is_tensor(weights):
+                        gate_delta = (1.0 - weights.detach().float()).abs()
+                        mean_abs_bias = float(gate_delta.mean().item()) if gate_delta.numel() else 0.0
+                        max_abs_bias = float(gate_delta.max().item()) if gate_delta.numel() else 0.0
                 mean_abs_query_gate_delta = 0.0
                 max_abs_query_gate_delta = 0.0
                 if frame_query_gate is not None:
                     gate_delta = (1.0 - frame_query_gate.detach().float()).abs()
                     mean_abs_query_gate_delta = float(gate_delta.mean().item()) if gate_delta.numel() else 0.0
                     max_abs_query_gate_delta = float(gate_delta.max().item()) if gate_delta.numel() else 0.0
-                self._append_hmc_trace(hmc_trace, hmc_attn_path, {
+                trace_record = {
                     "layer": int(i),
                     "identity": bool(hmc_control.get("identity_hooks", False)) if hmc_control else False,
                     "layer_enabled": bool(layer_enabled),
                     "shape": [int(x) for x in hidden_for_block.shape],
                     "attn_mask_applied": attn_mask is not None,
                     "query_gate_applied": frame_query_gate is not None,
+                    "context_source_skip_layer_enabled": bool(context_skip_layer_enabled),
                     "mean_abs_bias": mean_abs_bias,
                     "max_abs_bias": max_abs_bias,
                     "mean_abs_query_gate_delta": mean_abs_query_gate_delta,
                     "max_abs_query_gate_delta": max_abs_query_gate_delta,
                     "hook_site": "decoder_block_attn",
-                })
+                    **context_skip_stats,
+                }
+                self._append_hmc_trace(hmc_trace, hmc_attn_path, trace_record)
+            else:
+                trace_record = None
 
             hidden = blk(hidden_for_block, xpos=pos_for_block, attn_mask=attn_mask)
+            if (
+                trace_record is not None
+                and isinstance(attn_mask, dict)
+                and isinstance(attn_mask.get("attention_mass_stats"), list)
+                and attn_mask["attention_mass_stats"]
+            ):
+                trace_record.update(attn_mask["attention_mass_stats"][-1])
             if frame_query_gate is not None:
                 hidden = hidden_before_block + (hidden - hidden_before_block) * frame_query_gate
 

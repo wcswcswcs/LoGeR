@@ -69,6 +69,13 @@ def main(args, para):
             Cluster_dis = 0.05   # 
             Step_num = 20        #  
         
+        frame_id_allowlist = getattr(args, "frame_id_allowlist", None)
+        if frame_id_allowlist is not None:
+            allowed = {int(value) for value in frame_id_allowlist}
+            frame_id = [int(value) for value in frame_id if int(value) in allowed]
+            if len(frame_id) == 0:
+                raise RuntimeError("frame_id_allowlist removed all frames for this sequence")
+
         # print(frame_id)
         
         Point_ratio = 0.05

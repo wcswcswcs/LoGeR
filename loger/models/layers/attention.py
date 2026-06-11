@@ -8,6 +8,7 @@
 #   https://github.com/rwightman/pytorch-image-models/tree/master/timm/models/vision_transformer.py
 
 import logging
+import math
 import os
 import warnings
 
@@ -43,6 +44,242 @@ except ImportError:
 
 # Cache for block masks to avoid recreation
 _BLOCK_MASK_CACHE = {}
+
+
+def _compact_kv_sdpa(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    source_keep_mask: Tensor,
+    attention_mass_stats: list | None = None,
+    attention_mass_max_queries: int = 512,
+) -> Tensor:
+    """Run SDPA with per-sample compacted K/V source tokens.
+
+    This keeps all query rows and only removes selected key/value source
+    columns.  Different samples may keep different source-token counts, so we
+    loop over the batch dimension instead of padding back to a dense mask.
+    """
+
+    if source_keep_mask.ndim != 2:
+        raise ValueError(f"compact_kv source_keep_mask must be [B,N], got {tuple(source_keep_mask.shape)}")
+    if int(source_keep_mask.shape[0]) != int(q.shape[0]) or int(source_keep_mask.shape[1]) != int(k.shape[2]):
+        raise ValueError(
+            "compact_kv source_keep_mask shape mismatch: "
+            f"mask={tuple(source_keep_mask.shape)} q={tuple(q.shape)} k={tuple(k.shape)}"
+        )
+    source_keep_mask = source_keep_mask.to(device=q.device, dtype=torch.bool)
+    if attention_mass_stats is not None:
+        with torch.no_grad():
+            removed_before_vals = []
+            retained_before_vals = []
+            removed_tokens = []
+            kept_tokens = []
+            query_samples = []
+            head_dim = max(1, int(q.shape[-1]))
+            scale = 1.0 / math.sqrt(float(head_dim))
+            max_q = max(1, int(attention_mass_max_queries))
+            for b in range(int(q.shape[0])):
+                keep_b = source_keep_mask[b]
+                removed_b = ~keep_b
+                n_tokens = int(keep_b.numel())
+                if n_tokens <= 0:
+                    continue
+                if int(removed_b.sum().item()) <= 0:
+                    removed_before_vals.append(0.0)
+                    retained_before_vals.append(1.0)
+                    removed_tokens.append(0)
+                    kept_tokens.append(int(keep_b.sum().item()))
+                    query_samples.append(0)
+                    continue
+                if n_tokens > max_q:
+                    q_idx = torch.linspace(0, n_tokens - 1, steps=max_q, device=q.device).round().long().unique()
+                else:
+                    q_idx = torch.arange(n_tokens, device=q.device)
+                qb = q[b : b + 1, :, q_idx, :].float()
+                kb = k[b : b + 1].float()
+                scores = torch.matmul(qb, kb.transpose(-2, -1)) * scale
+                attn_full = torch.softmax(scores, dim=-1)
+                removed_mass = attn_full[..., removed_b].sum(dim=-1)
+                retained_mass = attn_full[..., keep_b].sum(dim=-1)
+                removed_before_vals.append(float(removed_mass.mean().item()))
+                retained_before_vals.append(float(retained_mass.mean().item()))
+                removed_tokens.append(int(removed_b.sum().item()))
+                kept_tokens.append(int(keep_b.sum().item()))
+                query_samples.append(int(q_idx.numel()))
+            if removed_before_vals:
+                attention_mass_stats.append({
+                    "attention_mass_removed_before": float(torch.tensor(removed_before_vals).mean().item()),
+                    "attention_mass_removed_after": 0.0,
+                    "attention_mass_retained_before": float(torch.tensor(retained_before_vals).mean().item()),
+                    "attention_mass_retained_after": 1.0,
+                    "attention_mass_removed_tokens_mean": float(torch.tensor(removed_tokens, dtype=torch.float32).mean().item()),
+                    "attention_mass_retained_tokens_mean": float(torch.tensor(kept_tokens, dtype=torch.float32).mean().item()),
+                    "attention_mass_query_sample_tokens_mean": float(torch.tensor(query_samples, dtype=torch.float32).mean().item()),
+                    "attention_mass_sampled": bool(max(removed_tokens or [0]) > 0),
+                })
+    outs = []
+    for b in range(int(q.shape[0])):
+        idx = torch.nonzero(source_keep_mask[b], as_tuple=False).reshape(-1)
+        if idx.numel() == 0:
+            idx = torch.arange(int(k.shape[2]), device=q.device)
+        qb = q[b : b + 1]
+        kb = k[b : b + 1, :, idx, :]
+        vb = v[b : b + 1, :, idx, :]
+        with nn.attention.sdpa_kernel([SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION]):
+            outs.append(scaled_dot_product_attention(qb, kb, vb))
+    return torch.cat(outs, dim=0)
+
+
+def _sample_query_indices(n_tokens: int, max_queries: int, device: torch.device) -> Tensor:
+    max_q = max(1, int(max_queries))
+    if int(n_tokens) > max_q:
+        return torch.linspace(0, int(n_tokens) - 1, steps=max_q, device=device).round().long().unique()
+    return torch.arange(int(n_tokens), device=device)
+
+
+def _append_source_soft_mass_stats(
+    q: Tensor,
+    k: Tensor,
+    *,
+    affected_mask: Tensor,
+    base_attn_mask: Tensor | None,
+    source_bias_values: Tensor | None,
+    source_weights: Tensor | None,
+    attention_mass_stats: list | None,
+    attention_mass_max_queries: int,
+    metric_type: str,
+) -> None:
+    """Record affected-source attention/effective-mass before and after soft control."""
+
+    if attention_mass_stats is None:
+        return
+    if affected_mask.ndim != 2:
+        raise ValueError(f"source soft affected_mask must be [B,N], got {tuple(affected_mask.shape)}")
+    if int(affected_mask.shape[0]) != int(q.shape[0]) or int(affected_mask.shape[1]) != int(k.shape[2]):
+        raise ValueError(
+            "source soft affected_mask shape mismatch: "
+            f"mask={tuple(affected_mask.shape)} q={tuple(q.shape)} k={tuple(k.shape)}"
+        )
+    affected_mask = affected_mask.to(device=q.device, dtype=torch.bool)
+    base_bias = base_attn_mask.to(device=q.device, dtype=torch.float32) if base_attn_mask is not None else None
+    bias = source_bias_values.to(device=q.device, dtype=torch.float32) if source_bias_values is not None else None
+    weights = source_weights.to(device=q.device, dtype=torch.float32) if source_weights is not None else None
+    if bias is not None and tuple(bias.shape) != tuple(affected_mask.shape):
+        raise ValueError(f"source soft bias shape mismatch: bias={tuple(bias.shape)} mask={tuple(affected_mask.shape)}")
+    if weights is not None and tuple(weights.shape) != tuple(affected_mask.shape):
+        raise ValueError(f"source soft weight shape mismatch: weights={tuple(weights.shape)} mask={tuple(affected_mask.shape)}")
+
+    with torch.no_grad():
+        before_vals = []
+        after_vals = []
+        actual_after_vals = []
+        retained_before_vals = []
+        retained_after_vals = []
+        affected_tokens = []
+        source_weight_vals = []
+        query_samples = []
+        head_dim = max(1, int(q.shape[-1]))
+        scale = 1.0 / math.sqrt(float(head_dim))
+        for b in range(int(q.shape[0])):
+            affected_b = affected_mask[b]
+            n_tokens = int(affected_b.numel())
+            if n_tokens <= 0:
+                continue
+            q_idx = _sample_query_indices(n_tokens, attention_mass_max_queries, q.device)
+            qb = q[b : b + 1, :, q_idx, :].float()
+            kb = k[b : b + 1].float()
+            scores = torch.matmul(qb, kb.transpose(-2, -1)) * scale
+            if base_bias is not None:
+                scores = scores + base_bias[b : b + 1, :, q_idx, :]
+            attn_full = torch.softmax(scores, dim=-1)
+            affected_mass_before = attn_full[..., affected_b].sum(dim=-1)
+            retained_mass_before = attn_full[..., ~affected_b].sum(dim=-1)
+
+            if bias is not None:
+                scores_after = scores + bias[b].reshape(1, 1, 1, n_tokens)
+                attn_after = torch.softmax(scores_after, dim=-1)
+                affected_mass_actual_after = attn_after[..., affected_b].sum(dim=-1)
+                affected_mass_after = affected_mass_actual_after
+                retained_mass_after = attn_after[..., ~affected_b].sum(dim=-1)
+            elif weights is not None:
+                weight_b = weights[b].reshape(1, 1, 1, n_tokens)
+                affected_mass_actual_after = affected_mass_before
+                affected_mass_after = (attn_full[..., affected_b] * weight_b[..., affected_b]).sum(dim=-1)
+                retained_mass_after = retained_mass_before
+            else:
+                affected_mass_actual_after = affected_mass_before
+                affected_mass_after = affected_mass_before
+                retained_mass_after = retained_mass_before
+
+            before_vals.append(float(affected_mass_before.mean().item()))
+            after_vals.append(float(affected_mass_after.mean().item()))
+            actual_after_vals.append(float(affected_mass_actual_after.mean().item()))
+            retained_before_vals.append(float(retained_mass_before.mean().item()))
+            retained_after_vals.append(float(retained_mass_after.mean().item()))
+            affected_tokens.append(int(affected_b.sum().item()))
+            query_samples.append(int(q_idx.numel()))
+            if weights is not None and bool(affected_b.any()):
+                source_weight_vals.append(float(weights[b][affected_b].mean().item()))
+
+        if before_vals:
+            attention_mass_stats.append({
+                "attention_mass_metric": str(metric_type),
+                "attention_mass_removed_before": float(torch.tensor(before_vals).mean().item()),
+                "attention_mass_removed_after": float(torch.tensor(after_vals).mean().item()),
+                "attention_mass_actual_after": float(torch.tensor(actual_after_vals).mean().item()),
+                "attention_mass_retained_before": float(torch.tensor(retained_before_vals).mean().item()),
+                "attention_mass_retained_after": float(torch.tensor(retained_after_vals).mean().item()),
+                "attention_mass_removed_tokens_mean": float(torch.tensor(affected_tokens, dtype=torch.float32).mean().item()),
+                "attention_mass_query_sample_tokens_mean": float(torch.tensor(query_samples, dtype=torch.float32).mean().item()),
+                "source_value_weight_mean": (
+                    float(torch.tensor(source_weight_vals).mean().item()) if source_weight_vals else None
+                ),
+                "attention_mass_sampled": bool(max(affected_tokens or [0]) > 0),
+            })
+
+
+def _source_soft_sdpa(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    control: dict,
+) -> Tensor:
+    """Run SDPA with source-column soft bias or V-only attenuation."""
+
+    affected_mask = control["affected_mask"].to(device=q.device, dtype=torch.bool)
+    base_attn_mask = control.get("base_attn_mask")
+    source_bias_values = control.get("source_bias_values")
+    source_weights = control.get("source_weights")
+    if base_attn_mask is not None:
+        base_attn_mask = base_attn_mask.to(device=q.device, dtype=q.dtype)
+    if source_bias_values is not None:
+        source_bias_values = source_bias_values.to(device=q.device, dtype=q.dtype)
+    if source_weights is not None:
+        source_weights = source_weights.to(device=q.device, dtype=v.dtype)
+    _append_source_soft_mass_stats(
+        q,
+        k,
+        affected_mask=affected_mask,
+        base_attn_mask=base_attn_mask,
+        source_bias_values=source_bias_values,
+        source_weights=source_weights,
+        attention_mass_stats=control.get("attention_mass_stats"),
+        attention_mass_max_queries=int(control.get("attention_mass_max_queries", 512) or 512),
+        metric_type=str(control.get("attention_mass_metric", "source_soft")),
+    )
+    v_eff = v
+    if source_weights is not None:
+        v_eff = v * source_weights[:, None, :, None]
+    attn_mask = base_attn_mask
+    if source_bias_values is not None:
+        source_bias = source_bias_values[:, None, None, :]
+        attn_mask = source_bias if attn_mask is None else attn_mask + source_bias
+    if attn_mask is None and q.dtype == torch.bfloat16:
+        with nn.attention.sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+            return scaled_dot_product_attention(q, k, v_eff)
+    with nn.attention.sdpa_kernel([SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION]):
+        return scaled_dot_product_attention(q, k, v_eff, attn_mask=attn_mask)
 
 
 def get_causal_block_mask(P, B, H, M, N, device="cuda", _compile=True):
@@ -345,6 +582,40 @@ class AttentionRope(nn.Module):
 
 class MemEffAttentionRope(AttentionRope):
     def forward(self, x: Tensor, attn_bias=None, xpos=None, attn_mask=None) -> Tensor:
+        compact_kv = attn_mask if isinstance(attn_mask, dict) and attn_mask.get("type") == "compact_kv" else None
+        source_soft = attn_mask if isinstance(attn_mask, dict) and attn_mask.get("type") == "source_soft" else None
+        if compact_kv is not None or source_soft is not None:
+            B, N, C = x.shape
+            qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).transpose(1, 3)
+            q, k, v = [qkv[:, :, i] for i in range(3)]
+            q, k = self.q_norm(q).to(v.dtype), self.k_norm(k).to(v.dtype)
+
+            if self.rope is not None:
+                q = self.rope(q, xpos)
+                k = self.rope(k, xpos)
+
+            target_dtype = v.dtype
+            if q.dtype != target_dtype:
+                q = q.to(target_dtype)
+            if k.dtype != target_dtype:
+                k = k.to(target_dtype)
+
+            if compact_kv is not None:
+                x = _compact_kv_sdpa(
+                    q,
+                    k,
+                    v,
+                    compact_kv["source_keep_mask"],
+                    compact_kv.get("attention_mass_stats"),
+                    int(compact_kv.get("attention_mass_max_queries", 512) or 512),
+                )
+            else:
+                x = _source_soft_sdpa(q, k, v, source_soft)
+            x = x.transpose(1, 2).reshape([B, N, C])
+            x = self.proj(x)
+            x = self.proj_drop(x)
+            return x
+
         # If attn_mask is provided and flex_attention is available, use flex_attention
         if attn_mask is not None and FLEX_ATTENTION_AVAILABLE:
             B, N, C = x.shape
@@ -541,6 +812,25 @@ class FlashAttentionRope(AttentionRope):
         if self.rope is not None:
             q = self.rope(q, xpos)
             k = self.rope(k, xpos)
+
+        compact_kv = attn_mask if isinstance(attn_mask, dict) and attn_mask.get("type") == "compact_kv" else None
+        source_soft = attn_mask if isinstance(attn_mask, dict) and attn_mask.get("type") == "source_soft" else None
+        if compact_kv is not None or source_soft is not None:
+            if compact_kv is not None:
+                x = _compact_kv_sdpa(
+                    q,
+                    k,
+                    v,
+                    compact_kv["source_keep_mask"],
+                    compact_kv.get("attention_mass_stats"),
+                    int(compact_kv.get("attention_mass_max_queries", 512) or 512),
+                )
+            else:
+                x = _source_soft_sdpa(q, k, v, source_soft)
+            x = x.transpose(1, 2).reshape([B, N, C])
+            x = self.proj(x)
+            x = self.proj_drop(x)
+            return x
 
         # If attn_mask (block_mask) is provided and flex_attention is available, use it
         # If attn_mask (block_mask) is provided and flex_attention is available, use it

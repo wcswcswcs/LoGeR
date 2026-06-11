@@ -1,0 +1,62 @@
+[
+  {
+    "method": "C0 oracle Stream3D pool",
+    "prediction_config": "stream4d_v11_oracle_c0_stream3d_probe5",
+    "pre_points_config": "stream4d_v11_oracle_c0_stream3d_probe5",
+    "output_config": "stream4d_v11_oracle_c0_stream3d_probe5",
+    "eval_policy": "oracle_candidate_upper_bound",
+    "support_source": "candidate_union",
+    "geometry_source": "mixed_existing_predictions",
+    "split": "probe5"
+  },
+  {
+    "method": "C1 oracle B1+O1 tiny clean",
+    "prediction_config": "stream4d_v11_oracle_c1_tiny_clean_probe5",
+    "pre_points_config": "stream4d_v11_oracle_c1_tiny_clean_probe5",
+    "output_config": "stream4d_v11_oracle_c1_tiny_clean_probe5",
+    "eval_policy": "oracle_candidate_upper_bound",
+    "support_source": "candidate_union",
+    "geometry_source": "mixed_existing_predictions",
+    "split": "probe5"
+  },
+  {
+    "method": "C2 oracle O38 large memory",
+    "prediction_config": "stream4d_v11_oracle_c2_o38_memory_probe5",
+    "pre_points_config": "stream4d_v11_oracle_c2_o38_memory_probe5",
+    "output_config": "stream4d_v11_oracle_c2_o38_memory_probe5",
+    "eval_policy": "oracle_candidate_upper_bound",
+    "support_source": "candidate_union",
+    "geometry_source": "mixed_existing_predictions",
+    "split": "probe5"
+  },
+  {
+    "method": "C3 oracle v10 regionlet birth",
+    "prediction_config": "stream4d_v11_oracle_c3_regionlet_birth_probe5",
+    "pre_points_config": "stream4d_v11_oracle_c3_regionlet_birth_probe5",
+    "output_config": "stream4d_v11_oracle_c3_regionlet_birth_probe5",
+    "eval_policy": "oracle_candidate_upper_bound",
+    "support_source": "candidate_union",
+    "geometry_source": "mixed_existing_predictions",
+    "split": "probe5"
+  },
+  {
+    "method": "C4 oracle v10 regionlet repair",
+    "prediction_config": "stream4d_v11_oracle_c4_regionlet_repair_probe5",
+    "pre_points_config": "stream4d_v11_oracle_c4_regionlet_repair_probe5",
+    "output_config": "stream4d_v11_oracle_c4_regionlet_repair_probe5",
+    "eval_policy": "oracle_candidate_upper_bound",
+    "support_source": "candidate_union",
+    "geometry_source": "mixed_existing_predictions",
+    "split": "probe5"
+  },
+  {
+    "method": "C5 oracle C1+C2+C3 union",
+    "prediction_config": "stream4d_v11_oracle_c5_c1_c2_c3_union_probe5",
+    "pre_points_config": "stream4d_v11_oracle_c5_c1_c2_c3_union_probe5",
+    "output_config": "stream4d_v11_oracle_c5_c1_c2_c3_union_probe5",
+    "eval_policy": "oracle_candidate_upper_bound",
+    "support_source": "candidate_union",
+    "geometry_source": "mixed_existing_predictions",
+    "split": "probe5"
+  }
+]
