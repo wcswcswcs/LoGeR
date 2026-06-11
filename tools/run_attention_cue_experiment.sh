@@ -36,6 +36,8 @@ READ_BLEND_LAMBDA="${READ_BLEND_LAMBDA:-0.25}"
 SWA_GATE_MIN="${SWA_GATE_MIN:-0.85}"
 BETA_SWA="${BETA_SWA:-$BETA}"
 END_FRAME="${END_FRAME:-10000}"
+OUTPUT_PT="${OUTPUT_PT-}"
+PER_CHUNK_GEOMETRY_DIR="${PER_CHUNK_GEOMETRY_DIR-}"
 RESET_EVERY="${RESET_EVERY:-5}"
 FAST_CUE_EVAL="${FAST_CUE_EVAL:-1}"
 STAGE_C_MODE="${STAGE_C_MODE:-none}"
@@ -186,6 +188,13 @@ COMMON_ARGS=(
   --output_txt "$OUT/$SEQ.txt"
   --hybrid_debug_jsonl "$OUT/hmc_state_hash.jsonl"
 )
+
+if [ -n "$OUTPUT_PT" ]; then
+  COMMON_ARGS+=(--output_pt "$OUTPUT_PT")
+fi
+if [ -n "$PER_CHUNK_GEOMETRY_DIR" ]; then
+  COMMON_ARGS+=(--per_chunk_geometry_dir "$PER_CHUNK_GEOMETRY_DIR")
+fi
 
 STAGE_B_ARGS=(
   --stage_c_mode "$STAGE_C_MODE"

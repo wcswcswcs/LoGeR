@@ -118,6 +118,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--output_video", default="results/pipeline_v2.mp4")
     p.add_argument("--output_pt", default=None, help="Save merged outputs as .pt file.")
     p.add_argument("--output_txt", default=None, help="Save merged camera trajectory in TUM format.")
+    p.add_argument(
+        "--per_chunk_geometry_dir",
+        default="",
+        help=(
+            "Optional debug directory for per-chunk geometry tensors. "
+            "Used by ACL2 scale diagnostics; empty keeps historical behavior."
+        ),
+    )
     p.add_argument("--save_frames", default=None)
     p.add_argument("--start_frame", type=int, default=0)
     p.add_argument("--end_frame", type=int, default=-1)
@@ -1796,6 +1804,37 @@ def _save_outputs(
     return merged_local_points, merged_world_points, merged_camera_poses, merged_confidence
 
 
+def _save_per_chunk_geometry_debug(
+    *,
+    root: str,
+    chunk_idx: int,
+    start: int,
+    end: int,
+    geo: GeometryOutput,
+) -> None:
+    if not root:
+        return
+    out_dir = Path(root)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    def _cpu(x: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        if x is None:
+            return None
+        return x.detach().cpu()
+
+    payload: Dict[str, Any] = {
+        "chunk_idx": int(chunk_idx),
+        "start_frame": int(start),
+        "end_frame": int(end),
+        "local_points": _cpu(geo.local_points),
+        "points": _cpu(geo.world_points),
+        "camera_poses": _cpu(geo.camera_poses),
+        "conf": _cpu(geo.confidence),
+        "token_type": _cpu(geo.token_type),
+    }
+    torch.save(payload, out_dir / f"chunk_{int(chunk_idx):03d}.pt")
+
+
 def main() -> None:
     args = build_parser().parse_args()
     _apply_read_path_selector(args)
@@ -2450,6 +2489,13 @@ def main() -> None:
                 wr=result.write_result,
             )
 
+        _save_per_chunk_geometry_debug(
+            root=args.per_chunk_geometry_dir,
+            chunk_idx=ci,
+            start=start,
+            end=end,
+            geo=final_geo,
+        )
         all_geo.append(final_geo)
         window_raw_predictions.append(_rebuild_batched_raw_window(final_geo, start, end))
 
