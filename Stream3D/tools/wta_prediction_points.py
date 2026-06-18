@@ -7,6 +7,8 @@ from pathlib import Path
 
 import numpy as np
 
+from tools.prediction_manifest import build_prediction_manifest, write_prediction_manifest
+
 
 def _read_seq_list(path: Path) -> list[str]:
     with path.open("r", encoding="utf-8") as handle:
@@ -189,6 +191,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--drop-empty", action="store_true")
     parser.add_argument("--min-area-after", type=int, default=0)
     parser.add_argument("--summary-root", default="outputs/stream4d_point_wta_v4_1")
+    parser.add_argument("--eval-policy", default="prediction_point_wta")
+    parser.add_argument("--diagnostic-only", action="store_true")
+    parser.add_argument("--forbidden-for-method-table", action="store_true")
+    parser.add_argument("--uses-rgbd-for-prediction", action="store_true")
+    parser.add_argument("--uses-pose-for-prediction", action="store_true")
+    parser.add_argument("--uses-scannet-mesh-for-prediction", action="store_true")
+    parser.add_argument("--alignment-source", default="none")
+    parser.add_argument("--alignment-used-for-prediction", action="store_true")
     return parser
 
 
@@ -201,6 +211,40 @@ def main() -> None:
     summary = {"args": vars(args), "aggregate": aggregate(rows, args), "rows": rows}
     out_path = out_dir / f"{args.output_config}_summary.json"
     out_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    manifest = build_prediction_manifest(
+        root=args.root,
+        output_config=args.output_config,
+        is_method_result=not bool(args.diagnostic_only),
+        is_diagnostic_only=bool(args.diagnostic_only),
+        uses_gt=False,
+        gt_usage="none",
+        source_configs=[args.input_config],
+        pre_points_policy="input_tmp_copy_or_union_recompute",
+        support_policy=(
+            f"prediction_point_wta:{args.priority_mode}:"
+            f"min_conflict_owners={args.min_conflict_owners}:"
+            f"min_priority_margin={args.min_priority_margin}:"
+            f"drop_empty={bool(args.drop_empty)}:min_area_after={args.min_area_after}"
+        ),
+        notes="Applies winner-take-all deconfliction to predicted point masks using prediction scores/areas only; no GT is read.",
+        extra={
+            "algorithm": "wta_prediction_points",
+            "eval_policy": args.eval_policy,
+            "input_config": args.input_config,
+            "priority_mode": args.priority_mode,
+            "min_conflict_owners": int(args.min_conflict_owners),
+            "min_priority_margin": float(args.min_priority_margin),
+            "drop_empty": bool(args.drop_empty),
+            "min_area_after": int(args.min_area_after),
+            "forbidden_for_method_table": bool(args.forbidden_for_method_table),
+            "uses_rgbd_for_prediction": bool(args.uses_rgbd_for_prediction),
+            "uses_pose_for_prediction": bool(args.uses_pose_for_prediction),
+            "uses_scannet_mesh_for_prediction": bool(args.uses_scannet_mesh_for_prediction),
+            "alignment_source": args.alignment_source,
+            "alignment_used_for_prediction": bool(args.alignment_used_for_prediction),
+        },
+    )
+    write_prediction_manifest(args.output_config, manifest, root=args.root, pred_suffix=args.pred_suffix.lstrip("_"))
     print(f"[wta-prediction-points] wrote {out_path}")
 
 

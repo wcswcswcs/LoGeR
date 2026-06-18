@@ -8,7 +8,10 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-import torch
+try:
+    import torch
+except ImportError:  # pragma: no cover - exercised in dependency-light test envs
+    torch = None  # type: ignore[assignment]
 
 STREAM3D_ROOT = Path(__file__).resolve().parents[1]
 if str(STREAM3D_ROOT) not in sys.path:
@@ -114,6 +117,8 @@ def _sample_map_uv(map_2d: np.ndarray, uv_norm: np.ndarray) -> tuple[np.ndarray,
 
 
 def _load_loger_output(path: Path) -> dict[str, np.ndarray]:
+    if torch is None:
+        raise ImportError("Loading LoGeR .pt outputs requires PyTorch. Install torch and retry.")
     payload = torch.load(path, map_location="cpu", weights_only=False)
     if "local_points" not in payload:
         raise KeyError(f"{path} does not contain local_points")

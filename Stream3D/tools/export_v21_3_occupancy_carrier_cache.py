@@ -17,10 +17,10 @@ from stream4d_native.occupancy_dense_tracker import (
     QueryBudget,
     query_d4rt_tubes_with_spatiotemporal_occupancy,
 )
+from stream4d_native.d4rt_scene_builder import source_xy_from_uv, stable_source_carrier_id
 from stream4d_native.occupancy_state import OccupancyCoverageTargets
 from tools.run_v21_3_native_occupancy_ablation import (
     _frame_ids,
-    _load_rgb_mask_window,
     _tracks_from_batch,
     _windows,
 )
@@ -40,6 +40,29 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
     return value
+
+
+def _load_rgb_sparse_mask_window(stream: ScanNetStream, frame_ids: list[int]) -> dict[str, Any]:
+    rgbs: list[np.ndarray] = []
+    masks: list[np.ndarray] = []
+    present: list[int] = []
+    missing: list[int] = []
+    for frame_id in frame_ids:
+        rgb = stream.load_rgb(int(frame_id))
+        rgbs.append(rgb)
+        try:
+            mask = stream.load_mask(int(frame_id))
+            present.append(int(frame_id))
+        except FileNotFoundError:
+            mask = np.zeros(rgb.shape[:2], dtype=np.int32)
+            missing.append(int(frame_id))
+        masks.append(np.asarray(mask))
+    return {
+        "rgb": np.stack(rgbs, axis=0),
+        "mask": np.stack(masks, axis=0),
+        "sparse_mask_present_frame_ids": present,
+        "sparse_mask_missing_frame_ids": missing,
+    }
 
 
 def _write_manifest(path: Path, *, frame_ids: list[int], variant: str, scene: str, window_index: int) -> None:
@@ -111,35 +134,74 @@ def _track_source_frame(track: dict[str, Any], frame_count: int) -> int:
     return min(max(value, 0), max(frame_count - 1, 0))
 
 
+def _source_arrays_from_points(
+    *,
+    source_points: np.ndarray,
+    frame_ids: list[int],
+    image_width: int,
+    image_height: int,
+    masks: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    source_points = np.asarray(source_points, dtype=np.float32)
+    src_frame = source_points[:, 0].astype(np.int64)
+    src_xy = np.zeros((source_points.shape[0], 2), dtype=np.int64)
+    src_frame_global = np.zeros((source_points.shape[0],), dtype=np.int64)
+    src_mask_id = np.full((source_points.shape[0],), -1, dtype=np.int64)
+    frame_arr = np.asarray(frame_ids, dtype=np.int64)
+    for idx, local_frame in enumerate(src_frame.tolist()):
+        clamped_frame = int(np.clip(local_frame, 0, max(len(frame_ids) - 1, 0)))
+        src_frame_global[idx] = int(frame_arr[clamped_frame]) if frame_arr.size else int(clamped_frame)
+        x, y = source_xy_from_uv(
+            source_points[idx, 1:3],
+            image_width=int(image_width),
+            image_height=int(image_height),
+        )
+        src_xy[idx] = (int(x), int(y))
+        if masks is not None and masks.size:
+            src_mask_id[idx] = int(np.asarray(masks)[clamped_frame, int(y), int(x)])
+    return src_frame_global, src_xy, src_mask_id
+
+
 def _tracks_to_batch(tracks: list[dict[str, Any]], frame_ids: list[int]) -> CarrierBatch:
     num_frames = int(len(frame_ids))
     num_tracks = int(len(tracks))
     xyz = np.empty((num_frames, num_tracks, 3), dtype=np.float32)
+    xyz_local = np.empty((num_frames, num_tracks, 3), dtype=np.float32)
     uv = np.empty((num_frames, num_tracks, 2), dtype=np.float32)
     visibility = np.zeros((num_frames, num_tracks), dtype=np.float32)
     confidence = np.zeros((num_frames, num_tracks), dtype=np.float32)
     valid = np.zeros((num_frames, num_tracks), dtype=bool)
     xyz.fill(np.nan)
+    xyz_local.fill(np.nan)
     uv.fill(np.nan)
     carrier_id = np.empty((num_tracks,), dtype=np.int64)
     src_frame = np.zeros((num_tracks,), dtype=np.int64)
     src_frame_global = np.zeros((num_tracks,), dtype=np.int64)
+    src_xy = np.full((num_tracks, 2), -1, dtype=np.int64)
     src_uv = np.zeros((num_tracks, 2), dtype=np.float32)
+    src_mask_id = np.full((num_tracks,), -1, dtype=np.int64)
     persistent_tube_id = np.full((num_tracks,), -1, dtype=np.int64)
     parent_tube_id = np.full((num_tracks,), -1, dtype=np.int64)
     warmstart_source_chunk = np.full((num_tracks,), -1, dtype=np.int64)
     warmstart_source_frame = np.full((num_tracks,), -1, dtype=np.int64)
     is_warmstarted = np.zeros((num_tracks,), dtype=bool)
+    has_xyz_local = False
     for idx, track in enumerate(tracks):
         xyz[:, idx, :] = np.asarray(track.get("xyz", np.full((num_frames, 3), np.nan)), dtype=np.float32)
+        if track.get("xyz_local") is not None:
+            xyz_local[:, idx, :] = np.asarray(track["xyz_local"], dtype=np.float32)
+            has_xyz_local = True
         uv[:, idx, :] = np.asarray(track.get("uv_norm", np.full((num_frames, 2), np.nan)), dtype=np.float32)
         visibility[:, idx] = np.asarray(track.get("visibility", np.zeros((num_frames,))), dtype=np.float32)
         confidence[:, idx] = np.asarray(track.get("confidence", np.zeros((num_frames,))), dtype=np.float32)
         valid[:, idx] = np.asarray(track.get("valid", np.zeros((num_frames,), dtype=bool)), dtype=bool)
         carrier_id[idx] = int(track.get("carrier_id", idx))
         src_frame[idx] = _track_source_frame(track, num_frames)
-        src_frame_global[idx] = int(frame_ids[src_frame[idx]]) if frame_ids else 0
+        src_frame_global[idx] = int(track.get("source_frame_global", frame_ids[src_frame[idx]] if frame_ids else 0))
+        if track.get("source_xy") is not None:
+            src_xy[idx] = np.asarray(track["source_xy"], dtype=np.int64).reshape(2)
         src_uv[idx] = np.asarray(track.get("source_uv", [0.0, 0.0]), dtype=np.float32)
+        src_mask_id[idx] = int(track.get("src_mask_id", track.get("source_mask_id", -1)))
         persistent_tube_id[idx] = int(track.get("persistent_tube_id", carrier_id[idx]))
         parent_tube_id[idx] = int(track.get("parent_tube_id", -1))
         warmstart_source_chunk[idx] = int(track.get("warmstart_source_chunk", -1))
@@ -154,7 +216,10 @@ def _tracks_to_batch(tracks: list[dict[str, Any]], frame_ids: list[int]) -> Carr
         visibility_prob=visibility,
         confidence_prob=confidence,
         valid=valid,
+        xyz_local=xyz_local if has_xyz_local else None,
         src_frame_global=src_frame_global,
+        src_xy=src_xy,
+        src_mask_id=src_mask_id,
         persistent_tube_id=persistent_tube_id,
         parent_tube_id=parent_tube_id,
         warmstart_source_chunk=warmstart_source_chunk,
@@ -163,13 +228,50 @@ def _tracks_to_batch(tracks: list[dict[str, Any]], frame_ids: list[int]) -> Carr
     )
 
 
-def _tracks_from_batch_with_source(batch: CarrierBatch, source_points: np.ndarray, carrier_ids: np.ndarray) -> list[dict[str, Any]]:
+def _tracks_from_batch_with_source(
+    batch: CarrierBatch,
+    source_points: np.ndarray,
+    carrier_ids: np.ndarray,
+    *,
+    frame_ids: list[int],
+    image_width: int,
+    image_height: int,
+    masks: np.ndarray | None = None,
+) -> list[dict[str, Any]]:
     tracks = _tracks_from_batch(batch)
     source_points = np.asarray(source_points, dtype=np.float32)
     carrier_ids = np.asarray(carrier_ids, dtype=np.int64)
+    fallback_frame_global, fallback_src_xy, fallback_mask_id = _source_arrays_from_points(
+        source_points=source_points,
+        frame_ids=frame_ids,
+        image_width=int(image_width),
+        image_height=int(image_height),
+        masks=masks,
+    )
+    batch_frame_global = getattr(batch, "src_frame_global", None)
+    batch_src_xy = getattr(batch, "src_xy", None)
+    batch_src_mask_id = getattr(batch, "src_mask_id", None)
+    batch_xyz_local = getattr(batch, "xyz_local", None)
     for idx, track in enumerate(tracks):
         track["source_frame"] = int(source_points[idx, 0])
         track["source_uv"] = np.asarray(source_points[idx, 1:3], dtype=np.float32)
+        track["source_frame_global"] = (
+            int(np.asarray(batch_frame_global, dtype=np.int64).reshape(-1)[idx])
+            if batch_frame_global is not None
+            else int(fallback_frame_global[idx])
+        )
+        track["source_xy"] = (
+            tuple(int(v) for v in np.asarray(batch_src_xy, dtype=np.int64).reshape(-1, 2)[idx].tolist())
+            if batch_src_xy is not None
+            else tuple(int(v) for v in fallback_src_xy[idx].tolist())
+        )
+        track["src_mask_id"] = (
+            int(np.asarray(batch_src_mask_id, dtype=np.int64).reshape(-1)[idx])
+            if batch_src_mask_id is not None
+            else int(fallback_mask_id[idx])
+        )
+        if batch_xyz_local is not None:
+            track["xyz_local"] = np.asarray(batch_xyz_local[:, idx, :], dtype=np.float32)
         track["carrier_id"] = int(carrier_ids[idx])
         track["persistent_tube_id"] = int(carrier_ids[idx])
         track["parent_tube_id"] = -1
@@ -243,31 +345,96 @@ def _assign_persistent_tube_ids(
 ) -> tuple[int, dict[str, Any]]:
     prev_index = {int(frame_id): idx for idx, frame_id in enumerate(previous_frame_ids)}
     shared = [(cur_idx, prev_index[int(frame_id)], int(frame_id)) for cur_idx, frame_id in enumerate(current_frame_ids) if int(frame_id) in prev_index]
-    candidates: list[tuple[float, int, int, int]] = []
+    candidate_stats: dict[tuple[int, int], list[float | int]] = {}
+
+    def source_key(track: dict[str, Any]) -> tuple[int, int, int] | None:
+        if "source_frame_global" not in track or "source_xy" not in track:
+            return None
+        xy = track.get("source_xy")
+        if xy is None:
+            return None
+        try:
+            return (int(track["source_frame_global"]), int(xy[0]), int(xy[1]))
+        except (TypeError, ValueError, IndexError):
+            return None
+
+    def add_candidate(cur_idx: int, prev_idx: int, dist: float, frame_id: int) -> None:
+        key = (int(cur_idx), int(prev_idx))
+        if key not in candidate_stats:
+            candidate_stats[key] = [0.0, 0, int(frame_id)]
+        candidate_stats[key][0] = float(candidate_stats[key][0]) + float(dist)
+        candidate_stats[key][1] = int(candidate_stats[key][1]) + 1
+
+    prev_by_source: dict[tuple[int, int, int], int] = {}
+    for prev_idx, prev in enumerate(previous_tracks):
+        key = source_key(prev)
+        if key is not None and key not in prev_by_source:
+            prev_by_source[key] = int(prev_idx)
     for cur_idx, cur in enumerate(tubes):
-        cur_uv = np.asarray(cur.get("uv_norm", []), dtype=np.float32)
-        cur_valid = np.asarray(cur.get("valid", np.zeros((len(current_frame_ids),), dtype=bool)), dtype=bool)
-        if cur_uv.shape[0] != len(current_frame_ids):
-            continue
-        for prev_idx, prev in enumerate(previous_tracks):
-            prev_uv = np.asarray(prev.get("uv_norm", []), dtype=np.float32)
-            prev_valid = np.asarray(prev.get("valid", np.zeros((len(previous_frame_ids),), dtype=bool)), dtype=bool)
-            if prev_uv.shape[0] != len(previous_frame_ids):
-                continue
-            dists: list[float] = []
-            frames: list[int] = []
+        key = source_key(cur)
+        if key is not None and key in prev_by_source:
+            add_candidate(cur_idx, prev_by_source[key], -1.0, key[0])
+
+    try:
+        from scipy.spatial import cKDTree
+    except Exception:  # pragma: no cover - scipy is present in the canonical env.
+        cKDTree = None
+
+    if shared:
+        if cKDTree is not None:
             for cur_local, prev_local, frame_id in shared:
-                if not (cur_valid[cur_local] and prev_valid[prev_local]):
+                prev_points: list[np.ndarray] = []
+                prev_ids: list[int] = []
+                for prev_idx, prev in enumerate(previous_tracks):
+                    prev_uv = np.asarray(prev.get("uv_norm", []), dtype=np.float32)
+                    prev_valid = np.asarray(prev.get("valid", np.zeros((len(previous_frame_ids),), dtype=bool)), dtype=bool)
+                    if prev_uv.shape[0] != len(previous_frame_ids):
+                        continue
+                    if not bool(prev_valid[prev_local]):
+                        continue
+                    uv = prev_uv[prev_local]
+                    if np.isfinite(uv).all():
+                        prev_points.append(uv)
+                        prev_ids.append(int(prev_idx))
+                if not prev_points:
                     continue
-                dist = float(np.linalg.norm(cur_uv[cur_local] - prev_uv[prev_local]))
-                if np.isfinite(dist):
-                    dists.append(dist)
-                    frames.append(int(frame_id))
-            if not dists:
-                continue
-            mean_dist = float(np.mean(dists))
-            if mean_dist <= float(uv_radius):
-                candidates.append((mean_dist, cur_idx, prev_idx, frames[0]))
+                tree = cKDTree(np.asarray(prev_points, dtype=np.float32))
+                for cur_idx, cur in enumerate(tubes):
+                    cur_uv = np.asarray(cur.get("uv_norm", []), dtype=np.float32)
+                    cur_valid = np.asarray(cur.get("valid", np.zeros((len(current_frame_ids),), dtype=bool)), dtype=bool)
+                    if cur_uv.shape[0] != len(current_frame_ids) or not bool(cur_valid[cur_local]):
+                        continue
+                    uv = cur_uv[cur_local]
+                    if not np.isfinite(uv).all():
+                        continue
+                    dist, pos = tree.query(uv, k=1, distance_upper_bound=float(uv_radius))
+                    if int(pos) >= len(prev_ids) or not np.isfinite(dist):
+                        continue
+                    add_candidate(cur_idx, prev_ids[int(pos)], float(dist), int(frame_id))
+        else:
+            for cur_idx, cur in enumerate(tubes):
+                cur_uv = np.asarray(cur.get("uv_norm", []), dtype=np.float32)
+                cur_valid = np.asarray(cur.get("valid", np.zeros((len(current_frame_ids),), dtype=bool)), dtype=bool)
+                if cur_uv.shape[0] != len(current_frame_ids):
+                    continue
+                for prev_idx, prev in enumerate(previous_tracks):
+                    prev_uv = np.asarray(prev.get("uv_norm", []), dtype=np.float32)
+                    prev_valid = np.asarray(prev.get("valid", np.zeros((len(previous_frame_ids),), dtype=bool)), dtype=bool)
+                    if prev_uv.shape[0] != len(previous_frame_ids):
+                        continue
+                    for cur_local, prev_local, frame_id in shared:
+                        if not (cur_valid[cur_local] and prev_valid[prev_local]):
+                            continue
+                        dist = float(np.linalg.norm(cur_uv[cur_local] - prev_uv[prev_local]))
+                        if np.isfinite(dist) and dist <= float(uv_radius):
+                            add_candidate(cur_idx, prev_idx, dist, frame_id)
+    candidates: list[tuple[float, int, int, int]] = []
+    for (cur_idx, prev_idx), stats in candidate_stats.items():
+        dist_sum, count, frame_id = stats
+        if int(count) <= 0:
+            continue
+        mean_dist = float(dist_sum) / float(count)
+        candidates.append((mean_dist, int(cur_idx), int(prev_idx), int(frame_id)))
     assigned_cur: set[int] = set()
     assigned_prev: set[int] = set()
     retained = 0
@@ -326,7 +493,7 @@ def _export_d2(
     total_time = 0.0
     total_saved = 0
     for window_index, cur_frame_ids in enumerate(window_ids):
-        data = _load_rgb_mask_window(stream, cur_frame_ids)
+        data = _load_rgb_sparse_mask_window(stream, cur_frame_ids)
         frames = np.asarray(data["rgb"])
         masks = np.asarray(data["mask"])
         sources = sampler.sample(masks=masks, frame_ids=cur_frame_ids)
@@ -341,6 +508,16 @@ def _export_d2(
             src_xy=sources.src_xy,
             src_mask_id=sources.src_mask_id,
         )
+        if batch.persistent_tube_id is None:
+            batch.persistent_tube_id = np.asarray(batch.carrier_id, dtype=np.int64).copy()
+        if batch.parent_tube_id is None:
+            batch.parent_tube_id = np.full_like(batch.persistent_tube_id, -1)
+        if batch.warmstart_source_chunk is None:
+            batch.warmstart_source_chunk = np.full_like(batch.persistent_tube_id, -1)
+        if batch.warmstart_source_frame is None:
+            batch.warmstart_source_frame = np.full_like(batch.persistent_tube_id, -1)
+        if batch.is_warmstarted is None:
+            batch.is_warmstarted = np.zeros_like(batch.persistent_tube_id, dtype=bool)
         elapsed = float(time.time() - t0)
         saved = _save_batch(
             batch=batch,
@@ -354,6 +531,8 @@ def _export_d2(
             {
                 "actual_source_query_count": int(sources.src_uv.shape[0]),
                 "total_d4rt_time_sec": elapsed,
+                "mask_measurement_frame_count": int(len(data.get("sparse_mask_present_frame_ids", []))),
+                "missing_mask_frame_count": int(len(data.get("sparse_mask_missing_frame_ids", []))),
             }
         )
         windows.append(saved)
@@ -395,7 +574,7 @@ def _export_d5(
     total_retained = 0
     next_persistent_id = 0
     for window_index, cur_frame_ids in enumerate(window_ids):
-        data = _load_rgb_mask_window(stream, cur_frame_ids)
+        data = _load_rgb_sparse_mask_window(stream, cur_frame_ids)
         frames = np.asarray(data["rgb"])
         masks = np.asarray(data["mask"])
         warmstart = _warmstart_tracks_for_window_with_identity(
@@ -403,23 +582,64 @@ def _export_d5(
             previous_frame_ids=previous_frame_ids,
             current_frame_ids=cur_frame_ids,
         )
-        next_carrier_base = int(window_index) * 10_000_000
-        carrier_counter = [0]
+        seen_source_ids: set[int] = set()
 
         def decode(source_points: np.ndarray) -> list[dict[str, Any]]:
             src_frame = source_points[:, 0].astype(np.int64)
             src_uv = source_points[:, 1:3].astype(np.float32)
-            start = int(carrier_counter[0])
-            carrier_counter[0] += int(source_points.shape[0])
-            carrier_ids = next_carrier_base + np.arange(start, start + source_points.shape[0], dtype=np.int64)
+            src_frame_global, src_xy, src_mask_id = _source_arrays_from_points(
+                source_points=source_points,
+                frame_ids=cur_frame_ids,
+                image_width=int(frames.shape[2]),
+                image_height=int(frames.shape[1]),
+                masks=masks,
+            )
+            carrier_ids = np.asarray(
+                [
+                    stable_source_carrier_id(
+                        int(src_frame_global[idx]),
+                        int(src_xy[idx, 0]),
+                        int(src_xy[idx, 1]),
+                        int(frames.shape[2]),
+                    )
+                    for idx in range(int(source_points.shape[0]))
+                ],
+                dtype=np.int64,
+            )
+            keep = np.asarray(
+                [idx for idx, carrier_id in enumerate(carrier_ids.tolist()) if int(carrier_id) not in seen_source_ids],
+                dtype=np.int64,
+            )
+            if keep.size == 0:
+                return []
+            for carrier_id in carrier_ids[keep].tolist():
+                seen_source_ids.add(int(carrier_id))
+            source_points = source_points[keep]
+            src_frame = src_frame[keep]
+            src_uv = src_uv[keep]
+            src_frame_global = src_frame_global[keep]
+            src_xy = src_xy[keep]
+            src_mask_id = src_mask_id[keep]
+            carrier_ids = carrier_ids[keep]
             batch = adapter.infer_carriers(
                 video_rgb_uint8=frames,
                 src_uv_norm=src_uv,
                 src_frame_local=src_frame,
                 query_chunk_size=int(args.query_chunk_size),
                 carrier_id=carrier_ids,
+                src_frame_global=src_frame_global,
+                src_xy=src_xy,
+                src_mask_id=src_mask_id,
             )
-            return _tracks_from_batch_with_source(batch, source_points, carrier_ids)
+            return _tracks_from_batch_with_source(
+                batch,
+                source_points,
+                carrier_ids,
+                frame_ids=cur_frame_ids,
+                image_width=int(frames.shape[2]),
+                image_height=int(frames.shape[1]),
+                masks=masks,
+            )
 
         tubes, diag = query_d4rt_tubes_with_spatiotemporal_occupancy(
             frames=frames,
@@ -432,6 +652,33 @@ def _export_d5(
             ),
             warmstart_tracks=warmstart,
         )
+        topup_query_count = 0
+        topup_track_count = 0
+        topup_time = 0.0
+        if int(args.topup_fixed_points_per_mask) > 0:
+            topup_sampler = CarrierSampler(
+                max_points_per_mask=int(args.topup_fixed_points_per_mask),
+                min_points_per_mask=int(args.topup_fixed_min_points_per_mask),
+                strategy="grid_inside_mask",
+                seed=int(args.topup_seed),
+            )
+            topup_sources = topup_sampler.sample(masks=masks, frame_ids=cur_frame_ids)
+            if topup_sources.src_uv.shape[0] > 0:
+                source_points = np.concatenate(
+                    [
+                        np.asarray(topup_sources.src_frame, dtype=np.float32).reshape(-1, 1),
+                        np.asarray(topup_sources.src_uv, dtype=np.float32).reshape(-1, 2),
+                    ],
+                    axis=1,
+                )
+                t_topup = time.time()
+                topup_tracks = decode(source_points)
+                topup_time = float(time.time() - t_topup)
+                for track in topup_tracks:
+                    track["topup_source"] = True
+                tubes.extend(topup_tracks)
+                topup_query_count = int(len(topup_tracks))
+                topup_track_count = int(len(topup_tracks))
         next_persistent_id, identity_diag = _assign_persistent_tube_ids(
             tubes=tubes,
             previous_tracks=previous_tracks,
@@ -457,17 +704,30 @@ def _export_d5(
                 "query_budget_hit": bool(diag.get("query_budget_hit", False)),
                 "mask_interior_coverage_mean": diag.get("mask_interior_coverage_mean"),
                 "mask_boundary_coverage_mean": diag.get("mask_boundary_coverage_mean"),
-                "total_d4rt_time_sec": diag.get("total_d4rt_time_sec"),
+                "topup_query_count": int(topup_query_count),
+                "topup_track_count": int(topup_track_count),
+                "topup_time_sec": float(topup_time),
+                "total_d4rt_time_sec": float(diag.get("total_d4rt_time_sec", 0.0) or 0.0) + float(topup_time),
+                "mask_measurement_frame_count": int(len(data.get("sparse_mask_present_frame_ids", []))),
+                "missing_mask_frame_count": int(len(data.get("sparse_mask_missing_frame_ids", []))),
                 **identity_diag,
             }
         )
         window_summaries.append(saved)
-        total_queries += int(diag.get("actual_source_query_count", 0))
-        total_time += float(diag.get("total_d4rt_time_sec", 0.0) or 0.0)
+        total_queries += int(diag.get("actual_source_query_count", 0)) + int(topup_query_count)
+        total_time += float(diag.get("total_d4rt_time_sec", 0.0) or 0.0) + float(topup_time)
         total_warmstart += int(diag.get("warmstart_track_count", 0))
         total_retained += int(identity_diag.get("persistent_tube_retention_count", 0))
         previous_tracks = tubes
         previous_frame_ids = list(cur_frame_ids)
+        if bool(args.empty_cuda_cache_between_windows):
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+            except Exception:
+                pass
     row = {
         "variant": "D5_occupancy_dense_overlap_warmstart",
         "scene": args.seq_name,
@@ -478,6 +738,8 @@ def _export_d5(
         "warmstart_track_count": int(total_warmstart),
         "persistent_tube_retention_count": int(total_retained),
         "persistent_tube_retention_rate": float(total_retained / max(sum(row["num_carriers"] for row in window_summaries), 1)),
+        "topup_query_count": int(sum(int(row.get("topup_query_count", 0) or 0) for row in window_summaries)),
+        "topup_track_count": int(sum(int(row.get("topup_track_count", 0) or 0) for row in window_summaries)),
         "num_carriers_saved": int(sum(row["num_carriers"] for row in window_summaries)),
         "mark_radius_px": int(targets.mark_radius_px),
         "output_scene_dir": str(scene_dir),
@@ -531,6 +793,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mask-fixed-min-points-per-mask", type=int, default=4)
     parser.add_argument("--query-budget", type=int, default=7168)
     parser.add_argument("--source-points-per-round", type=int, default=512)
+    parser.add_argument("--topup-fixed-points-per-mask", type=int, default=0)
+    parser.add_argument("--topup-fixed-min-points-per-mask", type=int, default=2)
+    parser.add_argument("--topup-seed", type=int, default=2600)
+    parser.add_argument("--empty-cuda-cache-between-windows", action="store_true")
     parser.add_argument("--persistent-uv-radius", type=float, default=0.01)
     parser.add_argument("--query-chunk-size", type=int, default=2048)
     parser.add_argument("--min-visibility", type=float, default=0.5)

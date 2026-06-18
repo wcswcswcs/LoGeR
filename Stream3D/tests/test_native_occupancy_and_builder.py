@@ -12,7 +12,12 @@ from stream4d.carrier_store import CarrierBatch
 from stream4d_native.d4rt_scene_builder import D4RTNativeSceneBuilder
 from stream4d_native.occupancy_dense_tracker import QueryBudget, query_d4rt_tubes_with_spatiotemporal_occupancy
 from stream4d_native.occupancy_state import OccupancyCoverageTargets, SpatioTemporalOccupancyState
-from tools.export_v21_3_occupancy_carrier_cache import _assign_persistent_tube_ids, _export_d2, _tracks_to_batch
+from tools.export_v21_3_occupancy_carrier_cache import (
+    _assign_persistent_tube_ids,
+    _export_d2,
+    _tracks_from_batch_with_source,
+    _tracks_to_batch,
+)
 
 
 class FakeBatch:
@@ -43,20 +48,25 @@ class FakeExportAdapter:
         src_xy,
         src_mask_id,
     ):
-        del src_frame_local, query_chunk_size, src_frame_global, src_xy, src_mask_id
+        del query_chunk_size
         frames = int(video_rgb_uint8.shape[0])
         queries = int(src_uv_norm.shape[0])
         uv = np.tile(np.asarray(src_uv_norm, dtype=np.float32)[None, :, :], (frames, 1, 1))
         xyz = np.zeros((frames, queries, 3), dtype=np.float32)
+        xyz_local = xyz + 1.0
         return CarrierBatch(
             carrier_id=np.asarray(carrier_id, dtype=np.int64),
-            src_frame=np.zeros((queries,), dtype=np.int64),
+            src_frame=np.asarray(src_frame_local, dtype=np.int64),
             src_uv=np.asarray(src_uv_norm, dtype=np.float32),
             xyz_ref=xyz,
             uv_pred=uv,
             visibility_prob=np.ones((frames, queries), dtype=np.float32),
             confidence_prob=np.ones((frames, queries), dtype=np.float32),
             valid=np.ones((frames, queries), dtype=bool),
+            xyz_local=xyz_local,
+            src_frame_global=np.asarray(src_frame_global, dtype=np.int64),
+            src_xy=np.asarray(src_xy, dtype=np.int64),
+            src_mask_id=np.asarray(src_mask_id, dtype=np.int64),
         )
 
 
@@ -218,7 +228,51 @@ class NativeOccupancyAndBuilderTest(unittest.TestCase):
                 scene_dir / "carriers_window001.npz"
             ) as second:
                 shared = np.intersect1d(first["carrier_id"], second["carrier_id"])
+                self.assertIn("xyz_local", first.files)
+                self.assertIn("persistent_tube_id", first.files)
+                np.testing.assert_array_equal(first["persistent_tube_id"], first["carrier_id"])
             self.assertGreater(shared.shape[0], 0)
+
+    def test_d5_track_roundtrip_preserves_v26_provenance_fields(self) -> None:
+        frames = 2
+        queries = 2
+        batch = CarrierBatch(
+            carrier_id=np.asarray([100, 101], dtype=np.int64),
+            src_frame=np.asarray([0, 1], dtype=np.int64),
+            src_uv=np.asarray([[0.25, 0.25], [0.75, 0.75]], dtype=np.float32),
+            xyz_ref=np.zeros((frames, queries, 3), dtype=np.float32),
+            uv_pred=np.ones((frames, queries, 2), dtype=np.float32) * 0.5,
+            visibility_prob=np.ones((frames, queries), dtype=np.float32),
+            confidence_prob=np.ones((frames, queries), dtype=np.float32),
+            valid=np.ones((frames, queries), dtype=bool),
+            xyz_local=np.ones((frames, queries, 3), dtype=np.float32) * 3.0,
+            src_frame_global=np.asarray([10, 20], dtype=np.int64),
+            src_xy=np.asarray([[2, 3], [6, 7]], dtype=np.int64),
+            src_mask_id=np.asarray([4, 5], dtype=np.int64),
+        )
+        tracks = _tracks_from_batch_with_source(
+            batch,
+            np.asarray([[0, 0.25, 0.25], [1, 0.75, 0.75]], dtype=np.float32),
+            np.asarray([100, 101], dtype=np.int64),
+            frame_ids=[10, 20],
+            image_width=8,
+            image_height=8,
+            masks=np.zeros((2, 8, 8), dtype=np.int32),
+        )
+        self.assertIn("xyz_local", tracks[0])
+        self.assertEqual(tracks[1]["source_frame_global"], 20)
+        self.assertEqual(tracks[0]["source_xy"], (2, 3))
+        self.assertEqual(tracks[1]["src_mask_id"], 5)
+        roundtrip = _tracks_to_batch(tracks, [10, 20])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "carriers_window000.npz"
+            roundtrip.save_npz(path)
+            with np.load(path) as data:
+                self.assertIn("xyz_local", data.files)
+                self.assertIn("src_xy", data.files)
+                self.assertIn("src_mask_id", data.files)
+                np.testing.assert_array_equal(data["src_xy"], np.asarray([[2, 3], [6, 7]], dtype=np.int64))
+                np.testing.assert_array_equal(data["src_mask_id"], np.asarray([4, 5], dtype=np.int64))
 
     def test_d5_identity_assignment_writes_persistent_fields(self) -> None:
         previous = [
@@ -239,9 +293,13 @@ class NativeOccupancyAndBuilderTest(unittest.TestCase):
                 "visibility": np.ones((2,), dtype=np.float32),
                 "confidence": np.ones((2,), dtype=np.float32),
                 "xyz": np.zeros((2, 3), dtype=np.float32),
+                "xyz_local": np.ones((2, 3), dtype=np.float32),
                 "carrier_id": 9,
                 "source_frame": 0,
+                "source_frame_global": 10,
+                "source_xy": (3, 3),
                 "source_uv": np.asarray([0.4, 0.4], dtype=np.float32),
+                "src_mask_id": 1,
             }
         ]
         _, diag = _assign_persistent_tube_ids(
@@ -263,6 +321,8 @@ class NativeOccupancyAndBuilderTest(unittest.TestCase):
             with np.load(path) as data:
                 self.assertEqual(int(data["persistent_tube_id"][0]), 77)
                 self.assertTrue(bool(data["is_warmstarted"][0]))
+                self.assertIn("xyz_local", data.files)
+                self.assertIn("src_xy", data.files)
 
 
 if __name__ == "__main__":

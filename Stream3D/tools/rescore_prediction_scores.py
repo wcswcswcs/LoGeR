@@ -111,8 +111,8 @@ def rescore_sequence(args: argparse.Namespace, seq_name: str) -> dict[str, float
     manifest = build_prediction_manifest(
         root=root,
         output_config=args.output_config,
-        is_method_result=True,
-        is_diagnostic_only=False,
+        is_method_result=not bool(args.diagnostic_only),
+        is_diagnostic_only=bool(args.diagnostic_only),
         uses_gt=False,
         gt_usage="none",
         source_configs=[args.input_config],
@@ -132,6 +132,12 @@ def rescore_sequence(args: argparse.Namespace, seq_name: str) -> dict[str, float
             "tiebreaker_weight": float(args.tiebreaker_weight),
             "min_area": int(args.min_area),
             "max_area": int(args.max_area),
+            "forbidden_for_method_table": bool(args.forbidden_for_method_table),
+            "uses_rgbd_for_prediction": bool(args.uses_rgbd_for_prediction),
+            "uses_pose_for_prediction": bool(args.uses_pose_for_prediction),
+            "uses_scannet_mesh_for_prediction": bool(args.uses_scannet_mesh_for_prediction),
+            "alignment_source": args.alignment_source,
+            "alignment_used_for_prediction": bool(args.alignment_used_for_prediction),
         },
     )
     write_prediction_manifest(
@@ -215,6 +221,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-area", type=int, default=0)
     parser.add_argument("--eval-policy", default="own_recompute_score_calibration")
     parser.add_argument("--summary-root", default="outputs/stream4d_score_calibration_v4_1")
+    parser.add_argument("--diagnostic-only", action="store_true")
+    parser.add_argument("--forbidden-for-method-table", action="store_true")
+    parser.add_argument("--uses-rgbd-for-prediction", action="store_true")
+    parser.add_argument("--uses-pose-for-prediction", action="store_true")
+    parser.add_argument("--uses-scannet-mesh-for-prediction", action="store_true")
+    parser.add_argument("--alignment-source", default="none")
+    parser.add_argument("--alignment-used-for-prediction", action="store_true")
     return parser
 
 

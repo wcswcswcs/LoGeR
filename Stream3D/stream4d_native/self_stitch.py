@@ -194,6 +194,17 @@ def _match_by_mutual_uv(
     return pairs, cycle_candidates
 
 
+def _uv_inbounds(uv: np.ndarray) -> np.ndarray:
+    values = np.asarray(uv, dtype=np.float64)
+    return np.isfinite(values).all(axis=1) & (values[:, 0] >= 0.0) & (values[:, 0] <= 1.0) & (values[:, 1] >= 0.0) & (values[:, 1] <= 1.0)
+
+
+def _carrier_ids(data: dict[str, np.ndarray], length: int) -> np.ndarray:
+    if "carrier_id" in data:
+        return np.asarray(data["carrier_id"], dtype=np.int64).reshape(-1)
+    return np.full((int(length),), -1, dtype=np.int64)
+
+
 def match_overlap_carriers(
     prev: dict[str, np.ndarray],
     curr: dict[str, np.ndarray],
@@ -212,59 +223,83 @@ def match_overlap_carriers(
     overlap_frames = sorted(set(prev_by_frame) & set(curr_by_frame))
     stats = {
         "overlap_frame_count": int(len(overlap_frames)),
+        "raw_persistent_match_count": 0,
+        "raw_carrier_id_match_count": 0,
+        "raw_source_pixel_match_count": 0,
+        "raw_mutual_uv_match_count": 0,
+        "used_persistent_match_count": 0,
+        "used_carrier_id_match_count": 0,
+        "used_source_pixel_match_count": 0,
+        "used_mutual_uv_match_count": 0,
+        "raw_total_match_count": 0,
+        "used_total_match_count": 0,
+        "used_anchor_count": 0,
         "match_source_stable_id_count": 0,
+        "match_source_persistent_id_count": 0,
+        "match_source_carrier_id_count": 0,
         "match_source_same_source_pixel_count": 0,
         "match_source_mutual_uv_count": 0,
         "match_source_rejected_count": 0,
         "mutual_uv_cycle_candidate_count": 0,
+        "candidate_point_count": 0,
+        "uv_inbounds_point_count": 0,
+        "visibility_confidence_pass_point_count": 0,
         "appearance_consistency_available": False,
         "appearance_consistency_pass_ratio": None,
+        "missing_carrier_id_in_prev": bool("carrier_id" not in prev),
+        "missing_carrier_id_in_curr": bool("carrier_id" not in curr),
+        "default_range_id_detected": False,
     }
     for frame_id in overlap_frames:
         prev_local = prev_by_frame[int(frame_id)]
         curr_local = curr_by_frame[int(frame_id)]
+        prev_uv_ok = _uv_inbounds(prev["uv"][prev_local])
+        curr_uv_ok = _uv_inbounds(curr["uv"][curr_local])
+        stats["candidate_point_count"] += int(prev["xyz"].shape[1] + curr["xyz"].shape[1])
+        stats["uv_inbounds_point_count"] += int(np.count_nonzero(prev_uv_ok) + np.count_nonzero(curr_uv_ok))
         p_ok = (
             prev["valid"][prev_local]
             & (prev["visibility"][prev_local] >= float(min_visibility))
             & (prev["confidence"][prev_local] >= float(min_confidence))
-            & np.isfinite(prev["uv"][prev_local]).all(axis=1)
+            & prev_uv_ok
             & np.isfinite(prev["xyz"][prev_local]).all(axis=1)
         )
         c_ok = (
             curr["valid"][curr_local]
             & (curr["visibility"][curr_local] >= float(min_visibility))
             & (curr["confidence"][curr_local] >= float(min_confidence))
-            & np.isfinite(curr["uv"][curr_local]).all(axis=1)
+            & curr_uv_ok
             & np.isfinite(curr["xyz"][curr_local]).all(axis=1)
         )
         prev_positions = np.flatnonzero(p_ok)
         curr_positions = np.flatnonzero(c_ok)
+        stats["visibility_confidence_pass_point_count"] += int(prev_positions.size + curr_positions.size)
         if prev_positions.size == 0 or curr_positions.size == 0:
             continue
         used_prev: set[int] = set()
         used_curr: set[int] = set()
         prev_persistent = _optional_array(prev, "persistent_tube_id", int(prev["xyz"].shape[1]), default=-1)
         curr_persistent = _optional_array(curr, "persistent_tube_id", int(curr["xyz"].shape[1]), default=-1)
-        if np.any(prev_persistent[prev_positions] >= 0) or np.any(curr_persistent[curr_positions] >= 0):
-            stable_pairs = _match_by_id(
-                prev_persistent[prev_positions],
-                curr_persistent[curr_positions],
-                prev_positions,
-                curr_positions,
-                used_prev,
-                used_curr,
-                require_nonnegative=True,
-            )
-        else:
-            stable_pairs = _match_by_id(
-                np.asarray(prev["carrier_id"], dtype=np.int64)[prev_positions],
-                np.asarray(curr["carrier_id"], dtype=np.int64)[curr_positions],
-                prev_positions,
-                curr_positions,
-                used_prev,
-                used_curr,
-                require_nonnegative=False,
-            )
+        persistent_pairs = _match_by_id(
+            prev_persistent[prev_positions],
+            curr_persistent[curr_positions],
+            prev_positions,
+            curr_positions,
+            used_prev,
+            used_curr,
+            require_nonnegative=True,
+        )
+        prev_carrier = _carrier_ids(prev, int(prev["xyz"].shape[1]))
+        curr_carrier = _carrier_ids(curr, int(curr["xyz"].shape[1]))
+        carrier_pairs = _match_by_id(
+            prev_carrier[prev_positions],
+            curr_carrier[curr_positions],
+            prev_positions,
+            curr_positions,
+            used_prev,
+            used_curr,
+            require_nonnegative=True,
+        )
         source_pairs = _match_by_source_pixel(prev, curr, prev_positions, curr_positions, used_prev, used_curr)
         uv_pairs, uv_cycle_candidates = _match_by_mutual_uv(
             prev["uv"][prev_local],
@@ -275,31 +310,71 @@ def match_overlap_carriers(
             used_curr,
             uv_radius=float(uv_radius),
         )
-        pairs = stable_pairs + source_pairs + uv_pairs
+        tagged_pairs: list[tuple[int, int, str]] = (
+            [(p, c, "persistent") for p, c in persistent_pairs]
+            + [(p, c, "carrier_id") for p, c in carrier_pairs]
+            + [(p, c, "source_pixel") for p, c in source_pairs]
+            + [(p, c, "mutual_uv") for p, c in uv_pairs]
+        )
+        stats["raw_persistent_match_count"] += int(len(persistent_pairs))
+        stats["raw_carrier_id_match_count"] += int(len(carrier_pairs))
+        stats["raw_source_pixel_match_count"] += int(len(source_pairs))
+        stats["raw_mutual_uv_match_count"] += int(len(uv_pairs))
+        pairs = tagged_pairs
         if len(pairs) > int(max_matches_per_frame):
             keep = np.linspace(0, len(pairs) - 1, num=int(max_matches_per_frame), dtype=np.int64)
             pairs = [pairs[int(idx)] for idx in keep.tolist()]
-        stats["match_source_stable_id_count"] += int(len(stable_pairs))
-        stats["match_source_same_source_pixel_count"] += int(len(source_pairs))
-        stats["match_source_mutual_uv_count"] += int(len(uv_pairs))
+        used_counts = {
+            "persistent": sum(1 for _, _, kind in pairs if kind == "persistent"),
+            "carrier_id": sum(1 for _, _, kind in pairs if kind == "carrier_id"),
+            "source_pixel": sum(1 for _, _, kind in pairs if kind == "source_pixel"),
+            "mutual_uv": sum(1 for _, _, kind in pairs if kind == "mutual_uv"),
+        }
+        stats["used_persistent_match_count"] += int(used_counts["persistent"])
+        stats["used_carrier_id_match_count"] += int(used_counts["carrier_id"])
+        stats["used_source_pixel_match_count"] += int(used_counts["source_pixel"])
+        stats["used_mutual_uv_match_count"] += int(used_counts["mutual_uv"])
+        stats["match_source_persistent_id_count"] += int(used_counts["persistent"])
+        stats["match_source_carrier_id_count"] += int(used_counts["carrier_id"])
+        stats["match_source_stable_id_count"] += int(used_counts["persistent"] + used_counts["carrier_id"])
+        stats["match_source_same_source_pixel_count"] += int(used_counts["source_pixel"])
+        stats["match_source_mutual_uv_count"] += int(used_counts["mutual_uv"])
         stats["mutual_uv_cycle_candidate_count"] += int(uv_cycle_candidates)
-        stats["match_source_rejected_count"] += int(max(min(prev_positions.size, curr_positions.size) - len(pairs), 0))
+        stats["match_source_rejected_count"] += int(max(len(tagged_pairs) - len(pairs), 0))
         if pairs:
             p_idx = np.asarray([item[0] for item in pairs], dtype=np.int64)
             c_idx = np.asarray([item[1] for item in pairs], dtype=np.int64)
             prev_xyz_parts.append(prev["xyz"][prev_local, p_idx])
             curr_xyz_parts.append(curr["xyz"][curr_local, c_idx])
+    stats["raw_total_match_count"] = int(
+        stats["raw_persistent_match_count"]
+        + stats["raw_carrier_id_match_count"]
+        + stats["raw_source_pixel_match_count"]
+        + stats["raw_mutual_uv_match_count"]
+    )
     matched = (
         int(stats["match_source_stable_id_count"])
         + int(stats["match_source_same_source_pixel_count"])
         + int(stats["match_source_mutual_uv_count"])
     )
+    stats["used_total_match_count"] = int(matched)
+    stats["used_anchor_count"] = int(matched)
     stats["overlap_anchor_count"] = int(matched)
+    stats["subsample_rate"] = float(matched / max(int(stats["raw_total_match_count"]), 1))
+    stats["used_persistent_ratio"] = float(stats["used_persistent_match_count"] / max(matched, 1))
+    stats["used_carrier_id_ratio"] = float(stats["used_carrier_id_match_count"] / max(matched, 1))
+    stats["used_source_pixel_ratio"] = float(stats["used_source_pixel_match_count"] / max(matched, 1))
+    stats["used_mutual_uv_ratio"] = float(stats["used_mutual_uv_match_count"] / max(matched, 1))
+    stats["used_persistent_or_carrier_id_ratio"] = float(stats["match_source_stable_id_count"] / max(matched, 1))
     stats["stable_id_match_ratio"] = float(stats["match_source_stable_id_count"] / max(matched, 1))
     stats["same_source_pixel_match_ratio"] = float(stats["match_source_same_source_pixel_count"] / max(matched, 1))
     stats["mutual_uv_match_ratio"] = float(stats["match_source_mutual_uv_count"] / max(matched, 1))
     stats["cycle_consistency_pass_ratio"] = float(
         stats["match_source_mutual_uv_count"] / max(stats["mutual_uv_cycle_candidate_count"], 1)
+    )
+    stats["uv_inbounds_ratio"] = float(stats["uv_inbounds_point_count"] / max(stats["candidate_point_count"], 1))
+    stats["visibility_confidence_pass_ratio"] = float(
+        stats["visibility_confidence_pass_point_count"] / max(stats["candidate_point_count"], 1)
     )
     if not prev_xyz_parts:
         return OverlapMatchResult(

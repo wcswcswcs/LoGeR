@@ -7,6 +7,8 @@ from pathlib import Path
 
 import numpy as np
 
+from tools.prediction_manifest import build_prediction_manifest, write_prediction_manifest
+
 
 def _read_seq_list(path: Path) -> list[str]:
     with path.open("r", encoding="utf-8") as handle:
@@ -50,21 +52,72 @@ def _order_indices(scores: np.ndarray, areas: np.ndarray, tie_breaker: str) -> l
     raise ValueError(f"Unsupported tie breaker: {tie_breaker}")
 
 
-def nms_sequence(args: argparse.Namespace, seq_name: str) -> dict[str, float | str]:
-    root = Path(args.root)
-    pred_in = root / "data" / "prediction" / f"{args.input_config}{args.pred_suffix}" / f"{seq_name}.npz"
-    if not pred_in.exists():
-        raise FileNotFoundError(f"Missing prediction: {pred_in}")
-    with np.load(pred_in) as data:
-        masks = data["pred_masks"].astype(bool, copy=False)
-        scores = data["pred_score"].astype(np.float32, copy=False)
-        classes = data["pred_classes"].astype(np.int32, copy=False)
-
-    if masks.ndim != 2:
-        raise ValueError(f"{seq_name}: pred_masks must be 2D, got {masks.shape}")
-    areas = masks.sum(axis=0).astype(np.float64)
+def _sparse_overlap_nms(
+    masks: np.ndarray,
+    scores: np.ndarray,
+    areas: np.ndarray,
+    args: argparse.Namespace,
+) -> tuple[list[int], list[dict[str, float | int | str]]]:
+    point_ids_by_idx: dict[int, np.ndarray] = {}
     kept: list[int] = []
-    suppressed: list[dict[str, float | int]] = []
+    owners_by_point: dict[int, list[int]] = {}
+    suppressed: list[dict[str, float | int | str]] = []
+    for idx in _order_indices(scores, areas, args.tie_breaker):
+        area = float(areas[idx])
+        if int(args.min_area) > 0 and area < float(args.min_area):
+            suppressed.append({"idx": int(idx), "reason": "min_area", "area": area, "score": float(scores[idx])})
+            continue
+        if int(args.max_area) > 0 and area > float(args.max_area):
+            suppressed.append({"idx": int(idx), "reason": "max_area", "area": area, "score": float(scores[idx])})
+            continue
+        point_ids = point_ids_by_idx.get(idx)
+        if point_ids is None:
+            point_ids = np.flatnonzero(masks[:, idx]).astype(np.int64)
+            point_ids_by_idx[idx] = point_ids
+        intersections: dict[int, int] = {}
+        for point_id in point_ids.tolist():
+            for kept_idx in owners_by_point.get(int(point_id), ()):
+                intersections[kept_idx] = intersections.get(kept_idx, 0) + 1
+        overlap = 0.0
+        if intersections:
+            for kept_idx, inter in intersections.items():
+                kept_area = float(areas[int(kept_idx)])
+                if args.overlap_mode == "iou":
+                    denom = kept_area + area - float(inter)
+                elif args.overlap_mode == "candidate_ioc":
+                    denom = area
+                elif args.overlap_mode == "min_ioc":
+                    denom = min(kept_area, area)
+                else:
+                    raise ValueError(f"Unsupported overlap mode: {args.overlap_mode}")
+                overlap = max(overlap, float(inter) / max(float(denom), 1.0))
+        if overlap >= float(args.overlap_threshold):
+            suppressed.append(
+                {
+                    "idx": int(idx),
+                    "reason": "overlap",
+                    "overlap": float(overlap),
+                    "area": area,
+                    "score": float(scores[idx]),
+                }
+            )
+            continue
+        kept.append(idx)
+        for point_id in point_ids.tolist():
+            owners_by_point.setdefault(int(point_id), []).append(int(idx))
+        if int(args.max_instances) > 0 and len(kept) >= int(args.max_instances):
+            break
+    return kept, suppressed
+
+
+def _dense_overlap_nms(
+    masks: np.ndarray,
+    scores: np.ndarray,
+    areas: np.ndarray,
+    args: argparse.Namespace,
+) -> tuple[list[int], list[dict[str, float | int | str]]]:
+    kept: list[int] = []
+    suppressed: list[dict[str, float | int | str]] = []
     for idx in _order_indices(scores, areas, args.tie_breaker):
         area = float(areas[idx])
         if int(args.min_area) > 0 and area < float(args.min_area):
@@ -97,6 +150,28 @@ def nms_sequence(args: argparse.Namespace, seq_name: str) -> dict[str, float | s
         kept.append(idx)
         if int(args.max_instances) > 0 and len(kept) >= int(args.max_instances):
             break
+    return kept, suppressed
+
+
+def nms_sequence(args: argparse.Namespace, seq_name: str) -> dict[str, float | str]:
+    root = Path(args.root)
+    pred_in = root / "data" / "prediction" / f"{args.input_config}{args.pred_suffix}" / f"{seq_name}.npz"
+    if not pred_in.exists():
+        raise FileNotFoundError(f"Missing prediction: {pred_in}")
+    with np.load(pred_in) as data:
+        masks = data["pred_masks"].astype(bool, copy=False)
+        scores = data["pred_score"].astype(np.float32, copy=False)
+        classes = data["pred_classes"].astype(np.int32, copy=False)
+
+    if masks.ndim != 2:
+        raise ValueError(f"{seq_name}: pred_masks must be 2D, got {masks.shape}")
+    areas = masks.sum(axis=0).astype(np.float64)
+    if args.backend == "sparse":
+        kept, suppressed = _sparse_overlap_nms(masks, scores, areas, args)
+    elif args.backend == "dense":
+        kept, suppressed = _dense_overlap_nms(masks, scores, areas, args)
+    else:
+        raise ValueError(f"Unsupported backend: {args.backend}")
 
     kept_arr = np.asarray(kept, dtype=np.int64)
     out_masks = masks[:, kept_arr]
@@ -134,6 +209,7 @@ def nms_sequence(args: argparse.Namespace, seq_name: str) -> dict[str, float | s
         "overlap_mode": args.overlap_mode,
         "overlap_threshold": float(args.overlap_threshold),
         "tie_breaker": args.tie_breaker,
+        "backend": args.backend,
         "min_area": int(args.min_area),
         "max_area": int(args.max_area),
         "tmp_mode": tmp_mode,
@@ -160,6 +236,7 @@ def aggregate(rows: list[dict[str, float | str]], args: argparse.Namespace) -> d
         "overlap_mode": args.overlap_mode,
         "overlap_threshold": float(args.overlap_threshold),
         "tie_breaker": args.tie_breaker,
+        "backend": args.backend,
         "scenes": len(rows),
         **means,
     }
@@ -175,10 +252,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--overlap-mode", default="min_ioc", choices=["iou", "candidate_ioc", "min_ioc"])
     parser.add_argument("--overlap-threshold", type=float, default=0.9)
     parser.add_argument("--tie-breaker", default="original", choices=["original", "area_desc", "area_asc"])
+    parser.add_argument("--backend", default="dense", choices=["dense", "sparse"])
     parser.add_argument("--min-area", type=int, default=0)
     parser.add_argument("--max-area", type=int, default=0)
     parser.add_argument("--max-instances", type=int, default=0)
     parser.add_argument("--summary-root", default="outputs/stream4d_mask_nms_v4_1")
+    parser.add_argument("--eval-policy", default="prediction_mask_nms")
+    parser.add_argument("--diagnostic-only", action="store_true")
+    parser.add_argument("--forbidden-for-method-table", action="store_true")
+    parser.add_argument("--uses-rgbd-for-prediction", action="store_true")
+    parser.add_argument("--uses-pose-for-prediction", action="store_true")
+    parser.add_argument("--uses-scannet-mesh-for-prediction", action="store_true")
+    parser.add_argument("--alignment-source", default="none")
+    parser.add_argument("--alignment-used-for-prediction", action="store_true")
     return parser
 
 
@@ -191,6 +277,41 @@ def main() -> None:
     summary = {"args": vars(args), "aggregate": aggregate(rows, args), "rows": rows}
     out_path = out_dir / f"{args.output_config}_summary.json"
     out_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    manifest = build_prediction_manifest(
+        root=args.root,
+        output_config=args.output_config,
+        is_method_result=not bool(args.diagnostic_only),
+        is_diagnostic_only=bool(args.diagnostic_only),
+        uses_gt=False,
+        gt_usage="none",
+        source_configs=[args.input_config],
+        pre_points_policy="input_tmp_copy_or_union_recompute",
+        support_policy=(
+            f"prediction_mask_nms:{args.overlap_mode}@{args.overlap_threshold}:"
+            f"tie={args.tie_breaker}:backend={args.backend}:area={args.min_area}-{args.max_area}:"
+            f"max_instances={args.max_instances}"
+        ),
+        notes="Applies mask-level non-maximum suppression to predicted point masks using prediction scores/areas only; no GT is read.",
+        extra={
+            "algorithm": "nms_prediction_masks",
+            "eval_policy": args.eval_policy,
+            "input_config": args.input_config,
+            "overlap_mode": args.overlap_mode,
+            "overlap_threshold": float(args.overlap_threshold),
+            "tie_breaker": args.tie_breaker,
+            "backend": args.backend,
+            "min_area": int(args.min_area),
+            "max_area": int(args.max_area),
+            "max_instances": int(args.max_instances),
+            "forbidden_for_method_table": bool(args.forbidden_for_method_table),
+            "uses_rgbd_for_prediction": bool(args.uses_rgbd_for_prediction),
+            "uses_pose_for_prediction": bool(args.uses_pose_for_prediction),
+            "uses_scannet_mesh_for_prediction": bool(args.uses_scannet_mesh_for_prediction),
+            "alignment_source": args.alignment_source,
+            "alignment_used_for_prediction": bool(args.alignment_used_for_prediction),
+        },
+    )
+    write_prediction_manifest(args.output_config, manifest, root=args.root, pred_suffix=args.pred_suffix.lstrip("_"))
     print(f"[nms-prediction-masks] wrote {out_path}")
 
 

@@ -91,6 +91,10 @@ _STATIC_THING_LABELS = [
     "cabinet", "shelf", "desk", "table", "sofa", "bed", "refrigerator",
     "oven", "sink", "toilet", "bathtub", "counter", "bookshelf",
     "fixed furniture", "large appliance", "door", "window",
+    "traffic sign", "road sign", "direction sign", "sign board", "billboard",
+    "guide sign", "highway sign", "roadside sign", "information sign",
+    "chevron marker", "signpost", "pole", "bollard", "delineator post",
+    "roadside post", "traffic light", "traffic cone", "guardrail", "barrier",
 ]
 _MOVABLE_THING_LABELS = [
     "person", "people", "rider", "bicycle", "motorcycle", "car", "bus",
@@ -110,6 +114,20 @@ _LOW_VALUE_STUFF_LABELS = [
 ]
 _PERSON_ALIASES = {
     "person", "people", "man", "woman", "singer", "dancer", "performer", "rider"
+}
+_LABEL_ALIASES = {
+    "road sign": "traffic sign",
+    "direction sign": "traffic sign",
+    "sign board": "traffic sign",
+    "billboard": "traffic sign",
+    "guide sign": "traffic sign",
+    "highway sign": "traffic sign",
+    "roadside sign": "traffic sign",
+    "information sign": "traffic sign",
+    "chevron marker": "traffic sign",
+    "signpost": "traffic sign",
+    "delineator post": "pole",
+    "roadside post": "pole",
 }
 
 for _lbl in _STRUCTURE_LABELS:
@@ -139,6 +157,7 @@ _GROUP_PRIORITY: Dict[int, int] = {
 @lru_cache(maxsize=512)
 def _classify_label(label: str) -> Tuple[int, str]:
     label_lower = label.strip().lower()
+    label_lower = _LABEL_ALIASES.get(label_lower, label_lower)
     if label_lower in _LABEL_TO_GROUP:
         return _LABEL_TO_GROUP[label_lower], label_lower
 
@@ -722,6 +741,7 @@ class YOLOEDetector(BaseDetector):
             "conf": yolo_conf,
             "verbose": False,
             "batch": self.batch_size,
+            "retina_masks": True,
         }
         if self.imgsz > 0:
             predict_kwargs["imgsz"] = self.imgsz
@@ -739,6 +759,7 @@ class YOLOEDetector(BaseDetector):
             "conf": yolo_conf,
             "verbose": False,
             "batch": self.batch_size,
+            "retina_masks": True,
         }
         if self.imgsz > 0:
             predict_kwargs["imgsz"] = self.imgsz
@@ -777,6 +798,7 @@ class MaskletOutput:
     source_type: List[str] = field(default_factory=list)  # "thing_tracked" | "structure_tracked" | "stuff_static"
     birth_frame: List[int] = field(default_factory=list)
     seed_global_track_idx: List[Optional[int]] = field(default_factory=list)
+    semantic_segmentation: Dict[str, Any] = field(default_factory=dict)
     debug: Dict[str, Any] = field(default_factory=dict)
 
 

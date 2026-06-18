@@ -18,6 +18,8 @@ Phase 1: deterministic replay with token-level prior weighting.
 
 from __future__ import annotations
 
+import os
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -369,6 +371,7 @@ class TTTWriteController:
             w2_new,
             debug_info,
         )
+        self._summarize_commit_against_native(write_cache, w0_new, w1_new, w2_new, debug_info)
         transient_delta_out = transient_delta if self._has_transient_delta(transient_delta) else carry_transient_delta
         if self._has_transient_delta(transient_delta):
             transient_delta_out["_ttl_remaining"] = int(self.transient_delta_ttl)
@@ -4954,6 +4957,142 @@ class TTTWriteController:
         debug_info["ttt_write_commit_ema_alpha"] = alpha
         debug_info["ttt_write_commit_ema_chunk_gate_active"] = True
         debug_info["ttt_write_commit_ema_num_tensors"] = int(applied)
+
+    def _summarize_commit_against_native(
+        self,
+        write_cache: WriteCacheOutput,
+        w0_new: List[Optional[torch.Tensor]],
+        w1_new: List[Optional[torch.Tensor]],
+        w2_new: List[Optional[torch.Tensor]],
+        debug_info: Dict[str, Any],
+    ) -> None:
+        """Record detached post-write delta summaries without changing state."""
+        enabled = str(os.environ.get("TTT_WRITE_POST_ZP_SUMMARY", "1")).strip().lower()
+        if enabled in {"0", "false", "off", "no"}:
+            debug_info["ttt_post_zp_delta_summary_available"] = False
+            debug_info["ttt_post_zp_delta_summary_disabled"] = True
+            return
+
+        branches = (
+            ("w0", w0_new, write_cache.w0_provisional, "w0_old"),
+            ("w1", w1_new, write_cache.w1_provisional, "w1_old"),
+            ("w2", w2_new, write_cache.w2_provisional, "w2_old"),
+        )
+        eps = 1e-12
+        committed_norms: List[float] = []
+        native_norms: List[float] = []
+        action_norms: List[float] = []
+        committed_native_cos: List[float] = []
+        action_native_cos: List[float] = []
+        row_count = 0
+        dump_dir_text = str(os.environ.get("TTT_WRITE_POST_ZP_DUMP_DIR", "") or "").strip()
+        dump_dtype_name = str(os.environ.get("TTT_WRITE_POST_ZP_DUMP_DTYPE", "float16") or "float16").strip().lower()
+        dump_dtype = torch.float32 if dump_dtype_name == "float32" else torch.float16
+        dump_payload: Optional[Dict[str, Any]] = None
+        if dump_dir_text:
+            current_chunk = int(getattr(self, "current_chunk_idx", getattr(self, "v11_projection_chunk_idx", -1)))
+            dump_payload = {
+                "schema": "acl2_v68_ttt_post_zp_delta_dump_v1",
+                "chunk_idx": current_chunk,
+                "dump_dtype": str(dump_dtype),
+                "tensors_are_fast_weight_deltas_not_spatial_token_maps": True,
+                "rows": [],
+                "deltas": {},
+            }
+
+        for name, committed_list, native_list, old_attr in branches:
+            for li, committed in enumerate(committed_list):
+                if committed is None or li >= len(native_list) or li >= len(write_cache.layer_caches):
+                    continue
+                native = native_list[li]
+                old = getattr(write_cache.layer_caches[li], old_attr, None)
+                if native is None or old is None:
+                    continue
+                committed_f = committed.detach().float()
+                native_f = native.detach().float().to(device=committed_f.device)
+                old_f = old.detach().float().to(device=committed_f.device)
+                if committed_f.shape != native_f.shape or committed_f.shape != old_f.shape:
+                    layer_debug = debug_info.get(f"layer_{li}")
+                    if isinstance(layer_debug, dict):
+                        layer_debug[f"ttt_post_zp_{name}_summary_skip"] = "shape_mismatch"
+                    continue
+
+                committed_delta = committed_f - old_f
+                native_delta = native_f - old_f
+                action_delta = committed_f - native_f
+                committed_norm = torch.linalg.vector_norm(committed_delta.reshape(-1)).clamp_min(eps)
+                native_norm = torch.linalg.vector_norm(native_delta.reshape(-1)).clamp_min(eps)
+                action_norm = torch.linalg.vector_norm(action_delta.reshape(-1)).clamp_min(eps)
+                cos_committed = (
+                    committed_delta.reshape(-1) @ native_delta.reshape(-1)
+                ) / (committed_norm * native_norm)
+                cos_action = (
+                    action_delta.reshape(-1) @ native_delta.reshape(-1)
+                ) / (action_norm * native_norm)
+                cos_committed = cos_committed.clamp(-1.0, 1.0)
+                cos_action = cos_action.clamp(-1.0, 1.0)
+
+                c_norm = float(committed_norm.item())
+                n_norm = float(native_norm.item())
+                a_norm = float(action_norm.item())
+                c_cos = float(cos_committed.item())
+                a_cos = float(cos_action.item())
+                committed_norms.append(c_norm)
+                native_norms.append(n_norm)
+                action_norms.append(a_norm)
+                committed_native_cos.append(c_cos)
+                action_native_cos.append(a_cos)
+                row_count += 1
+
+                layer_debug = debug_info.get(f"layer_{li}")
+                if isinstance(layer_debug, dict):
+                    layer_debug[f"ttt_post_zp_{name}_committed_delta_norm"] = c_norm
+                    layer_debug[f"ttt_post_zp_{name}_native_delta_norm"] = n_norm
+                    layer_debug[f"ttt_post_zp_{name}_action_delta_norm"] = a_norm
+                    layer_debug[f"candidate_native_cos_{name}"] = c_cos
+                    layer_debug[f"candidate_action_native_cos_{name}"] = a_cos
+
+                if dump_payload is not None:
+                    key = f"layer_{int(li):02d}_{name}"
+                    dump_payload["rows"].append({
+                        "layer": int(li),
+                        "branch": str(name),
+                        "shape": [int(v) for v in committed_delta.shape],
+                        "committed_delta_norm": c_norm,
+                        "native_delta_norm": n_norm,
+                        "action_delta_norm": a_norm,
+                        "candidate_native_cos": c_cos,
+                        "candidate_action_native_cos": a_cos,
+                    })
+                    dump_payload["deltas"][key] = {
+                        "committed_delta": committed_delta.detach().cpu().to(dtype=dump_dtype),
+                        "native_delta": native_delta.detach().cpu().to(dtype=dump_dtype),
+                        "action_delta": action_delta.detach().cpu().to(dtype=dump_dtype),
+                    }
+
+        def mean(values: List[float]) -> Optional[float]:
+            return float(sum(values) / len(values)) if values else None
+
+        debug_info["ttt_post_zp_delta_summary_available"] = bool(row_count)
+        debug_info["ttt_post_zp_delta_summary_count"] = int(row_count)
+        debug_info["ttt_post_zp_committed_delta_norm_mean"] = mean(committed_norms)
+        debug_info["ttt_post_zp_native_delta_norm_mean"] = mean(native_norms)
+        debug_info["ttt_post_zp_action_delta_norm_mean"] = mean(action_norms)
+        debug_info["candidate_native_cosine_mean"] = mean(committed_native_cos)
+        debug_info["candidate_action_native_cosine_mean"] = mean(action_native_cos)
+        if dump_payload is not None:
+            out_dir = Path(dump_dir_text)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            chunk_idx = int(dump_payload.get("chunk_idx", -1))
+            if chunk_idx >= 0:
+                out_path = out_dir / f"chunk_{chunk_idx:03d}_ttt_post_zp_delta.pt"
+            else:
+                out_path = out_dir / "chunk_unknown_ttt_post_zp_delta.pt"
+            torch.save(dump_payload, out_path)
+            debug_info["ttt_post_zp_delta_dump_path"] = str(out_path)
+            debug_info["ttt_post_zp_delta_dump_tensor_groups"] = int(len(dump_payload["deltas"]))
+            debug_info["ttt_post_zp_delta_dump_rows"] = int(len(dump_payload["rows"]))
+            debug_info["ttt_post_zp_delta_dump_dtype"] = str(dump_dtype)
 
     @staticmethod
     def _has_transient_delta(

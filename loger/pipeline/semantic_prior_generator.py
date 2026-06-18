@@ -33,6 +33,7 @@ from .video_masklet_frontend import (
     SEMANTIC_GROUP_STRUCTURE_ANCHOR,
     SEMANTIC_GROUP_UNCERTAIN_REGION,
     canonicalize_label,
+    label_to_group,
 )
 
 SEMANTIC_ROLE_FALLBACK = 0
@@ -61,6 +62,12 @@ SEMANTIC_FINE_LABEL_TO_ID = {
     "railing": 7,
     "floor": 8,
     "stair": 9,
+    "ground": 10,
+    "crosswalk": 11,
+    "pole": 12,
+    "traffic sign": 13,
+    "billboard": 14,
+    "house": 15,
     "sky": 20,
     "vegetation": 21,
     "grass": 22,
@@ -68,6 +75,8 @@ SEMANTIC_FINE_LABEL_TO_ID = {
     "plant": 24,
     "water": 25,
     "cloud": 26,
+    "terrain": 27,
+    "mountain": 28,
     "person": 40,
     "people": 40,
     "rider": 41,
@@ -86,12 +95,12 @@ SEMANTIC_FINE_ID_TO_LABEL = {
 
 SEMANTIC_FINE_STRUCTURE_IDS = {
     SEMANTIC_FINE_LABEL_TO_ID[k]
-    for k in ("road", "sidewalk", "building", "wall", "fence", "bridge", "railing", "floor", "stair")
+    for k in ("road", "sidewalk", "building", "wall", "fence", "bridge", "railing", "floor", "stair", "ground", "crosswalk", "pole", "traffic sign", "house")
 }
 SEMANTIC_FINE_SKY_IDS = {SEMANTIC_FINE_LABEL_TO_ID["sky"], SEMANTIC_FINE_LABEL_TO_ID["cloud"]}
 SEMANTIC_FINE_VEGETATION_IDS = {
     SEMANTIC_FINE_LABEL_TO_ID[k]
-    for k in ("vegetation", "grass", "tree", "plant")
+    for k in ("vegetation", "grass", "tree", "plant", "terrain", "mountain")
 }
 SEMANTIC_FINE_MOVABLE_IDS = {
     SEMANTIC_FINE_LABEL_TO_ID[k]
@@ -271,6 +280,357 @@ def project_masklet_semantic_groups(
         "R_global_tok": R_global_tok,
         "R_swa_tok": R_swa_tok,
         "R_ttt_tok": R_ttt_tok,
+    }
+
+
+def _normalise_dense_label_name(label: str) -> str:
+    return str(label).strip().lower().replace("_", " ").replace("/", " ")
+
+
+def _dense_label_metadata(label_names: Any) -> Dict[str, Any]:
+    names = [str(x) for x in (list(label_names) if label_names is not None else [])]
+    group_ids = []
+    fine_ids = []
+    canonical_names = []
+    void_ids = []
+    dynamic_ids = []
+    sky_ids = []
+    vegetation_ids = []
+    vertical_static_ids = []
+    ground_static_ids = []
+
+    dynamic = {"car", "truck", "bus", "van", "person", "people", "rider", "cyclist", "bicycle", "motorcycle", "animal"}
+    sky = {"sky", "cloud"}
+    vegetation = {"vegetation", "tree", "grass", "plant", "terrain", "mountain"}
+    vertical_static = {
+        "building",
+        "wall",
+        "fence",
+        "railing",
+        "pole",
+        "traffic sign",
+        "traffic light",
+        "bridge",
+        "billboard",
+        "house",
+    }
+    ground_static = {"road", "ground", "sidewalk", "floor", "crosswalk"}
+    void = {"void", "unknown", "unlabeled"}
+
+    for idx, raw_name in enumerate(names):
+        norm = _normalise_dense_label_name(raw_name)
+        try:
+            canonical = canonicalize_label(norm)
+        except Exception:
+            canonical = norm
+        if "fence" in norm and canonical not in {"fence", "railing"}:
+            canonical = "fence"
+        elif "billboard" in norm:
+            canonical = "billboard"
+        elif canonical == "unknown" and norm in {"ground", "crosswalk", "house", "mountain"}:
+            canonical = norm
+
+        if norm in void or canonical in void or idx == 0:
+            group = int(SEMANTIC_GROUP_UNCERTAIN_REGION)
+            fine = int(SEMANTIC_FINE_LABEL_UNKNOWN)
+            void_ids.append(idx)
+        elif canonical in dynamic:
+            group = int(SEMANTIC_GROUP_MOVABLE_THING)
+            fine = semantic_fine_label_id(canonical)
+            dynamic_ids.append(idx)
+        elif canonical in sky:
+            group = int(SEMANTIC_GROUP_LOW_VALUE_STUFF)
+            fine = semantic_fine_label_id(canonical)
+            sky_ids.append(idx)
+        elif canonical in vegetation:
+            group = int(SEMANTIC_GROUP_LOW_VALUE_STUFF)
+            fine = semantic_fine_label_id(canonical)
+            vegetation_ids.append(idx)
+        elif canonical in vertical_static:
+            group = int(SEMANTIC_GROUP_STRUCTURE_ANCHOR)
+            fine = semantic_fine_label_id(canonical)
+            vertical_static_ids.append(idx)
+        elif canonical in ground_static:
+            group = int(SEMANTIC_GROUP_STRUCTURE_ANCHOR)
+            fine = semantic_fine_label_id(canonical)
+            ground_static_ids.append(idx)
+        else:
+            group = int(label_to_group(canonical))
+            fine = semantic_fine_label_id(canonical)
+
+        group_ids.append(group)
+        fine_ids.append(fine)
+        canonical_names.append(canonical)
+
+    return {
+        "label_names": names,
+        "canonical_names": canonical_names,
+        "group_ids": torch.tensor(group_ids, dtype=torch.long),
+        "fine_ids": torch.tensor(fine_ids, dtype=torch.long),
+        "void_ids": void_ids,
+        "dynamic_ids": dynamic_ids,
+        "sky_ids": sky_ids,
+        "vegetation_ids": vegetation_ids,
+        "vertical_static_ids": vertical_static_ids,
+        "ground_static_ids": ground_static_ids,
+    }
+
+
+def _normalize_dense_semantic_confidence(
+    confidence_maps: Any,
+    *,
+    target_shape: Tuple[int, int, int],
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    T, H, W = (int(target_shape[0]), int(target_shape[1]), int(target_shape[2]))
+    default = torch.ones((T, H, W), dtype=torch.float32)
+    debug: Dict[str, Any] = {
+        "semantic_confidence_available": False,
+        "semantic_confidence_shape": None,
+        "semantic_confidence_raw_min": None,
+        "semantic_confidence_raw_max": None,
+        "semantic_confidence_normalized_min": None,
+        "semantic_confidence_normalized_max": None,
+        "semantic_confidence_normalization_applied": False,
+        "semantic_confidence_projection_note": "unavailable_default_ones",
+    }
+    if confidence_maps is None:
+        return default, debug
+    if not isinstance(confidence_maps, torch.Tensor):
+        confidence_maps = torch.as_tensor(confidence_maps)
+    debug["semantic_confidence_available"] = True
+    debug["semantic_confidence_shape"] = [int(x) for x in confidence_maps.shape]
+    was_uint8 = confidence_maps.dtype == torch.uint8
+    conf = confidence_maps.detach().cpu().float()
+    if conf.ndim == 4 and int(conf.shape[-1]) == 1:
+        conf = conf[..., 0]
+        debug["semantic_confidence_projection_note"] = "squeezed_last_singleton"
+    if conf.ndim != 3:
+        debug["semantic_confidence_available"] = False
+        debug["semantic_confidence_projection_note"] = f"invalid_ndim_{int(conf.ndim)}_default_ones"
+        return default, debug
+
+    raw_finite = torch.isfinite(conf)
+    if bool(raw_finite.any().item()):
+        raw_vals = conf[raw_finite]
+        raw_min = float(raw_vals.min().item())
+        raw_max = float(raw_vals.max().item())
+    else:
+        raw_min = 0.0
+        raw_max = 0.0
+    debug["semantic_confidence_raw_min"] = raw_min
+    debug["semantic_confidence_raw_max"] = raw_max
+    normalization_applied = bool(was_uint8 or raw_max > 2.0)
+    if normalization_applied:
+        conf = conf / 255.0
+    conf = torch.nan_to_num(conf, nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+
+    if int(conf.shape[0]) < T:
+        pad = torch.zeros((T - int(conf.shape[0]), int(conf.shape[-2]), int(conf.shape[-1])), dtype=torch.float32)
+        conf = torch.cat([conf, pad], dim=0)
+        debug["semantic_confidence_projection_note"] = "temporal_zero_pad"
+    conf = conf[:T]
+    if (int(conf.shape[1]), int(conf.shape[2])) != (H, W):
+        conf = F.interpolate(conf[:, None], size=(H, W), mode="bilinear", align_corners=False).squeeze(1)
+        prev_note = str(debug.get("semantic_confidence_projection_note") or "as_is")
+        debug["semantic_confidence_projection_note"] = f"{prev_note}+bilinear_resize"
+    conf = conf.clamp(0.0, 1.0)
+    finite = torch.isfinite(conf)
+    if bool(finite.any().item()):
+        vals = conf[finite]
+        debug["semantic_confidence_normalized_min"] = float(vals.min().item())
+        debug["semantic_confidence_normalized_max"] = float(vals.max().item())
+    else:
+        debug["semantic_confidence_normalized_min"] = 0.0
+        debug["semantic_confidence_normalized_max"] = 0.0
+    debug["semantic_confidence_normalization_applied"] = normalization_applied
+    if debug["semantic_confidence_projection_note"] == "unavailable_default_ones":
+        debug["semantic_confidence_projection_note"] = "as_is"
+    return conf.to(torch.float32), debug
+
+
+def _mode_pool_dense_semantic_patches(
+    maps: torch.Tensor,
+    confidence: torch.Tensor,
+    *,
+    patch_grid: Tuple[int, int],
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    T, H, W = int(maps.shape[0]), int(maps.shape[1]), int(maps.shape[2])
+    H_tok, W_tok = int(patch_grid[0]), int(patch_grid[1])
+    label_patch = torch.zeros((T, H_tok, W_tok), dtype=torch.long)
+    purity_patch = torch.zeros((T, H_tok, W_tok), dtype=torch.float32)
+    confidence_patch = torch.zeros((T, H_tok, W_tok), dtype=torch.float32)
+    y_edges = [int(round(i * H / max(H_tok, 1))) for i in range(H_tok + 1)]
+    x_edges = [int(round(i * W / max(W_tok, 1))) for i in range(W_tok + 1)]
+    y_edges[0], y_edges[-1] = 0, H
+    x_edges[0], x_edges[-1] = 0, W
+    for t in range(T):
+        frame = maps[t]
+        conf = confidence[t]
+        for yi in range(H_tok):
+            y0 = max(0, min(H, y_edges[yi]))
+            y1 = max(y0 + 1, min(H, y_edges[yi + 1]))
+            for xi in range(W_tok):
+                x0 = max(0, min(W, x_edges[xi]))
+                x1 = max(x0 + 1, min(W, x_edges[xi + 1]))
+                region = frame[y0:y1, x0:x1].reshape(-1).long()
+                if region.numel() <= 0:
+                    continue
+                values, counts = torch.unique(region, return_counts=True)
+                best = int(torch.argmax(counts).item())
+                mode_label = values[best]
+                mode_count = counts[best]
+                label_patch[t, yi, xi] = mode_label
+                purity_patch[t, yi, xi] = float(mode_count.item()) / float(max(int(region.numel()), 1))
+                mode_mask = region == mode_label
+                conf_region = conf[y0:y1, x0:x1].reshape(-1).float()
+                if bool(mode_mask.any().item()):
+                    confidence_patch[t, yi, xi] = conf_region[mode_mask].mean()
+    return label_patch, purity_patch.clamp(0.0, 1.0), confidence_patch.clamp(0.0, 1.0)
+
+
+def project_dense_semantic_label_maps(
+    masklet: MaskletOutput,
+    geo: GeometryOutput,
+    *,
+    num_frames: int,
+    pixel_resolution: Tuple[int, int],
+    patch_grid: Tuple[int, int],
+) -> Optional[Dict[str, torch.Tensor]]:
+    """Project dense semantic label maps to the existing patch/token streams."""
+
+    sem = getattr(masklet, "semantic_segmentation", {}) or {}
+    label_maps = sem.get("label_maps")
+    if label_maps is None:
+        return None
+    if not isinstance(label_maps, torch.Tensor):
+        label_maps = torch.as_tensor(label_maps)
+    if int(label_maps.ndim) != 3:
+        return None
+
+    T = int(num_frames)
+    H_tok, W_tok = int(patch_grid[0]), int(patch_grid[1])
+    if T <= 0 or H_tok <= 0 or W_tok <= 0:
+        return None
+    T_use = min(T, int(label_maps.shape[0]))
+    maps = label_maps[:T_use].detach().cpu().long()
+    if T_use < T:
+        pad = torch.zeros((T - T_use, int(maps.shape[-2]), int(maps.shape[-1])), dtype=torch.long)
+        maps = torch.cat([maps, pad], dim=0)
+
+    confidence_maps = sem.get("confidence_maps")
+    confidence, confidence_debug = _normalize_dense_semantic_confidence(
+        confidence_maps,
+        target_shape=(T, int(maps.shape[-2]), int(maps.shape[-1])),
+    )
+    label_patch, patch_purity, patch_confidence = _mode_pool_dense_semantic_patches(
+        maps,
+        confidence,
+        patch_grid=(H_tok, W_tok),
+    )
+
+    meta = _dense_label_metadata(sem.get("label_names", []))
+    max_label_id = int(label_patch.max().item()) if label_patch.numel() > 0 else 0
+    lut_len = max(max_label_id + 1, int(meta["group_ids"].numel()), 1)
+    group_lut = torch.full((lut_len,), int(SEMANTIC_GROUP_UNCERTAIN_REGION), dtype=torch.long)
+    fine_lut = torch.full((lut_len,), int(SEMANTIC_FINE_LABEL_UNKNOWN), dtype=torch.long)
+    n_meta = int(meta["group_ids"].numel())
+    if n_meta > 0:
+        group_lut[:n_meta] = meta["group_ids"][: min(n_meta, lut_len)]
+        fine_lut[:n_meta] = meta["fine_ids"][: min(n_meta, lut_len)]
+
+    safe_label_patch = label_patch.clamp(min=0, max=lut_len - 1)
+    group_patch = group_lut[safe_label_patch]
+    fine_patch = fine_lut[safe_label_patch]
+    void_ids = set(int(x) for x in meta["void_ids"])
+    if void_ids:
+        nonvoid_patch = torch.ones_like(label_patch, dtype=torch.float32)
+        for vid in void_ids:
+            nonvoid_patch[label_patch == int(vid)] = 0.0
+    else:
+        nonvoid_patch = (label_patch != 0).float()
+    semantic_trust_patch = (patch_confidence * patch_purity.square() * nonvoid_patch).clamp(0.0, 1.0)
+
+    G_patch_flat = group_patch.reshape(-1).long()
+    Q_patch_flat = semantic_trust_patch.reshape(-1).float().clamp(0.0, 1.0)
+    L_patch_flat = fine_patch.reshape(-1).long()
+    R_patch_flat = semantic_roles_from_groups(G_patch_flat, Q_patch_flat)
+    path_roles = semantic_path_role_priors_from_fine_labels(L_patch_flat, G_patch_flat, Q_patch_flat)
+
+    token_type = geo.token_type.detach().cpu().long()
+    L_tok = int(token_type.numel())
+    G_tok = torch.full((L_tok,), int(SEMANTIC_GROUP_UNCERTAIN_REGION), dtype=torch.long)
+    Q_tok = torch.zeros((L_tok,), dtype=torch.float32)
+    L_label_tok = torch.full((L_tok,), int(SEMANTIC_FINE_LABEL_UNKNOWN), dtype=torch.long)
+    R_tok = torch.full((L_tok,), int(SEMANTIC_ROLE_FALLBACK), dtype=torch.long)
+    R_frame_tok = torch.full((L_tok,), int(SEMANTIC_ROLE_FALLBACK), dtype=torch.long)
+    R_global_tok = torch.full((L_tok,), int(SEMANTIC_ROLE_FALLBACK), dtype=torch.long)
+    R_swa_tok = torch.full((L_tok,), int(SEMANTIC_ROLE_FALLBACK), dtype=torch.long)
+    R_ttt_tok = torch.full((L_tok,), int(SEMANTIC_ROLE_FALLBACK), dtype=torch.long)
+    patch_idx = 0
+    for i in range(L_tok):
+        if int(token_type[i].item()) == TOKEN_TYPE_PATCH:
+            if patch_idx < int(G_patch_flat.numel()):
+                G_tok[i] = G_patch_flat[patch_idx]
+                Q_tok[i] = Q_patch_flat[patch_idx]
+                L_label_tok[i] = L_patch_flat[patch_idx]
+                R_tok[i] = R_patch_flat[patch_idx]
+                R_frame_tok[i] = path_roles["R_frame_patch_flat"][patch_idx]
+                R_global_tok[i] = path_roles["R_global_patch_flat"][patch_idx]
+                R_swa_tok[i] = path_roles["R_swa_patch_flat"][patch_idx]
+                R_ttt_tok[i] = path_roles["R_ttt_patch_flat"][patch_idx]
+            patch_idx += 1
+
+    nonvoid_ratio = float(nonvoid_patch.reshape(-1).mean().item()) if nonvoid_patch.numel() > 0 else 0.0
+    patch_purity_mean = float(patch_purity.mean().item()) if patch_purity.numel() > 0 else 0.0
+    patch_confidence_mean = float(patch_confidence.mean().item()) if patch_confidence.numel() > 0 else 0.0
+    semantic_trust_mean = float(Q_patch_flat.mean().item()) if Q_patch_flat.numel() > 0 else 0.0
+    semantic_source = (
+        "dense_label_maps_and_confidence_maps"
+        if bool(confidence_debug.get("semantic_confidence_available"))
+        else "dense_label_maps_without_confidence"
+    )
+    return {
+        "G_sem_patch_flat": G_patch_flat,
+        "Q_sem_patch_flat": Q_patch_flat,
+        "L_sem_patch_flat": L_patch_flat,
+        "R_sem_patch_flat": R_patch_flat,
+        "R_frame_patch_flat": path_roles["R_frame_patch_flat"],
+        "R_global_patch_flat": path_roles["R_global_patch_flat"],
+        "R_swa_patch_flat": path_roles["R_swa_patch_flat"],
+        "R_ttt_patch_flat": path_roles["R_ttt_patch_flat"],
+        "G_sem_tok": G_tok,
+        "Q_sem_tok": Q_tok,
+        "L_sem_tok": L_label_tok,
+        "R_sem_tok": R_tok,
+        "R_frame_tok": R_frame_tok,
+        "R_global_tok": R_global_tok,
+        "R_swa_tok": R_swa_tok,
+        "R_ttt_tok": R_ttt_tok,
+        "debug": {
+            "semantic_source": semantic_source,
+            "dense_semantic_available": True,
+            "semantic_confidence_available": bool(confidence_debug.get("semantic_confidence_available")),
+            "semantic_confidence_shape": confidence_debug.get("semantic_confidence_shape"),
+            "semantic_confidence_raw_min": confidence_debug.get("semantic_confidence_raw_min"),
+            "semantic_confidence_raw_max": confidence_debug.get("semantic_confidence_raw_max"),
+            "semantic_confidence_normalized_min": confidence_debug.get("semantic_confidence_normalized_min"),
+            "semantic_confidence_normalized_max": confidence_debug.get("semantic_confidence_normalized_max"),
+            "semantic_confidence_normalization_applied": confidence_debug.get("semantic_confidence_normalization_applied"),
+            "semantic_confidence_projection_note": confidence_debug.get("semantic_confidence_projection_note"),
+            "dense_semantic_patch_nonvoid_ratio": nonvoid_ratio,
+            "dense_semantic_token_projection_nonempty": bool(Q_patch_flat.numel() > 0 and nonvoid_ratio > 0.0),
+            "dense_semantic_label_names": meta["label_names"],
+            "dense_semantic_canonical_names": meta["canonical_names"],
+            "dense_semantic_dynamic_label_ids": meta["dynamic_ids"],
+            "dense_semantic_sky_label_ids": meta["sky_ids"],
+            "dense_semantic_vegetation_label_ids": meta["vegetation_ids"],
+            "dense_semantic_vertical_static_label_ids": meta["vertical_static_ids"],
+            "dense_semantic_ground_static_label_ids": meta["ground_static_ids"],
+            "dense_semantic_projection_mode": "mode_pool_confidence_trust",
+            "dense_semantic_patch_purity": patch_purity_mean,
+            "dense_semantic_patch_confidence_mean": patch_confidence_mean,
+            "semantic_trust_mean": semantic_trust_mean,
+        },
     }
 
 
@@ -467,13 +827,27 @@ class SemanticPriorGenerator:
         )
         V_sem_patch_flat = self._pool_to_patch(V_sem_pix, H_tok, W_tok).reshape(-1).float().clamp(0.0, 1.0)
         R_mask_patch_flat = self._pool_to_patch(R_mask_pix, H_tok, W_tok).reshape(-1).float().clamp(0.0, 1.0)
-        group_projection = project_masklet_semantic_groups(
+        group_projection = project_dense_semantic_label_maps(
             masklet,
             geo,
             num_frames=T,
             pixel_resolution=(H_p, W_p),
             patch_grid=(H_tok, W_tok),
         )
+        semantic_projection_source = "dense_label_maps_without_confidence"
+        if group_projection is None:
+            group_projection = project_masklet_semantic_groups(
+                masklet,
+                geo,
+                num_frames=T,
+                pixel_resolution=(H_p, W_p),
+                patch_grid=(H_tok, W_tok),
+            )
+            semantic_projection_source = "masklet_sparse_projection"
+        else:
+            semantic_projection_source = str(
+                group_projection.get("debug", {}).get("semantic_source") or semantic_projection_source
+            )
         V_sem_tok = torch.full((int(geo.token_type.numel()),), 1.0, dtype=torch.float32)
         token_type = geo.token_type.detach().cpu().long()
         patch_mask = token_type == TOKEN_TYPE_PATCH
@@ -522,10 +896,28 @@ class SemanticPriorGenerator:
                 "mean_r_mask": float(r_mask.mean().item()) if r_mask.numel() > 0 else 0.0,
                 "mean_v_sem_patch": float(V_sem_patch_flat.mean().item()) if V_sem_patch_flat.numel() > 0 else 1.0,
                 "mean_r_mask_patch": float(R_mask_patch_flat.mean().item()) if R_mask_patch_flat.numel() > 0 else 0.0,
+                "semantic_source": semantic_projection_source,
+                "dense_semantic_available": bool(semantic_projection_source.startswith("dense_label_maps")),
+                "semantic_confidence_available": group_projection.get("debug", {}).get("semantic_confidence_available"),
+                "semantic_confidence_shape": group_projection.get("debug", {}).get("semantic_confidence_shape"),
+                "semantic_confidence_raw_min": group_projection.get("debug", {}).get("semantic_confidence_raw_min"),
+                "semantic_confidence_raw_max": group_projection.get("debug", {}).get("semantic_confidence_raw_max"),
+                "semantic_confidence_normalized_min": group_projection.get("debug", {}).get("semantic_confidence_normalized_min"),
+                "semantic_confidence_normalized_max": group_projection.get("debug", {}).get("semantic_confidence_normalized_max"),
+                "semantic_confidence_normalization_applied": group_projection.get("debug", {}).get("semantic_confidence_normalization_applied"),
+                "semantic_confidence_projection_note": group_projection.get("debug", {}).get("semantic_confidence_projection_note"),
+                "dense_semantic_patch_nonvoid_ratio": group_projection.get("debug", {}).get("dense_semantic_patch_nonvoid_ratio"),
+                "dense_semantic_token_projection_nonempty": group_projection.get("debug", {}).get("dense_semantic_token_projection_nonempty"),
+                "dense_semantic_projection_mode": group_projection.get("debug", {}).get("dense_semantic_projection_mode"),
+                "dense_semantic_patch_purity": group_projection.get("debug", {}).get("dense_semantic_patch_purity"),
+                "dense_semantic_patch_confidence_mean": group_projection.get("debug", {}).get("dense_semantic_patch_confidence_mean"),
+                "semantic_trust_mean": group_projection.get("debug", {}).get("semantic_trust_mean"),
+                "dense_semantic_label_names": group_projection.get("debug", {}).get("dense_semantic_label_names"),
+                "dense_semantic_canonical_names": group_projection.get("debug", {}).get("dense_semantic_canonical_names"),
                 "semantic_group_taxonomy": "stage_c_coarse_5_groups",
                 "semantic_fine_label_available": True,
-                "semantic_fine_label_exact_source": "MaskletOutput.L_sem",
-                "semantic_group_exact_source": "MaskletOutput.G_sem",
+                "semantic_fine_label_exact_source": "semantic_segmentation.label_maps" if semantic_projection_source.startswith("dense_label_maps") else "MaskletOutput.L_sem",
+                "semantic_group_exact_source": "semantic_segmentation.label_maps" if semantic_projection_source.startswith("dense_label_maps") else "MaskletOutput.G_sem",
                 "semantic_group_token_count": int(group_projection["G_sem_tok"].numel()),
                 "semantic_role_token_count": int(group_projection["R_sem_tok"].numel()),
                 "semantic_role_policy": "fine_label_path_prior",

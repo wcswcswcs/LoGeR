@@ -37,6 +37,7 @@ from .geometry_backbone import (
 )
 from .semantic_prior_generator import (
     PriorOutput,
+    SEMANTIC_FINE_LABEL_TO_ID,
     SEMANTIC_FINE_LABEL_UNKNOWN,
     SEMANTIC_FINE_MOVABLE_IDS,
     SEMANTIC_FINE_SKY_IDS,
@@ -63,6 +64,22 @@ _DUAL_LIFETIME_TRANSIENT_MODES = {
     "dual_fast_weight",
     "apply_short_delta",
     "short_apply_delta",
+}
+
+_V67_SEMCUE_VERTICAL_STATIC_FINE_IDS = {
+    int(SEMANTIC_FINE_LABEL_TO_ID[name])
+    for name in ("building", "wall", "fence", "bridge", "railing", "pole", "traffic sign", "billboard", "house")
+    if name in SEMANTIC_FINE_LABEL_TO_ID
+}
+_V67_SEMCUE_GROUND_STATIC_FINE_IDS = {
+    int(SEMANTIC_FINE_LABEL_TO_ID[name])
+    for name in ("road", "sidewalk", "floor", "stair", "ground", "crosswalk")
+    if name in SEMANTIC_FINE_LABEL_TO_ID
+}
+_V68_LOWOBS_FINE_IDS = {
+    int(SEMANTIC_FINE_LABEL_TO_ID[name])
+    for name in ("tree", "vegetation", "grass", "mountain")
+    if name in SEMANTIC_FINE_LABEL_TO_ID
 }
 
 
@@ -638,6 +655,164 @@ def _semantic_z_recondition_patch(
     return out.clamp(0.0, 1.0), debug
 
 
+def _parse_v67_semz_read_cue(read_cue_source: str) -> Optional[Dict[str, Any]]:
+    src = str(read_cue_source or "")
+    if not (src.startswith("v67.semz_") and src.endswith(".c23past")):
+        return None
+    body = src[len("v67.semz_") : -len(".c23past")]
+    parts = [p for p in body.split(".") if p]
+    if not parts:
+        return None
+    head = parts[0]
+    control_mode = parts[1] if len(parts) > 1 else "semantic"
+    if control_mode in {"control", "sem"}:
+        control_mode = "semantic"
+    if "_beta" not in head:
+        return None
+    label_mode, beta_token = head.split("_beta", 1)
+    if label_mode not in {"coarse", "fine"}:
+        return None
+    try:
+        beta_int = int(beta_token)
+    except ValueError:
+        return None
+    # Historical names use beta025/beta040/beta525/beta650 for 0.25/0.40/0.525/0.65.
+    beta = float(beta_int) / (1000.0 if beta_int >= 100 else 100.0)
+    return {
+        "label_mode": label_mode,
+        "beta": beta,
+        "beta_token": beta_token,
+        "control_mode": control_mode,
+    }
+
+
+def _v67_semantic_mad_recondition_patch(
+    base_patch: torch.Tensor,
+    patch_labels: Optional[torch.Tensor],
+    *,
+    beta: float,
+    min_count: int = 256,
+    control_mode: str = "semantic",
+    chunk_idx: int = -1,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    base_shape = tuple(base_patch.shape)
+    base = torch.nan_to_num(
+        base_patch.detach().cpu().float().reshape(-1),
+        nan=0.0,
+        posinf=1.0,
+        neginf=0.0,
+    ).clamp(0.0, 1.0)
+    debug: Dict[str, Any] = {
+        "v67_semz_available": False,
+        "v67_semz_mode": "median_mad_beta",
+        "v67_semz_beta": float(beta),
+        "v67_semz_min_count": int(min_count),
+        "v67_semz_control_mode": str(control_mode or "semantic"),
+        "v67_semz_chunk_idx": int(chunk_idx),
+        "v67_semz_base_mean": float(base.mean().item()) if base.numel() else 0.0,
+    }
+    if patch_labels is None:
+        debug["v67_semz_reason"] = "missing_patch_labels"
+        return base.reshape(base_shape), debug
+    labels = patch_labels.detach().cpu().long().reshape(-1)
+    if int(labels.numel()) != int(base.numel()) or int(base.numel()) <= 0:
+        debug["v67_semz_reason"] = "empty_or_mismatched_patch_labels"
+        return base.reshape(base_shape), debug
+
+    mode = str(control_mode or "semantic").strip().lower()
+    seed = int(6700003 + max(int(chunk_idx), 0) * 1009 + int(base.numel()))
+    if mode in {"random_hist", "random_same_histogram", "random"}:
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(seed)
+        labels = labels[torch.randperm(int(labels.numel()), generator=generator)]
+    elif mode in {"shuffled", "shuffled_spatial", "spatial_shuffle", "shuffle"}:
+        if len(base_shape) >= 3 and int(labels.numel()) == int(torch.tensor(base_shape).prod().item()):
+            label_grid = labels.reshape(base_shape)
+            flat_frames = label_grid.reshape(int(base_shape[0]), -1).clone()
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(seed)
+            for frame_idx in range(int(flat_frames.shape[0])):
+                flat_frames[frame_idx] = flat_frames[frame_idx, torch.randperm(int(flat_frames.shape[1]), generator=generator)]
+            labels = flat_frames.reshape(-1)
+        else:
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(seed)
+            labels = labels[torch.randperm(int(labels.numel()), generator=generator)]
+    elif mode in {"geometry_only_z", "geometry", "global_z"}:
+        labels = torch.zeros_like(labels)
+    elif mode in {"semantic_only", "semantic_prior_only"}:
+        out = torch.full_like(base, 0.5, dtype=torch.float32)
+        out[labels == int(SEMANTIC_GROUP_MOVABLE_THING)] = 0.85
+        out[labels == int(SEMANTIC_GROUP_LOW_VALUE_STUFF)] = 0.65
+        out[labels == int(SEMANTIC_GROUP_UNCERTAIN_REGION)] = 0.55
+        out[labels == int(SEMANTIC_GROUP_STATIC_THING)] = 0.35
+        out[labels == int(SEMANTIC_GROUP_STRUCTURE_ANCHOR)] = 0.20
+        debug.update({
+            "v67_semz_available": True,
+            "v67_semz_reason": "semantic_only_prior",
+            "v67_semz_label_count": int(torch.unique(labels).numel()),
+            "v67_semz_fallback_ratio": 0.0,
+            "v67_semz_read_mean_after": float(out.mean().item()) if out.numel() else 0.0,
+            "v67_semz_random_seed": seed,
+        })
+        return out.clamp(0.0, 1.0).reshape(base_shape), debug
+    elif mode not in {"semantic", "none", ""}:
+        debug["v67_semz_reason"] = f"unknown_control_mode:{mode}"
+        return base.reshape(base_shape), debug
+
+    out = base.clone()
+    fallback = torch.zeros_like(base, dtype=torch.bool)
+    label_stats: Dict[str, Dict[str, float]] = {}
+    applied_labels = 0
+    beta = float(beta)
+    eps = 1e-6
+    for label in labels.unique(sorted=True):
+        mask = labels == label
+        count = int(mask.sum().item())
+        if count < int(min_count):
+            fallback |= mask
+            label_stats[str(int(label.item()))] = {"count": float(count), "fallback": 1.0}
+            continue
+        vals = base[mask]
+        med = torch.median(vals)
+        mad = torch.median(torch.abs(vals - med))
+        if not torch.isfinite(mad):
+            fallback |= mask
+            label_stats[str(int(label.item()))] = {
+                "count": float(count),
+                "median": float(med.item()) if torch.isfinite(med) else 0.0,
+                "mad": 0.0,
+                "fallback": 1.0,
+                "fallback_reason": "nonfinite_mad",
+            }
+            continue
+        mad_value = float(mad.item())
+        denom = mad.clamp_min(eps)
+        z = ((vals - med) / denom).clamp(-6.0, 6.0)
+        out[mask] = (0.5 + beta * z).clamp(0.0, 1.0)
+        label_stats[str(int(label.item()))] = {
+            "count": float(count),
+            "median": float(med.item()),
+            "mad": mad_value,
+            "mad_epsilon_used": bool(mad_value < eps),
+            "mean_before": float(vals.mean().item()),
+            "mean_after": float(out[mask].mean().item()),
+            "fallback": 0.0,
+        }
+        applied_labels += 1
+
+    debug.update({
+        "v67_semz_available": bool(applied_labels > 0),
+        "v67_semz_reason": "ok" if applied_labels > 0 else "no_label_with_sufficient_mad_support",
+        "v67_semz_label_count": int(applied_labels),
+        "v67_semz_fallback_ratio": float(fallback.float().mean().item()) if fallback.numel() else 1.0,
+        "v67_semz_label_stats": label_stats,
+        "v67_semz_read_mean_after": float(out.mean().item()) if out.numel() else 0.0,
+        "v67_semz_random_seed": seed,
+    })
+    return out.clamp(0.0, 1.0).reshape(base_shape), debug
+
+
 def _semantic_anchor_rescue_patch(
     base_patch: torch.Tensor,
     *,
@@ -694,6 +869,802 @@ def _semantic_anchor_rescue_patch(
         "semantic_anchor_rescue_static_score_mean": float(static_score.mean().item()) if static_score.numel() else 0.0,
     })
     return out, debug
+
+
+def _parse_v67_semantic_cue(read_cue_source: str) -> Optional[Dict[str, Any]]:
+    src = str(read_cue_source or "").strip().lower()
+    if not src.startswith("v67.semcue_"):
+        return None
+    body = src[len("v67.semcue_"):]
+    random_same_distribution = False
+    for suffix in ("_random_same_mass", ".random_same_mass", "_random_same_distribution", ".random_same_distribution"):
+        if body.endswith(suffix):
+            random_same_distribution = True
+            body = body[: -len(suffix)]
+            break
+    aliases = {
+        "anchor_support": "anchor_support",
+        "support": "anchor_support",
+        "stable_support": "anchor_support",
+        "anchor_risk": "anchor_risk",
+        "risk": "anchor_risk",
+        "low_observability": "anchor_risk",
+    }
+    kind = aliases.get(body)
+    if kind is None:
+        return None
+    return {
+        "kind": kind,
+        "random_same_distribution": bool(random_same_distribution),
+    }
+
+
+def _strip_v68_control_suffix(body: str) -> Tuple[str, str]:
+    control = "none"
+    suffixes = (
+        ("same_cue_distribution_random", "same_cue_distribution_random"),
+        ("random_same_distribution", "same_cue_distribution_random"),
+        ("random_same_mass", "same_cue_distribution_random"),
+        ("label_confidence_shuffled", "joint_label_confidence_shuffled"),
+        ("joint_label_confidence_shuffled", "joint_label_confidence_shuffled"),
+        ("joint_shuffled", "joint_label_confidence_shuffled"),
+        ("label_shuffled", "label_shuffled"),
+        ("confidence_shuffled", "confidence_shuffled"),
+        ("geometry_only", "geometry_only"),
+        ("geo_only", "geometry_only"),
+        ("semantic_only", "semantic_only"),
+        ("sem_only", "semantic_only"),
+    )
+    changed = True
+    while changed:
+        changed = False
+        for suffix, name in suffixes:
+            for sep in (".", "_"):
+                token = f"{sep}{suffix}"
+                if body.endswith(token):
+                    control = name
+                    body = body[: -len(token)]
+                    changed = True
+                    break
+            if changed:
+                break
+    return body, control
+
+
+def _parse_v68_layer_list(body: str) -> List[int]:
+    layers: List[int] = []
+    parts = [p for p in str(body or "").replace("-", "_").replace(".", "_").split("_") if p]
+    i = 0
+    while i < len(parts):
+        token = parts[i].strip().lower()
+        parsed: List[int] = []
+        if token.startswith("layers") and token[len("layers"):].isdigit():
+            parsed.append(int(token[len("layers"):]))
+        elif token.startswith("l") and token[1:].isdigit():
+            parsed.append(int(token[1:]))
+        if parsed:
+            j = i + 1
+            while j < len(parts) and parts[j].isdigit():
+                parsed.append(int(parts[j]))
+                j += 1
+            layers.extend(parsed)
+            i = j
+            continue
+        i += 1
+    out: List[int] = []
+    seen = set()
+    for layer in layers or [5, 7]:
+        li = int(layer)
+        if li not in seen:
+            out.append(li)
+            seen.add(li)
+    return out
+
+
+def _parse_v68_read_cue(read_cue_source: str) -> Optional[Dict[str, Any]]:
+    src = str(read_cue_source or "").strip().lower()
+    if not src.startswith("v68.read."):
+        return None
+    body = src[len("v68.read."):]
+    body, control = _strip_v68_control_suffix(body)
+    tap = "global_k_raw_patchvec_layers"
+    if ".q" in body or "_q" in body or "global_q" in body:
+        tap = "global_q_raw_patchvec_layers"
+    if "semantic_only" in body or "sem_only" in body:
+        fusion = "semantic_only"
+    elif "geometry_only" in body or "geo_only" in body:
+        fusion = "geometry_only"
+    elif "support_gate" in body or "semsupport" in body:
+        fusion = "support_gate"
+    else:
+        fusion = "motion_semrisk"
+    layers = _parse_v68_layer_list(body)
+    return {
+        "path": "read",
+        "body": body,
+        "tap": tap,
+        "layers": layers,
+        "fusion": fusion,
+        "control": control,
+    }
+
+
+def _v68_patch_semantic_support_risk(
+    *,
+    token_type: torch.Tensor,
+    prior_output: Optional[PriorOutput],
+    control: str,
+    chunk_idx: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
+    token_type_cpu = token_type.detach().cpu().long().reshape(-1)
+    patch_mask = token_type_cpu == TOKEN_TYPE_PATCH
+    n_patch = int(patch_mask.sum().item())
+    zeros = torch.zeros((n_patch,), dtype=torch.float32)
+    debug: Dict[str, Any] = {
+        "v68_read_semantic_available": False,
+        "v68_read_semantic_control": str(control),
+        "v68_read_patch_tokens": int(n_patch),
+    }
+    if prior_output is None or n_patch <= 0:
+        debug["v68_read_semantic_reason"] = "missing_prior_or_empty_patch"
+        return zeros, torch.ones((n_patch,), dtype=torch.float32), zeros, debug
+
+    L_patch = _patch_labels_from_token_labels(getattr(prior_output, "L_sem_tok", None), token_type_cpu)
+    G_patch = _patch_labels_from_token_labels(getattr(prior_output, "G_sem_tok", None), token_type_cpu)
+    Q_patch = None
+    Q_sem_tok = getattr(prior_output, "Q_sem_tok", None)
+    if Q_sem_tok is not None:
+        q = Q_sem_tok.detach().cpu().float().reshape(-1)
+        if int(q.numel()) == int(token_type_cpu.numel()):
+            Q_patch = q[patch_mask].clamp(0.0, 1.0)
+    if Q_patch is None or int(Q_patch.numel()) != n_patch:
+        debug["v68_read_semantic_reason"] = "missing_trust"
+        return zeros, torch.ones((n_patch,), dtype=torch.float32), zeros, debug
+
+    trust = Q_patch.detach().cpu().float().reshape(-1).clamp(0.0, 1.0)
+    labels = L_patch.detach().cpu().long().reshape(-1) if L_patch is not None and int(L_patch.numel()) == n_patch else None
+    groups = G_patch.detach().cpu().long().reshape(-1) if G_patch is not None and int(G_patch.numel()) == n_patch else None
+
+    seed = 6809000 + max(int(chunk_idx), 0) * 101.0
+    if control in {"label_shuffled", "joint_label_confidence_shuffled"}:
+        noise = _deterministic_patch_noise(n_patch, seed=seed + 11.0)
+        perm = torch.argsort(noise, stable=True)
+        if labels is not None:
+            labels = labels[perm]
+        if groups is not None:
+            groups = groups[perm]
+    if control in {"confidence_shuffled", "joint_label_confidence_shuffled"}:
+        noise = _deterministic_patch_noise(n_patch, seed=seed + 23.0)
+        perm = torch.argsort(noise, stable=True)
+        trust = trust[perm]
+
+    vertical = torch.zeros((n_patch,), dtype=torch.bool)
+    road = torch.zeros((n_patch,), dtype=torch.bool)
+    dynamic = torch.zeros((n_patch,), dtype=torch.bool)
+    sky = torch.zeros((n_patch,), dtype=torch.bool)
+    lowstuff = torch.zeros((n_patch,), dtype=torch.bool)
+    known = torch.zeros((n_patch,), dtype=torch.bool)
+    if labels is not None:
+        known = (labels >= 0) & (labels != int(SEMANTIC_FINE_LABEL_UNKNOWN))
+        for label_id in _V67_SEMCUE_VERTICAL_STATIC_FINE_IDS:
+            vertical |= labels == int(label_id)
+        for label_id in _V67_SEMCUE_GROUND_STATIC_FINE_IDS:
+            road |= labels == int(label_id)
+        for label_id in SEMANTIC_FINE_MOVABLE_IDS:
+            dynamic |= labels == int(label_id)
+        for label_id in SEMANTIC_FINE_SKY_IDS:
+            sky |= labels == int(label_id)
+        for label_id in SEMANTIC_FINE_VEGETATION_IDS:
+            lowstuff |= labels == int(label_id)
+        for label_id in _V68_LOWOBS_FINE_IDS:
+            lowstuff |= labels == int(label_id)
+    if groups is not None:
+        vertical |= groups == int(SEMANTIC_GROUP_STRUCTURE_ANCHOR)
+        road |= groups == int(SEMANTIC_GROUP_STATIC_THING)
+        dynamic |= groups == int(SEMANTIC_GROUP_MOVABLE_THING)
+        lowstuff |= groups == int(SEMANTIC_GROUP_LOW_VALUE_STUFF)
+        known |= groups >= 0
+
+    support = trust * (vertical.float() + 0.25 * road.float()).clamp(0.0, 1.0)
+    label_risk = torch.maximum(dynamic.float(), torch.maximum(0.9 * sky.float(), 0.7 * lowstuff.float()))
+    void_lowtrust = (~known).float()
+    label_risk = torch.maximum(label_risk, void_lowtrust)
+    risk = (trust * label_risk + (1.0 - trust)).clamp(0.0, 1.0)
+    lowobs = (
+        0.5 * sky.float()
+        + 0.4 * road.float()
+        + 0.4 * lowstuff.float()
+        - 0.8 * vertical.float()
+    ).clamp(0.0, 1.0) * trust
+
+    debug.update({
+        "v68_read_semantic_available": True,
+        "v68_read_semantic_reason": "ok",
+        "v68_read_semantic_trust_mean": float(trust.mean().item()) if trust.numel() else 0.0,
+        "v68_read_semantic_support_mean": float(support.mean().item()) if support.numel() else 0.0,
+        "v68_read_semantic_support_q90": float(torch.quantile(support, 0.90).item()) if support.numel() else 0.0,
+        "v68_read_semantic_risk_mean": float(risk.mean().item()) if risk.numel() else 0.0,
+        "v68_read_semantic_risk_q90": float(torch.quantile(risk, 0.90).item()) if risk.numel() else 0.0,
+        "v68_read_semantic_lowobs_mean": float(lowobs.mean().item()) if lowobs.numel() else 0.0,
+        "v68_read_semantic_vertical_tokens": int(vertical.sum().item()),
+        "v68_read_semantic_road_tokens": int(road.sum().item()),
+        "v68_read_semantic_dynamic_tokens": int(dynamic.sum().item()),
+        "v68_read_semantic_sky_tokens": int(sky.sum().item()),
+        "v68_read_semantic_lowstuff_tokens": int(lowstuff.sum().item()),
+        "v68_read_semantic_known_tokens": int(known.sum().item()),
+    })
+    return support.clamp(0.0, 1.0), risk.clamp(0.0, 1.0), lowobs.clamp(0.0, 1.0), debug
+
+
+def _v68_grammotion_patch(
+    q_layers: Optional[torch.Tensor],
+    k_layers: Optional[torch.Tensor],
+    default: torch.Tensor,
+    *,
+    tap: str,
+    layers: List[int],
+    num_frames: int,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    tensor = k_layers if str(tap) == "global_k_raw_patchvec_layers" else q_layers
+    debug: Dict[str, Any] = {
+        "v68_read_gram_available": False,
+        "v68_read_gram_tap": str(tap),
+        "v68_read_gram_layers_requested": list(int(x) for x in layers),
+    }
+    if tensor is None:
+        debug["v68_read_gram_reason"] = "missing_tap_tensor"
+        return torch.zeros_like(default), debug
+    raw = tensor.detach().cpu().float()
+    if raw.ndim != 5:
+        debug["v68_read_gram_reason"] = f"bad_tensor_ndim:{raw.ndim}"
+        return torch.zeros_like(default), debug
+    T, L, H, W, D = [int(x) for x in raw.shape]
+    if T < 2 or L <= 0 or H <= 0 or W <= 0 or D <= 0:
+        debug["v68_read_gram_reason"] = "insufficient_shape"
+        return torch.zeros_like(default), debug
+    selected = [li for li in layers if 0 <= int(li) < L]
+    if not selected:
+        debug["v68_read_gram_reason"] = "no_valid_selected_layers"
+        return torch.zeros_like(default), debug
+
+    layer_scores: List[torch.Tensor] = []
+    for layer in selected:
+        feat = F.normalize(raw[:, int(layer)].reshape(T, H * W, D), dim=-1, eps=1e-6)
+        mean: Optional[torch.Tensor] = None
+        m2: Optional[torch.Tensor] = None
+        count = 0
+        for t in range(T):
+            gram = feat[t] @ feat[t].T
+            count += 1
+            if mean is None:
+                mean = gram.clone()
+                m2 = torch.zeros_like(gram)
+                continue
+            delta = gram - mean
+            mean = mean + delta / float(count)
+            assert m2 is not None
+            m2 = m2 + delta * (gram - mean)
+        assert m2 is not None
+        row_var = (m2 / float(max(count - 1, 1))).mean(dim=1).reshape(T * 0 + H * W)
+        layer_scores.append(row_var)
+    raw_score = torch.stack(layer_scores, dim=0).mean(dim=0)
+    repeated = raw_score.reshape(1, H * W).repeat(T, 1).reshape(-1)
+    motion = _robust_quantile01(repeated, num_frames=max(int(num_frames), 1))
+    motion = _flatten_or_default(motion, default).clamp(0.0, 1.0)
+    debug.update({
+        "v68_read_gram_available": True,
+        "v68_read_gram_reason": "ok",
+        "v68_read_gram_layers": list(int(x) for x in selected),
+        "v68_read_gram_num_frames": int(T),
+        "v68_read_gram_patch_grid": [int(H), int(W)],
+        "v68_read_gram_feature_dim": int(D),
+        "v68_read_gram_mean": float(motion.mean().item()) if motion.numel() else 0.0,
+        "v68_read_gram_q90": float(torch.quantile(motion, 0.90).item()) if motion.numel() else 0.0,
+        "v68_read_gram_gt050_mass": float((motion > 0.50).float().mean().item()) if motion.numel() else 0.0,
+    })
+    return motion, debug
+
+
+def _v68_read_cue_patch(
+    *,
+    token_type: torch.Tensor,
+    prior_output: Optional[PriorOutput],
+    cfg: Dict[str, Any],
+    q_layers: Optional[torch.Tensor],
+    k_layers: Optional[torch.Tensor],
+    default: torch.Tensor,
+    num_frames: int,
+    chunk_idx: int,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    fusion = str(cfg.get("fusion", "motion_semrisk"))
+    control = str(cfg.get("control", "none"))
+    layers = [int(x) for x in cfg.get("layers", [5, 7])]
+    tap = str(cfg.get("tap", "global_k_raw_patchvec_layers"))
+    motion, gram_debug = _v68_grammotion_patch(
+        q_layers,
+        k_layers,
+        default,
+        tap=tap,
+        layers=layers,
+        num_frames=num_frames,
+    )
+    support, risk, lowobs, sem_debug = _v68_patch_semantic_support_risk(
+        token_type=token_type,
+        prior_output=prior_output,
+        control=control,
+        chunk_idx=chunk_idx,
+    )
+    debug: Dict[str, Any] = {
+        "v68_read_available": False,
+        "v68_read_cue_source": f"v68.read.{cfg.get('body', '')}",
+        "v68_read_path": "read",
+        "v68_read_fusion": fusion,
+        "v68_read_control": control,
+        "v68_read_tap": tap,
+        "v68_read_layers": layers,
+    }
+    debug.update(gram_debug)
+    debug.update(sem_debug)
+    if fusion == "geometry_only" or control == "geometry_only":
+        out = motion
+        semantic_required = False
+    elif fusion == "semantic_only" or control == "semantic_only":
+        out = risk
+        semantic_required = True
+    elif fusion == "support_gate":
+        out = _robust_quantile01((motion * (1.0 - support)).clamp(0.0, 1.0), num_frames=max(int(num_frames), 1))
+        semantic_required = True
+    else:
+        out = _robust_quantile01((motion * risk).clamp(0.0, 1.0), num_frames=max(int(num_frames), 1))
+        semantic_required = True
+    out_before_control = out.clone()
+    if semantic_required and not bool(sem_debug.get("v68_read_semantic_available", False)):
+        debug["v68_read_reason"] = "semantic_required_but_unavailable"
+        return torch.zeros_like(default), debug
+    if not bool(gram_debug.get("v68_read_gram_available", False)) and fusion not in {"semantic_only"} and control != "semantic_only":
+        debug["v68_read_reason"] = "grammotion_unavailable"
+        return torch.zeros_like(default), debug
+    if control == "same_cue_distribution_random" and int(out.numel()) > 1:
+        noise = _deterministic_patch_noise(int(out.numel()), seed=6817000 + max(int(chunk_idx), 0) * 101.0)
+        out = out[torch.argsort(noise, stable=True)]
+
+    out = torch.nan_to_num(out.detach().cpu().float().reshape(-1), nan=0.0, posinf=1.0, neginf=0.0)
+    out = _flatten_or_default(out, default).clamp(0.0, 1.0)
+    debug.update({
+        "v68_read_available": True,
+        "v68_read_reason": "ok",
+        "v68_read_output_mean_before_control": float(out_before_control.mean().item()) if out_before_control.numel() else 0.0,
+        "v68_read_output_q90_before_control": float(torch.quantile(out_before_control, 0.90).item()) if out_before_control.numel() else 0.0,
+        "v68_read_output_gt050_mass_before_control": float((out_before_control > 0.50).float().mean().item()) if out_before_control.numel() else 0.0,
+        "v68_read_output_mean": float(out.mean().item()) if out.numel() else 0.0,
+        "v68_read_output_q90": float(torch.quantile(out, 0.90).item()) if out.numel() else 0.0,
+        "v68_read_output_gt050_mass": float((out > 0.50).float().mean().item()) if out.numel() else 0.0,
+        "v68_read_corr_motion_risk": _pearson_corr(motion, risk),
+        "v68_read_corr_output_motion": _pearson_corr(out, motion),
+        "v68_read_corr_output_sem_support": _pearson_corr(out, support),
+        "v68_read_corr_output_sem_risk": _pearson_corr(out, risk),
+        "v68_read_corr_output_sem_lowobs": _pearson_corr(out, lowobs),
+    })
+    return out, debug
+
+
+def _strip_v67_random_suffix(body: str) -> Tuple[str, bool]:
+    random_same_distribution = False
+    for suffix in ("_random_same_mass", ".random_same_mass", "_random_same_distribution", ".random_same_distribution"):
+        if body.endswith(suffix):
+            random_same_distribution = True
+            body = body[: -len(suffix)]
+            break
+    return body, random_same_distribution
+
+
+def _parse_v67_semgeo_read_cue(read_cue_source: str) -> Optional[Dict[str, Any]]:
+    src = str(read_cue_source or "").strip().lower()
+    if src.startswith("v67.geocue_"):
+        body, random_same_distribution = _strip_v67_random_suffix(src[len("v67.geocue_"):])
+        if not body:
+            return None
+        return {
+            "mode": "geo_only",
+            "geo_kind": body,
+            "sem_kind": None,
+            "fusion": "geo",
+            "random_same_distribution": bool(random_same_distribution),
+        }
+    if not src.startswith("v67.semgeo_"):
+        return None
+    body, random_same_distribution = _strip_v67_random_suffix(src[len("v67.semgeo_"):])
+    parts = [p for p in body.split("_") if p]
+    if len(parts) < 2:
+        return None
+    sem_aliases = {
+        "support": "anchor_support",
+        "anchor_support": "anchor_support",
+        "stable": "anchor_support",
+        "risk": "anchor_risk",
+        "anchor_risk": "anchor_risk",
+    }
+    sem_kind = sem_aliases.get(parts[0])
+    if sem_kind is None:
+        return None
+    fusion = "gate"
+    if parts[-1] in {"mul", "gate", "blend", "min", "geo"}:
+        fusion = parts[-1]
+        geo_kind = "_".join(parts[1:-1])
+    else:
+        geo_kind = "_".join(parts[1:])
+    if not geo_kind:
+        return None
+    return {
+        "mode": "sem_geo",
+        "geo_kind": geo_kind,
+        "sem_kind": sem_kind,
+        "fusion": fusion,
+        "random_same_distribution": bool(random_same_distribution),
+    }
+
+
+def _v67_geo_candidate_patch(
+    geo_kind: str,
+    *,
+    dyn_patch: torch.Tensor,
+    occ_patch: torch.Tensor,
+    unc_patch: torch.Tensor,
+    conf_patch: torch.Tensor,
+    anchor_patch: torch.Tensor,
+    stage_geo_patch: torch.Tensor,
+    qkstable_patch: torch.Tensor,
+    deepstatic_patch: torch.Tensor,
+    smd_patch: torch.Tensor,
+    fa_decay_patch: torch.Tensor,
+    key_avg_patch: torch.Tensor,
+    chunk_idx: int,
+    num_frames: int = 1,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    kind = str(geo_kind or "").strip().lower()
+    n_patch = int(dyn_patch.numel())
+    zeros = torch.zeros((n_patch,), dtype=torch.float32)
+    dyn = dyn_patch.detach().cpu().float().reshape(-1).clamp(0.0, 1.0)
+    occ = _flatten_or_default(occ_patch, dyn).clamp(0.0, 1.0)
+    unc = _flatten_or_default(unc_patch, dyn).clamp(0.0, 1.0)
+    conf = _flatten_or_default(conf_patch, dyn).clamp(0.0, 1.0)
+    anchor = _flatten_or_default(anchor_patch, dyn).clamp(0.0, 1.0)
+    stage_geo = _flatten_or_default(stage_geo_patch, dyn).clamp(0.0, 1.0)
+    qkstable = _flatten_or_default(qkstable_patch, dyn).clamp(0.0, 1.0)
+    deepstatic = _flatten_or_default(deepstatic_patch, dyn).clamp(0.0, 1.0)
+    smd = _flatten_or_default(smd_patch, dyn).clamp(0.0, 1.0)
+    fa_decay = _flatten_or_default(fa_decay_patch, dyn).clamp(0.0, 1.0)
+    key_avg = _flatten_or_default(key_avg_patch, dyn).clamp(0.0, 1.0)
+    reliable_static = torch.sqrt(((1.0 - dyn) * (1.0 - occ) * (1.0 - unc) * conf).clamp(0.0, 1.0))
+    loose_static = torch.sqrt(((1.0 - dyn) * (1.0 - occ) * (1.0 - 0.5 * unc).clamp(0.0, 1.0) * conf).clamp(0.0, 1.0))
+    aliases = {
+        "conf": "confstatic",
+        "static": "confstatic",
+        "conf_static": "confstatic",
+        "conf_loose": "confloose",
+        "loose": "confloose",
+        "conf_q": "confq",
+        "conf_quantile": "confq",
+        "reliable": "confstatic",
+        "reliable_static": "confstatic",
+        "stageb": "stagebgeo",
+        "stageb_geo": "stagebgeo",
+        "gwrite": "stagebgeo",
+        "qk": "qkstable",
+        "qk_stable": "qkstable",
+        "deep": "deepstatic",
+        "deep_static": "deepstatic",
+        "attn": "attndecay",
+        "attn_decay": "attndecay",
+        "keydecay": "attndecay",
+        "loger": "logermix",
+        "mix": "logermix",
+    }
+    kind = aliases.get(kind, kind)
+    if kind == "confstatic":
+        out = reliable_static
+    elif kind == "confloose":
+        out = loose_static
+    elif kind == "confq":
+        out = _robust_quantile01(reliable_static, num_frames=max(int(num_frames), 1))
+    elif kind == "stagebgeo":
+        out = stage_geo
+    elif kind == "qkstable":
+        out = qkstable
+    elif kind == "deepstatic":
+        out = deepstatic
+    elif kind == "smd":
+        out = smd
+    elif kind == "attndecay":
+        out = fa_decay
+    elif kind == "keyavg":
+        out = key_avg
+    elif kind == "anchorconf":
+        out = torch.sqrt((anchor * conf * (1.0 - unc).clamp(0.0, 1.0)).clamp(0.0, 1.0))
+    elif kind == "logermix":
+        out = (
+            0.30 * loose_static
+            + 0.25 * qkstable
+            + 0.20 * deepstatic
+            + 0.10 * stage_geo
+            + 0.15 * key_avg
+        ).clamp(0.0, 1.0)
+    elif kind == "strictmix":
+        out = torch.sqrt((reliable_static * qkstable * (0.25 + 0.75 * deepstatic)).clamp(0.0, 1.0))
+    else:
+        debug = {
+            "v67_semgeo_available": False,
+            "v67_semgeo_reason": f"unknown_geo_kind:{geo_kind}",
+            "v67_semgeo_geo_kind": str(geo_kind),
+            "v67_semgeo_chunk_idx": int(chunk_idx),
+        }
+        return zeros, debug
+
+    out = torch.nan_to_num(out.float().reshape(-1), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+    debug = {
+        "v67_semgeo_geo_kind": kind,
+        "v67_semgeo_chunk_idx": int(chunk_idx),
+        "v67_semgeo_geo_mean": float(out.mean().item()) if out.numel() else 0.0,
+        "v67_semgeo_geo_q90": float(torch.quantile(out, 0.90).item()) if out.numel() else 0.0,
+        "v67_semgeo_geo_gt050_mass": float((out > 0.50).float().mean().item()) if out.numel() else 0.0,
+        "v67_semgeo_geo_gt075_mass": float((out > 0.75).float().mean().item()) if out.numel() else 0.0,
+        "v67_semgeo_geo_corr_dyn": _pearson_corr(out, dyn),
+        "v67_semgeo_geo_corr_unc": _pearson_corr(out, unc),
+        "v67_semgeo_geo_corr_occ": _pearson_corr(out, occ),
+        "v67_semgeo_geo_corr_conf": _pearson_corr(out, conf),
+        "v67_semgeo_geo_corr_anchor": _pearson_corr(out, anchor),
+    }
+    return out, debug
+
+
+def _v67_semgeo_cue_patch(
+    *,
+    token_type: torch.Tensor,
+    prior_output: Optional[PriorOutput],
+    cfg: Dict[str, Any],
+    dyn_patch: torch.Tensor,
+    occ_patch: torch.Tensor,
+    unc_patch: torch.Tensor,
+    conf_patch: torch.Tensor,
+    anchor_patch: torch.Tensor,
+    stage_geo_patch: torch.Tensor,
+    qkstable_patch: torch.Tensor,
+    deepstatic_patch: torch.Tensor,
+    smd_patch: torch.Tensor,
+    fa_decay_patch: torch.Tensor,
+    key_avg_patch: torch.Tensor,
+    chunk_idx: int,
+    num_frames: int = 1,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    geo_kind = str(cfg.get("geo_kind", "confstatic"))
+    fusion = str(cfg.get("fusion", "gate")).strip().lower()
+    sem_kind = cfg.get("sem_kind")
+    random_same_distribution = bool(cfg.get("random_same_distribution", False))
+    geo_score, geo_debug = _v67_geo_candidate_patch(
+        geo_kind,
+        dyn_patch=dyn_patch,
+        occ_patch=occ_patch,
+        unc_patch=unc_patch,
+        conf_patch=conf_patch,
+        anchor_patch=anchor_patch,
+        stage_geo_patch=stage_geo_patch,
+        qkstable_patch=qkstable_patch,
+        deepstatic_patch=deepstatic_patch,
+        smd_patch=smd_patch,
+        fa_decay_patch=fa_decay_patch,
+        key_avg_patch=key_avg_patch,
+        num_frames=max(int(num_frames), 1),
+        chunk_idx=chunk_idx,
+    )
+    debug: Dict[str, Any] = {
+        "v67_semgeo_available": bool(geo_score.numel() > 0),
+        "v67_semgeo_mode": str(cfg.get("mode", "sem_geo")),
+        "v67_semgeo_geo_kind": str(geo_debug.get("v67_semgeo_geo_kind", geo_kind)),
+        "v67_semgeo_sem_kind": sem_kind,
+        "v67_semgeo_fusion": fusion,
+        "v67_semgeo_random_same_distribution": random_same_distribution,
+        "v67_semgeo_chunk_idx": int(chunk_idx),
+        "v67_semgeo_patch_tokens": int(geo_score.numel()),
+    }
+    debug.update(geo_debug)
+    if not bool(geo_debug.get("v67_semgeo_available", True)):
+        debug["v67_semgeo_available"] = False
+        debug["v67_semgeo_reason"] = geo_debug.get("v67_semgeo_reason", "geo_unavailable")
+        return geo_score, debug
+
+    sem_score = None
+    sem_debug: Dict[str, Any] = {}
+    if sem_kind is not None:
+        sem_score, sem_debug = _v67_semantic_anchor_cue_patch(
+            token_type=token_type,
+            prior_output=prior_output,
+            kind=str(sem_kind),
+            random_same_distribution=False,
+            chunk_idx=chunk_idx,
+        )
+        debug.update({
+            "v67_semgeo_sem_available": bool(sem_debug.get("v67_semcue_available", False)),
+            "v67_semgeo_sem_support_mean": sem_debug.get("v67_semcue_support_mean"),
+            "v67_semgeo_sem_support_q90": sem_debug.get("v67_semcue_support_q90"),
+            "v67_semgeo_sem_risk_mean": sem_debug.get("v67_semcue_risk_mean"),
+            "v67_semgeo_sem_risk_q90": sem_debug.get("v67_semcue_risk_q90"),
+            "v67_semgeo_sem_reason": sem_debug.get("v67_semcue_reason"),
+        })
+        if int(sem_score.numel()) != int(geo_score.numel()):
+            debug["v67_semgeo_available"] = False
+            debug["v67_semgeo_reason"] = "sem_geo_size_mismatch"
+            return torch.zeros_like(geo_score), debug
+
+    if sem_score is None:
+        out = geo_score
+    elif fusion == "mul":
+        out = (sem_score * geo_score).clamp(0.0, 1.0)
+    elif fusion == "blend":
+        out = (0.5 * sem_score + 0.5 * geo_score).clamp(0.0, 1.0)
+    elif fusion == "min":
+        out = torch.minimum(sem_score, geo_score).clamp(0.0, 1.0)
+    elif fusion == "geo":
+        out = geo_score
+    else:
+        out = (geo_score * (0.25 + 0.75 * sem_score)).clamp(0.0, 1.0)
+        fusion = "gate"
+
+    before_random = out.clone()
+    if random_same_distribution and int(out.numel()) > 1:
+        noise = _deterministic_patch_noise(int(out.numel()), seed=6713009 + max(int(chunk_idx), 0) * 101.0)
+        out = out[torch.argsort(noise, stable=True)]
+
+    debug.update({
+        "v67_semgeo_available": True,
+        "v67_semgeo_reason": "ok",
+        "v67_semgeo_fusion": fusion,
+        "v67_semgeo_output_mean_before_random": float(before_random.mean().item()) if before_random.numel() else 0.0,
+        "v67_semgeo_output_q90_before_random": float(torch.quantile(before_random, 0.90).item()) if before_random.numel() else 0.0,
+        "v67_semgeo_output_mean": float(out.mean().item()) if out.numel() else 0.0,
+        "v67_semgeo_output_q90": float(torch.quantile(out, 0.90).item()) if out.numel() else 0.0,
+        "v67_semgeo_output_gt050_mass": float((out > 0.50).float().mean().item()) if out.numel() else 0.0,
+        "v67_semgeo_output_gt075_mass": float((out > 0.75).float().mean().item()) if out.numel() else 0.0,
+        "v67_semgeo_output_corr_geo": _pearson_corr(out, geo_score),
+        "v67_semgeo_output_corr_dyn": _pearson_corr(out, dyn_patch),
+        "v67_semgeo_output_corr_conf": _pearson_corr(out, conf_patch),
+        "v67_semgeo_output_corr_unc": _pearson_corr(out, unc_patch),
+    })
+    if sem_score is not None:
+        debug["v67_semgeo_output_corr_sem"] = _pearson_corr(out, sem_score)
+    return out.clamp(0.0, 1.0), debug
+
+
+def _v67_semantic_anchor_cue_patch(
+    *,
+    token_type: torch.Tensor,
+    prior_output: Optional[PriorOutput],
+    kind: str,
+    random_same_distribution: bool,
+    chunk_idx: int,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    token_type_cpu = token_type.detach().cpu().long().reshape(-1)
+    n_patch = int((token_type_cpu == TOKEN_TYPE_PATCH).sum().item())
+    out = torch.zeros((n_patch,), dtype=torch.float32)
+    debug: Dict[str, Any] = {
+        "v67_semcue_available": False,
+        "v67_semcue_kind": str(kind),
+        "v67_semcue_random_same_distribution": bool(random_same_distribution),
+        "v67_semcue_chunk_idx": int(chunk_idx),
+        "v67_semcue_patch_tokens": int(n_patch),
+    }
+    if prior_output is None or n_patch <= 0:
+        debug["v67_semcue_reason"] = "missing_prior_or_empty_patch"
+        return out, debug
+
+    G_patch = _patch_labels_from_token_labels(getattr(prior_output, "G_sem_tok", None), token_type_cpu)
+    L_patch = _patch_labels_from_token_labels(getattr(prior_output, "L_sem_tok", None), token_type_cpu)
+    Q_patch = None
+    Q_sem_tok = getattr(prior_output, "Q_sem_tok", None)
+    if Q_sem_tok is not None:
+        q = Q_sem_tok.detach().cpu().float().reshape(-1)
+        if int(q.numel()) == int(token_type_cpu.numel()):
+            Q_patch = q[token_type_cpu == TOKEN_TYPE_PATCH].clamp(0.0, 1.0)
+    trust = Q_patch if Q_patch is not None and int(Q_patch.numel()) == n_patch else torch.ones((n_patch,), dtype=torch.float32)
+
+    support = torch.zeros((n_patch,), dtype=torch.float32)
+    risk = torch.full((n_patch,), 0.75, dtype=torch.float32)
+    known = torch.zeros((n_patch,), dtype=torch.bool)
+
+    if L_patch is not None and int(L_patch.numel()) == n_patch:
+        L = L_patch.detach().cpu().long().reshape(-1)
+        known = (L >= 0) & (L != int(SEMANTIC_FINE_LABEL_UNKNOWN))
+        vertical = torch.zeros_like(known)
+        ground = torch.zeros_like(known)
+        sky = torch.zeros_like(known)
+        vegetation = torch.zeros_like(known)
+        movable = torch.zeros_like(known)
+        for label_id in _V67_SEMCUE_VERTICAL_STATIC_FINE_IDS:
+            vertical |= L == int(label_id)
+        for label_id in _V67_SEMCUE_GROUND_STATIC_FINE_IDS:
+            ground |= L == int(label_id)
+        for label_id in SEMANTIC_FINE_SKY_IDS:
+            sky |= L == int(label_id)
+        for label_id in SEMANTIC_FINE_VEGETATION_IDS:
+            vegetation |= L == int(label_id)
+        for label_id in SEMANTIC_FINE_MOVABLE_IDS:
+            movable |= L == int(label_id)
+        support[vertical & known] = 1.00
+        support[ground & known] = torch.maximum(support[ground & known], torch.full_like(support[ground & known], 0.55))
+        support[(sky | vegetation) & known] = torch.maximum(
+            support[(sky | vegetation) & known],
+            torch.full_like(support[(sky | vegetation) & known], 0.10),
+        )
+        support[movable & known] = 0.0
+        risk[vertical & known] = 0.05
+        risk[ground & known] = 0.35
+        risk[sky & known] = 1.00
+        risk[vegetation & known] = torch.maximum(risk[vegetation & known], torch.full_like(risk[vegetation & known], 0.90))
+        risk[movable & known] = torch.maximum(risk[movable & known], torch.full_like(risk[movable & known], 0.85))
+        debug.update({
+            "v67_semcue_vertical_static_tokens": int((vertical & known).sum().item()),
+            "v67_semcue_ground_static_tokens": int((ground & known).sum().item()),
+            "v67_semcue_sky_tokens": int((sky & known).sum().item()),
+            "v67_semcue_vegetation_tokens": int((vegetation & known).sum().item()),
+            "v67_semcue_movable_tokens": int((movable & known).sum().item()),
+            "v67_semcue_known_fine_tokens": int(known.sum().item()),
+        })
+
+    if G_patch is not None and int(G_patch.numel()) == n_patch:
+        G = G_patch.detach().cpu().long().reshape(-1)
+        coarse_support = torch.zeros_like(support)
+        coarse_risk = torch.full_like(risk, 0.75)
+        coarse_support[G == int(SEMANTIC_GROUP_STRUCTURE_ANCHOR)] = 0.75
+        coarse_support[G == int(SEMANTIC_GROUP_STATIC_THING)] = 0.65
+        coarse_support[G == int(SEMANTIC_GROUP_LOW_VALUE_STUFF)] = 0.10
+        coarse_support[G == int(SEMANTIC_GROUP_MOVABLE_THING)] = 0.0
+        coarse_support[G == int(SEMANTIC_GROUP_UNCERTAIN_REGION)] = 0.0
+        coarse_risk[G == int(SEMANTIC_GROUP_STRUCTURE_ANCHOR)] = 0.25
+        coarse_risk[G == int(SEMANTIC_GROUP_STATIC_THING)] = 0.35
+        coarse_risk[G == int(SEMANTIC_GROUP_LOW_VALUE_STUFF)] = 0.90
+        coarse_risk[G == int(SEMANTIC_GROUP_MOVABLE_THING)] = 0.85
+        coarse_risk[G == int(SEMANTIC_GROUP_UNCERTAIN_REGION)] = 0.75
+        support = torch.maximum(support, coarse_support)
+        risk = torch.maximum(risk, coarse_risk)
+        debug.update({
+            "v67_semcue_group_structure_tokens": int((G == int(SEMANTIC_GROUP_STRUCTURE_ANCHOR)).sum().item()),
+            "v67_semcue_group_static_tokens": int((G == int(SEMANTIC_GROUP_STATIC_THING)).sum().item()),
+            "v67_semcue_group_lowstuff_tokens": int((G == int(SEMANTIC_GROUP_LOW_VALUE_STUFF)).sum().item()),
+            "v67_semcue_group_movable_tokens": int((G == int(SEMANTIC_GROUP_MOVABLE_THING)).sum().item()),
+            "v67_semcue_group_uncertain_tokens": int((G == int(SEMANTIC_GROUP_UNCERTAIN_REGION)).sum().item()),
+        })
+
+    support = (support * trust).clamp(0.0, 1.0)
+    risk = torch.maximum(risk, (1.0 - trust).clamp(0.0, 1.0)).clamp(0.0, 1.0)
+    if kind == "anchor_support":
+        out = support
+    elif kind == "anchor_risk":
+        out = risk
+    else:
+        debug["v67_semcue_reason"] = f"unknown_kind:{kind}"
+        return torch.zeros((n_patch,), dtype=torch.float32), debug
+
+    before_random = out.clone()
+    if random_same_distribution and int(out.numel()) > 1:
+        noise = _deterministic_patch_noise(int(out.numel()), seed=6705007 + max(int(chunk_idx), 0) * 101.0)
+        out = out[torch.argsort(noise, stable=True)]
+
+    debug.update({
+        "v67_semcue_available": True,
+        "v67_semcue_reason": "ok",
+        "v67_semcue_trust_missing": Q_patch is None,
+        "v67_semcue_trust_mean": float(trust.mean().item()) if trust.numel() else 0.0,
+        "v67_semcue_support_mean": float(support.mean().item()) if support.numel() else 0.0,
+        "v67_semcue_support_q90": float(torch.quantile(support, 0.90).item()) if support.numel() else 0.0,
+        "v67_semcue_risk_mean": float(risk.mean().item()) if risk.numel() else 0.0,
+        "v67_semcue_risk_q90": float(torch.quantile(risk, 0.90).item()) if risk.numel() else 0.0,
+        "v67_semcue_output_mean_before_random": float(before_random.mean().item()) if before_random.numel() else 0.0,
+        "v67_semcue_output_q90_before_random": float(torch.quantile(before_random, 0.90).item()) if before_random.numel() else 0.0,
+        "v67_semcue_output_mean": float(out.mean().item()) if out.numel() else 0.0,
+        "v67_semcue_output_q90": float(torch.quantile(out, 0.90).item()) if out.numel() else 0.0,
+        "v67_semcue_output_gt050_mass": float((out > 0.50).float().mean().item()) if out.numel() else 0.0,
+        "v67_semcue_output_gt075_mass": float((out > 0.75).float().mean().item()) if out.numel() else 0.0,
+    })
+    return out.clamp(0.0, 1.0), debug
 
 
 def _robust_quantile01(
@@ -1460,6 +2431,8 @@ class HybridMemoryController:
         swa_overlap_source_replace_target: str = "kv",
         swa_overlap_source_replace_layer_mode: str = "last",
         swa_overlap_source_replace_single_layer: int = -1,
+        swa_overlap_feature_dump_dir: str = "",
+        swa_overlap_feature_dump_dtype: str = "float16",
         enable_context_source_skip: bool = False,
         context_source_skip_impl: str = "bias",
         context_source_skip_scope: str = "frame",
@@ -1471,6 +2444,11 @@ class HybridMemoryController:
         context_source_skip_soft_min_keep: float = 0.5,
         context_source_skip_record_attention_mass: bool = False,
         context_source_skip_attention_mass_max_queries: int = 512,
+        context_source_skip_attention_map_dump_dir: str = "",
+        context_source_skip_attention_map_dump_max_queries: int = 64,
+        context_source_skip_attention_map_dump_dtype: str = "float16",
+        context_source_skip_attention_map_dump_full_query_marginal: bool = False,
+        context_source_skip_attention_map_dump_query_block: int = 32,
         semantic_role_policy: str = "none",
         semantic_memory_paths: str = "",
         semantic_role_highd_quantile: float = 0.80,
@@ -1479,6 +2457,9 @@ class HybridMemoryController:
         semantic_role_neutral_scale: float = 0.85,
         semantic_role_negative_scale: float = 0.65,
         semantic_role_swa_negative_scale: float = 1.0,
+        semantic_role_swa_protect_scale: float = 1.0,
+        semantic_role_control_mode: str = "none",
+        semantic_role_control_seed: int = 12345,
         semantic_anchor_mode: str = "semantic",
         semantic_anchor_target_ratio: float = 0.12,
         semantic_anchor_min_ratio: float = 0.03,
@@ -1582,6 +2563,8 @@ class HybridMemoryController:
         self.swa_overlap_source_replace_target = str(swa_overlap_source_replace_target)
         self.swa_overlap_source_replace_layer_mode = str(swa_overlap_source_replace_layer_mode)
         self.swa_overlap_source_replace_single_layer = int(swa_overlap_source_replace_single_layer)
+        self.swa_overlap_feature_dump_dir = str(swa_overlap_feature_dump_dir)
+        self.swa_overlap_feature_dump_dtype = str(swa_overlap_feature_dump_dtype)
         self.enable_context_source_skip = bool(enable_context_source_skip)
         self.context_source_skip_impl = str(context_source_skip_impl)
         self.context_source_skip_scope = str(context_source_skip_scope)
@@ -1593,6 +2576,15 @@ class HybridMemoryController:
         self.context_source_skip_soft_min_keep = float(context_source_skip_soft_min_keep)
         self.context_source_skip_record_attention_mass = bool(context_source_skip_record_attention_mass)
         self.context_source_skip_attention_mass_max_queries = int(context_source_skip_attention_mass_max_queries)
+        self.context_source_skip_attention_map_dump_dir = str(context_source_skip_attention_map_dump_dir)
+        self.context_source_skip_attention_map_dump_max_queries = int(context_source_skip_attention_map_dump_max_queries)
+        self.context_source_skip_attention_map_dump_dtype = str(context_source_skip_attention_map_dump_dtype)
+        self.context_source_skip_attention_map_dump_full_query_marginal = bool(
+            context_source_skip_attention_map_dump_full_query_marginal
+        )
+        self.context_source_skip_attention_map_dump_query_block = int(
+            context_source_skip_attention_map_dump_query_block
+        )
         self.semantic_role_policy = str(semantic_role_policy)
         self.semantic_memory_paths = str(semantic_memory_paths)
         self.semantic_role_highd_quantile = float(semantic_role_highd_quantile)
@@ -1601,6 +2593,9 @@ class HybridMemoryController:
         self.semantic_role_neutral_scale = float(semantic_role_neutral_scale)
         self.semantic_role_negative_scale = float(semantic_role_negative_scale)
         self.semantic_role_swa_negative_scale = float(semantic_role_swa_negative_scale)
+        self.semantic_role_swa_protect_scale = float(semantic_role_swa_protect_scale)
+        self.semantic_role_control_mode = str(semantic_role_control_mode or "none").strip().lower()
+        self.semantic_role_control_seed = int(semantic_role_control_seed)
         self.semantic_anchor_mode = str(semantic_anchor_mode or "semantic").strip().lower()
         self.semantic_anchor_target_ratio = float(semantic_anchor_target_ratio)
         self.semantic_anchor_min_ratio = float(semantic_anchor_min_ratio)
@@ -1941,13 +2936,17 @@ class HybridMemoryController:
         n_patch = int(patch_mask.sum().item())
         A_tok = torch.zeros((L_tok,), dtype=torch.float32)
         M_tok = torch.zeros((L_tok,), dtype=torch.float32)
+        mode = str(self.semantic_anchor_mode or "none").strip().lower()
         debug: Dict[str, Any] = {
-            "semantic_anchor_mode": self.semantic_anchor_mode,
+            "semantic_anchor_mode": mode,
             "semantic_anchor_bank_available": False,
             "semantic_anchor_token_count": 0,
             "semantic_anchor_token_ratio": 0.0,
             "semantic_anchor_patch_tokens": int(n_patch),
         }
+        if mode in {"", "none", "off", "noop"}:
+            debug["semantic_anchor_reason"] = "disabled"
+            return A_tok, M_tok, debug
         if n_patch <= 0 or D_tok is None:
             debug["semantic_anchor_reason"] = "missing_patch_or_D"
             return A_tok, M_tok, debug
@@ -1990,7 +2989,6 @@ class HybridMemoryController:
 
         geo_score = (torch.sqrt((1.0 - D_patch).clamp(0.0, 1.0)) * stage_score * conf_score).clamp(0.0, 1.0)
         raw_score = (sem_score * geo_score * source_score).clamp(0.0, 1.0)
-        mode = self.semantic_anchor_mode
         base_mask, select_debug = _select_spatially_diverse_anchors(
             raw_score,
             num_frames=num_frames,
@@ -2367,6 +3365,175 @@ class HybridMemoryController:
             return {}
         unique, counts = torch.unique(v, return_counts=True)
         return {str(int(k.item())): int(c.item()) for k, c in zip(unique, counts)}
+
+    @staticmethod
+    def _semantic_role_control_offset(
+        *,
+        G: torch.Tensor,
+        L: torch.Tensor,
+        D: torch.Tensor,
+        Q: torch.Tensor,
+        patch_mask: torch.Tensor,
+    ) -> int:
+        """Build a deterministic per-chunk seed offset from semantic/risk tokens."""
+
+        accum = 0x345678
+        specs = (
+            (G.detach().cpu().long().reshape(-1), 1),
+            (L.detach().cpu().long().reshape(-1), 17),
+            ((D.detach().cpu().float().reshape(-1) * 1000.0).long(), 31),
+            ((Q.detach().cpu().float().reshape(-1) * 1000.0).long(), 47),
+        )
+        mask = patch_mask.detach().cpu().bool().reshape(-1)
+        for values, mul in specs:
+            if values.numel() != mask.numel() or not bool(mask.any()):
+                continue
+            selected = values[mask]
+            if selected.numel() == 0:
+                continue
+            stride = max(int(selected.numel()) // 128, 1)
+            sample = selected[::stride]
+            total = int(sample.sum().item())
+            accum = (accum * 1000003 + total * mul + int(selected.numel()) * (mul + 97)) & 0x7FFFFFFF
+        return int(accum)
+
+    def _apply_ttt_semantic_role_control(
+        self,
+        roles: torch.Tensor,
+        *,
+        G: torch.Tensor,
+        L: torch.Tensor,
+        D: torch.Tensor,
+        Q: torch.Tensor,
+        patch_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Apply same-path TTT role controls while preserving role mass."""
+
+        mode = str(getattr(self, "semantic_role_control_mode", "none") or "none").strip().lower()
+        seed = int(getattr(self, "semantic_role_control_seed", 12345))
+        idx = torch.nonzero(patch_mask.detach().cpu().bool().reshape(-1), as_tuple=False).reshape(-1)
+        before_counts = self._role_counts(roles[idx]) if idx.numel() else {}
+        debug: Dict[str, Any] = {
+            "semantic_role_control_mode": mode or "none",
+            "semantic_role_control_seed": seed,
+            "semantic_role_control_scope": "ttt_patch_roles",
+            "semantic_role_control_applied": False,
+            "semantic_role_control_reason": "disabled",
+            "R_ttt_role_counts_before_control": before_counts,
+            "R_ttt_role_counts_after_control": before_counts,
+            "semantic_role_control_changed_fraction": 0.0,
+        }
+        if mode in {"", "none", "off", "noop"}:
+            return roles, debug
+        if idx.numel() <= 1:
+            debug["semantic_role_control_reason"] = "insufficient_patch_tokens"
+            return roles, debug
+
+        offset = self._semantic_role_control_offset(G=G, L=L, D=D, Q=Q, patch_mask=patch_mask)
+        effective_seed = int((seed + offset) % 2147483647)
+        if effective_seed <= 0:
+            effective_seed += 1
+        patch_roles = roles.detach().cpu().long().reshape(-1)[idx].clone()
+        controlled_roles = patch_roles.clone()
+
+        if mode in {"random_same_mass", "random", "random_role_same_mass"}:
+            unique, counts = torch.unique(patch_roles, return_counts=True)
+            multiset = torch.repeat_interleave(unique, counts)
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(effective_seed)
+            controlled_roles = multiset[torch.randperm(int(multiset.numel()), generator=generator)]
+            debug["semantic_role_control_reason"] = "random_same_mass"
+        elif mode in {"shuffled_semantic", "semantic_shuffle", "cyclic_shuffle"}:
+            shift = int(effective_seed % int(patch_roles.numel()))
+            if shift == 0:
+                shift = max(int(patch_roles.numel()) // 2, 1)
+            controlled_roles = torch.roll(patch_roles, shifts=shift)
+            debug["semantic_role_control_reason"] = "cyclic_shuffled_semantic_roles"
+            debug["semantic_role_control_shift"] = shift
+        else:
+            debug["semantic_role_control_reason"] = f"unknown_mode:{mode}"
+            return roles, debug
+
+        out = roles.detach().cpu().long().reshape(-1).clone()
+        out[idx] = controlled_roles
+        changed = (controlled_roles != patch_roles).float()
+        debug.update({
+            "semantic_role_control_applied": True,
+            "semantic_role_control_effective_seed": effective_seed,
+            "R_ttt_role_counts_after_control": self._role_counts(out[idx]),
+            "semantic_role_control_changed_fraction": float(changed.mean().item()) if changed.numel() else 0.0,
+            "semantic_role_control_note": "Role-level TTT control preserves role mass and perturbs patch-token role positions.",
+        })
+        return out.reshape_as(roles), debug
+
+    def _apply_swa_semantic_role_control(
+        self,
+        roles: torch.Tensor,
+        *,
+        G: torch.Tensor,
+        L: torch.Tensor,
+        D: torch.Tensor,
+        Q: torch.Tensor,
+        patch_mask: torch.Tensor,
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Apply same-mass SWA role controls without touching TTT role fields."""
+
+        mode = str(getattr(self, "semantic_role_control_mode", "none") or "none").strip().lower()
+        seed = int(getattr(self, "semantic_role_control_seed", 12345))
+        idx = torch.nonzero(patch_mask.detach().cpu().bool().reshape(-1), as_tuple=False).reshape(-1)
+        before_counts = self._role_counts(roles[idx]) if idx.numel() else {}
+        debug: Dict[str, Any] = {
+            "semantic_swa_role_control_mode": mode or "none",
+            "semantic_swa_role_control_seed": seed,
+            "semantic_swa_role_control_scope": "swa_patch_roles",
+            "semantic_swa_role_control_applied": False,
+            "semantic_swa_role_control_reason": "disabled",
+            "R_swa_role_counts_before_control": before_counts,
+            "R_swa_role_counts_after_control": before_counts,
+            "semantic_swa_role_control_changed_fraction": 0.0,
+        }
+        if mode in {"", "none", "off", "noop"}:
+            return roles, debug
+        if idx.numel() <= 1:
+            debug["semantic_swa_role_control_reason"] = "insufficient_patch_tokens"
+            return roles, debug
+
+        offset = self._semantic_role_control_offset(G=G, L=L, D=D, Q=Q, patch_mask=patch_mask)
+        effective_seed = int((seed + offset) % 2147483647)
+        if effective_seed <= 0:
+            effective_seed += 1
+        patch_roles = roles.detach().cpu().long().reshape(-1)[idx].clone()
+        controlled_roles = patch_roles.clone()
+
+        if mode in {"random_same_mass", "random", "random_role_same_mass"}:
+            unique, counts = torch.unique(patch_roles, return_counts=True)
+            multiset = torch.repeat_interleave(unique, counts)
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(effective_seed)
+            controlled_roles = multiset[torch.randperm(int(multiset.numel()), generator=generator)]
+            debug["semantic_swa_role_control_reason"] = "random_same_mass"
+        elif mode in {"shuffled_semantic", "semantic_shuffle", "cyclic_shuffle"}:
+            shift = int(effective_seed % int(patch_roles.numel()))
+            if shift == 0:
+                shift = max(int(patch_roles.numel()) // 2, 1)
+            controlled_roles = torch.roll(patch_roles, shifts=shift)
+            debug["semantic_swa_role_control_reason"] = "cyclic_shuffled_semantic_roles"
+            debug["semantic_swa_role_control_shift"] = shift
+        else:
+            debug["semantic_swa_role_control_reason"] = f"unknown_mode:{mode}"
+            return roles, debug
+
+        out = roles.detach().cpu().long().reshape(-1).clone()
+        out[idx] = controlled_roles
+        changed = (controlled_roles != patch_roles).float()
+        debug.update({
+            "semantic_swa_role_control_applied": True,
+            "semantic_swa_role_control_effective_seed": effective_seed,
+            "R_swa_role_counts_after_control": self._role_counts(out[idx]),
+            "semantic_swa_role_control_changed_fraction": float(changed.mean().item()) if changed.numel() else 0.0,
+            "semantic_swa_role_control_note": "SWA control preserves role mass and perturbs patch-token source roles.",
+        })
+        return out.reshape_as(roles), debug
 
     @staticmethod
     def _label_counts(values: Optional[torch.Tensor]) -> Dict[str, int]:
@@ -2872,6 +4039,46 @@ class HybridMemoryController:
         ttt_on = self._semantic_path_enabled("ttt")
         lifecycle_on = self._semantic_path_enabled("lifecycle")
 
+        role_control_debug: Dict[str, Any] = {
+            "semantic_role_control_mode": str(getattr(self, "semantic_role_control_mode", "none") or "none").strip().lower(),
+            "semantic_role_control_seed": int(getattr(self, "semantic_role_control_seed", 12345)),
+            "semantic_role_control_scope": "ttt_patch_roles",
+            "semantic_role_control_applied": False,
+            "semantic_role_control_reason": "ttt_path_disabled_or_missing_write_prior",
+            "R_ttt_role_counts_before_control": self._role_counts(R_ttt[patch_mask]),
+            "R_ttt_role_counts_after_control": self._role_counts(R_ttt[patch_mask]),
+            "semantic_role_control_changed_fraction": 0.0,
+        }
+        swa_role_control_debug: Dict[str, Any] = {
+            "semantic_swa_role_control_mode": str(getattr(self, "semantic_role_control_mode", "none") or "none").strip().lower(),
+            "semantic_swa_role_control_seed": int(getattr(self, "semantic_role_control_seed", 12345)),
+            "semantic_swa_role_control_scope": "swa_patch_roles",
+            "semantic_swa_role_control_applied": False,
+            "semantic_swa_role_control_reason": "swa_path_disabled",
+            "R_swa_role_counts_before_control": self._role_counts(R_swa[patch_mask]),
+            "R_swa_role_counts_after_control": self._role_counts(R_swa[patch_mask]),
+            "semantic_swa_role_control_changed_fraction": 0.0,
+        }
+        if (ttt_on or lifecycle_on) and P_ttt_write is not None:
+            R_ttt, role_control_debug = self._apply_ttt_semantic_role_control(
+                R_ttt,
+                G=G,
+                L=L,
+                D=D,
+                Q=Q,
+                patch_mask=patch_mask,
+            )
+            R = R_ttt.clone()
+        if swa_on:
+            R_swa, swa_role_control_debug = self._apply_swa_semantic_role_control(
+                R_swa,
+                G=G,
+                L=L,
+                D=D,
+                Q=Q,
+                patch_mask=patch_mask,
+            )
+
         P_out = P_ttt_write
         if (ttt_on or lifecycle_on) and P_ttt_write is not None:
             P = P_ttt_write.detach().cpu().float().reshape(-1).clone()
@@ -2884,6 +4091,18 @@ class HybridMemoryController:
             P_out = P
 
         D_swa_out = D_swa_write_tok
+        swa_adjust_debug: Dict[str, Any] = {
+            "semantic_role_swa_negative_scale": float(self.semantic_role_swa_negative_scale),
+            "semantic_role_swa_protect_scale": float(getattr(self, "semantic_role_swa_protect_scale", 1.0)),
+            "semantic_role_swa_negative_count": int(((R_swa == int(SEMANTIC_ROLE_NEGATIVE_SHORT)) & patch_mask).sum().item()),
+            "semantic_role_swa_protect_count": int(((R_swa == int(SEMANTIC_ROLE_PROTECT_NEUTRAL)) & patch_mask).sum().item()),
+            "semantic_role_swa_protect_adjusted": False,
+            "semantic_role_swa_score_before_mean": None,
+            "semantic_role_swa_score_after_mean": None,
+            "semantic_role_swa_score_protect_before_mean": None,
+            "semantic_role_swa_score_protect_after_mean": None,
+            "semantic_role_swa_score_negative_after_mean": None,
+        }
         if swa_on:
             base = (
                 D_swa_write_tok.detach().cpu().float().reshape(-1).clone()
@@ -2892,6 +4111,22 @@ class HybridMemoryController:
             )
             neg_score = (R_swa == int(SEMANTIC_ROLE_NEGATIVE_SHORT)).float() * float(self.semantic_role_swa_negative_scale)
             D_swa_out = torch.maximum(base, neg_score).clamp(0.0, 1.0)
+            protect = (R_swa == int(SEMANTIC_ROLE_PROTECT_NEUTRAL)) & patch_mask
+            protect_scale = min(max(float(getattr(self, "semantic_role_swa_protect_scale", 1.0)), 0.0), 1.0)
+            before = D_swa_out.clone()
+            if protect_scale < 1.0 and bool(protect.any()):
+                D_swa_out[protect] = (D_swa_out[protect] * protect_scale).clamp(0.0, 1.0)
+            neg = (R_swa == int(SEMANTIC_ROLE_NEGATIVE_SHORT)) & patch_mask
+            swa_adjust_debug.update({
+                "semantic_role_swa_negative_scale": float(self.semantic_role_swa_negative_scale),
+                "semantic_role_swa_protect_scale": float(protect_scale),
+                "semantic_role_swa_protect_adjusted": bool(protect_scale < 1.0 and bool(protect.any())),
+                "semantic_role_swa_score_before_mean": float(before[patch_mask].mean().item()) if bool(patch_mask.any()) else 0.0,
+                "semantic_role_swa_score_after_mean": float(D_swa_out[patch_mask].mean().item()) if bool(patch_mask.any()) else 0.0,
+                "semantic_role_swa_score_protect_before_mean": float(before[protect].mean().item()) if bool(protect.any()) else None,
+                "semantic_role_swa_score_protect_after_mean": float(D_swa_out[protect].mean().item()) if bool(protect.any()) else None,
+                "semantic_role_swa_score_negative_after_mean": float(D_swa_out[neg].mean().item()) if bool(neg.any()) else None,
+            })
 
         V = (
             V_sem_tok.detach().cpu().float().reshape(-1).clamp(0.0, 1.0)
@@ -2936,6 +4171,9 @@ class HybridMemoryController:
             "semantic_role_swa_adjusted": bool(swa_on),
         }
         debug.update(fine_debug)
+        debug.update(role_control_debug)
+        debug.update(swa_role_control_debug)
+        debug.update(swa_adjust_debug)
         return R, R_frame, R_global, R_swa, R_ttt, P_out, D_swa_out, debug
 
     def _apply_swa_history_write_gate(
@@ -3242,24 +4480,43 @@ class HybridMemoryController:
         mode: str,
     ) -> HybridMemoryControlPrior:
         saved_read_cue_source = self.read_cue_source
+        saved_semantic_role_policy = self.semantic_role_policy
+        saved_semantic_memory_paths = self.semantic_memory_paths
+        saved_semantic_role_control_mode = self.semantic_role_control_mode
+        saved_semantic_anchor_mode = self.semantic_anchor_mode
+        saved_enable_semantic_anchor_ttt_floor = self.enable_semantic_anchor_ttt_floor
+        gate_mode = "fixed_chunks" if self.semantic_action_active_chunks else "ungated"
+        gate_active = self._semantic_action_chunk_active()
         inactive_source = self.semantic_action_inactive_read_cue_source.strip()
         use_inactive_source = bool(
             inactive_source
             and self.semantic_action_active_chunks
-            and not self._semantic_action_chunk_active()
+            and not gate_active
         )
+        inactive_chunk = bool(self.semantic_action_active_chunks and not gate_active)
         if use_inactive_source:
             self.read_cue_source = inactive_source
+        if inactive_chunk:
+            self.semantic_role_policy = "none"
+            self.semantic_memory_paths = ""
+            self.semantic_role_control_mode = "none"
+            self.semantic_anchor_mode = "none"
+            self.enable_semantic_anchor_ttt_floor = False
         try:
             out = self._build_control_prior_impl(
                 probe=probe,
                 cue=cue,
-                prior_output=None if use_inactive_source else prior_output,
+                prior_output=None if inactive_chunk else prior_output,
                 mode=mode,
             )
-            out.debug["semantic_action_read_cue_gate_mode"] = (
-                "fixed_chunks" if self.semantic_action_active_chunks else "ungated"
+            out.debug["semantic_action_chunk_gate_mode"] = gate_mode
+            out.debug["semantic_action_chunk_gate_active"] = bool(gate_active)
+            out.debug["semantic_action_prior_gate_active"] = bool(not inactive_chunk)
+            out.debug["semantic_action_prior_consumed"] = bool((not inactive_chunk) and prior_output is not None)
+            out.debug["semantic_action_inactive_policy"] = (
+                "disable_semantic_prior_role_control_anchor" if inactive_chunk else "none"
             )
+            out.debug["semantic_action_read_cue_gate_mode"] = gate_mode
             out.debug["semantic_action_read_cue_gate_active"] = bool(not use_inactive_source)
             out.debug["semantic_action_inactive_read_cue_source"] = inactive_source or None
             out.debug["semantic_action_active_chunks"] = sorted(int(v) for v in self.semantic_action_active_chunks)
@@ -3267,6 +4524,11 @@ class HybridMemoryController:
             return out
         finally:
             self.read_cue_source = saved_read_cue_source
+            self.semantic_role_policy = saved_semantic_role_policy
+            self.semantic_memory_paths = saved_semantic_memory_paths
+            self.semantic_role_control_mode = saved_semantic_role_control_mode
+            self.semantic_anchor_mode = saved_semantic_anchor_mode
+            self.enable_semantic_anchor_ttt_floor = saved_enable_semantic_anchor_ttt_floor
 
     def _build_control_prior_impl(
         self,
@@ -3912,6 +5174,12 @@ class HybridMemoryController:
                 num_frames=num_frames,
                 patch_grid=(int(geo.patch_grid[0]), int(geo.patch_grid[1])),
             ).clamp(0.0, 1.0)
+            stage_geo_patch = _flatten_cue_field_or_default(
+                cue.G_write_geo_patch,
+                dyn_patch,
+                num_frames=num_frames,
+                patch_grid=(int(geo.patch_grid[0]), int(geo.patch_grid[1])),
+            ).clamp(0.0, 1.0)
             flow_proxy_raw = (dyn_patch * (1.0 - occ_patch).clamp(0.0, 1.0) * conf_patch).clamp(0.0, 1.0)
             structure_like = (anchor_patch >= self.read_static_anchor_thr) & (dyn_patch <= self.read_static_dyn_thr)
             flow_sem_veto_raw = torch.where(structure_like, torch.zeros_like(flow_proxy_raw), flow_proxy_raw)
@@ -3939,8 +5207,26 @@ class HybridMemoryController:
                 num_frames=num_frames,
                 overlap_frames=self.read_overlap_frames,
             )
+            v68_cfg = _parse_v68_read_cue(self.read_cue_source)
+            v68_patch = None
+            if v68_cfg is not None:
+                current_chunk_idx = int(getattr(self, "current_chunk_idx", -1))
+                v68_patch, v68_debug = _v68_read_cue_patch(
+                    token_type=token_type,
+                    prior_output=prior_output,
+                    cfg=v68_cfg,
+                    q_layers=geo.global_q_raw_patchvec_layers,
+                    k_layers=geo.global_k_raw_patchvec_layers,
+                    default=dyn_patch,
+                    num_frames=num_frames,
+                    chunk_idx=current_chunk_idx,
+                )
+                cue_extra_debug.update(v68_debug)
 
-            if acl2_patch is not None:
+            if v68_patch is not None:
+                read_patch = v68_patch
+                cue_source_effective = self.read_cue_source
+            elif acl2_patch is not None:
                 read_patch = acl2_patch
             elif self.read_cue_source in {"dyn", "old_dyn", "old_dyn_calibrated_soft_or"}:
                 read_patch = dyn_patch
@@ -4111,6 +5397,73 @@ class HybridMemoryController:
                     alpha=alpha,
                 )
                 cue_extra_debug.update(rescue_debug)
+                cue_source_effective = self.read_cue_source
+            elif _parse_v67_semgeo_read_cue(self.read_cue_source) is not None:
+                semgeo_cfg = _parse_v67_semgeo_read_cue(self.read_cue_source) or {}
+                current_chunk_idx = int(getattr(self, "current_chunk_idx", -1))
+                read_patch, semgeo_debug = _v67_semgeo_cue_patch(
+                    token_type=token_type,
+                    prior_output=prior_output,
+                    cfg=semgeo_cfg,
+                    dyn_patch=dyn_patch,
+                    occ_patch=occ_patch,
+                    unc_patch=unc_patch,
+                    conf_patch=conf_patch,
+                    anchor_patch=anchor_patch,
+                    stage_geo_patch=stage_geo_patch,
+                    qkstable_patch=(1.0 - gg_qk_middle_patch).clamp(0.0, 1.0),
+                    deepstatic_patch=gg_deep_static_patch,
+                    smd_patch=gg_smd_a1b1g1_patch,
+                    fa_decay_patch=fa_key_decay_patch,
+                    key_avg_patch=key_avg_patch,
+                    num_frames=num_frames,
+                    chunk_idx=current_chunk_idx,
+                )
+                semgeo_debug["v67_semgeo_read_cue_source"] = self.read_cue_source
+                cue_extra_debug.update(semgeo_debug)
+                cue_source_effective = self.read_cue_source
+            elif _parse_v67_semantic_cue(self.read_cue_source) is not None:
+                semcue_cfg = _parse_v67_semantic_cue(self.read_cue_source) or {}
+                current_chunk_idx = int(getattr(self, "current_chunk_idx", -1))
+                read_patch, semcue_debug = _v67_semantic_anchor_cue_patch(
+                    token_type=token_type,
+                    prior_output=prior_output,
+                    kind=str(semcue_cfg.get("kind", "anchor_risk")),
+                    random_same_distribution=bool(semcue_cfg.get("random_same_distribution", False)),
+                    chunk_idx=current_chunk_idx,
+                )
+                semcue_debug["v67_semcue_read_cue_source"] = self.read_cue_source
+                cue_extra_debug.update(semcue_debug)
+                cue_source_effective = self.read_cue_source
+            elif _parse_v67_semz_read_cue(self.read_cue_source) is not None:
+                v67_cfg = _parse_v67_semz_read_cue(self.read_cue_source) or {}
+                D_g = _acl2_read_patch_from_source(
+                    "acl2.gg.qq.low.g2_3.past_only.headmean.robustq",
+                    geo.global_q_raw_patchvec_layers,
+                    geo.global_k_raw_patchvec_layers,
+                    dyn_patch,
+                    num_frames=num_frames,
+                    overlap_frames=self.read_overlap_frames,
+                )
+                if D_g is None:
+                    D_g = dyn_patch
+                D_g = D_g.clamp(0.0, 1.0)
+                label_mode = str(v67_cfg.get("label_mode", "coarse"))
+                label_field = "G_sem_tok" if label_mode == "coarse" else "L_sem_tok"
+                label_tok = getattr(prior_output, label_field, None) if prior_output is not None else None
+                patch_labels = _patch_labels_from_token_labels(label_tok, token_type)
+                current_chunk_idx = int(getattr(self, "current_chunk_idx", -1))
+                read_patch, v67_debug = _v67_semantic_mad_recondition_patch(
+                    D_g,
+                    patch_labels,
+                    beta=float(v67_cfg.get("beta", 0.525)),
+                    min_count=256,
+                    control_mode=str(v67_cfg.get("control_mode", "semantic")),
+                    chunk_idx=current_chunk_idx,
+                )
+                v67_debug["v67_semz_label_field"] = label_field
+                v67_debug["v67_semz_read_cue_source"] = self.read_cue_source
+                cue_extra_debug.update(v67_debug)
                 cue_source_effective = self.read_cue_source
             elif self.read_cue_source in {
                 "v31.sem_z_fine.c23past",
@@ -4681,6 +6034,12 @@ class HybridMemoryController:
             prev_D_patch = state_m.prev_control_summary.get("D_patch")
             if prev_D_patch is not None:
                 model_hmc_control["D_prev_patch"] = prev_D_patch
+            prev_G_patch = state_m.prev_control_summary.get("G_patch")
+            if prev_G_patch is not None:
+                model_hmc_control["G_prev_patch"] = prev_G_patch
+            prev_L_patch = state_m.prev_control_summary.get("L_patch")
+            if prev_L_patch is not None:
+                model_hmc_control["L_prev_patch"] = prev_L_patch
         geo, write_cache = backbone.run(
             images,
             ttt_state=state_m.to_ttt_input() if state_m is not None else None,
@@ -4719,6 +6078,7 @@ class HybridMemoryController:
             else:
                 old_mode = self.ttt_update_controller.write_mode
                 self.ttt_update_controller.write_mode = write_mode
+                self.ttt_update_controller.current_chunk_idx = int(getattr(self, "current_chunk_idx", -1))
                 write_cache_for_commit, dual_lifetime_debug = _write_cache_with_long_old_weights_for_dual_lifetime(
                     write_cache,
                     state_m.ttt_state if state_m is not None else None,
@@ -4911,11 +6271,83 @@ class HybridMemoryController:
                 for rec in records
                 if isinstance(rec, dict) and rec.get("attention_mass_query_sample_tokens_mean") is not None
             ]
+            attention_mass_removed_token_vals = [
+                float(rec.get("attention_mass_removed_tokens_mean"))
+                for rec in records
+                if isinstance(rec, dict) and rec.get("attention_mass_removed_tokens_mean") is not None
+            ]
+            attention_mass_retained_token_vals = [
+                float(rec.get("attention_mass_retained_tokens_mean"))
+                for rec in records
+                if isinstance(rec, dict) and rec.get("attention_mass_retained_tokens_mean") is not None
+            ]
             attention_mass_metrics = sorted({
                 str(rec.get("attention_mass_metric"))
                 for rec in records
                 if isinstance(rec, dict) and rec.get("attention_mass_metric") is not None
             })
+            extra_numeric_summary: Dict[str, float] = {}
+            for extra_key in (
+                "context_source_selected_token_count",
+                "context_source_selected_token_ratio",
+                "context_source_selected_fine_sky_frac",
+                "context_source_selected_group_structure_frac",
+                "context_source_selected_group_static_frac",
+                "context_source_selected_group_movable_frac",
+                "context_source_selected_group_lowstuff_frac",
+                "context_source_selected_group_uncertain_frac",
+                "v40_r2_sky_token_count",
+                "v40_r2_sky_token_ratio",
+                "v40_r2_sky_highd_token_ratio",
+                "v40_r2_source_mass_proxy_ratio",
+                "v40_r2_sky_highd_threshold",
+                "v40_r2_global_keep_proxy_after",
+                "v40_r3_highd_quantile",
+                "v40_r3_highd_threshold",
+                "v67_phase2_highd_quantile",
+                "v67_phase2_highd_threshold",
+                "v67_source_attention_top_quantile",
+                "v67_source_attention_semantic_group_id",
+                "v67_source_attention_group_eligible_tokens",
+                "swa_overlap_source_semantic_highd_quantile",
+                "swa_overlap_source_semantic_tokens_before_random",
+                "swa_overlap_source_semantic_selected_tokens",
+                "swa_overlap_source_semantic_selected_ratio",
+                "swa_overlap_source_semantic_selected_index_mean",
+                "swa_overlap_source_semantic_selected_D_mean",
+                "source_control_score_mean",
+                "source_control_score_max",
+                "source_weight_mean",
+                "source_weight_min",
+            ):
+                vals = [
+                    float(rec.get(extra_key))
+                    for rec in records
+                    if isinstance(rec, dict)
+                    and rec.get(extra_key) is not None
+                    and torch.isfinite(torch.tensor(float(rec.get(extra_key))))
+                ]
+                if vals:
+                    extra_numeric_summary[f"mean_{extra_key}"] = float(torch.tensor(vals).mean().item())
+                    extra_numeric_summary[f"max_{extra_key}"] = max(vals)
+            extra_bool_summary: Dict[str, float] = {}
+            for extra_key in (
+                "v40_r2_source_mass_proxy_gate_pass",
+                "v40_r2_no_source_mass_control",
+                "v40_r3_residual_available",
+                "v40_r3_source_attention_mass_available_before_action",
+                "v67_source_attention_random_same_mass",
+                "v67_source_attention_group_missing_semantic",
+                "swa_overlap_source_semantic_missing_labels",
+                "swa_overlap_source_semantic_random_same_mass",
+            ):
+                vals = [
+                    bool(rec.get(extra_key))
+                    for rec in records
+                    if isinstance(rec, dict) and rec.get(extra_key) is not None
+                ]
+                if vals:
+                    extra_bool_summary[f"frac_{extra_key}"] = float(torch.tensor(vals, dtype=torch.float32).mean().item())
             hook_effect_summary[path_name] = {
                 "num_calls": len(records),
                 "num_enabled_layers": sum(
@@ -4986,9 +6418,15 @@ class HybridMemoryController:
                 if attention_mass_retained_after_vals else None,
                 "mean_attention_mass_query_sample_tokens": float(torch.tensor(attention_mass_query_sample_vals).mean().item())
                 if attention_mass_query_sample_vals else None,
+                "mean_attention_mass_removed_tokens": float(torch.tensor(attention_mass_removed_token_vals).mean().item())
+                if attention_mass_removed_token_vals else None,
+                "mean_attention_mass_retained_tokens": float(torch.tensor(attention_mass_retained_token_vals).mean().item())
+                if attention_mass_retained_token_vals else None,
                 "max_history_tokens": max(history_token_vals) if history_token_vals else 0,
                 "max_d_prev_tokens": max(d_prev_token_vals) if d_prev_token_vals else 0,
             }
+            hook_effect_summary[path_name].update(extra_numeric_summary)
+            hook_effect_summary[path_name].update(extra_bool_summary)
         implemented_paths: List[str] = []
         if mode == "identity_hooks":
             implemented_paths = ["frame_attention", "swa_read", "ttt_apply", "chunk_attention"]
@@ -5085,6 +6523,7 @@ class HybridMemoryController:
         B_chunk_geo = control_prior.B_chunk_geo if control_prior is not None else None
         old_mode = self.ttt_update_controller.write_mode
         self.ttt_update_controller.write_mode = "semantic"
+        self.ttt_update_controller.current_chunk_idx = int(getattr(self, "current_chunk_idx", -1))
         write_result = self.ttt_update_controller.run(
             write_cache,
             A_tok,
@@ -5131,7 +6570,7 @@ class HybridMemoryController:
         if not self.semantic_action_active_chunks:
             return True
         try:
-            chunk_idx = int(getattr(self, "current_chunk_idx"))
+            chunk_idx = int(getattr(self, "current_chunk_idx", -1))
         except (TypeError, ValueError):
             return False
         return chunk_idx in self.semantic_action_active_chunks
@@ -5203,6 +6642,8 @@ class HybridMemoryController:
             "swa_overlap_source_replace_target": self.swa_overlap_source_replace_target,
             "swa_overlap_source_replace_layer_mode": self.swa_overlap_source_replace_layer_mode,
             "swa_overlap_source_replace_single_layer": self.swa_overlap_source_replace_single_layer,
+            "swa_overlap_feature_dump_dir": "" if is_identity else self.swa_overlap_feature_dump_dir,
+            "swa_overlap_feature_dump_dtype": self.swa_overlap_feature_dump_dtype,
             "enable_context_source_skip": context_source_skip_enabled,
             "context_source_skip_impl": "bias" if is_identity else self.context_source_skip_impl,
             "context_source_skip_scope": self.context_source_skip_scope,
@@ -5214,6 +6655,13 @@ class HybridMemoryController:
             "context_source_skip_soft_min_keep": self.context_source_skip_soft_min_keep,
             "context_source_skip_record_attention_mass": False if is_identity else self.context_source_skip_record_attention_mass,
             "context_source_skip_attention_mass_max_queries": self.context_source_skip_attention_mass_max_queries,
+            "context_source_skip_attention_map_dump_dir": "" if is_identity else self.context_source_skip_attention_map_dump_dir,
+            "context_source_skip_attention_map_dump_max_queries": self.context_source_skip_attention_map_dump_max_queries,
+            "context_source_skip_attention_map_dump_dtype": self.context_source_skip_attention_map_dump_dtype,
+            "context_source_skip_attention_map_dump_full_query_marginal": (
+                False if is_identity else self.context_source_skip_attention_map_dump_full_query_marginal
+            ),
+            "context_source_skip_attention_map_dump_query_block": self.context_source_skip_attention_map_dump_query_block,
             "swa_write_cache_store_post": self.enable_swa_write_control and self.swa_write_cache_blend_alpha > 0.0,
             "swa_overlap_frames": int(self.read_overlap_frames),
             "beta_chunk": 0.0 if is_identity else self.beta_chunk,
@@ -5301,14 +6749,34 @@ class HybridMemoryController:
             return None
         token_type = geo.token_type.detach().cpu().long()
         patch_mask = token_type == TOKEN_TYPE_PATCH
-        return {
+        source_tok = (
+            control_prior.D_swa_write_tok
+            if control_prior.D_swa_write_tok is not None
+            else control_prior.D_tok
+        )
+        out: Dict[str, Any] = {
             "mean_D_tok": float(control_prior.D_tok.float().mean().item()),
             "mean_D_patch": float(control_prior.D_tok[patch_mask].float().mean().item()) if patch_mask.any() else 0.0,
+            "mean_D_swa_source_tok": float(source_tok.float().mean().item()),
+            "mean_D_swa_source_patch": float(source_tok[patch_mask].float().mean().item()) if patch_mask.any() else 0.0,
+            "D_patch_source": "D_swa_write_tok" if control_prior.D_swa_write_tok is not None else "D_tok",
             "mean_R_tok": float(control_prior.R_tok.float().mean().item()) if control_prior.R_tok is not None else 1.0,
             "num_frames": int(geo.num_frames),
             "patch_grid": tuple(int(x) for x in geo.patch_grid),
-            "D_patch": control_prior.D_tok[patch_mask].detach().cpu().float() if patch_mask.any() else None,
+            "D_patch": source_tok[patch_mask].detach().cpu().float() if patch_mask.any() else None,
         }
+        for field_name, tensor, dtype in (
+            ("G_patch", control_prior.G_sem_tok, torch.long),
+            ("L_patch", control_prior.L_sem_tok, torch.long),
+        ):
+            if tensor is None:
+                continue
+            flat = tensor.detach().cpu().to(dtype=dtype).reshape(-1)
+            if int(flat.numel()) == int(token_type.numel()):
+                out[field_name] = flat[patch_mask]
+            elif int(flat.numel()) == int(patch_mask.sum().item()):
+                out[field_name] = flat
+        return out
 
 
 __all__ = [

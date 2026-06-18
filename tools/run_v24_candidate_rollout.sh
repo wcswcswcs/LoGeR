@@ -1470,6 +1470,41 @@ case "$CANDIDATE_ID" in
     enable_swa_policy
     V24_FAMILY="allmem_pathspec"
     ;;
+  V67_R1C_SEMZ_COARSE_BETA525)
+    RUN_MODE="readonly"
+    READ_CUE="v67.semz_coarse_beta525.c23past"
+    READ_CALIB_MODE="${READ_CALIB_MODE:-none}"
+    FINE_SPLIT_AVAILABLE=true
+    V24_FAMILY="v67_semz_median_mad_c23"
+    ;;
+  V67_R1C_RANDOM)
+    RUN_MODE="readonly"
+    READ_CUE="v67.semz_coarse_beta525.random_hist.c23past"
+    READ_CALIB_MODE="${READ_CALIB_MODE:-none}"
+    FINE_SPLIT_AVAILABLE=true
+    V24_FAMILY="v67_semz_median_mad_c23_control"
+    ;;
+  V67_R1C_SHUFFLED)
+    RUN_MODE="readonly"
+    READ_CUE="v67.semz_coarse_beta525.shuffled_spatial.c23past"
+    READ_CALIB_MODE="${READ_CALIB_MODE:-none}"
+    FINE_SPLIT_AVAILABLE=true
+    V24_FAMILY="v67_semz_median_mad_c23_control"
+    ;;
+  V67_R1C_GEOMETRY_ONLY_Z)
+    RUN_MODE="readonly"
+    READ_CUE="v67.semz_coarse_beta525.geometry_only_z.c23past"
+    READ_CALIB_MODE="${READ_CALIB_MODE:-none}"
+    FINE_SPLIT_AVAILABLE=true
+    V24_FAMILY="v67_semz_median_mad_c23_control"
+    ;;
+  V67_R1C_SEMANTIC_ONLY)
+    RUN_MODE="readonly"
+    READ_CUE="v67.semz_coarse_beta525.semantic_only.c23past"
+    READ_CALIB_MODE="${READ_CALIB_MODE:-none}"
+    FINE_SPLIT_AVAILABLE=true
+    V24_FAMILY="v67_semz_median_mad_c23_control"
+    ;;
   *)
     echo "Unsupported CANDIDATE_ID for v24 rollout: $CANDIDATE_ID" >&2
     exit 2

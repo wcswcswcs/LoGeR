@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from functools import partial
 from copy import deepcopy
+from pathlib import Path
 from typing import Any, Dict, Optional, Union, List, Tuple
 
 from .dinov2.layers import Mlp
@@ -16,6 +17,16 @@ from .layers.conv_head import ConvHead
 from .dinov2.hub.backbones import dinov2_vitl14, dinov2_vitl14_reg
 from huggingface_hub import PyTorchModelHubMixin
 from loger.models.ttt import FastWeightGluMLPMultihead, TTTOperator
+
+_CONTEXT_SKY_FINE_LABEL_IDS = {20, 26}
+_CONTEXT_VEGETATION_FINE_LABEL_IDS = {21, 22, 23, 24, 27, 28}
+_CONTEXT_GROUND_FINE_LABEL_IDS = {1, 2, 8, 10, 11}
+_CONTEXT_VERTICAL_STATIC_FINE_LABEL_IDS = {3, 4, 5, 6, 7, 12, 13, 15}
+_CONTEXT_SEM_GROUP_STRUCTURE = 0
+_CONTEXT_SEM_GROUP_STATIC = 1
+_CONTEXT_SEM_GROUP_MOVABLE = 2
+_CONTEXT_SEM_GROUP_LOWSTUFF = 3
+_CONTEXT_SEM_GROUP_UNCERTAIN = 4
 
 class Pi3(nn.Module, PyTorchModelHubMixin):
     def __init__(
@@ -1044,17 +1055,103 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             "semantic_anchor_bank",
             "anchor_bank",
         }
-        random_same_mass = mask_name in {
+        random_same_mass_semantic_role = mask_name in {
             "random_same_mass_semantic_role_negative",
             "random_same_mass_semrole_negative",
             "random_same_mass",
         }
+        random_same_mass_high_influence = mask_name in {
+            "random_same_mass_high_influence",
+            "random_high_influence_same_mass",
+            "v40_read_a2_high_influence_random_same_mass",
+        }
+        phase2_random_base_map = {
+            "v67_carrier_highd_q80_random_same_mass": "v67_carrier_highd_q80",
+            "v67_carrier_highd_q90_random_same_mass": "v67_carrier_highd_q90",
+            "v67_source_attention_q90_random_same_mass": "v67_source_attention_q90",
+            "v67_source_attention_q95_random_same_mass": "v67_source_attention_q95",
+            "v67_carrier_dynamic_highd_random_same_mass": "v67_carrier_dynamic_highd",
+            "v67_carrier_sky_highd_random_same_mass": "v67_carrier_sky_highd",
+            "v67_carrier_vegetation_highd_random_same_mass": "v67_carrier_vegetation_highd",
+            "v67_carrier_ground_highd_random_same_mass": "v67_carrier_ground_highd",
+            "v67_carrier_vertical_static_highd_random_same_mass": "v67_carrier_vertical_static_highd",
+            "v67_carrier_overlap_highd_random_same_mass": "v67_carrier_overlap_highd",
+            "v67_carrier_tail_highd_random_same_mass": "v67_carrier_tail_highd",
+        }
+        phase2_source_attention_group_specs = {
+            "v67_source_attention_sky_q90": ("sky", 0.90),
+            "v67_source_attention_sky_q95": ("sky", 0.95),
+            "v67_source_attention_lowstuff_q90": ("lowstuff", 0.90),
+            "v67_source_attention_lowstuff_q95": ("lowstuff", 0.95),
+            "v67_source_attention_structure_q90": ("structure", 0.90),
+            "v67_source_attention_structure_q95": ("structure", 0.95),
+            "v67_source_attention_movable_q90": ("movable", 0.90),
+            "v67_source_attention_movable_q95": ("movable", 0.95),
+        }
+        for _source_attention_group_base in tuple(phase2_source_attention_group_specs.keys()):
+            phase2_random_base_map[f"{_source_attention_group_base}_random_same_mass"] = _source_attention_group_base
+        phase2_shuffled_base_map = {
+            "v67_carrier_sky_highd_shuffled": "v67_carrier_sky_highd",
+            "v67_carrier_vegetation_highd_shuffled": "v67_carrier_vegetation_highd",
+            "v67_carrier_ground_highd_shuffled": "v67_carrier_ground_highd",
+            "v67_carrier_vertical_static_highd_shuffled": "v67_carrier_vertical_static_highd",
+        }
+        random_same_mass_phase2 = mask_name in phase2_random_base_map
+        random_same_mass = random_same_mass_semantic_role or random_same_mass_high_influence or random_same_mass_phase2
         sem_z_dg_soft = mask_name in {
             "sem_z_dg_soft_resid",
             "semantic_z_dg_soft_resid",
             "semantic_conditioned_dg_soft_resid",
         }
-        base_mask_name = "semantic_role_negative" if random_same_mass else mask_name
+        if random_same_mass_semantic_role:
+            base_mask_name = "semantic_role_negative"
+        elif random_same_mass_high_influence:
+            base_mask_name = "v40_read_a2_high_influence"
+        elif random_same_mass_phase2:
+            base_mask_name = phase2_random_base_map[mask_name]
+        elif mask_name in phase2_shuffled_base_map:
+            base_mask_name = phase2_shuffled_base_map[mask_name]
+        else:
+            base_mask_name = mask_name
+        r2_sky_masks = {
+            "v40_read_a4_sky_appanom",
+            "v40_read_a4_sky_appanom_rho",
+            "sky_appanom",
+            "sky_highd_source_mass",
+        }
+        r2_sky_no_source_gate_masks = {
+            "v40_read_a4_sky_appanom_no_source_mass_control",
+            "sky_appanom_no_source_mass_control",
+        }
+        r2_sky_shuffled_masks = {
+            "v40_read_a4_sky_appanom_shuffled",
+            "sky_appanom_shuffled",
+            "shuffled_sky_appanom",
+        }
+        r3_high_influence_masks = {
+            "v40_read_a2_high_influence",
+            "high_influence_anomaly",
+            "source_influence_dg_q80",
+        }
+        phase2_carrier_masks = {
+            "v67_carrier_highd_q80",
+            "v67_carrier_highd_q90",
+            "v67_carrier_dynamic_highd",
+            "v67_carrier_sky_highd",
+            "v67_carrier_vegetation_highd",
+            "v67_carrier_ground_highd",
+            "v67_carrier_vertical_static_highd",
+            "v67_carrier_overlap_highd",
+            "v67_carrier_tail_highd",
+        }
+        phase2_source_attention_masks = {
+            "v67_source_attention_q90",
+            "v67_source_attention_q95",
+        }
+        phase2_source_attention_masks.update(phase2_source_attention_group_specs.keys())
+        semantic_extra_stats: Dict[str, Any] = {}
+        source_attention_top_quantile = None
+        source_attention_top_random_same_mass = False
         if anchor_boost_mask:
             quantile = 0.0
         elif base_mask_name in {"dg_q80", "dg_high", "highd_q80"}:
@@ -1077,8 +1174,51 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             "semantic_conditioned_dg_soft_resid",
         }:
             quantile = 0.80
+        elif base_mask_name in r2_sky_masks or base_mask_name in r2_sky_no_source_gate_masks or base_mask_name in r2_sky_shuffled_masks:
+            quantile = 0.80
+        elif base_mask_name in r3_high_influence_masks:
+            quantile = 0.80
+        elif base_mask_name in phase2_carrier_masks:
+            quantile = 0.90 if base_mask_name == "v67_carrier_highd_q90" else 0.80
+        elif base_mask_name in phase2_source_attention_masks:
+            if base_mask_name in phase2_source_attention_group_specs:
+                quantile = float(phase2_source_attention_group_specs[base_mask_name][1])
+            else:
+                quantile = 0.95 if base_mask_name == "v67_source_attention_q95" else 0.90
         else:
             quantile = 0.90
+
+        source_attention_group_name = None
+        if base_mask_name in phase2_source_attention_group_specs:
+            source_attention_group_name = phase2_source_attention_group_specs[base_mask_name][0]
+            group_mask = torch.zeros_like(eligible, dtype=torch.bool)
+            if source_attention_group_name == "sky":
+                L_sem_tok = hmc_control.get("L_sem_tok")
+                if L_sem_tok is not None:
+                    L = L_sem_tok.to(device=device, dtype=torch.long).reshape(batch_size, frame_num, tokens_per_frame)
+                    for label_id in _CONTEXT_SKY_FINE_LABEL_IDS:
+                        group_mask |= L == int(label_id)
+            else:
+                G_sem_tok = hmc_control.get("G_sem_tok")
+                group_id_map = {
+                    "structure": _CONTEXT_SEM_GROUP_STRUCTURE,
+                    "movable": _CONTEXT_SEM_GROUP_MOVABLE,
+                    "lowstuff": _CONTEXT_SEM_GROUP_LOWSTUFF,
+                }
+                if G_sem_tok is not None and source_attention_group_name in group_id_map:
+                    G = G_sem_tok.to(device=device, dtype=torch.long).reshape(batch_size, frame_num, tokens_per_frame)
+                    group_mask = G == int(group_id_map[source_attention_group_name])
+            eligible = eligible & group_mask
+            semantic_extra_stats.update({
+                "v67_source_attention_semantic_group_id": float({
+                    "sky": 10,
+                    "structure": _CONTEXT_SEM_GROUP_STRUCTURE,
+                    "movable": _CONTEXT_SEM_GROUP_MOVABLE,
+                    "lowstuff": _CONTEXT_SEM_GROUP_LOWSTUFF,
+                }.get(source_attention_group_name, -1)),
+                "v67_source_attention_group_eligible_tokens": float(eligible.sum().item()),
+                "v67_source_attention_group_missing_semantic": bool(not group_mask.any().item()),
+            })
 
         eligible_scores = D[eligible]
         if eligible_scores.numel() == 0:
@@ -1138,6 +1278,161 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                     skip = skip & (~structure)
                     protected = protected | structure
                     semantic_reason = "exact_semantic_structure_rescue_and_highD"
+        elif base_mask_name in r2_sky_masks or base_mask_name in r2_sky_no_source_gate_masks or base_mask_name in r2_sky_shuffled_masks:
+            L_sem_tok = hmc_control.get("L_sem_tok")
+            no_source_gate = base_mask_name in r2_sky_no_source_gate_masks
+            shuffled_label_control = base_mask_name in r2_sky_shuffled_masks
+            if L_sem_tok is None:
+                skip = torch.zeros_like(skip, dtype=torch.bool)
+                semantic_reason = "v40_read_a4_sky_appanom_label_missing"
+            else:
+                L = L_sem_tok.to(device=device, dtype=torch.long).reshape(batch_size, frame_num, tokens_per_frame)
+                if shuffled_label_control:
+                    flat_l = L.reshape(-1)
+                    token_idx = torch.arange(int(flat_l.numel()), device=device, dtype=torch.float32)
+                    chunk = float(hmc_control.get("semantic_action_chunk_idx", -1) if hmc_control else -1)
+                    scores = torch.frac(torch.sin((token_idx + 1.0 + chunk * 131.0) * 12.9898) * 43758.5453)
+                    order = torch.argsort(scores)
+                    L = flat_l[order].reshape_as(L)
+                sky = torch.zeros_like(eligible, dtype=torch.bool)
+                for label_id in _CONTEXT_SKY_FINE_LABEL_IDS:
+                    sky |= L == int(label_id)
+                sky = sky & eligible
+                sky_count = int(sky.sum().item())
+                eligible_count = max(int(eligible.sum().item()), 1)
+                if sky_count <= 0:
+                    skip = torch.zeros_like(skip, dtype=torch.bool)
+                    sky_thr = torch.tensor(float("nan"), device=device)
+                    source_mass_proxy_ratio = 0.0
+                    sky_highd_proxy_ratio = 0.0
+                    proxy_gate_pass = bool(no_source_gate)
+                    semantic_reason = "v40_read_a4_sky_appanom_no_sky_tokens"
+                else:
+                    sky_vals = D[sky].float()
+                    sky_thr = torch.quantile(sky_vals, 0.80)
+                    sky_risk = sky & (D >= sky_thr)
+                    source_mass_proxy_ratio = float(sky_count / eligible_count)
+                    sky_highd_proxy_ratio = float(int(sky_risk.sum().item()) / eligible_count)
+                    proxy_gate_pass = bool(
+                        no_source_gate
+                        or (
+                            source_mass_proxy_ratio >= 0.05
+                            and sky_highd_proxy_ratio >= 0.01
+                        )
+                    )
+                    skip = sky_risk if proxy_gate_pass else torch.zeros_like(skip, dtype=torch.bool)
+                    semantic_reason = (
+                        "v40_read_a4_sky_appanom_"
+                        + ("shuffled_label_" if shuffled_label_control else "")
+                        + ("no_source_gate" if no_source_gate else "proxy_source_gate")
+                    )
+                rho = float(hmc_control.get("context_source_skip_soft_rho", 0.0) or 0.0)
+                semantic_extra_stats.update({
+                    "v40_r2_label_control": "shuffled" if shuffled_label_control else "semantic",
+                    "v40_r2_no_source_mass_control": bool(no_source_gate),
+                    "v40_r2_sky_token_count": int(sky_count),
+                    "v40_r2_sky_token_ratio": float(sky_count / eligible_count),
+                    "v40_r2_sky_highd_token_ratio": float(sky_highd_proxy_ratio),
+                    "v40_r2_source_mass_proxy_ratio": float(source_mass_proxy_ratio),
+                    "v40_r2_source_mass_proxy_gate_pass": bool(proxy_gate_pass),
+                    "v40_r2_sky_highd_threshold": (
+                        float(sky_thr.item()) if torch.isfinite(sky_thr).item() else None
+                    ),
+                    "v40_r2_context_floor_sky_min_keep_target": 0.30,
+                    "v40_r2_context_floor_global_min_keep_target": 0.95,
+                    "v40_r2_global_keep_proxy_after": float(1.0 - rho * max(sky_highd_proxy_ratio, 0.0)),
+                })
+        elif base_mask_name in r3_high_influence_masks:
+            semantic_reason = "v40_read_a2_high_influence_source_proxy_D_q80"
+            source_control_score = None
+            semantic_extra_stats.update({
+                "v40_r3_source_influence_proxy": "D_tok_q80",
+                "v40_r3_residual_available": False,
+                "v40_r3_source_attention_mass_available_before_action": False,
+                "v40_r3_highd_quantile": float(quantile),
+                "v40_r3_highd_threshold": float(thr.item()),
+            })
+        elif base_mask_name in phase2_carrier_masks:
+            semantic_reason = f"v67_phase2_carrier:{base_mask_name}"
+            shuffled_label_control = mask_name in phase2_shuffled_base_map
+            source_control_score = None
+
+            def _fine_mask(label_ids: set[int]) -> torch.Tensor:
+                L_sem_tok = hmc_control.get("L_sem_tok")
+                if L_sem_tok is None:
+                    return torch.zeros_like(eligible, dtype=torch.bool)
+                L = L_sem_tok.to(device=device, dtype=torch.long).reshape(batch_size, frame_num, tokens_per_frame)
+                if shuffled_label_control:
+                    flat_l = L.reshape(-1)
+                    token_idx = torch.arange(int(flat_l.numel()), device=device, dtype=torch.float32)
+                    chunk = float(hmc_control.get("semantic_action_chunk_idx", -1) if hmc_control else -1)
+                    scores = torch.frac(torch.sin((token_idx + 1.0 + chunk * 131.0) * 12.9898) * 43758.5453)
+                    order = torch.argsort(scores)
+                    L = flat_l[order].reshape_as(L)
+                out = torch.zeros_like(eligible, dtype=torch.bool)
+                for label_id in sorted(int(x) for x in label_ids):
+                    out |= L == int(label_id)
+                return out & eligible
+
+            if base_mask_name in {"v67_carrier_highd_q80", "v67_carrier_highd_q90"}:
+                skip = skip & eligible
+            elif base_mask_name == "v67_carrier_dynamic_highd":
+                G_sem_tok = hmc_control.get("G_sem_tok")
+                if G_sem_tok is None:
+                    skip = torch.zeros_like(skip, dtype=torch.bool)
+                    semantic_reason = "v67_phase2_carrier:dynamic_group_missing"
+                else:
+                    G = G_sem_tok.to(device=device, dtype=torch.long).reshape(batch_size, frame_num, tokens_per_frame)
+                    skip = skip & (G == _CONTEXT_SEM_GROUP_MOVABLE)
+            elif base_mask_name == "v67_carrier_sky_highd":
+                sem = _fine_mask(_CONTEXT_SKY_FINE_LABEL_IDS)
+                if int(sem.sum().item()) > 0:
+                    sem_thr = torch.quantile(D[sem].float(), 0.80)
+                    skip = sem & (D >= sem_thr)
+                else:
+                    skip = torch.zeros_like(skip, dtype=torch.bool)
+            elif base_mask_name == "v67_carrier_vegetation_highd":
+                sem = _fine_mask(_CONTEXT_VEGETATION_FINE_LABEL_IDS)
+                if int(sem.sum().item()) > 0:
+                    sem_thr = torch.quantile(D[sem].float(), 0.80)
+                    skip = sem & (D >= sem_thr)
+                else:
+                    skip = torch.zeros_like(skip, dtype=torch.bool)
+            elif base_mask_name == "v67_carrier_ground_highd":
+                skip = _fine_mask(_CONTEXT_GROUND_FINE_LABEL_IDS) & (D >= thr)
+            elif base_mask_name == "v67_carrier_vertical_static_highd":
+                skip = _fine_mask(_CONTEXT_VERTICAL_STATIC_FINE_LABEL_IDS) & (D >= thr)
+            elif base_mask_name == "v67_carrier_overlap_highd":
+                ov = max(int(hmc_control.get("read_overlap_frames", 0) or 0), 0)
+                if ov <= 0:
+                    ov = min(3, int(frame_num))
+                frame_ids = torch.arange(int(frame_num), device=device).reshape(1, frame_num, 1)
+                overlap_region = (frame_ids < ov) | (frame_ids >= max(int(frame_num) - ov, 0))
+                skip = skip & overlap_region
+            elif base_mask_name == "v67_carrier_tail_highd":
+                ov = max(int(hmc_control.get("read_overlap_frames", 0) or 0), 0)
+                if ov <= 0:
+                    ov = min(3, int(frame_num))
+                frame_ids = torch.arange(int(frame_num), device=device).reshape(1, frame_num, 1)
+                skip = skip & (frame_ids >= max(int(frame_num) - ov, 0))
+            else:
+                skip = torch.zeros_like(skip, dtype=torch.bool)
+            semantic_extra_stats.update({
+                "v67_phase2_carrier_mask": base_mask_name,
+                "v67_phase2_label_control": "shuffled" if shuffled_label_control else "semantic_or_geometry",
+                "v67_phase2_highd_quantile": float(quantile),
+                "v67_phase2_highd_threshold": float(thr.item()),
+            })
+        elif base_mask_name in phase2_source_attention_masks:
+            semantic_reason = f"v67_phase2_source_attention:{base_mask_name}"
+            source_attention_top_quantile = float(quantile)
+            source_attention_top_random_same_mass = bool(mask_name in phase2_random_base_map)
+            source_control_score = torch.where(eligible, torch.ones_like(D, dtype=torch.float32), torch.zeros_like(D, dtype=torch.float32))
+            skip = eligible
+            semantic_extra_stats.update({
+                "v67_source_attention_top_quantile": float(source_attention_top_quantile),
+                "v67_source_attention_random_same_mass": bool(source_attention_top_random_same_mass),
+            })
         elif base_mask_name in {
             "semantic_role_negative",
             "semantic_role_source_skip",
@@ -1223,7 +1518,33 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 top = torch.topk(scores[idx], k_select).indices
                 skip_flat[idx[top]] = True
             skip = skip_flat.reshape_as(skip)
-            semantic_reason = f"random_same_mass_control_from_semantic_role_negative:n={base_selected}"
+            semantic_reason = f"random_same_mass_control_from_{base_mask_name}:n={base_selected}"
+
+        selected_for_stats = skip & eligible
+        selected_count = int(selected_for_stats.sum().item())
+        eligible_count = max(int(eligible.sum().item()), 1)
+        semantic_extra_stats.update({
+            "context_source_selected_token_count": selected_count,
+            "context_source_selected_token_ratio": float(selected_count / eligible_count),
+        })
+        G_sem_tok = hmc_control.get("G_sem_tok")
+        if G_sem_tok is not None and selected_count > 0:
+            G = G_sem_tok.to(device=device, dtype=torch.long).reshape(batch_size, frame_num, tokens_per_frame)
+            denom = max(selected_count, 1)
+            semantic_extra_stats.update({
+                "context_source_selected_group_structure_frac": float(((G == _CONTEXT_SEM_GROUP_STRUCTURE) & selected_for_stats).sum().item() / denom),
+                "context_source_selected_group_static_frac": float(((G == _CONTEXT_SEM_GROUP_STATIC) & selected_for_stats).sum().item() / denom),
+                "context_source_selected_group_movable_frac": float(((G == _CONTEXT_SEM_GROUP_MOVABLE) & selected_for_stats).sum().item() / denom),
+                "context_source_selected_group_lowstuff_frac": float(((G == _CONTEXT_SEM_GROUP_LOWSTUFF) & selected_for_stats).sum().item() / denom),
+                "context_source_selected_group_uncertain_frac": float(((G == _CONTEXT_SEM_GROUP_UNCERTAIN) & selected_for_stats).sum().item() / denom),
+            })
+        L_sem_tok = hmc_control.get("L_sem_tok")
+        if L_sem_tok is not None and selected_count > 0:
+            L = L_sem_tok.to(device=device, dtype=torch.long).reshape(batch_size, frame_num, tokens_per_frame)
+            sky_sel = torch.zeros_like(selected_for_stats, dtype=torch.bool)
+            for label_id in _CONTEXT_SKY_FINE_LABEL_IDS:
+                sky_sel |= L == int(label_id)
+            semantic_extra_stats["context_source_selected_fine_sky_frac"] = float((sky_sel & selected_for_stats).sum().item() / max(selected_count, 1))
 
         if source_control_score is None:
             source_control_score = skip.float()
@@ -1247,6 +1568,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 "source_tokens_after": source_tokens_after,
                 "special_token_keep_ratio": special_keep,
             })
+            stats.update(semantic_extra_stats)
             return None, stats
 
         mode = str(hmc_control.get("context_source_skip_mode", "hard")).lower()
@@ -1293,6 +1615,16 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             source_bias_values = source_bias_values.masked_fill(skip, -1.0e4)
             source_weights = None
 
+        def _attach_source_attention_top(control: Dict[str, Any], eligible_out: torch.Tensor) -> None:
+            if source_attention_top_quantile is None:
+                return
+            control["source_attention_top_quantile"] = float(source_attention_top_quantile)
+            control["source_attention_top_random_same_mass"] = bool(source_attention_top_random_same_mass)
+            control["source_attention_top_random_salt"] = int(hmc_control.get("semantic_action_chunk_idx", 0) if hmc_control else 0)
+            control["source_attention_top_rho"] = float(hmc_control.get("context_source_skip_soft_rho", 0.5) or 0.5)
+            control["source_attention_top_min_keep"] = float(hmc_control.get("context_source_skip_soft_min_keep", 0.5) or 0.5)
+            control["source_attention_top_eligible_mask"] = eligible_out.detach()
+
         if impl == "compact_kv":
             bias = {
                 "type": "compact_kv",
@@ -1319,6 +1651,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 "source_weights": source_weights_out.detach(),
                 "attention_mass_metric": "v_only_effective_value_mass",
             }
+            _attach_source_attention_top(bias, affected_mask)
             if bool(hmc_control.get("context_source_skip_record_attention_mass", False)):
                 bias["attention_mass_stats"] = []
                 bias["attention_mass_max_queries"] = int(
@@ -1337,6 +1670,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                         "source_bias_values": source_bias.detach(),
                         "attention_mass_metric": attention_mass_metric,
                     }
+                    _attach_source_attention_top(bias, eligible.reshape(batch_size * frame_num, tokens_per_frame))
                     bias["attention_mass_stats"] = []
                     bias["attention_mass_max_queries"] = int(
                         hmc_control.get("context_source_skip_attention_mass_max_queries", 512) or 512
@@ -1359,6 +1693,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                         "source_bias_values": source_bias.detach(),
                         "attention_mass_metric": attention_mass_metric,
                     }
+                    _attach_source_attention_top(bias, eligible.reshape(batch_size, frame_num * tokens_per_frame))
                     bias["attention_mass_stats"] = []
                     bias["attention_mass_max_queries"] = int(
                         hmc_control.get("context_source_skip_attention_mass_max_queries", 512) or 512
@@ -1414,7 +1749,27 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             "special_token_keep_ratio": special_keep,
             "empty_source_events": empty_events,
         }
+        stats.update(semantic_extra_stats)
         if isinstance(bias, dict):
+            dump_dir = str(hmc_control.get("context_source_skip_attention_map_dump_dir", "") or "").strip()
+            if dump_dir and bias.get("type") == "source_soft":
+                bias["source_attention_map_dump_dir"] = dump_dir
+                bias["source_attention_map_dump_chunk_idx"] = int(
+                    hmc_control.get("semantic_action_chunk_idx", -1) if hmc_control else -1
+                )
+                bias["source_attention_map_dump_hook_path"] = str(path)
+                bias["source_attention_map_dump_max_queries"] = int(
+                    hmc_control.get("context_source_skip_attention_map_dump_max_queries", 64) or 64
+                )
+                bias["source_attention_map_dump_dtype"] = str(
+                    hmc_control.get("context_source_skip_attention_map_dump_dtype", "float16") or "float16"
+                )
+                bias["source_attention_map_dump_full_query_marginal"] = bool(
+                    hmc_control.get("context_source_skip_attention_map_dump_full_query_marginal", False)
+                )
+                bias["source_attention_map_dump_query_block"] = int(
+                    hmc_control.get("context_source_skip_attention_map_dump_query_block", 32) or 32
+                )
             return bias, stats
         return bias.to(dtype=dtype), stats
 
@@ -1621,6 +1976,9 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             return False
         if not hmc_control.get("enable_swa_overlap_source_gate", False):
             return False
+        gate_mode = str(hmc_control.get("swa_overlap_source_gate_mode", "source")).lower()
+        if gate_mode.startswith("semantic_") and not bool(hmc_control.get("semantic_action_chunk_gate_active", True)):
+            return False
         mode = str(hmc_control.get("swa_overlap_source_gate_layer_mode", "last"))
         if mode == "all":
             return True
@@ -1643,6 +2001,9 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             return False
         if not hmc_control.get("enable_swa_overlap_source_replace", False):
             return False
+        replace_mode = str(hmc_control.get("swa_overlap_source_replace_mode", "union")).lower()
+        if replace_mode.startswith("semantic_") and not bool(hmc_control.get("semantic_action_chunk_gate_active", True)):
+            return False
         mode = str(hmc_control.get("swa_overlap_source_replace_layer_mode", "last"))
         if mode == "all":
             return True
@@ -1653,6 +2014,289 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         if mode == "single":
             return int(layer_idx) == int(hmc_control.get("swa_overlap_source_replace_single_layer", -1))
         return False
+
+    @staticmethod
+    def _swa_overlap_source_semantic_modes() -> set:
+        groups = (
+            "structure",
+            "static",
+            "movable",
+            "lowstuff",
+            "uncertain",
+            "sky",
+            "vegetation",
+            "ground",
+            "vertical_static",
+        )
+        suffixes = ("", "_highd_q80", "_highd_q90", "_highd_q95")
+        modes = set()
+        for group in groups:
+            for suffix in suffixes:
+                base = f"semantic_{group}{suffix}"
+                modes.add(base)
+                modes.add(f"{base}_random_same_mass")
+        return modes
+
+    @staticmethod
+    def _randomize_swa_overlap_score_same_distribution(
+        score: torch.Tensor,
+        hmc_control: Optional[Dict[str, Any]],
+        *,
+        swa_layer_idx: int,
+        salt_offset: float = 0.0,
+    ) -> torch.Tensor:
+        if score.ndim != 2 or int(score.shape[-1]) <= 1:
+            return score
+        out = torch.empty_like(score)
+        source_tokens = int(score.shape[-1])
+        base_idx = torch.arange(source_tokens, device=score.device, dtype=torch.float32)
+        chunk = float(hmc_control.get("semantic_action_chunk_idx", -1) if hmc_control else -1)
+        for b in range(int(score.shape[0])):
+            salt = chunk * 149.0 + float(swa_layer_idx) * 31.0 + float(b) * 17.0 + float(salt_offset)
+            rand = torch.frac(torch.sin((base_idx + 1.0 + salt) * 12.9898) * 43758.5453)
+            perm = torch.argsort(rand, stable=True)
+            out[b] = score[b, perm]
+        return out
+
+    def _make_swa_overlap_source_semantic_score(
+        self,
+        hmc_control: Optional[Dict[str, Any]],
+        *,
+        mode: str,
+        batch_size: int,
+        frame_num: int,
+        tokens_per_frame: int,
+        history_tokens: int,
+        source_tokens: int,
+        ov: int,
+        Ds: torch.Tensor,
+        device: torch.device,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
+        stats: Dict[str, Any] = {}
+        mode_l = str(mode).lower()
+        if mode_l not in self._swa_overlap_source_semantic_modes():
+            return None, stats
+
+        random_same_mass = mode_l.endswith("_random_same_mass")
+        base_mode = mode_l[:-len("_random_same_mass")] if random_same_mass else mode_l
+        highd_quantile = None
+        for suffix, q in (("_highd_q80", 0.80), ("_highd_q90", 0.90), ("_highd_q95", 0.95)):
+            if base_mode.endswith(suffix):
+                highd_quantile = q
+                base_mode = base_mode[:-len(suffix)]
+                break
+        group_name = base_mode[len("semantic_"):]
+
+        coarse_groups = {
+            "structure": _CONTEXT_SEM_GROUP_STRUCTURE,
+            "static": _CONTEXT_SEM_GROUP_STATIC,
+            "movable": _CONTEXT_SEM_GROUP_MOVABLE,
+            "lowstuff": _CONTEXT_SEM_GROUP_LOWSTUFF,
+            "uncertain": _CONTEXT_SEM_GROUP_UNCERTAIN,
+        }
+        fine_groups = {
+            "sky": _CONTEXT_SKY_FINE_LABEL_IDS,
+            "vegetation": _CONTEXT_VEGETATION_FINE_LABEL_IDS,
+            "ground": _CONTEXT_GROUND_FINE_LABEL_IDS,
+            "vertical_static": _CONTEXT_VERTICAL_STATIC_FINE_LABEL_IDS,
+        }
+
+        def _prev_overlap_labels(key: str) -> Optional[torch.Tensor]:
+            raw = hmc_control.get(key) if hmc_control else None
+            if raw is None:
+                return None
+            flat = raw.to(device=device, dtype=torch.long).reshape(-1)
+            if int(flat.numel()) < int(tokens_per_frame):
+                return None
+            prev_frames = int(flat.numel() // tokens_per_frame)
+            hist_frames = int(history_tokens // tokens_per_frame)
+            usable_frames = min(prev_frames, hist_frames)
+            if usable_frames <= 0:
+                return None
+            label_ov = min(int(ov), usable_frames)
+            if label_ov <= 0:
+                return None
+            labels = (
+                flat[-usable_frames * tokens_per_frame:]
+                .reshape(1, usable_frames, tokens_per_frame)
+                .expand(batch_size, -1, -1)[:, -label_ov:, :]
+                .reshape(batch_size, label_ov * tokens_per_frame)
+            )
+            if int(labels.shape[1]) < int(source_tokens):
+                return None
+            if int(labels.shape[1]) != int(source_tokens):
+                labels = labels[:, -source_tokens:]
+            return labels
+
+        def _current_head_labels(key: str) -> Optional[torch.Tensor]:
+            raw = hmc_control.get(key) if hmc_control else None
+            if raw is None:
+                return None
+            flat = raw.to(device=device, dtype=torch.long)
+            if int(flat.numel()) != int(batch_size * frame_num * tokens_per_frame):
+                return None
+            labels = flat.reshape(batch_size, frame_num, tokens_per_frame)[:, :ov, :].reshape(
+                batch_size, ov * tokens_per_frame
+            )
+            if int(labels.shape[1]) < int(source_tokens):
+                return None
+            if int(labels.shape[1]) != int(source_tokens):
+                labels = labels[:, :source_tokens]
+            return labels
+
+        if group_name in coarse_groups:
+            labels = _prev_overlap_labels("G_prev_patch")
+            label_source = "prev_tail_G_patch"
+            if labels is None:
+                labels = _current_head_labels("G_sem_tok")
+                label_source = "current_head_G_sem_tok_fallback" if labels is not None else "missing_G"
+            if labels is None:
+                score = torch.zeros(batch_size, source_tokens, device=device, dtype=torch.float32)
+                missing = True
+            else:
+                score = (labels == int(coarse_groups[group_name])).float()
+                missing = False
+        elif group_name in fine_groups:
+            labels = _prev_overlap_labels("L_prev_patch")
+            label_source = "prev_tail_L_patch"
+            if labels is None:
+                labels = _current_head_labels("L_sem_tok")
+                label_source = "current_head_L_sem_tok_fallback" if labels is not None else "missing_L"
+            if labels is None:
+                score = torch.zeros(batch_size, source_tokens, device=device, dtype=torch.float32)
+                missing = True
+            else:
+                score = torch.zeros(batch_size, source_tokens, device=device, dtype=torch.float32)
+                for label_id in sorted(int(x) for x in fine_groups[group_name]):
+                    score = torch.maximum(score, (labels == int(label_id)).float())
+                missing = False
+        else:
+            return None, stats
+
+        if highd_quantile is not None and bool((score > 0.0).any().item()):
+            highd = torch.zeros_like(score)
+            for b in range(int(batch_size)):
+                mask_b = score[b] > 0.0
+                if int(mask_b.sum().item()) <= 0:
+                    continue
+                vals = Ds[b][mask_b].float()
+                thr = torch.quantile(vals, float(highd_quantile))
+                highd[b] = (mask_b & (Ds[b].float() >= thr)).float()
+            score = highd
+
+        semantic_count_before_random = int((score > 0.0).sum().item())
+        if random_same_mass and semantic_count_before_random > 0:
+            randomized = torch.zeros_like(score)
+            chunk = float(hmc_control.get("semantic_action_chunk_idx", -1) if hmc_control else -1)
+            base_idx = torch.arange(int(source_tokens), device=device, dtype=torch.float32)
+            for b in range(int(batch_size)):
+                k_select = min(int((score[b] > 0.0).sum().item()), int(source_tokens))
+                if k_select <= 0:
+                    continue
+                salt = chunk * 149.0 + float(b) * 17.0
+                rand = torch.frac(torch.sin((base_idx + 1.0 + salt) * 12.9898) * 43758.5453)
+                top = torch.topk(rand, k_select).indices
+                randomized[b, top] = 1.0
+            score = randomized
+
+        selected_tokens = int((score > 0.0).sum().item())
+        selected_mask = score > 0.0
+        if selected_tokens > 0:
+            local_idx = torch.arange(int(source_tokens), device=device, dtype=torch.float32).reshape(1, source_tokens)
+            selected_index_mean = float(local_idx.expand(batch_size, -1)[selected_mask].mean().item())
+            selected_d_mean = float(Ds.float()[selected_mask].mean().item())
+        else:
+            selected_index_mean = 0.0
+            selected_d_mean = 0.0
+        stats.update({
+            "swa_overlap_source_semantic_mode": mode_l,
+            "swa_overlap_source_semantic_group": group_name,
+            "swa_overlap_source_semantic_label_source": label_source,
+            "swa_overlap_source_semantic_missing_labels": bool(missing),
+            "swa_overlap_source_semantic_random_same_mass": bool(random_same_mass),
+            "swa_overlap_source_semantic_highd_quantile": (
+                float(highd_quantile) if highd_quantile is not None else None
+            ),
+            "swa_overlap_source_semantic_tokens_before_random": int(semantic_count_before_random),
+            "swa_overlap_source_semantic_selected_tokens": int(selected_tokens),
+            "swa_overlap_source_semantic_selected_ratio": float(selected_tokens / max(int(batch_size * source_tokens), 1)),
+            "swa_overlap_source_semantic_selected_index_mean": selected_index_mean,
+            "swa_overlap_source_semantic_selected_D_mean": selected_d_mean,
+        })
+        return score.clamp(0.0, 1.0), stats
+
+    @staticmethod
+    def _dump_swa_overlap_feature_map(
+        hmc_control: Optional[Dict[str, Any]],
+        *,
+        kind: str,
+        mode: str,
+        swa_layer_idx: int,
+        batch_size: int,
+        frame_num: int,
+        tokens_per_frame: int,
+        history_tokens: int,
+        source_start: int,
+        source_end: int,
+        overlap_frames: int,
+        Dq: torch.Tensor,
+        Ds: torch.Tensor,
+        score: torch.Tensor,
+        control: torch.Tensor,
+    ) -> Dict[str, Any]:
+        dump_dir_text = str((hmc_control or {}).get("swa_overlap_feature_dump_dir", "") or "").strip()
+        if not dump_dir_text:
+            return {}
+        try:
+            dtype_name = str((hmc_control or {}).get("swa_overlap_feature_dump_dtype", "float16") or "float16").lower()
+            dump_dtype = torch.float32 if dtype_name in {"float", "float32", "fp32"} else torch.float16
+            dump_dir = Path(dump_dir_text)
+            dump_dir.mkdir(parents=True, exist_ok=True)
+            chunk_idx = int((hmc_control or {}).get("semantic_action_chunk_idx", -1))
+
+            def _pack_map(x: torch.Tensor) -> torch.Tensor:
+                flat = x.detach().cpu().to(dtype=dump_dtype)
+                if tokens_per_frame > 0 and int(flat.shape[-1]) % int(tokens_per_frame) == 0:
+                    frames = int(flat.shape[-1]) // int(tokens_per_frame)
+                    return flat.reshape(int(batch_size), frames, int(tokens_per_frame))
+                return flat
+
+            out_path = dump_dir / (
+                f"chunk_{chunk_idx:03d}_swa_overlap_{kind}_layer_{int(swa_layer_idx):02d}.pt"
+            )
+            payload = {
+                "schema": "acl2_v68_swa_overlap_feature_map_v1",
+                "artifact": "SAVE_V68_OVERLAP_FEATURES",
+                "kind": str(kind),
+                "mode": str(mode),
+                "chunk_idx": int(chunk_idx),
+                "swa_layer_idx": int(swa_layer_idx),
+                "batch_size": int(batch_size),
+                "frame_num": int(frame_num),
+                "tokens_per_frame": int(tokens_per_frame),
+                "history_tokens": int(history_tokens),
+                "source_start": int(source_start),
+                "source_end": int(source_end),
+                "source_tokens": int(max(0, int(source_end) - int(source_start))),
+                "overlap_frames_effective": int(overlap_frames),
+                "runtime_swa_overlap_feature_not_qk_proxy": True,
+                "Dq_overlap": _pack_map(Dq),
+                "Ds_overlap": _pack_map(Ds),
+                "score_overlap": _pack_map(score),
+                "control_overlap": _pack_map(control),
+                "score_mean": float(score.detach().float().mean().item()),
+                "score_q90": float(torch.quantile(score.detach().float(), 0.90).item()),
+                "control_mean": float(control.detach().float().mean().item()),
+                "control_q90": float(torch.quantile(control.detach().float(), 0.90).item()),
+            }
+            torch.save(payload, out_path)
+            return {
+                "swa_overlap_feature_dump_path": str(out_path),
+                "swa_overlap_feature_dump_schema": payload["schema"],
+                "swa_overlap_feature_dump_kind": str(kind),
+            }
+        except Exception as exc:  # pragma: no cover - audit-only best effort.
+            return {"swa_overlap_feature_dump_error": f"{type(exc).__name__}: {exc}"}
 
     def _make_swa_overlap_source_gate(
         self,
@@ -1665,6 +2309,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         current_tokens: int,
         device: torch.device,
         dtype: torch.dtype,
+        swa_layer_idx: int,
     ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
         stats: Dict[str, Any] = {
             "swa_overlap_source_gate_applied": False,
@@ -1718,28 +2363,76 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             Dq = Dq[:, :source_tokens]
 
         mode = str(hmc_control.get("swa_overlap_source_gate_mode", "source"))
+        mode_l = mode.lower()
+        random_same_mass = mode_l.endswith("_random_same_mass")
+        base_mode = mode_l[:-len("_random_same_mass")] if random_same_mass else mode_l
         Dq = Dq.clamp(0.0, 1.0)
         Ds = Ds.clamp(0.0, 1.0)
-        if mode in {"source", "prev", "previous"}:
+        if base_mode in {"source", "prev", "previous"}:
             score = Ds
-        elif mode in {"current", "query"}:
+        elif base_mode in {"current", "query"}:
             score = Dq
-        elif mode == "union":
+        elif base_mode == "union":
             score = torch.maximum(Dq, Ds)
-        elif mode in {"intersection", "inter"}:
+        elif base_mode in {"intersection", "inter"}:
             score = torch.minimum(Dq, Ds)
-        elif mode in {"disagreement", "mismatch"}:
+        elif base_mode in {"disagreement", "mismatch"}:
             score = (Dq - Ds).abs()
-        elif mode in {"agree_dyn", "product"}:
+        elif base_mode in {"agree_dyn", "product"}:
             score = Dq * Ds
+        elif mode_l in self._swa_overlap_source_semantic_modes():
+            semantic_score, semantic_stats = self._make_swa_overlap_source_semantic_score(
+                hmc_control,
+                mode=mode,
+                batch_size=batch_size,
+                frame_num=frame_num,
+                tokens_per_frame=tokens_per_frame,
+                history_tokens=history_tokens,
+                source_tokens=source_tokens,
+                ov=ov,
+                Ds=Ds,
+                device=device,
+            )
+            if semantic_score is None:
+                return None, stats
+            score = semantic_score
+            stats.update(semantic_stats)
         else:
             raise ValueError(f"Unsupported SWA overlap source gate mode: {mode}")
+        if random_same_mass and mode_l not in self._swa_overlap_source_semantic_modes():
+            score = self._randomize_swa_overlap_score_same_distribution(
+                score,
+                hmc_control,
+                swa_layer_idx=swa_layer_idx,
+                salt_offset=1000.0,
+            )
+            stats.update({
+                "swa_overlap_source_geometric_random_same_mass": True,
+                "swa_overlap_source_geometric_random_base_mode": base_mode,
+            })
 
         min_gate = min(max(float(hmc_control.get("swa_overlap_source_gate_min", 0.85)), 0.0), 1.0)
         gate_slice = (1.0 - rho * score).clamp(min_gate, 1.0).to(dtype=dtype)
         gate = torch.ones(batch_size, 1, history_tokens, 1, device=device, dtype=dtype)
         gate[:, :, source_start:source_end, :] = gate_slice.reshape(batch_size, 1, source_tokens, 1)
         gate_delta = (1.0 - gate_slice.detach().float()).abs()
+        stats.update(self._dump_swa_overlap_feature_map(
+            hmc_control,
+            kind="source_gate",
+            mode=mode,
+            swa_layer_idx=swa_layer_idx,
+            batch_size=batch_size,
+            frame_num=frame_num,
+            tokens_per_frame=tokens_per_frame,
+            history_tokens=history_tokens,
+            source_start=source_start,
+            source_end=source_end,
+            overlap_frames=ov,
+            Dq=Dq,
+            Ds=Ds,
+            score=score,
+            control=gate_slice,
+        ))
         stats.update({
             "swa_overlap_source_gate_applied": True,
             "swa_overlap_source_gate_mode": mode,
@@ -1770,6 +2463,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         current_tokens: int,
         device: torch.device,
         dtype: torch.dtype,
+        swa_layer_idx: int,
     ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
         stats: Dict[str, Any] = {
             "swa_overlap_source_replace_applied": False,
@@ -1823,25 +2517,73 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             Dq = Dq[:, :source_tokens]
 
         mode = str(hmc_control.get("swa_overlap_source_replace_mode", "union"))
+        mode_l = mode.lower()
+        random_same_mass = mode_l.endswith("_random_same_mass")
+        base_mode = mode_l[:-len("_random_same_mass")] if random_same_mass else mode_l
         Dq = Dq.clamp(0.0, 1.0)
         Ds = Ds.clamp(0.0, 1.0)
-        if mode in {"source", "prev", "previous"}:
+        if base_mode in {"source", "prev", "previous"}:
             score = Ds
-        elif mode in {"current", "query"}:
+        elif base_mode in {"current", "query"}:
             score = Dq
-        elif mode == "union":
+        elif base_mode == "union":
             score = torch.maximum(Dq, Ds)
-        elif mode in {"intersection", "inter"}:
+        elif base_mode in {"intersection", "inter"}:
             score = torch.minimum(Dq, Ds)
-        elif mode in {"disagreement", "mismatch"}:
+        elif base_mode in {"disagreement", "mismatch"}:
             score = (Dq - Ds).abs()
-        elif mode in {"agree_dyn", "product"}:
+        elif base_mode in {"agree_dyn", "product"}:
             score = Dq * Ds
+        elif mode_l in self._swa_overlap_source_semantic_modes():
+            semantic_score, semantic_stats = self._make_swa_overlap_source_semantic_score(
+                hmc_control,
+                mode=mode,
+                batch_size=batch_size,
+                frame_num=frame_num,
+                tokens_per_frame=tokens_per_frame,
+                history_tokens=history_tokens,
+                source_tokens=source_tokens,
+                ov=ov,
+                Ds=Ds,
+                device=device,
+            )
+            if semantic_score is None:
+                return None, stats
+            score = semantic_score
+            stats.update(semantic_stats)
         else:
             raise ValueError(f"Unsupported SWA overlap source replace mode: {mode}")
+        if random_same_mass and mode_l not in self._swa_overlap_source_semantic_modes():
+            score = self._randomize_swa_overlap_score_same_distribution(
+                score,
+                hmc_control,
+                swa_layer_idx=swa_layer_idx,
+                salt_offset=2000.0,
+            )
+            stats.update({
+                "swa_overlap_source_geometric_random_same_mass": True,
+                "swa_overlap_source_geometric_random_base_mode": base_mode,
+            })
 
         alpha = (alpha_max * score).clamp(0.0, min(alpha_max, 1.0)).to(dtype=dtype)
         alpha_delta = alpha.detach().float()
+        stats.update(self._dump_swa_overlap_feature_map(
+            hmc_control,
+            kind="source_replace",
+            mode=mode,
+            swa_layer_idx=swa_layer_idx,
+            batch_size=batch_size,
+            frame_num=frame_num,
+            tokens_per_frame=tokens_per_frame,
+            history_tokens=history_tokens,
+            source_start=source_start,
+            source_end=source_end,
+            overlap_frames=ov,
+            Dq=Dq,
+            Ds=Ds,
+            score=score,
+            control=alpha,
+        ))
         desc = {
             "source_start": int(source_start),
             "source_end": int(source_end),
@@ -2054,6 +2796,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 )
                 if context_skip_bias is not None:
                     if isinstance(context_skip_bias, dict):
+                        context_skip_bias["source_attention_map_dump_layer"] = int(i)
                         if attn_mask is None:
                             attn_mask = context_skip_bias
                         elif (
@@ -2301,11 +3044,12 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                             batch_size=B,
                             frame_num=N,
                             tokens_per_frame=hw,
-                            history_tokens=history_tokens,
-                            current_tokens=int(N * hw),
-                            device=v_cache.device,
-                            dtype=v_cache.dtype,
-                        )
+	                            history_tokens=history_tokens,
+	                            current_tokens=int(N * hw),
+	                            device=v_cache.device,
+	                            dtype=v_cache.dtype,
+	                            swa_layer_idx=layer_idx,
+	                        )
                         if swa_overlap_source_gate is not None:
                             target = str(hmc_control.get("swa_overlap_source_gate_target", "v"))
                             if target in {"v", "value", "kv", "both"}:
@@ -2329,11 +3073,12 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                             batch_size=B,
                             frame_num=N,
                             tokens_per_frame=hw,
-                            history_tokens=history_tokens,
-                            current_tokens=int(N * hw),
-                            device=v_cache.device,
-                            dtype=v_cache.dtype,
-                        )
+	                            history_tokens=history_tokens,
+	                            current_tokens=int(N * hw),
+	                            device=v_cache.device,
+	                            dtype=v_cache.dtype,
+	                            swa_layer_idx=layer_idx,
+	                        )
                         if source_replace is not None:
                             source_start = int(source_replace["source_start"])
                             source_end = int(source_replace["source_end"])
@@ -2670,6 +3415,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         turn_off_ttt = kwargs.pop('turn_off_ttt', False)
         turn_off_swa = kwargs.pop('turn_off_swa', False)
         sim3_scale_mode = kwargs.pop('sim3_scale_mode', 'median')
+        sim3_reuse_reset_block = kwargs.pop('sim3_reuse_reset_block', False)
         cache_ttt_primitives = kwargs.pop('cache_ttt_primitives', False)
         return_ttt_state = kwargs.pop('return_ttt_state', False)
         offload_adaptive_state_to_cpu = kwargs.pop('offload_adaptive_state_to_cpu', False)
@@ -3057,6 +3803,8 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 all_predictions, 
                 allow_scale=True, 
                 scale_mode=sim3_scale_mode,
+                reset_every=reset_every,
+                reuse_transform_within_reset_block=bool(sim3_reuse_reset_block),
             )
         elif se3 or align_on_resets_without_explicit_pose:
             merged = self._merge_windowed_predictions_sim3(

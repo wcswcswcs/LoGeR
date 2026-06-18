@@ -54,6 +54,7 @@ START_FRAME="${START_FRAME:-0}"
 OUTPUT_VIDEO="${OUTPUT_VIDEO-}"
 OUTPUT_PT="${OUTPUT_PT-}"
 PER_CHUNK_GEOMETRY_DIR="${PER_CHUNK_GEOMETRY_DIR-}"
+PER_CHUNK_POSE_TRACE_JSONL="${PER_CHUNK_POSE_TRACE_JSONL-}"
 GLOBAL_CHUNK_OFFSET="${GLOBAL_CHUNK_OFFSET:-}"
 SAVE_HMC_STATES="${SAVE_HMC_STATES:-}"
 SAVE_HMC_STATE_CHUNKS="${SAVE_HMC_STATE_CHUNKS:-}"
@@ -63,8 +64,19 @@ LOAD_HMC_STATE_AT_CHUNK_INDEX="${LOAD_HMC_STATE_AT_CHUNK_INDEX:-}"
 SAVE_MERGE_STATES="${SAVE_MERGE_STATES:-}"
 SAVE_MERGE_STATE_CHUNKS="${SAVE_MERGE_STATE_CHUNKS:-}"
 SAVE_MERGE_STATE_KINDS="${SAVE_MERGE_STATE_KINDS:-}"
+MERGE_STATE_TRACE_JSONL="${MERGE_STATE_TRACE_JSONL:-}"
 LOAD_MERGE_STATE_AT_CHUNK="${LOAD_MERGE_STATE_AT_CHUNK:-}"
 LOAD_MERGE_STATE_AT_CHUNK_INDEX="${LOAD_MERGE_STATE_AT_CHUNK_INDEX:-}"
+LOAD_MERGE_STATE_PATH="${LOAD_MERGE_STATE_PATH:-}"
+OVERRIDE_MERGE_TRANSFORM_AT_CHUNK="${OVERRIDE_MERGE_TRANSFORM_AT_CHUNK:-}"
+OVERRIDE_MERGE_TRANSFORM_JSON="${OVERRIDE_MERGE_TRANSFORM_JSON:-}"
+SEMANTIC_MERGE_MODE="${SEMANTIC_MERGE_MODE:-none}"
+SEMANTIC_MERGE_STRATEGY="${SEMANTIC_MERGE_STRATEGY:-S11_SEMANTIC_GEOMETRY_WEIGHTED}"
+SEMANTIC_MERGE_MAX_POINTS="${SEMANTIC_MERGE_MAX_POINTS:-12000}"
+SEMANTIC_MERGE_RANDOM_SEED="${SEMANTIC_MERGE_RANDOM_SEED:-123}"
+SEMANTIC_MERGE_CONF_MIN="${SEMANTIC_MERGE_CONF_MIN:-0.05}"
+SAVE_PREMERGE_LOCAL_OUTPUT="${SAVE_PREMERGE_LOCAL_OUTPUT:-}"
+SAVE_POSTMERGE_GLOBAL_OUTPUT="${SAVE_POSTMERGE_GLOBAL_OUTPUT:-}"
 RESET_EVERY="${RESET_EVERY:-5}"
 FAST_CUE_EVAL="${FAST_CUE_EVAL:-1}"
 STAGE_C_MODE="${STAGE_C_MODE:-none}"
@@ -226,6 +238,15 @@ SEMANTIC_ROLE_POSITIVE_SCALE="${SEMANTIC_ROLE_POSITIVE_SCALE:-1.05}"
 SEMANTIC_ROLE_NEUTRAL_SCALE="${SEMANTIC_ROLE_NEUTRAL_SCALE:-0.85}"
 SEMANTIC_ROLE_NEGATIVE_SCALE="${SEMANTIC_ROLE_NEGATIVE_SCALE:-0.65}"
 SEMANTIC_ROLE_SWA_NEGATIVE_SCALE="${SEMANTIC_ROLE_SWA_NEGATIVE_SCALE:-1.0}"
+SEMANTIC_ROLE_SWA_PROTECT_SCALE="${SEMANTIC_ROLE_SWA_PROTECT_SCALE:-1.0}"
+SEMANTIC_ROLE_CONTROL_MODE="${SEMANTIC_ROLE_CONTROL_MODE:-none}"
+SEMANTIC_ROLE_CONTROL_SEED="${SEMANTIC_ROLE_CONTROL_SEED:-12345}"
+SEMANTIC_CONDITION_CONFLICT_LEVEL="${SEMANTIC_CONDITION_CONFLICT_LEVEL:-unavailable}"
+SEMANTIC_CONDITION_CONFLICT_SOURCE="${SEMANTIC_CONDITION_CONFLICT_SOURCE:-none}"
+SEMANTIC_CONDITION_CONFLICT_VALUE="${SEMANTIC_CONDITION_CONFLICT_VALUE:-0.0}"
+SEMANTIC_CONDITION_SCALE_LEVEL="${SEMANTIC_CONDITION_SCALE_LEVEL:-unavailable}"
+SEMANTIC_CONDITION_SCALE_SOURCE="${SEMANTIC_CONDITION_SCALE_SOURCE:-none}"
+SEMANTIC_CONDITION_SCALE_VALUE="${SEMANTIC_CONDITION_SCALE_VALUE:-0.0}"
 V29C_MASKLET_ALIGNMENT_CSV="${V29C_MASKLET_ALIGNMENT_CSV:-}"
 V29C_MASKLET_INTERVENTION_POLICY="${V29C_MASKLET_INTERVENTION_POLICY:-none}"
 V29C_MASKLET_INTERVENTION_CHUNK="${V29C_MASKLET_INTERVENTION_CHUNK:--1}"
@@ -254,6 +275,7 @@ PROBE_CACHE_MODE="${PROBE_CACHE_MODE:-off}"
 PROBE_CACHE_PAYLOAD="${PROBE_CACHE_PAYLOAD:-read_path_min}"
 PROBE_CACHE_REQUIRE_HIT="${PROBE_CACHE_REQUIRE_HIT:-0}"
 EMPTY_CUDA_CACHE_EACH_CHUNK="${EMPTY_CUDA_CACHE_EACH_CHUNK:-1}"
+EXTRA_RUN_ARGS="${EXTRA_RUN_ARGS:-}"
 
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-4}"
@@ -291,6 +313,11 @@ COMMON_ARGS=(
   --probe_cache_payload "$PROBE_CACHE_PAYLOAD"
   --probe_cache_require_hit "$PROBE_CACHE_REQUIRE_HIT"
   --empty_cuda_cache_each_chunk "$EMPTY_CUDA_CACHE_EACH_CHUNK"
+  --semantic_merge_mode "$SEMANTIC_MERGE_MODE"
+  --semantic_merge_strategy "$SEMANTIC_MERGE_STRATEGY"
+  --semantic_merge_max_points "$SEMANTIC_MERGE_MAX_POINTS"
+  --semantic_merge_random_seed "$SEMANTIC_MERGE_RANDOM_SEED"
+  --semantic_merge_conf_min "$SEMANTIC_MERGE_CONF_MIN"
 )
 
 if [ -n "$OUTPUT_PT" ]; then
@@ -298,6 +325,9 @@ if [ -n "$OUTPUT_PT" ]; then
 fi
 if [ -n "$PER_CHUNK_GEOMETRY_DIR" ]; then
   COMMON_ARGS+=(--per_chunk_geometry_dir "$PER_CHUNK_GEOMETRY_DIR")
+fi
+if [ -n "$PER_CHUNK_POSE_TRACE_JSONL" ]; then
+  COMMON_ARGS+=(--per_chunk_pose_trace_jsonl "$PER_CHUNK_POSE_TRACE_JSONL")
 fi
 
 if [ -n "$PROBE_CACHE_DIR" ]; then
@@ -332,11 +362,29 @@ fi
 if [ -n "$SAVE_MERGE_STATE_KINDS" ]; then
   COMMON_ARGS+=(--save_merge_state_kinds "$SAVE_MERGE_STATE_KINDS")
 fi
+if [ -n "$MERGE_STATE_TRACE_JSONL" ]; then
+  COMMON_ARGS+=(--merge_state_trace_jsonl "$MERGE_STATE_TRACE_JSONL")
+fi
 if [ -n "$LOAD_MERGE_STATE_AT_CHUNK" ]; then
   COMMON_ARGS+=(--load_merge_state_at_chunk "$LOAD_MERGE_STATE_AT_CHUNK")
 fi
 if [ -n "$LOAD_MERGE_STATE_AT_CHUNK_INDEX" ]; then
   COMMON_ARGS+=(--load_merge_state_at_chunk_index "$LOAD_MERGE_STATE_AT_CHUNK_INDEX")
+fi
+if [ -n "$LOAD_MERGE_STATE_PATH" ]; then
+  COMMON_ARGS+=(--load_merge_state_path "$LOAD_MERGE_STATE_PATH")
+fi
+if [ -n "$OVERRIDE_MERGE_TRANSFORM_AT_CHUNK" ]; then
+  COMMON_ARGS+=(--override_merge_transform_at_chunk "$OVERRIDE_MERGE_TRANSFORM_AT_CHUNK")
+fi
+if [ -n "$OVERRIDE_MERGE_TRANSFORM_JSON" ]; then
+  COMMON_ARGS+=(--override_merge_transform_json "$OVERRIDE_MERGE_TRANSFORM_JSON")
+fi
+if [ -n "$SAVE_PREMERGE_LOCAL_OUTPUT" ]; then
+  COMMON_ARGS+=(--save_premerge_local_output "$SAVE_PREMERGE_LOCAL_OUTPUT")
+fi
+if [ -n "$SAVE_POSTMERGE_GLOBAL_OUTPUT" ]; then
+  COMMON_ARGS+=(--save_postmerge_global_output "$SAVE_POSTMERGE_GLOBAL_OUTPUT")
 fi
 
 STAGE_B_ARGS=(
@@ -441,6 +489,24 @@ CONTEXT_SOURCE_SKIP_ARGS=(
 if [ -n "$CONTEXT_SOURCE_SKIP_SINGLE_LAYER" ]; then
   CONTEXT_SOURCE_SKIP_ARGS+=(--context_source_skip_single_layer "$CONTEXT_SOURCE_SKIP_SINGLE_LAYER")
 fi
+SWA_OVERLAP_READ_ARGS=(
+  --enable_swa_overlap_bias "$ENABLE_SWA_OVERLAP_BIAS"
+  --swa_overlap_bias_beta "$SWA_OVERLAP_BIAS_BETA"
+  --swa_overlap_bias_min_keep "$SWA_OVERLAP_BIAS_MIN_KEEP"
+  --swa_overlap_bias_mode "$SWA_OVERLAP_BIAS_MODE"
+  --swa_overlap_bias_layer_mode "$SWA_OVERLAP_BIAS_LAYER_MODE"
+  --enable_swa_overlap_source_gate "$ENABLE_SWA_OVERLAP_SOURCE_GATE"
+  --swa_overlap_source_gate_rho "$SWA_OVERLAP_SOURCE_GATE_RHO"
+  --swa_overlap_source_gate_min "$SWA_OVERLAP_SOURCE_GATE_MIN"
+  --swa_overlap_source_gate_mode "$SWA_OVERLAP_SOURCE_GATE_MODE"
+  --swa_overlap_source_gate_target "$SWA_OVERLAP_SOURCE_GATE_TARGET"
+  --swa_overlap_source_gate_layer_mode "$SWA_OVERLAP_SOURCE_GATE_LAYER_MODE"
+  --enable_swa_overlap_source_replace "$ENABLE_SWA_OVERLAP_SOURCE_REPLACE"
+  --swa_overlap_source_replace_alpha "$SWA_OVERLAP_SOURCE_REPLACE_ALPHA"
+  --swa_overlap_source_replace_mode "$SWA_OVERLAP_SOURCE_REPLACE_MODE"
+  --swa_overlap_source_replace_target "$SWA_OVERLAP_SOURCE_REPLACE_TARGET"
+  --swa_overlap_source_replace_layer_mode "$SWA_OVERLAP_SOURCE_REPLACE_LAYER_MODE"
+)
 SEMANTIC_ROLE_ARGS=(
   --semantic_role_policy "$SEMANTIC_ROLE_POLICY"
   --semantic_memory_paths "$SEMANTIC_MEMORY_PATHS"
@@ -452,6 +518,15 @@ SEMANTIC_ROLE_ARGS=(
   --semantic_role_neutral_scale "$SEMANTIC_ROLE_NEUTRAL_SCALE"
   --semantic_role_negative_scale "$SEMANTIC_ROLE_NEGATIVE_SCALE"
   --semantic_role_swa_negative_scale "$SEMANTIC_ROLE_SWA_NEGATIVE_SCALE"
+  --semantic_role_swa_protect_scale "$SEMANTIC_ROLE_SWA_PROTECT_SCALE"
+  --semantic_role_control_mode "$SEMANTIC_ROLE_CONTROL_MODE"
+  --semantic_role_control_seed "$SEMANTIC_ROLE_CONTROL_SEED"
+  --semantic_condition_conflict_level "$SEMANTIC_CONDITION_CONFLICT_LEVEL"
+  --semantic_condition_conflict_source "$SEMANTIC_CONDITION_CONFLICT_SOURCE"
+  --semantic_condition_conflict_value "$SEMANTIC_CONDITION_CONFLICT_VALUE"
+  --semantic_condition_scale_level "$SEMANTIC_CONDITION_SCALE_LEVEL"
+  --semantic_condition_scale_source "$SEMANTIC_CONDITION_SCALE_SOURCE"
+  --semantic_condition_scale_value "$SEMANTIC_CONDITION_SCALE_VALUE"
   --v29c_masklet_alignment_csv "$V29C_MASKLET_ALIGNMENT_CSV"
   --v29c_masklet_intervention_policy "$V29C_MASKLET_INTERVENTION_POLICY"
   --v29c_masklet_intervention_chunk "$V29C_MASKLET_INTERVENTION_CHUNK"
@@ -477,6 +552,7 @@ case "$MODE" in
       "${COMMON_ARGS[@]}"
       "${STAGE_B_ARGS[@]}"
       "${CONTEXT_SOURCE_SKIP_ARGS[@]}"
+      "${SWA_OVERLAP_READ_ARGS[@]}"
       "${SEMANTIC_ROLE_ARGS[@]}"
       --hybrid_memory_mode read_path_only
       --hmc_commit_mode probe_native
@@ -487,6 +563,7 @@ case "$MODE" in
       "${COMMON_ARGS[@]}"
       "${STAGE_B_ARGS[@]}"
       "${CONTEXT_SOURCE_SKIP_ARGS[@]}"
+      "${SWA_OVERLAP_READ_ARGS[@]}"
       "${SEMANTIC_ROLE_ARGS[@]}"
       --hybrid_memory_mode probe_only
       --hmc_commit_mode probe_native
@@ -497,6 +574,7 @@ case "$MODE" in
       "${COMMON_ARGS[@]}"
       "${STAGE_B_ARGS[@]}"
       "${CONTEXT_SOURCE_SKIP_ARGS[@]}"
+      "${SWA_OVERLAP_READ_ARGS[@]}"
       "${SEMANTIC_ROLE_ARGS[@]}"
       --hybrid_memory_mode controlled_probe_only
       --hmc_commit_mode probe_native
@@ -631,6 +709,14 @@ case "$MODE" in
     exit 2
     ;;
 esac
+
+if [ -n "$EXTRA_RUN_ARGS" ]; then
+  # Whitespace-split intentional: this is a developer/audit escape hatch for
+  # simple flag/value pairs such as --v67_carrier_dump_dir /path.
+  # shellcheck disable=SC2206
+  EXTRA_RUN_ARGS_ARRAY=($EXTRA_RUN_ARGS)
+  RUN_ARGS+=("${EXTRA_RUN_ARGS_ARRAY[@]}")
+fi
 
 WALL_START_EPOCH="$(date +%s)"
 WALL_START_ISO="$(date -Is)"

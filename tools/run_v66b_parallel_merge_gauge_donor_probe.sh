@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="${LOGER_ROOT:-/mnt/data/users/chengshun.wang/pjs/LoGeR}"
+cd "$ROOT"
+
+BASE="${ATTN_CUE_BASE:-results/kitti01_hmc_v2/acl2_v66b_dense_semantic_scale/phase9_parallel_continuation/rollouts}"
+mkdir -p "$BASE"
+END_FRAME_VALUE="${END_FRAME:-704}"
+RUN_PREFIX="${RUN_PREFIX:-V66B_P18_704_MERGE_GAUGE_PROBE}"
+
+SEM_REF="${SEM_REF_RUN:-V66B_P17_704_SWA_OVERLAP_FULL_REPLACE_INTER_P025_SEM_A030_96F}"
+RANDOM_REF="${RANDOM_REF_RUN:-V66B_P17_704_SWA_OVERLAP_FULL_REPLACE_INTER_P025_RANDOM_A030_96F}"
+SEM_TRACE="$BASE/$SEM_REF/merge_state_trace.jsonl"
+RANDOM_TRACE="$BASE/$RANDOM_REF/merge_state_trace.jsonl"
+
+for trace in "$SEM_TRACE" "$RANDOM_TRACE"; do
+  if [ ! -s "$trace" ]; then
+    echo "Missing merge trace: $trace" >&2
+    exit 2
+  fi
+done
+
+COMMON_ENV=(
+  ATTN_CUE_BASE="$BASE"
+  END_FRAME="$END_FRAME_VALUE"
+  STAGE_C_MODE=reference
+  STAGE_C_CACHE_DIR=results/kitti_preprocess/01/stage_c_cache_semantic_chunks
+  STAGE_C_CACHE_MODE=read
+  STAGE_C_CACHE_REQUIRE_HIT=1
+  STAGE_C_CACHE_VALIDATE=0
+  STAGE_C_INLINE_WHEN_IGNORED=0
+  SEMANTIC_PRIOR_MODE=spg_v2
+  HMC_IGNORE_SEMANTIC_PRIOR=0
+  SEMANTIC_ROLE_POLICY=causal_fg_semantic_risk_skip
+  SEMANTIC_MEMORY_PATHS=swa
+  SEMANTIC_ROLE_SWA_NEGATIVE_SCALE=1.0
+  SEMANTIC_ROLE_SWA_PROTECT_SCALE=0.25
+  READ_PATH=frame
+  FRAME_BIAS_MODE=pair
+  BETA_SWA=4.75
+  RESET_EVERY=5
+  TTT_WRITE_POST_ZP_SUMMARY=1
+  CONTEXT_SOURCE_SKIP_RECORD_ATTENTION_MASS=1
+  CONTEXT_SOURCE_SKIP_ATTENTION_MASS_MAX_QUERIES=256
+  ENABLE_SWA_OVERLAP_SOURCE_GATE=0
+  SWA_OVERLAP_SOURCE_GATE_RHO=0.0
+  SWA_OVERLAP_SOURCE_GATE_MIN=0.50
+  SWA_OVERLAP_SOURCE_GATE_MODE=source
+  SWA_OVERLAP_SOURCE_GATE_TARGET=v
+  SWA_OVERLAP_SOURCE_GATE_LAYER_MODE=last
+  ENABLE_SWA_OVERLAP_SOURCE_REPLACE=1
+  SWA_OVERLAP_SOURCE_REPLACE_ALPHA=0.30
+  SWA_OVERLAP_SOURCE_REPLACE_MODE=intersection
+  SWA_OVERLAP_SOURCE_REPLACE_TARGET=kv
+  SWA_OVERLAP_SOURCE_REPLACE_LAYER_MODE=last
+)
+
+run_job() {
+  local gpu="$1"
+  local run_name="$2"
+  shift 2
+  (
+    set -x
+    env "${COMMON_ENV[@]}" "$@" \
+      bash tools/run_attention_cue_experiment.sh "$gpu" "$run_name" hybrid dyn 4.75 stage_d
+  ) &
+}
+
+run_job 0 "${RUN_PREFIX}_SEM_LOADSAME" \
+  SEMANTIC_ROLE_CONTROL_MODE=none \
+  LOAD_MERGE_STATE_PATH="$SEM_TRACE"
+
+run_job 1 "${RUN_PREFIX}_RANDOM_LOADSAME" \
+  SEMANTIC_ROLE_CONTROL_MODE=random_same_mass \
+  SEMANTIC_ROLE_CONTROL_SEED=12345 \
+  LOAD_MERGE_STATE_PATH="$RANDOM_TRACE"
+
+run_job 2 "${RUN_PREFIX}_SEM_USE_RANDOM_MERGE" \
+  SEMANTIC_ROLE_CONTROL_MODE=none \
+  LOAD_MERGE_STATE_PATH="$RANDOM_TRACE"
+
+run_job 3 "${RUN_PREFIX}_RANDOM_USE_SEM_MERGE" \
+  SEMANTIC_ROLE_CONTROL_MODE=random_same_mass \
+  SEMANTIC_ROLE_CONTROL_SEED=12345 \
+  LOAD_MERGE_STATE_PATH="$SEM_TRACE"
+
+wait
+
+echo "[$(date '+%F %T')] all v66b phase18 merge/gauge donor probe jobs finished"

@@ -134,6 +134,13 @@ def _collect_v61_debug(run_dir: Path) -> Dict[str, Any]:
     neg_mass: List[float] = []
     post_delta: List[float] = []
     native_cos: List[float] = []
+    probe_ttt_tri_delta: List[float] = []
+    probe_ttt_tri_pos_mass: List[float] = []
+    probe_ttt_tri_neu_mass: List[float] = []
+    probe_ttt_tri_neg_mass: List[float] = []
+    probe_ttt_tri_applied: List[float] = []
+    probe_ttt_post_delta: List[float] = []
+    probe_ttt_native_cos: List[float] = []
     semantic_group_counts: List[float] = []
     semantic_label_counts: List[float] = []
 
@@ -194,6 +201,17 @@ def _collect_v61_debug(run_dir: Path) -> Dict[str, Any]:
                     post_delta.append(_safe_float(value))
             if node.get("role_collapse_count") is not None:
                 role_collapse.append(_safe_float(node.get("role_collapse_count")))
+            for key, target in (
+                ("probe_ttt_write_tri_delta_norm_mean", probe_ttt_tri_delta),
+                ("probe_ttt_write_tri_pos_mass_mean", probe_ttt_tri_pos_mass),
+                ("probe_ttt_write_tri_neu_mass_mean", probe_ttt_tri_neu_mass),
+                ("probe_ttt_write_tri_neg_mass_mean", probe_ttt_tri_neg_mass),
+                ("probe_ttt_write_tri_replay_applied_count", probe_ttt_tri_applied),
+                ("probe_ttt_write_post_delta_norm_mean", probe_ttt_post_delta),
+                ("probe_ttt_write_native_cosine_mean", probe_ttt_native_cos),
+            ):
+                if node.get(key) is not None:
+                    target.append(_safe_float(node.get(key)))
 
     scale = _read_json(run_dir / "scale_metrics" / "scale_residual_summary.json")
     scale_rows = _read_csv(run_dir / "scale_metrics" / "per_chunk_scale_metrics.csv")
@@ -220,6 +238,13 @@ def _collect_v61_debug(run_dir: Path) -> Dict[str, Any]:
         "role_collapse_count": int(sum(_values(role_collapse))) if role_collapse else 0,
         "post_zp_delta_norm_mean": _mean(post_delta),
         "candidate_native_cosine": _mean(native_cos),
+        "probe_ttt_write_tri_delta_norm_mean": _mean(probe_ttt_tri_delta),
+        "probe_ttt_write_tri_pos_mass_mean": _mean(probe_ttt_tri_pos_mass),
+        "probe_ttt_write_tri_neu_mass_mean": _mean(probe_ttt_tri_neu_mass),
+        "probe_ttt_write_tri_neg_mass_mean": _mean(probe_ttt_tri_neg_mass),
+        "probe_ttt_write_tri_replay_applied_count": _sum_values(probe_ttt_tri_applied),
+        "probe_ttt_write_post_delta_norm_mean": _mean(probe_ttt_post_delta),
+        "probe_ttt_write_native_cosine_mean": _mean(probe_ttt_native_cos),
         "scale_rows": len(scale_rows),
         "scale_overlap_point_pairs_available": scale.get("overlap_point_pairs_available"),
         "semantic_point_weights_available": scale.get("semantic_point_weights_available"),

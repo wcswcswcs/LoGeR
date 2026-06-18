@@ -11,11 +11,12 @@ without re-running SAM / detector / panoptic inference.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import shutil
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -62,6 +63,117 @@ def _normalise_track(track: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _normalise_semantic_segmentation(
+    semantic: Any,
+    *,
+    total_frames: int,
+    height: int,
+    width: int,
+) -> Optional[Dict[str, Any]]:
+    if semantic is None:
+        return None
+    if not isinstance(semantic, dict):
+        raise SystemExit(f"Expected semantic_segmentation dict, got {type(semantic)}")
+    label_maps = semantic.get("label_maps")
+    if label_maps is None:
+        raise SystemExit("semantic_segmentation exists but missing label_maps")
+    if isinstance(label_maps, torch.Tensor):
+        maps = label_maps.detach().cpu()
+    else:
+        maps = torch.as_tensor(label_maps)
+    if int(maps.ndim) != 3:
+        raise SystemExit(f"semantic_segmentation.label_maps must be [T,H,W], got shape={tuple(maps.shape)}")
+    expected = (int(total_frames), int(height), int(width))
+    if tuple(int(x) for x in maps.shape) != expected:
+        raise SystemExit(f"semantic_segmentation.label_maps shape mismatch: got {tuple(maps.shape)} expected {expected}")
+
+    out = copy.deepcopy({k: v for k, v in semantic.items() if k != "label_maps"})
+    out["label_maps"] = maps
+    out["frame_height"] = int(height)
+    out["frame_width"] = int(width)
+    out["num_frames"] = int(total_frames)
+    out.setdefault("label_dtype", str(maps.dtype).replace("torch.", ""))
+    confidence_maps = semantic.get("confidence_maps")
+    if confidence_maps is not None:
+        if isinstance(confidence_maps, torch.Tensor):
+            confidence = confidence_maps.detach().cpu()
+        else:
+            confidence = torch.as_tensor(confidence_maps)
+        if int(confidence.ndim) != 3:
+            raise SystemExit(
+                f"semantic_segmentation.confidence_maps must be [T,H,W], got shape={tuple(confidence.shape)}"
+            )
+        if tuple(int(x) for x in confidence.shape) != expected:
+            raise SystemExit(
+                f"semantic_segmentation.confidence_maps shape mismatch: got {tuple(confidence.shape)} expected {expected}"
+            )
+        out["confidence_maps"] = confidence.float().contiguous()
+    return out
+
+
+def _slice_semantic_segmentation(
+    semantic: Optional[Dict[str, Any]],
+    *,
+    start: int,
+    end: int,
+    chunk_idx: int,
+    total_frames: int,
+    height: int,
+    width: int,
+) -> Optional[Dict[str, Any]]:
+    if semantic is None:
+        return None
+    maps = semantic["label_maps"]
+    chunk_maps = maps[int(start) : int(end)].clone()
+    chunk = copy.deepcopy({k: v for k, v in semantic.items() if k != "label_maps"})
+    chunk["label_maps"] = chunk_maps
+    chunk["frame_height"] = int(height)
+    chunk["frame_width"] = int(width)
+    chunk["num_frames"] = int(end) - int(start)
+    chunk["global_start_frame"] = int(start)
+    chunk["global_end_frame"] = int(end)
+    if "confidence_maps" in chunk and chunk["confidence_maps"] is not None:
+        chunk_confidence = chunk["confidence_maps"][int(start) : int(end)].clone()
+        chunk["confidence_maps"] = chunk_confidence
+    else:
+        chunk_confidence = None
+
+    provenance = copy.deepcopy(chunk.get("provenance", {})) if isinstance(chunk.get("provenance"), dict) else {}
+    provenance.update(
+        {
+            "chunked_from_full_sequence": True,
+            "source_global_num_frames": int(total_frames),
+            "source_global_frame_range": [int(start), int(end)],
+        }
+    )
+    chunk["provenance"] = provenance
+
+    debug = copy.deepcopy(chunk.get("debug", {})) if isinstance(chunk.get("debug"), dict) else {}
+    debug.update(
+        {
+            "chunked_from_full_sequence": True,
+            "converted_to_stage_c_chunk": True,
+            "chunk_idx": int(chunk_idx),
+            "global_start_frame": int(start),
+            "global_end_frame": int(end),
+            "chunk_nonvoid_pixels": int((chunk_maps != 0).sum().item()),
+            "semantic_nonvoid_pixels": int((chunk_maps != 0).sum().item()),
+            "chunk_total_pixels": int(chunk_maps.numel()),
+        }
+    )
+    if chunk_confidence is not None:
+        debug.update(
+            {
+                "chunk_confidence_shape": list(chunk_confidence.shape),
+                "chunk_confidence_min": float(chunk_confidence.min().item()) if chunk_confidence.numel() else 0.0,
+                "chunk_confidence_max": float(chunk_confidence.max().item()) if chunk_confidence.numel() else 0.0,
+                "chunk_confidence_mean": float(chunk_confidence.mean().item()) if chunk_confidence.numel() else 0.0,
+            }
+        )
+    chunk["debug"] = debug
+    return chunk
+
+
 def _chunk_cache_dict(
     tracks: List[Dict[str, Any]],
     *,
@@ -71,6 +183,7 @@ def _chunk_cache_dict(
     height: int,
     width: int,
     manifest: Dict[str, Any],
+    semantic_segmentation: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     active: List[Dict[str, Any]] = []
     for global_idx, track in enumerate(tracks):
@@ -117,7 +230,7 @@ def _chunk_cache_dict(
             Q_mask[j, local_t] = float(rec["score"])
             A_ratio[j, local_t] = float(rec["area"])
 
-    return {
+    payload = {
         "schema_version": 1,
         "manifest": manifest,
         "M_mask": M_mask,
@@ -139,8 +252,25 @@ def _chunk_cache_dict(
             "converted_from_sparse_masklets_v1": True,
             "source_global_track_indices": seed_global_track_idx,
             "visible_masklet_frames": int(V_mask.sum().item()),
+            "has_semantic_segmentation": semantic_segmentation is not None,
         },
     }
+    if semantic_segmentation is not None:
+        payload["semantic_segmentation"] = semantic_segmentation
+        payload["debug"]["semantic_nonvoid_pixels"] = int(
+            semantic_segmentation.get("debug", {}).get("chunk_nonvoid_pixels", 0)
+        )
+        payload["debug"]["semantic_total_pixels"] = int(
+            semantic_segmentation.get("debug", {}).get("chunk_total_pixels", 0)
+        )
+        payload["debug"]["semantic_has_confidence"] = bool(semantic_segmentation.get("confidence_maps") is not None)
+        if semantic_segmentation.get("confidence_maps") is not None:
+            confidence = semantic_segmentation["confidence_maps"]
+            payload["debug"]["semantic_confidence_shape"] = list(confidence.shape)
+            payload["debug"]["semantic_confidence_min"] = float(confidence.min().item()) if confidence.numel() else 0.0
+            payload["debug"]["semantic_confidence_max"] = float(confidence.max().item()) if confidence.numel() else 0.0
+            payload["debug"]["semantic_confidence_mean"] = float(confidence.mean().item()) if confidence.numel() else 0.0
+    return payload
 
 
 def _write_chunk(cache_root: Path, chunk_name: str, payload: Dict[str, Any], manifest: Dict[str, Any]) -> None:
@@ -177,8 +307,10 @@ def main() -> None:
     args = build_argparser().parse_args()
     input_pt = Path(args.input_pt)
     cache_root = Path(args.cache_dir)
-    if cache_root.exists() and any(cache_root.iterdir()) and not bool(args.overwrite):
-        raise SystemExit(f"Refusing to overwrite non-empty cache dir: {cache_root}")
+    if cache_root.exists() and any(cache_root.iterdir()):
+        if not bool(args.overwrite):
+            raise SystemExit(f"Refusing to overwrite non-empty cache dir: {cache_root}")
+        shutil.rmtree(cache_root)
     cache_root.mkdir(parents=True, exist_ok=True)
 
     data = torch.load(input_pt, map_location="cpu", weights_only=False)
@@ -189,10 +321,25 @@ def main() -> None:
     width = int(data["frame_width"])
     total_frames = int(data["num_frames"])
     tracks = [_normalise_track(dict(track)) for track in data.get("tracks", [])]
+    semantic = _normalise_semantic_segmentation(
+        data.get("semantic_segmentation"),
+        total_frames=total_frames,
+        height=height,
+        width=width,
+    )
     chunks = _split_into_chunks(total_frames, int(args.chunk_size), int(args.chunk_overlap))
 
     index_rows: List[Dict[str, Any]] = []
     for chunk_idx, (start, end) in enumerate(chunks):
+        semantic_chunk = _slice_semantic_segmentation(
+            semantic,
+            start=start,
+            end=end,
+            chunk_idx=chunk_idx,
+            total_frames=total_frames,
+            height=height,
+            width=width,
+        )
         manifest = {
             "schema_version": 1,
             "chunk_idx": int(chunk_idx),
@@ -205,6 +352,13 @@ def main() -> None:
             "source_sparse_pt": str(input_pt),
             "source_format": "sparse_masklets_v1",
             "conversion_tag": str(args.tag),
+            "has_semantic_segmentation": semantic_chunk is not None,
+            "semantic_segmentation_format": str(semantic.get("format")) if semantic is not None else None,
+            "semantic_global_shape": list(semantic["label_maps"].shape) if semantic is not None else None,
+            "semantic_chunk_shape": list(semantic_chunk["label_maps"].shape) if semantic_chunk is not None else None,
+            "semantic_global_confidence_shape": list(semantic["confidence_maps"].shape) if semantic is not None and "confidence_maps" in semantic else None,
+            "semantic_chunk_confidence_shape": list(semantic_chunk["confidence_maps"].shape) if semantic_chunk is not None and "confidence_maps" in semantic_chunk else None,
+            "has_semantic_confidence": bool(semantic is not None and "confidence_maps" in semantic),
         }
         payload = _chunk_cache_dict(
             tracks,
@@ -214,6 +368,7 @@ def main() -> None:
             height=height,
             width=width,
             manifest=manifest,
+            semantic_segmentation=semantic_chunk,
         )
         chunk_name = f"chunk_{chunk_idx:03d}_{int(start):06d}_{int(end):06d}"
         _write_chunk(cache_root, chunk_name, payload, manifest)
@@ -224,11 +379,21 @@ def main() -> None:
             "end_frame": int(end),
             "num_masklets": int(payload["num_masklets"]),
             "visible_masklet_frames": int(payload["debug"]["visible_masklet_frames"]),
+            "has_semantic_segmentation": semantic_chunk is not None,
+            "semantic_nonvoid_pixels": int(payload["debug"].get("semantic_nonvoid_pixels", 0)),
+            "semantic_shape": list(semantic_chunk["label_maps"].shape) if semantic_chunk is not None else None,
+            "has_semantic_confidence": bool(semantic_chunk is not None and "confidence_maps" in semantic_chunk),
+            "semantic_confidence_shape": list(semantic_chunk["confidence_maps"].shape) if semantic_chunk is not None and "confidence_maps" in semantic_chunk else None,
+            "semantic_confidence_min": float(semantic_chunk["confidence_maps"].min().item()) if semantic_chunk is not None and "confidence_maps" in semantic_chunk else None,
+            "semantic_confidence_max": float(semantic_chunk["confidence_maps"].max().item()) if semantic_chunk is not None and "confidence_maps" in semantic_chunk else None,
+            "semantic_confidence_mean": float(semantic_chunk["confidence_maps"].mean().item()) if semantic_chunk is not None and "confidence_maps" in semantic_chunk else None,
         }
         index_rows.append(row)
         print(
             f"{chunk_name}: J={row['num_masklets']} "
-            f"visible={row['visible_masklet_frames']}",
+            f"visible={row['visible_masklet_frames']} "
+            f"semantic={int(row['has_semantic_segmentation'])} "
+            f"semantic_nonvoid={row['semantic_nonvoid_pixels']}",
             flush=True,
         )
 
@@ -245,6 +410,14 @@ def main() -> None:
         "source_num_masklets": int(data.get("num_masklets", len(tracks))),
         "chunk_size": int(args.chunk_size),
         "chunk_overlap": int(args.chunk_overlap),
+        "has_semantic_segmentation": semantic is not None,
+        "semantic_format": str(semantic.get("format")) if semantic is not None else None,
+        "semantic_global_shape": list(semantic["label_maps"].shape) if semantic is not None else None,
+        "semantic_dtype": str(semantic["label_maps"].dtype) if semantic is not None else None,
+        "semantic_num_labels": len(semantic.get("label_names", [])) if semantic is not None else 0,
+        "has_semantic_confidence": bool(semantic is not None and "confidence_maps" in semantic),
+        "semantic_global_confidence_shape": list(semantic["confidence_maps"].shape) if semantic is not None and "confidence_maps" in semantic else None,
+        "semantic_global_confidence_dtype": str(semantic["confidence_maps"].dtype) if semantic is not None and "confidence_maps" in semantic else None,
     }
     (cache_root / "conversion_summary.json").write_text(
         json.dumps(summary, indent=2, sort_keys=True),

@@ -11,6 +11,7 @@ import logging
 import math
 import os
 import warnings
+from pathlib import Path
 
 from torch import Tensor
 from torch import nn
@@ -239,6 +240,238 @@ def _append_source_soft_mass_stats(
             })
 
 
+def _dump_source_soft_attention_sample(
+    q: Tensor,
+    k: Tensor,
+    *,
+    affected_mask: Tensor,
+    base_attn_mask: Tensor | None,
+    source_bias_values: Tensor | None,
+    source_weights: Tensor | None,
+    control: dict,
+) -> dict:
+    """Persist a sampled raw QK attention map for audit-only cue construction."""
+
+    dump_dir_text = str(control.get("source_attention_map_dump_dir", "") or "").strip()
+    if not dump_dir_text:
+        return {}
+    if affected_mask.ndim != 2:
+        return {"source_attention_map_dump_error": f"affected_mask_ndim={affected_mask.ndim}"}
+    if int(affected_mask.shape[0]) != int(q.shape[0]) or int(affected_mask.shape[1]) != int(k.shape[2]):
+        return {
+            "source_attention_map_dump_error": (
+                f"shape_mismatch mask={tuple(affected_mask.shape)} q={tuple(q.shape)} k={tuple(k.shape)}"
+            )
+        }
+
+    try:
+        max_queries = int(control.get("source_attention_map_dump_max_queries", 64) or 64)
+        dump_dtype_name = str(control.get("source_attention_map_dump_dtype", "float16") or "float16").lower()
+        dump_dtype = torch.float32 if dump_dtype_name == "float32" else torch.float16
+        hook_path = str(control.get("source_attention_map_dump_hook_path", "unknown") or "unknown")
+        layer = int(control.get("source_attention_map_dump_layer", -1))
+        chunk = int(control.get("source_attention_map_dump_chunk_idx", -1))
+        n_tokens = int(k.shape[2])
+        full_query_marginal = bool(control.get("source_attention_map_dump_full_query_marginal", False))
+        query_block = max(1, int(control.get("source_attention_map_dump_query_block", 32) or 32))
+        if full_query_marginal:
+            head_dim = max(1, int(q.shape[-1]))
+            scale = 1.0 / math.sqrt(float(head_dim))
+            with torch.no_grad():
+                source_sum_before = torch.zeros(
+                    (int(q.shape[0]), int(k.shape[2])),
+                    device=q.device,
+                    dtype=torch.float32,
+                )
+                source_sum_after = (
+                    torch.zeros_like(source_sum_before) if source_bias_values is not None else None
+                )
+                base_bias = (
+                    base_attn_mask.to(device=q.device, dtype=torch.float32)
+                    if base_attn_mask is not None else None
+                )
+                bias = (
+                    source_bias_values.to(device=q.device, dtype=torch.float32)
+                    if source_bias_values is not None else None
+                )
+                kb = k.float()
+                query_count = int(q.shape[2])
+                denom = max(1, int(q.shape[1]) * query_count)
+                for q0 in range(0, query_count, query_block):
+                    q1 = min(query_count, q0 + query_block)
+                    qb = q[:, :, q0:q1, :].float()
+                    scores = torch.matmul(qb, kb.transpose(-2, -1)) * scale
+                    if base_bias is not None:
+                        scores = scores + base_bias[:, :, q0:q1, :]
+                    attn_before = torch.softmax(scores, dim=-1)
+                    source_sum_before += attn_before.sum(dim=(1, 2))
+                    if bias is not None and source_sum_after is not None:
+                        attn_after = torch.softmax(scores + bias[:, None, None, :], dim=-1)
+                        source_sum_after += attn_after.sum(dim=(1, 2))
+                before_marginal = (source_sum_before / float(denom)).detach().cpu().to(dtype=dump_dtype)
+
+                payload = {
+                    "schema": "acl2_v68_fullquery_source_attention_marginal_v1",
+                    "chunk_idx": chunk,
+                    "layer": layer,
+                    "hook_path": hook_path,
+                    "sampled_not_full_attention_map": False,
+                    "full_query_source_marginal": True,
+                    "pairwise_attention_matrix_stored": False,
+                    "query_axis_fully_covered": True,
+                    "attention_source": "raw_qk_softmax_inside_source_soft_sdpa",
+                    "source_attention_before_marginal": before_marginal,
+                    "affected_mask": affected_mask.detach().cpu().to(dtype=torch.bool),
+                    "source_attention_top_quantile": control.get("source_attention_top_quantile"),
+                    "attention_mass_metric": control.get("attention_mass_metric"),
+                    "dump_dtype": str(dump_dtype),
+                    "q_shape": [int(v) for v in q.shape],
+                    "k_shape": [int(v) for v in k.shape],
+                    "query_block_size": int(query_block),
+                    "full_query_count": query_count,
+                    "source_token_count": int(k.shape[2]),
+                    "source_attention_before_affected_mass_mean": float(
+                        (before_marginal.float() * affected_mask.detach().cpu().float()).sum(dim=-1).mean().item()
+                    ),
+                }
+                if source_sum_after is not None:
+                    after_marginal = (source_sum_after / float(denom)).detach().cpu().to(dtype=dump_dtype)
+                    payload["source_attention_after_bias_marginal"] = after_marginal
+                    payload["source_attention_after_affected_mass_mean"] = float(
+                        (after_marginal.float() * affected_mask.detach().cpu().float()).sum(dim=-1).mean().item()
+                    )
+                if source_weights is not None:
+                    payload["source_weights"] = source_weights.detach().cpu().to(dtype=dump_dtype)
+
+            out_dir = Path(dump_dir_text)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            safe_hook = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in hook_path)
+            chunk_name = f"chunk_{chunk:03d}" if chunk >= 0 else "chunk_unknown"
+            layer_name = f"layer_{layer:03d}" if layer >= 0 else "layer_unknown"
+            out_path = out_dir / f"{chunk_name}_{layer_name}_{safe_hook}_source_attention_fullquery_marginal.pt"
+            torch.save(payload, out_path)
+            return {
+                "source_attention_map_dump_path": str(out_path),
+                "source_attention_map_dump_full_query_marginal": True,
+                "source_attention_map_dump_pairwise_matrix_stored": False,
+                "source_attention_map_dump_shape": [int(v) for v in before_marginal.shape],
+            }
+
+        q_idx = _sample_query_indices(n_tokens, max_queries, q.device)
+        head_dim = max(1, int(q.shape[-1]))
+        scale = 1.0 / math.sqrt(float(head_dim))
+
+        with torch.no_grad():
+            qb = q[:, :, q_idx, :].float()
+            kb = k.float()
+            scores = torch.matmul(qb, kb.transpose(-2, -1)) * scale
+            if base_attn_mask is not None:
+                base_bias = base_attn_mask.to(device=q.device, dtype=torch.float32)
+                scores = scores + base_bias[:, :, q_idx, :]
+            attention_before = torch.softmax(scores, dim=-1)
+
+            payload = {
+                "schema": "acl2_v68_sampled_source_attention_map_v1",
+                "chunk_idx": chunk,
+                "layer": layer,
+                "hook_path": hook_path,
+                "sampled_not_full_attention_map": True,
+                "attention_source": "raw_qk_softmax_inside_source_soft_sdpa",
+                "query_indices": q_idx.detach().cpu().long(),
+                "attention_before_control": attention_before.detach().cpu().to(dtype=dump_dtype),
+                "affected_mask": affected_mask.detach().cpu().to(dtype=torch.bool),
+                "source_attention_top_quantile": control.get("source_attention_top_quantile"),
+                "attention_mass_metric": control.get("attention_mass_metric"),
+                "dump_dtype": str(dump_dtype),
+                "q_shape": [int(v) for v in q.shape],
+                "k_shape": [int(v) for v in k.shape],
+            }
+            if source_bias_values is not None:
+                bias = source_bias_values.to(device=q.device, dtype=torch.float32)
+                scores_after = scores + bias[:, None, None, :]
+                payload["attention_after_bias_control"] = torch.softmax(scores_after, dim=-1).detach().cpu().to(dtype=dump_dtype)
+            if source_weights is not None:
+                payload["source_weights"] = source_weights.detach().cpu().to(dtype=dump_dtype)
+
+        out_dir = Path(dump_dir_text)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        safe_hook = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in hook_path)
+        chunk_name = f"chunk_{chunk:03d}" if chunk >= 0 else "chunk_unknown"
+        layer_name = f"layer_{layer:03d}" if layer >= 0 else "layer_unknown"
+        out_path = out_dir / f"{chunk_name}_{layer_name}_{safe_hook}_source_attention_sample.pt"
+        torch.save(payload, out_path)
+        return {
+            "source_attention_map_dump_path": str(out_path),
+            "source_attention_map_dump_sampled": True,
+            "source_attention_map_dump_queries": int(q_idx.numel()),
+            "source_attention_map_dump_shape": [int(v) for v in attention_before.shape],
+        }
+    except Exception as exc:  # pragma: no cover - diagnostic path must not break inference.
+        return {"source_attention_map_dump_error": f"{type(exc).__name__}: {exc}"}
+
+
+def _select_source_attention_top_mask(
+    q: Tensor,
+    k: Tensor,
+    *,
+    eligible_mask: Tensor,
+    base_attn_mask: Tensor | None,
+    attention_mass_max_queries: int,
+    quantile: float,
+    random_same_mass: bool,
+    random_salt: int,
+) -> Tensor:
+    """Select source columns with the largest pre-control attention mass."""
+
+    if eligible_mask.ndim != 2:
+        raise ValueError(f"source attention eligible_mask must be [B,N], got {tuple(eligible_mask.shape)}")
+    if int(eligible_mask.shape[0]) != int(q.shape[0]) or int(eligible_mask.shape[1]) != int(k.shape[2]):
+        raise ValueError(
+            "source attention eligible_mask shape mismatch: "
+            f"mask={tuple(eligible_mask.shape)} q={tuple(q.shape)} k={tuple(k.shape)}"
+        )
+    eligible_mask = eligible_mask.to(device=q.device, dtype=torch.bool)
+    base_bias = base_attn_mask.to(device=q.device, dtype=torch.float32) if base_attn_mask is not None else None
+    out = torch.zeros_like(eligible_mask, dtype=torch.bool)
+    head_dim = max(1, int(q.shape[-1]))
+    scale = 1.0 / math.sqrt(float(head_dim))
+    qv = float(quantile)
+    qv = min(max(qv, 0.0), 1.0)
+    with torch.no_grad():
+        for b in range(int(q.shape[0])):
+            valid = eligible_mask[b]
+            if int(valid.sum().item()) <= 0:
+                continue
+            n_tokens = int(valid.numel())
+            q_idx = _sample_query_indices(n_tokens, attention_mass_max_queries, q.device)
+            qb = q[b : b + 1, :, q_idx, :].float()
+            kb = k[b : b + 1].float()
+            scores = torch.matmul(qb, kb.transpose(-2, -1)) * scale
+            if base_bias is not None:
+                scores = scores + base_bias[b : b + 1, :, q_idx, :]
+            attn_full = torch.softmax(scores, dim=-1)
+            source_mass = attn_full.mean(dim=(0, 1, 2))
+            valid_mass = source_mass[valid]
+            if valid_mass.numel() <= 0:
+                continue
+            thr = torch.quantile(valid_mass.float(), qv)
+            selected = valid & (source_mass >= thr)
+            if random_same_mass:
+                k_count = int(selected.sum().item())
+                idx = torch.nonzero(valid, as_tuple=False).reshape(-1)
+                if k_count > 0 and idx.numel() > 0:
+                    token_idx = torch.arange(n_tokens, device=q.device, dtype=torch.float32)
+                    scores_rand = torch.frac(
+                        torch.sin((token_idx + 1.0 + float(b + random_salt) * 97.0) * 12.9898)
+                        * 43758.5453
+                    )
+                    top = torch.topk(scores_rand[idx], min(k_count, int(idx.numel()))).indices
+                    selected = torch.zeros_like(valid, dtype=torch.bool)
+                    selected[idx[top]] = True
+            out[b] = selected
+    return out
+
+
 def _source_soft_sdpa(
     q: Tensor,
     k: Tensor,
@@ -257,6 +490,24 @@ def _source_soft_sdpa(
         source_bias_values = source_bias_values.to(device=q.device, dtype=q.dtype)
     if source_weights is not None:
         source_weights = source_weights.to(device=q.device, dtype=v.dtype)
+    top_quantile = control.get("source_attention_top_quantile")
+    if top_quantile is not None:
+        eligible_mask = control.get("source_attention_top_eligible_mask", affected_mask)
+        affected_mask = _select_source_attention_top_mask(
+            q,
+            k,
+            eligible_mask=eligible_mask,
+            base_attn_mask=base_attn_mask,
+            attention_mass_max_queries=int(control.get("attention_mass_max_queries", 512) or 512),
+            quantile=float(top_quantile),
+            random_same_mass=bool(control.get("source_attention_top_random_same_mass", False)),
+            random_salt=int(control.get("source_attention_top_random_salt", 0) or 0),
+        )
+        rho = float(control.get("source_attention_top_rho", 0.5) or 0.5)
+        min_keep = float(control.get("source_attention_top_min_keep", 0.5) or 0.5)
+        keep = (1.0 - rho * affected_mask.to(dtype=torch.float32)).clamp(min_keep, 1.0)
+        source_bias_values = torch.log(keep.clamp_min(1e-4)).to(device=q.device, dtype=q.dtype)
+        source_weights = None
     _append_source_soft_mass_stats(
         q,
         k,
@@ -268,6 +519,21 @@ def _source_soft_sdpa(
         attention_mass_max_queries=int(control.get("attention_mass_max_queries", 512) or 512),
         metric_type=str(control.get("attention_mass_metric", "source_soft")),
     )
+    dump_info = _dump_source_soft_attention_sample(
+        q,
+        k,
+        affected_mask=affected_mask,
+        base_attn_mask=base_attn_mask,
+        source_bias_values=source_bias_values,
+        source_weights=source_weights,
+        control=control,
+    )
+    stats = control.get("attention_mass_stats")
+    if dump_info and isinstance(stats, list):
+        if stats:
+            stats[-1].update(dump_info)
+        else:
+            stats.append(dump_info)
     v_eff = v
     if source_weights is not None:
         v_eff = v * source_weights[:, None, :, None]

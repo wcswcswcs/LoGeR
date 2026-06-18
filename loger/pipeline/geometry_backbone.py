@@ -292,6 +292,7 @@ class LoGeRGeometryBackbone:
         se3: bool = False,
         sim3: bool = False,
         sim3_scale_mode: str = "median",
+        sim3_reuse_reset_block: bool = False,
         turn_off_ttt: bool = False,
         turn_off_swa: bool = False,
         edge_rtol: float = 0.03,
@@ -314,6 +315,7 @@ class LoGeRGeometryBackbone:
             se3=se3,
             sim3=sim3,
             sim3_scale_mode=sim3_scale_mode,
+            sim3_reuse_reset_block=sim3_reuse_reset_block,
             turn_off_ttt=turn_off_ttt,
             turn_off_swa=turn_off_swa,
         )

@@ -7,7 +7,10 @@ from typing import Any
 
 import cv2
 import numpy as np
-import torch
+try:
+    import torch
+except ImportError:  # pragma: no cover - exercised in dependency-light test envs
+    torch = None  # type: ignore[assignment]
 
 from .carrier_store import CarrierBatch
 
@@ -36,6 +39,10 @@ class D4RTAdapter:
             raise FileNotFoundError(
                 "D4RT checkpoint does not exist: "
                 f"{self.ckpt_path}. Download/provide the matching .ckpt and retry."
+            )
+        if torch is None:
+            raise ImportError(
+                "D4RTAdapter requires PyTorch. Install torch before running D4RT inference."
             )
 
         sys.path.insert(0, str(self.d4rt_root))
