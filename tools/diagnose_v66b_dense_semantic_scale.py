@@ -803,6 +803,167 @@ def _strategy_weights(
                 "overlap_support_weighted_mass": float(w.sum().item()),
             }
         )
+    elif core == "V73_RADIO_COMPONENT_HANDOFF":
+        radio_stable = masks.get("radio_component_stable")
+        radio_risk = masks.get("radio_component_risk")
+        if not torch.is_tensor(radio_stable) or not torch.is_tensor(radio_risk):
+            raise ValueError("V73_RADIO_COMPONENT_HANDOFF requires RADIO component tensors")
+        radio_stable = radio_stable.to(device=base_w.device, dtype=base_w.dtype).clamp(0.0, 1.0)
+        radio_risk = radio_risk.to(device=base_w.device, dtype=base_w.dtype).clamp(0.0, 1.0)
+        if control == "shuffled":
+            gen = torch.Generator().manual_seed(int(random_seed) + int(chunk_id) * 131 + len(strategy))
+            for tensor_name, tensor in (("stable", radio_stable), ("risk", radio_risk)):
+                flat = tensor.reshape(-1)
+                perm = torch.randperm(flat.numel(), generator=gen, device=flat.device)
+                shuffled_tensor = flat[perm].reshape_as(tensor)
+                if tensor_name == "stable":
+                    radio_stable = shuffled_tensor
+                else:
+                    radio_risk = shuffled_tensor
+        support = masks.get("overlap_support")
+        support_weight = torch.ones_like(base_w)
+        support_floor = 0.25
+        if torch.is_tensor(support):
+            support = support.to(device=base_w.device, dtype=base_w.dtype).clamp(0.0, 1.0)
+            floor_raw = masks.get("overlap_support_floor", 0.25)
+            try:
+                support_floor = float(floor_raw)
+            except (TypeError, ValueError):
+                support_floor = 0.25
+            support_floor = min(1.0, max(0.0, support_floor))
+            support_weight = (support_floor + (1.0 - support_floor) * support).clamp(0.0, 1.0)
+        semantic_base = base_w.masked_fill(dyn | sky, 0.0)
+        component_boost = (0.35 + 0.85 * radio_stable).clamp(0.0, 1.20)
+        risk_gate = (1.0 - 0.70 * radio_risk).clamp(0.10, 1.0)
+        w = (semantic_base * support_weight * component_boost * risk_gate).clamp(0.0, 2.0) * base_valid.float()
+        valid_stable = radio_stable[base_valid]
+        valid_risk = radio_risk[base_valid]
+        info.update(
+            {
+                "v73_radio_component_handoff_weight": True,
+                "radio_component_control_type": control or "none",
+                "radio_component_stable_mean": float(valid_stable.mean().item()) if bool(valid_stable.numel()) else 0.0,
+                "radio_component_stable_q90": float(torch.quantile(valid_stable.float(), 0.90).item()) if bool(valid_stable.numel()) else 0.0,
+                "radio_component_risk_mean": float(valid_risk.mean().item()) if bool(valid_risk.numel()) else 0.0,
+                "radio_component_risk_q90": float(torch.quantile(valid_risk.float(), 0.90).item()) if bool(valid_risk.numel()) else 0.0,
+                "radio_component_support_floor": float(support_floor),
+                "radio_component_boost_mean": float(component_boost[base_valid].mean().item()) if bool(base_valid.any().item()) else 0.0,
+                "radio_component_risk_gate_mean": float(risk_gate[base_valid].mean().item()) if bool(base_valid.any().item()) else 0.0,
+                "radio_component_weighted_mass": float(w.sum().item()),
+            }
+        )
+    elif core == "V73_RADIO_QSCALE_HANDOFF":
+        radio_stable = masks.get("radio_component_stable")
+        radio_risk = masks.get("radio_component_risk")
+        if not torch.is_tensor(radio_stable) or not torch.is_tensor(radio_risk):
+            raise ValueError("V73_RADIO_QSCALE_HANDOFF requires RADIO component tensors")
+        radio_stable = radio_stable.to(device=base_w.device, dtype=base_w.dtype).clamp(0.0, 1.0)
+        radio_risk = radio_risk.to(device=base_w.device, dtype=base_w.dtype).clamp(0.0, 1.0)
+        if control == "shuffled":
+            gen = torch.Generator().manual_seed(int(random_seed) + int(chunk_id) * 137 + len(strategy))
+            stable_flat = radio_stable.reshape(-1)
+            risk_flat = radio_risk.reshape(-1)
+            radio_stable = stable_flat[torch.randperm(stable_flat.numel(), generator=gen, device=stable_flat.device)].reshape_as(radio_stable)
+            radio_risk = risk_flat[torch.randperm(risk_flat.numel(), generator=gen, device=risk_flat.device)].reshape_as(radio_risk)
+        support = masks.get("overlap_support")
+        if not torch.is_tensor(support):
+            raise ValueError("V73_RADIO_QSCALE_HANDOFF requires overlap_support tensor")
+        support = support.to(device=base_w.device, dtype=base_w.dtype).clamp(0.0, 1.0)
+        floor_raw = masks.get("overlap_support_floor", 0.25)
+        try:
+            support_floor = float(floor_raw)
+        except (TypeError, ValueError):
+            support_floor = 0.25
+        support_floor = min(1.0, max(0.0, support_floor))
+        support_weight = (support_floor + (1.0 - support_floor) * support).clamp(0.0, 1.0)
+        semantic_base = base_w.masked_fill(dyn | sky, 0.0)
+        w = semantic_base * support_weight
+        valid_stable = radio_stable[base_valid]
+        valid_risk = radio_risk[base_valid]
+        stable_mean = float(valid_stable.mean().item()) if bool(valid_stable.numel()) else 0.0
+        risk_mean = float(valid_risk.mean().item()) if bool(valid_risk.numel()) else 0.0
+        q_handoff = stable_mean / (stable_mean + risk_mean + 1.0e-12)
+        info.update(
+            {
+                "v73_radio_qscale_handoff": True,
+                "radio_component_control_type": control or "none",
+                "radio_handoff_qscale_observability": float(q_handoff),
+                "radio_handoff_stable_mean": stable_mean,
+                "radio_handoff_risk_mean": risk_mean,
+                "radio_handoff_support_floor": float(support_floor),
+                "radio_handoff_weighted_mass": float(w.sum().item()),
+            }
+        )
+    elif core in {"V73_THINGSTUFF_STATE_HANDOFF", "V73_THINGSTUFF_RADIO_QSCALE_HANDOFF"}:
+        radio_stable = masks.get("radio_component_stable")
+        radio_risk = masks.get("radio_component_risk")
+        if not torch.is_tensor(radio_stable):
+            radio_stable = torch.zeros_like(base_w)
+        else:
+            radio_stable = radio_stable.to(device=base_w.device, dtype=base_w.dtype).clamp(0.0, 1.0)
+        if not torch.is_tensor(radio_risk):
+            radio_risk = torch.zeros_like(base_w)
+        else:
+            radio_risk = radio_risk.to(device=base_w.device, dtype=base_w.dtype).clamp(0.0, 1.0)
+        if control == "shuffled":
+            gen = torch.Generator().manual_seed(int(random_seed) + int(chunk_id) * 149 + len(strategy))
+            stable_flat = radio_stable.reshape(-1)
+            risk_flat = radio_risk.reshape(-1)
+            radio_stable = stable_flat[torch.randperm(stable_flat.numel(), generator=gen, device=stable_flat.device)].reshape_as(radio_stable)
+            radio_risk = risk_flat[torch.randperm(risk_flat.numel(), generator=gen, device=risk_flat.device)].reshape_as(radio_risk)
+        support = masks.get("overlap_support")
+        support_weight = torch.ones_like(base_w)
+        support_floor = 0.25
+        if torch.is_tensor(support):
+            support = support.to(device=base_w.device, dtype=base_w.dtype).clamp(0.0, 1.0)
+            floor_raw = masks.get("overlap_support_floor", 0.25)
+            try:
+                support_floor = float(floor_raw)
+            except (TypeError, ValueError):
+                support_floor = 0.25
+            support_floor = min(1.0, max(0.0, support_floor))
+            support_weight = (support_floor + (1.0 - support_floor) * support).clamp(0.0, 1.0)
+        thing_static = (radio_stable * (1.0 - radio_risk)).clamp(0.0, 1.0)
+        dynamic_role = (0.10 + 0.90 * thing_static).clamp(0.0, 1.0)
+        role_weight = torch.ones_like(base_w) * 0.40
+        role_weight = role_weight.masked_fill(ground, 0.35)
+        role_weight = role_weight.masked_fill(veg | void, 0.10)
+        role_weight = role_weight.masked_fill(sky, 0.0)
+        role_weight = role_weight.masked_fill(boundary, 0.65)
+        role_weight = role_weight.masked_fill(vert, 1.0)
+        role_weight = torch.where(dyn, dynamic_role, role_weight)
+        risk_veto = (1.0 - 0.50 * radio_risk).clamp(0.20, 1.0)
+        w = (base_w * support_weight * role_weight * risk_veto).clamp(0.0, 2.0) * base_valid.float()
+        state_static_mass = float((base_w * dyn.float() * thing_static).sum().item())
+        state_moving_mass = float((base_w * dyn.float() * (1.0 - thing_static)).sum().item())
+        valid_stable = radio_stable[base_valid]
+        valid_risk = radio_risk[base_valid]
+        stable_mean = float(valid_stable.mean().item()) if bool(valid_stable.numel()) else 0.0
+        risk_mean = float(valid_risk.mean().item()) if bool(valid_risk.numel()) else 0.0
+        info.update(
+            {
+                "v73_thingstuff_state_handoff": True,
+                "thingstuff_control_type": control or "none",
+                "thing_static_proxy_mass": state_static_mass,
+                "thing_moving_proxy_mass": state_moving_mass,
+                "thingstuff_role_weight_mean": float(role_weight[base_valid].mean().item()) if bool(base_valid.any().item()) else 0.0,
+                "thingstuff_risk_veto_mean": float(risk_veto[base_valid].mean().item()) if bool(base_valid.any().item()) else 0.0,
+                "thingstuff_support_floor": float(support_floor),
+                "thingstuff_weighted_mass": float(w.sum().item()),
+            }
+        )
+        if core == "V73_THINGSTUFF_RADIO_QSCALE_HANDOFF":
+            q_handoff = stable_mean / (stable_mean + risk_mean + 1.0e-12)
+            info.update(
+                {
+                    "v73_thingstuff_radio_qscale_handoff": True,
+                    "radio_handoff_qscale_observability": float(q_handoff),
+                    "radio_handoff_stable_mean": stable_mean,
+                    "radio_handoff_risk_mean": risk_mean,
+                    "radio_handoff_support_floor": float(support_floor),
+                    "radio_handoff_weighted_mass": float(w.sum().item()),
+                }
+            )
     else:
         raise ValueError(f"Unknown strategy: {strategy}")
 
@@ -952,6 +1113,18 @@ PHASE3_STRATEGIES = [
     "V68_OVERLAP_SUPPORT_WEIGHT",
     "V68_OVERLAP_SUPPORT_WEIGHT_RANDOM",
     "V68_OVERLAP_SUPPORT_WEIGHT_SHUFFLED",
+    "V73_RADIO_COMPONENT_HANDOFF",
+    "V73_RADIO_COMPONENT_HANDOFF_RANDOM",
+    "V73_RADIO_COMPONENT_HANDOFF_SHUFFLED",
+    "V73_RADIO_QSCALE_HANDOFF",
+    "V73_RADIO_QSCALE_HANDOFF_RANDOM",
+    "V73_RADIO_QSCALE_HANDOFF_SHUFFLED",
+    "V73_THINGSTUFF_STATE_HANDOFF",
+    "V73_THINGSTUFF_STATE_HANDOFF_RANDOM",
+    "V73_THINGSTUFF_STATE_HANDOFF_SHUFFLED",
+    "V73_THINGSTUFF_RADIO_QSCALE_HANDOFF",
+    "V73_THINGSTUFF_RADIO_QSCALE_HANDOFF_RANDOM",
+    "V73_THINGSTUFF_RADIO_QSCALE_HANDOFF_SHUFFLED",
     "S5_SUPPRESS_DYNAMIC_SKY_RANDOM",
     "S5_SUPPRESS_DYNAMIC_SKY_SHUFFLED",
     "S6_SUPPRESS_DYNAMIC_SKY_VEGETATION_RANDOM",
@@ -1122,6 +1295,18 @@ PHASE4_STRATEGIES = [
     "V68_OVERLAP_SUPPORT_WEIGHT",
     "V68_OVERLAP_SUPPORT_WEIGHT_RANDOM",
     "V68_OVERLAP_SUPPORT_WEIGHT_SHUFFLED",
+    "V73_RADIO_COMPONENT_HANDOFF",
+    "V73_RADIO_COMPONENT_HANDOFF_RANDOM",
+    "V73_RADIO_COMPONENT_HANDOFF_SHUFFLED",
+    "V73_RADIO_QSCALE_HANDOFF",
+    "V73_RADIO_QSCALE_HANDOFF_RANDOM",
+    "V73_RADIO_QSCALE_HANDOFF_SHUFFLED",
+    "V73_THINGSTUFF_STATE_HANDOFF",
+    "V73_THINGSTUFF_STATE_HANDOFF_RANDOM",
+    "V73_THINGSTUFF_STATE_HANDOFF_SHUFFLED",
+    "V73_THINGSTUFF_RADIO_QSCALE_HANDOFF",
+    "V73_THINGSTUFF_RADIO_QSCALE_HANDOFF_RANDOM",
+    "V73_THINGSTUFF_RADIO_QSCALE_HANDOFF_SHUFFLED",
     "S5_SUPPRESS_DYNAMIC_SKY_RANDOM",
     "S5_SUPPRESS_DYNAMIC_SKY_SHUFFLED",
     "S8_VERTICAL_STATIC_ONLY_RANDOM",

@@ -67,6 +67,66 @@ MERGE_CASES: Dict[str, Dict[str, Any]] = {
         "strategy": "V68_OVERLAP_SUPPORT_WEIGHT_SHUFFLED",
         "ttt_tail_drop": False,
     },
+    "radio_component": {
+        "semantic_merge": True,
+        "strategy": "V73_RADIO_COMPONENT_HANDOFF",
+        "ttt_tail_drop": False,
+    },
+    "radio_component_random": {
+        "semantic_merge": True,
+        "strategy": "V73_RADIO_COMPONENT_HANDOFF_RANDOM",
+        "ttt_tail_drop": False,
+    },
+    "radio_component_shuffled": {
+        "semantic_merge": True,
+        "strategy": "V73_RADIO_COMPONENT_HANDOFF_SHUFFLED",
+        "ttt_tail_drop": False,
+    },
+    "radio_qscale": {
+        "semantic_merge": True,
+        "strategy": "V73_RADIO_QSCALE_HANDOFF",
+        "ttt_tail_drop": False,
+    },
+    "radio_qscale_random": {
+        "semantic_merge": True,
+        "strategy": "V73_RADIO_QSCALE_HANDOFF_RANDOM",
+        "ttt_tail_drop": False,
+    },
+    "radio_qscale_shuffled": {
+        "semantic_merge": True,
+        "strategy": "V73_RADIO_QSCALE_HANDOFF_SHUFFLED",
+        "ttt_tail_drop": False,
+    },
+    "thingstuff_state": {
+        "semantic_merge": True,
+        "strategy": "V73_THINGSTUFF_STATE_HANDOFF",
+        "ttt_tail_drop": False,
+    },
+    "thingstuff_state_random": {
+        "semantic_merge": True,
+        "strategy": "V73_THINGSTUFF_STATE_HANDOFF_RANDOM",
+        "ttt_tail_drop": False,
+    },
+    "thingstuff_state_shuffled": {
+        "semantic_merge": True,
+        "strategy": "V73_THINGSTUFF_STATE_HANDOFF_SHUFFLED",
+        "ttt_tail_drop": False,
+    },
+    "thingstuff_radio_qscale": {
+        "semantic_merge": True,
+        "strategy": "V73_THINGSTUFF_RADIO_QSCALE_HANDOFF",
+        "ttt_tail_drop": False,
+    },
+    "thingstuff_radio_qscale_random": {
+        "semantic_merge": True,
+        "strategy": "V73_THINGSTUFF_RADIO_QSCALE_HANDOFF_RANDOM",
+        "ttt_tail_drop": False,
+    },
+    "thingstuff_radio_qscale_shuffled": {
+        "semantic_merge": True,
+        "strategy": "V73_THINGSTUFF_RADIO_QSCALE_HANDOFF_SHUFFLED",
+        "ttt_tail_drop": False,
+    },
     "combo_candidate": {
         "semantic_merge": True,
         "strategy": "S5_SUPPRESS_DYNAMIC_SKY",
@@ -235,6 +295,9 @@ def _build_command(args: argparse.Namespace, *, chunk: int, case: str, out_dir: 
                     str(args.semantic_merge_overlap_support_floor),
                 ]
             )
+        radio_sidecar_dir = str(args.radio_sidecar_dir or "").strip()
+        if radio_sidecar_dir:
+            cmd.extend(["--v70_radio_sidecar_dir", radio_sidecar_dir])
         if bool(args.reject_worse_than_native_overlap):
             cmd.extend(
                 [
@@ -259,6 +322,18 @@ def _build_command(args: argparse.Namespace, *, chunk: int, case: str, out_dir: 
                     str(args.qscale_residual_reference),
                 ]
             )
+    online_scale_state_mode = str(args.online_scale_state_mode or "none").strip().lower()
+    if online_scale_state_mode not in {"", "none", "off"}:
+        cmd.extend(
+            [
+                "--online_scale_state_mode",
+                online_scale_state_mode,
+                "--online_scale_state_min",
+                str(args.online_scale_state_min),
+                "--online_scale_state_max",
+                str(args.online_scale_state_max),
+            ]
+        )
     cmd.extend(
         [
             "--fast_cue_eval",
@@ -333,6 +408,7 @@ def main() -> None:
     parser.add_argument("--semantic-merge-overlap-support-dir", default="")
     parser.add_argument("--semantic-merge-overlap-support-kind", default="source_gate")
     parser.add_argument("--semantic-merge-overlap-support-floor", type=float, default=0.25)
+    parser.add_argument("--radio-sidecar-dir", default="results/kitti_preprocess/01/radio_sidecar_chunks_r5_overlap")
     parser.add_argument("--reject-worse-than-native-overlap", action="store_true")
     parser.add_argument("--native-overlap-tolerance", type=float, default=0.0)
     parser.add_argument("--qscale-hold-refresh", action="store_true")
@@ -340,6 +416,9 @@ def main() -> None:
     parser.add_argument("--qscale-min-factor", type=float, default=0.35)
     parser.add_argument("--qscale-condition-reference", type=float, default=0.0)
     parser.add_argument("--qscale-residual-reference", type=float, default=0.0)
+    parser.add_argument("--online-scale-state-mode", default="none")
+    parser.add_argument("--online-scale-state-min", type=float, default=0.80)
+    parser.add_argument("--online-scale-state-max", type=float, default=1.25)
     parser.add_argument(
         "--disable-ttt-compile",
         action="store_true",

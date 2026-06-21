@@ -27,6 +27,11 @@ _CONTEXT_SEM_GROUP_STATIC = 1
 _CONTEXT_SEM_GROUP_MOVABLE = 2
 _CONTEXT_SEM_GROUP_LOWSTUFF = 3
 _CONTEXT_SEM_GROUP_UNCERTAIN = 4
+_SEMANTIC_ROLE_FALLBACK = 0
+_SEMANTIC_ROLE_POSITIVE_LONG = 1
+_SEMANTIC_ROLE_NEUTRAL_KEEP = 2
+_SEMANTIC_ROLE_NEGATIVE_SHORT = 3
+_SEMANTIC_ROLE_PROTECT_NEUTRAL = 4
 
 class Pi3(nn.Module, PyTorchModelHubMixin):
     def __init__(
@@ -72,6 +77,8 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         self.ttt_insert_after = parsed_ttt_insert_after
         self.attn_insert_after = parsed_attn_insert_after
         self.export_attn_debug = bool(export_attn_debug)
+        self.export_full_pca_debug = False
+        self.pca_debug_max_feature_dim = 64
         self.detach_swa_history = False
         self.initialize_swa_from_global = True
         self.encoder = dinov2_vitl14_reg(pretrained=False)
@@ -480,6 +487,213 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             deep = middle[-1:]
         return shallow, middle, deep
 
+    def _pca_debug_enabled(self) -> bool:
+        return bool(getattr(self, "export_full_pca_debug", False))
+
+    def _pca_feature_limit(self) -> int:
+        try:
+            return max(0, int(getattr(self, "pca_debug_max_feature_dim", 64)))
+        except Exception:
+            return 64
+
+    def _pca_truncate_feature_dim(self, x: torch.Tensor) -> torch.Tensor:
+        max_dim = self._pca_feature_limit()
+        if max_dim > 0 and int(x.shape[-1]) > max_dim:
+            x = x[..., :max_dim]
+        return x.contiguous()
+
+    def _pca_tokens_to_patchvec(
+        self,
+        tokens: Optional[torch.Tensor],
+        *,
+        batch_size: int,
+        frame_num: int,
+        patch_h: int,
+        patch_w: int,
+    ) -> Optional[torch.Tensor]:
+        if tokens is None or tokens.ndim != 4:
+            return None
+        if int(tokens.shape[0]) != int(batch_size) or int(tokens.shape[1]) != int(frame_num):
+            return None
+        patch_tokens = int(patch_h) * int(patch_w)
+        start = int(self.patch_start_idx)
+        end = start + patch_tokens
+        if int(tokens.shape[2]) < end:
+            return None
+        x = tokens[:, :, start:end, :]
+        x = x.reshape(batch_size, frame_num, patch_h, patch_w, int(x.shape[-1]))
+        return self._pca_truncate_feature_dim(x.detach())
+
+    def _pca_heads_to_patchvec(
+        self,
+        heads_tokens: Optional[torch.Tensor],
+        *,
+        batch_size: int,
+        frame_num: int,
+        tokens_per_frame: int,
+        patch_h: int,
+        patch_w: int,
+        layout: str,
+    ) -> Optional[torch.Tensor]:
+        if heads_tokens is None or heads_tokens.ndim != 4:
+            return None
+        if layout == "frame":
+            expected_batch = int(batch_size) * int(frame_num)
+            expected_tokens = int(tokens_per_frame)
+            if int(heads_tokens.shape[0]) != expected_batch or int(heads_tokens.shape[2]) != expected_tokens:
+                return None
+            x = heads_tokens.transpose(1, 2).reshape(
+                batch_size,
+                frame_num,
+                tokens_per_frame,
+                -1,
+            )
+        else:
+            expected_tokens = int(frame_num) * int(tokens_per_frame)
+            if int(heads_tokens.shape[0]) != int(batch_size) or int(heads_tokens.shape[2]) != expected_tokens:
+                return None
+            x = heads_tokens.transpose(1, 2).reshape(
+                batch_size,
+                frame_num,
+                tokens_per_frame,
+                -1,
+            )
+        return self._pca_tokens_to_patchvec(
+            x,
+            batch_size=batch_size,
+            frame_num=frame_num,
+            patch_h=patch_h,
+            patch_w=patch_w,
+        )
+
+    def _extract_pca_attention_qkv_patchvec(
+        self,
+        blk: nn.Module,
+        x: torch.Tensor,
+        xpos: Optional[torch.Tensor],
+        *,
+        batch_size: int,
+        frame_num: int,
+        tokens_per_frame: int,
+        patch_h: int,
+        patch_w: int,
+        layout: str,
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        if not self._pca_debug_enabled():
+            return None
+        try:
+            with torch.no_grad():
+                x_norm = blk.norm1(x)
+                Bx, Nt, C = x_norm.shape
+                attn = blk.attn
+                qkv = attn.qkv(x_norm).reshape(
+                    Bx,
+                    Nt,
+                    3,
+                    attn.num_heads,
+                    C // attn.num_heads,
+                ).transpose(1, 3)
+                q, k, v = [qkv[:, :, idx] for idx in range(3)]
+                q = attn.q_norm(q).to(v.dtype)
+                k = attn.k_norm(k).to(v.dtype)
+                if attn.rope is not None and xpos is not None:
+                    q = attn.rope(q, xpos)
+                    k = attn.rope(k, xpos)
+                return {
+                    "q": self._pca_heads_to_patchvec(
+                        q,
+                        batch_size=batch_size,
+                        frame_num=frame_num,
+                        tokens_per_frame=tokens_per_frame,
+                        patch_h=patch_h,
+                        patch_w=patch_w,
+                        layout=layout,
+                    ),
+                    "k": self._pca_heads_to_patchvec(
+                        k,
+                        batch_size=batch_size,
+                        frame_num=frame_num,
+                        tokens_per_frame=tokens_per_frame,
+                        patch_h=patch_h,
+                        patch_w=patch_w,
+                        layout=layout,
+                    ),
+                    "v": self._pca_heads_to_patchvec(
+                        v,
+                        batch_size=batch_size,
+                        frame_num=frame_num,
+                        tokens_per_frame=tokens_per_frame,
+                        patch_h=patch_h,
+                        patch_w=patch_w,
+                        layout=layout,
+                    ),
+                }
+        except Exception:
+            return None
+
+    def _extract_pca_swa_current_qkv_patchvec(
+        self,
+        swa_layer: nn.Module,
+        x_flat: torch.Tensor,
+        xpos: Optional[torch.Tensor],
+        *,
+        batch_size: int,
+        frame_num: int,
+        tokens_per_frame: int,
+        patch_h: int,
+        patch_w: int,
+    ) -> Optional[Dict[str, torch.Tensor]]:
+        if not self._pca_debug_enabled():
+            return None
+        return self._extract_pca_attention_qkv_patchvec(
+            swa_layer,
+            x_flat,
+            xpos,
+            batch_size=batch_size,
+            frame_num=frame_num,
+            tokens_per_frame=tokens_per_frame,
+            patch_h=patch_h,
+            patch_w=patch_w,
+            layout="global",
+        )
+
+    def _pca_ttt_heads_to_patchvec(
+        self,
+        heads_tokens: Optional[torch.Tensor],
+        *,
+        batch_size: int,
+        frame_num: int,
+        tokens_per_frame: int,
+        patch_h: int,
+        patch_w: int,
+    ) -> Optional[torch.Tensor]:
+        if heads_tokens is None or heads_tokens.ndim != 3:
+            return None
+        if int(heads_tokens.shape[0]) % int(batch_size) != 0:
+            return None
+        if int(heads_tokens.shape[1]) != int(frame_num) * int(tokens_per_frame):
+            return None
+        heads = int(heads_tokens.shape[0]) // int(batch_size)
+        x = heads_tokens.reshape(
+            batch_size,
+            heads,
+            frame_num,
+            tokens_per_frame,
+            int(heads_tokens.shape[-1]),
+        ).permute(0, 2, 3, 1, 4).reshape(
+            batch_size,
+            frame_num,
+            tokens_per_frame,
+            heads * int(heads_tokens.shape[-1]),
+        )
+        return self._pca_tokens_to_patchvec(
+            x,
+            batch_size=batch_size,
+            frame_num=frame_num,
+            patch_h=patch_h,
+            patch_w=patch_w,
+        )
+
     def _extract_frame_attention_cosine_map(
         self,
         blk: nn.Module,
@@ -664,7 +878,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         patch_w: int,
         window_radius: int,
     ) -> Optional[dict]:
-        """Export raw patch-level q/k vectors from one global-attention layer."""
+        """Export raw patch-level q/k/v vectors from one global-attention layer."""
         if frame_num <= 1:
             return None
 
@@ -710,9 +924,13 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         k_raw = k.reshape(
             batch_size, blk.attn.num_heads, frame_num, num_patch_tokens, -1,
         ).float()
+        v_raw = v.reshape(
+            batch_size, blk.attn.num_heads, frame_num, num_patch_tokens, -1,
+        ).float()
         return {
             "q_raw_patchvec": q_raw.mean(dim=1).reshape(batch_size, frame_num, patch_h, patch_w, -1),
             "k_raw_patchvec": k_raw.mean(dim=1).reshape(batch_size, frame_num, patch_h, patch_w, -1),
+            "v_raw_patchvec": v_raw.mean(dim=1).reshape(batch_size, frame_num, patch_h, patch_w, -1),
         }
 
     def _aggregate_dyn4d_from_global_stats(
@@ -743,6 +961,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
 
         global_q_raw_layers = _collect_stack(available_layers, "q_raw_patchvec")
         global_k_raw_layers = _collect_stack(available_layers, "k_raw_patchvec")
+        global_v_raw_layers = _collect_stack(available_layers, "v_raw_patchvec")
         if global_q_raw_layers is None or global_k_raw_layers is None:
             return None
 
@@ -818,6 +1037,12 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         dyn4d_norm = (dyn4d_flat - dyn4d_min) / (dyn4d_max - dyn4d_min).clamp_min(1e-6)
         global_q_raw = global_q_raw_layers.mean(dim=1)
         global_k_raw = global_k_raw_layers.mean(dim=1)
+        global_v_raw = global_v_raw_layers.mean(dim=1) if global_v_raw_layers is not None else None
+        global_v_layers_out = (
+            global_v_raw_layers.permute(0, 2, 1, 3, 4, 5).contiguous().float()
+            if global_v_raw_layers is not None
+            else None
+        )
         return {
             "dyn4d_patch": dyn4d_norm.reshape_as(dyn4d_raw).clamp(0.0, 1.0),
             "dyn4d_qq_mean_patch": qq_mean,
@@ -825,8 +1050,10 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             "dyn4d_kk_mean_patch": kk_mean,
             "global_q_raw_patchvec": global_q_raw.float(),
             "global_k_raw_patchvec": global_k_raw.float(),
+            "global_v_raw_patchvec": global_v_raw.float() if global_v_raw is not None else None,
             "global_q_raw_patchvec_layers": global_q_raw_layers.permute(0, 2, 1, 3, 4, 5).contiguous().float(),
             "global_k_raw_patchvec_layers": global_k_raw_layers.permute(0, 2, 1, 3, 4, 5).contiguous().float(),
+            "global_v_raw_patchvec_layers": global_v_layers_out,
             "dyn4d_global_layer_ids": torch.tensor(
                 available_layers,
                 device=global_q_raw_layers.device,
@@ -993,6 +1220,58 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         gate = (1.0 - beta * D).clamp(0.0, 1.0)
         return gate.reshape(batch_size * frame_num, tokens_per_frame, 1).to(dtype=dtype)
 
+    def _make_chunk_attention_source_bias(
+        self,
+        hmc_control: Optional[Dict[str, Any]],
+        *,
+        batch_size: int,
+        frame_num: int,
+        tokens_per_frame: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[Dict[str, Any]]:
+        """Build a compact global/chunk attention source bias.
+
+        Global decoder layers see all frames as one long token sequence. A
+        dense pairwise bias would be prohibitively large for KITTI chunks, so
+        this uses the attention layer's source_soft descriptor to apply a
+        source-column logit bias without materializing a [Q,K] matrix.
+        """
+        if not hmc_control or hmc_control.get("identity_hooks", False):
+            return None
+        if not hmc_control.get("enable_chunk_read_control", False):
+            return None
+        beta = float(hmc_control.get("beta_chunk", hmc_control.get("beta_frame", 0.0)))
+        if beta == 0.0:
+            return None
+        D_tok = hmc_control.get("D_tok")
+        if D_tok is None:
+            return None
+        D = D_tok.to(device=device, dtype=torch.float32).reshape(batch_size, frame_num, tokens_per_frame)
+        P_ref = hmc_control.get("P_ref")
+        if P_ref is not None:
+            ref = P_ref.to(device=device, dtype=torch.float32).reshape(batch_size, frame_num, tokens_per_frame)
+            D = D * (1.0 - ref.clamp(0.0, 1.0))
+        D = D.reshape(batch_size, frame_num * tokens_per_frame)
+        mode = str(hmc_control.get("chunk_bias_mode", "key")).strip().lower()
+        if mode in {"query", "none", "off"}:
+            return None
+        min_keep = min(max(float(hmc_control.get("chunk_bias_min_keep", 1e-4)), 1e-6), 1.0)
+        if mode in {"inverse_key", "source_inverse"}:
+            keep = D.clamp_min(min_keep)
+        else:
+            keep = (1.0 - D).clamp_min(min_keep)
+        source_bias = beta * torch.log(keep)
+        affected = D > 0.0
+        return {
+            "type": "source_soft",
+            "affected_mask": affected,
+            "source_bias_values": source_bias.to(dtype=dtype),
+            "attention_mass_stats": [],
+            "attention_mass_max_queries": int(hmc_control.get("attention_mass_max_queries", 512) or 512),
+            "attention_mass_metric": "chunk_source_soft",
+        }
+
     def _make_context_source_skip_bias(
         self,
         hmc_control: Optional[Dict[str, Any]],
@@ -1047,6 +1326,35 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 > 0.5
             )
         eligible = ~protected
+        frame_region = str(hmc_control.get("context_source_skip_frame_region", "all")).strip().lower()
+        if frame_region not in {"all", "head", "mid_tail", "tail"}:
+            frame_region = "all"
+        frame_region_debug: Dict[str, Any] = {
+            "context_source_skip_frame_region": frame_region,
+            "context_source_skip_frame_region_overlap_frames": 0,
+            "context_source_skip_frame_region_eligible_before": int(eligible.sum().item()),
+            "context_source_skip_frame_region_eligible_after": int(eligible.sum().item()),
+        }
+        if frame_region != "all":
+            ov = max(int(hmc_control.get("read_overlap_frames", 0) or 0), 0)
+            if ov <= 0:
+                ov = min(3, int(frame_num))
+            ov = min(int(ov), int(frame_num))
+            frame_ids = torch.arange(int(frame_num), device=device).reshape(1, int(frame_num), 1)
+            if frame_region == "head":
+                region_mask = frame_ids < ov
+            elif frame_region == "tail":
+                region_mask = frame_ids >= max(int(frame_num) - ov, 0)
+            else:
+                region_mask = frame_ids >= ov
+            region_mask = region_mask.expand_as(eligible)
+            before_region = int(eligible.sum().item())
+            eligible = eligible & region_mask
+            frame_region_debug.update({
+                "context_source_skip_frame_region_overlap_frames": int(ov),
+                "context_source_skip_frame_region_eligible_before": before_region,
+                "context_source_skip_frame_region_eligible_after": int(eligible.sum().item()),
+            })
         mask_name = str(hmc_control.get("context_source_skip_mask", "dg_q90")).lower()
         anchor_boost_mask = mask_name in {
             "semantic_anchor",
@@ -1055,11 +1363,18 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             "semantic_anchor_bank",
             "anchor_bank",
         }
-        random_same_mass_semantic_role = mask_name in {
-            "random_same_mass_semantic_role_negative",
-            "random_same_mass_semrole_negative",
-            "random_same_mass",
+        semantic_role_random_base_map = {
+            "random_same_mass_semantic_role_negative": "semantic_role_negative",
+            "random_same_mass_semrole_negative": "semantic_role_negative",
+            "random_same_mass": "semantic_role_negative",
+            "random_same_mass_semantic_role_positive": "semantic_role_positive",
+            "random_same_mass_semrole_positive": "semantic_role_positive",
+            "random_same_mass_semantic_role_protect": "semantic_role_protect",
+            "random_same_mass_semantic_role_protected": "semantic_role_protect",
+            "random_same_mass_semantic_role_stable": "semantic_role_stable",
+            "random_same_mass_semantic_role_anchor": "semantic_role_stable",
         }
+        random_same_mass_semantic_role = mask_name in semantic_role_random_base_map
         random_same_mass_high_influence = mask_name in {
             "random_same_mass_high_influence",
             "random_high_influence_same_mass",
@@ -1104,7 +1419,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             "semantic_conditioned_dg_soft_resid",
         }
         if random_same_mass_semantic_role:
-            base_mask_name = "semantic_role_negative"
+            base_mask_name = semantic_role_random_base_map[mask_name]
         elif random_same_mass_high_influence:
             base_mask_name = "v40_read_a2_high_influence"
         elif random_same_mass_phase2:
@@ -1168,6 +1483,11 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             "semantic_role_negative",
             "semantic_role_source_skip",
             "semrole_negative",
+            "semantic_role_positive",
+            "semantic_role_stable",
+            "semantic_role_anchor",
+            "semantic_role_protect",
+            "semantic_role_protected",
             "v36_synthetic_role_negative",
             "sem_z_dg_soft_resid",
             "semantic_z_dg_soft_resid",
@@ -1227,6 +1547,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 "context_source_skip_mask": mask_name,
                 "context_source_skip_reason": "no_eligible_patch_tokens",
             })
+            stats.update(frame_region_debug)
             return None, stats
         thr = torch.quantile(eligible_scores.float(), float(quantile))
         skip = (D > thr) & eligible
@@ -1467,6 +1788,18 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 protected_neutral = R == 4
                 if base_mask_name == "v36_synthetic_role_negative":
                     skip = negative_short & eligible
+                elif base_mask_name in {"semantic_role_positive", "semantic_role_anchor"}:
+                    skip = positive_long & eligible
+                    source_control_score = torch.where(skip, torch.ones_like(D, dtype=torch.float32), torch.zeros_like(D, dtype=torch.float32))
+                    semantic_reason = f"semantic_role_positive_long:{role_stream_name}"
+                elif base_mask_name in {"semantic_role_protect", "semantic_role_protected"}:
+                    skip = protected_neutral & eligible
+                    source_control_score = torch.where(skip, torch.ones_like(D, dtype=torch.float32), torch.zeros_like(D, dtype=torch.float32))
+                    semantic_reason = f"semantic_role_protect_neutral:{role_stream_name}"
+                elif base_mask_name == "semantic_role_stable":
+                    skip = (positive_long | protected_neutral) & eligible
+                    source_control_score = torch.where(skip, torch.ones_like(D, dtype=torch.float32), torch.zeros_like(D, dtype=torch.float32))
+                    semantic_reason = f"semantic_role_stable_positive_or_protect:{role_stream_name}"
                 elif sem_z_dg_soft:
                     G_sem_tok = hmc_control.get("G_sem_tok")
                     if G_sem_tok is None:
@@ -1492,10 +1825,12 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                         source_control_score = risk.clamp(0.0, 1.0)
                         skip = source_control_score > 0.05
                         semantic_reason = f"semantic_z_dg_soft_risk:{role_stream_name}"
-                else:
+                elif base_mask_name in {"semantic_role_negative", "semantic_role_source_skip", "semrole_negative"}:
                     skip = skip & negative_short
+                else:
+                    skip = torch.zeros_like(skip, dtype=torch.bool)
                 protected = protected | positive_long | protected_neutral
-                if not sem_z_dg_soft:
+                if not sem_z_dg_soft and base_mask_name in {"semantic_role_negative", "semantic_role_source_skip", "semrole_negative"}:
                     semantic_reason = f"semantic_role_negative_short_and_highD:{role_stream_name}"
                 if sem_z_dg_soft and R_sem_tok is not None and hmc_control.get("G_sem_tok") is not None:
                     semantic_reason = f"semantic_z_dg_soft_risk:{role_stream_name}"
@@ -1568,6 +1903,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 "source_tokens_after": source_tokens_after,
                 "special_token_keep_ratio": special_keep,
             })
+            stats.update(frame_region_debug)
             stats.update(semantic_extra_stats)
             return None, stats
 
@@ -1718,6 +2054,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             "context_source_skip_mode": mode,
             "context_source_skip_impl": impl,
             "context_source_skip_mask": mask_name,
+            **frame_region_debug,
             "context_source_skip_threshold": float(thr.item()),
             "context_source_skip_quantile": float(quantile),
             "context_source_skip_semantic_reason": semantic_reason,
@@ -1868,6 +2205,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         current_tokens: int,
         device: torch.device,
         dtype: torch.dtype,
+        swa_layer_idx: int = -1,
     ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
         stats: Dict[str, Any] = {
             "swa_overlap_bias_applied": False,
@@ -1923,13 +2261,345 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             Dq = Dq[:, :qn]
 
         mode = str(hmc_control.get("swa_overlap_bias_mode", "pair"))
+        mode_l = mode.lower()
         Dq_c = Dq.clamp(0.0, 1.0)
         Ds_c = Ds.clamp(0.0, 1.0)
-        if mode == "source":
+        role_bias_min_keep = min(max(float(hmc_control.get("swa_overlap_bias_min_keep", 1e-4)), 1e-6), 1.0)
+        Dq_aligned = Dq_c[:, :sn] if Dq_c.shape[1] != sn else Dq_c
+        Ds_aligned = Ds_c[:, :sn] if Ds_c.shape[1] != sn else Ds_c
+        if mode_l == "semantic_role_stable_protect_minus_negative":
+            stable_score, stable_stats = self._make_swa_overlap_source_role_score(
+                hmc_control,
+                mode="semantic_role_stable",
+                batch_size=batch_size,
+                frame_num=frame_num,
+                tokens_per_frame=tokens_per_frame,
+                source_tokens=sn,
+                ov=ov,
+                Dq=Dq_aligned,
+                device=device,
+            )
+            negative_score, negative_stats = self._make_swa_overlap_source_role_score(
+                hmc_control,
+                mode="semantic_role_negative",
+                batch_size=batch_size,
+                frame_num=frame_num,
+                tokens_per_frame=tokens_per_frame,
+                source_tokens=sn,
+                ov=ov,
+                Dq=Dq_aligned,
+                device=device,
+            )
+            if stable_score is None or negative_score is None:
+                return None, stats
+            alpha = max(abs(beta), 0.0)
+            factor = (1.0 + alpha * stable_score - alpha * negative_score).clamp_min(role_bias_min_keep)
+            keep = factor.unsqueeze(1).expand(batch_size, qn, sn)
+            score_for_dump = (stable_score - negative_score).clamp(-1.0, 1.0)
+            stats.update({
+                "swa_overlap_bias_role_mode": mode_l,
+                "swa_overlap_bias_role_base_mode": mode_l,
+                "swa_overlap_bias_role_action": "stable_protect_boost_and_negative_damp",
+                "swa_overlap_bias_mass_preserving_logit_reweight": True,
+                "swa_overlap_bias_role_factor_mean": float(factor.detach().float().mean().item()),
+                "swa_overlap_bias_role_factor_p10": float(torch.quantile(factor.detach().float(), 0.10).item()),
+                "swa_overlap_bias_role_factor_p90": float(torch.quantile(factor.detach().float(), 0.90).item()),
+                "swa_overlap_bias_stable_selected_tokens": int((stable_score > 0.0).sum().item()),
+                "swa_overlap_bias_negative_selected_tokens": int((negative_score > 0.0).sum().item()),
+                "swa_overlap_bias_stable_mode": stable_stats.get("swa_overlap_source_semantic_role_mode"),
+                "swa_overlap_bias_negative_mode": negative_stats.get("swa_overlap_source_semantic_role_mode"),
+            })
+            stats.update(self._dump_swa_overlap_feature_map(
+                hmc_control,
+                kind="source_bias_role",
+                mode=mode,
+                swa_layer_idx=int(swa_layer_idx),
+                batch_size=batch_size,
+                frame_num=frame_num,
+                tokens_per_frame=tokens_per_frame,
+                history_tokens=history_tokens,
+                source_start=source_start,
+                source_end=source_end,
+                overlap_frames=ov,
+                Dq=Dq_aligned,
+                Ds=Ds_aligned,
+                score=score_for_dump,
+                control=factor,
+            ))
+        elif mode_l in self._swa_overlap_source_role_modes():
+            role_score, role_stats = self._make_swa_overlap_source_role_score(
+                hmc_control,
+                mode=mode,
+                batch_size=batch_size,
+                frame_num=frame_num,
+                tokens_per_frame=tokens_per_frame,
+                source_tokens=sn,
+                ov=ov,
+                Dq=Dq_aligned,
+                device=device,
+            )
+            if role_score is None:
+                return None, stats
+            role_base = mode_l
+            if role_base.startswith("random_same_mass_"):
+                role_base = role_base[len("random_same_mass_"):]
+            if role_base.endswith("_random_same_mass"):
+                role_base = role_base[:-len("_random_same_mass")]
+            alpha = max(abs(beta), 0.0)
+            if role_base in {"semantic_role_negative", "semantic_role_source_skip", "semrole_negative"}:
+                factor = (1.0 - alpha * role_score).clamp_min(role_bias_min_keep)
+                role_action = "damp"
+            else:
+                factor = (1.0 + alpha * role_score).clamp_min(1e-6)
+                role_action = "boost"
+            keep = factor.unsqueeze(1).expand(batch_size, qn, sn)
+            stats.update(role_stats)
+            stats.update({
+                "swa_overlap_bias_role_mode": mode_l,
+                "swa_overlap_bias_role_base_mode": role_base,
+                "swa_overlap_bias_role_action": role_action,
+                "swa_overlap_bias_mass_preserving_logit_reweight": True,
+                "swa_overlap_bias_role_factor_mean": float(factor.detach().float().mean().item()),
+                "swa_overlap_bias_role_factor_p10": float(torch.quantile(factor.detach().float(), 0.10).item()),
+                "swa_overlap_bias_role_factor_p90": float(torch.quantile(factor.detach().float(), 0.90).item()),
+            })
+            stats.update(self._dump_swa_overlap_feature_map(
+                hmc_control,
+                kind="source_bias_role",
+                mode=mode,
+                swa_layer_idx=int(swa_layer_idx),
+                batch_size=batch_size,
+                frame_num=frame_num,
+                tokens_per_frame=tokens_per_frame,
+                history_tokens=history_tokens,
+                source_start=source_start,
+                source_end=source_end,
+                overlap_frames=ov,
+                Dq=Dq_aligned,
+                Ds=Ds_aligned,
+                score=role_score,
+                control=factor,
+            ))
+        elif mode_l in {
+            "semantic_same_group_boost_stable_agreement",
+            "semantic_same_group_boost_stable_agreement_random_same_mass",
+        }:
+            random_same_mass = mode_l.endswith("_random_same_mass")
+            base_mode = mode_l[:-len("_random_same_mass")] if random_same_mass else mode_l
+
+            def _prev_overlap_groups() -> Tuple[Optional[torch.Tensor], str]:
+                raw = hmc_control.get("G_prev_patch") if hmc_control else None
+                if raw is None:
+                    return None, "missing_G_prev_patch"
+                flat = raw.to(device=device, dtype=torch.long).reshape(-1)
+                if int(flat.numel()) <= 0:
+                    return None, "empty_G_prev_patch"
+                if int(flat.numel()) % int(tokens_per_frame) == 0:
+                    prev_frames_local = int(flat.numel() // int(tokens_per_frame))
+                    labels_full = flat.reshape(prev_frames_local, int(tokens_per_frame))
+                    layout = "full_token_G_prev_patch"
+                else:
+                    patch_tokens = int(tokens_per_frame) - int(getattr(self, "patch_start_idx", 0))
+                    if patch_tokens <= 0 or int(flat.numel()) % int(patch_tokens) != 0:
+                        return None, "shape_mismatch_G_prev_patch"
+                    prev_frames_local = int(flat.numel() // int(patch_tokens))
+                    labels_full = torch.full(
+                        (prev_frames_local, int(tokens_per_frame)),
+                        int(_CONTEXT_SEM_GROUP_UNCERTAIN),
+                        device=device,
+                        dtype=torch.long,
+                    )
+                    labels_full[:, int(getattr(self, "patch_start_idx", 0)):] = flat.reshape(
+                        prev_frames_local, patch_tokens
+                    )
+                    layout = "patch_G_prev_patch_with_uncertain_special_tokens"
+                hist_frames_local = int(history_tokens // tokens_per_frame)
+                usable_local = min(prev_frames_local, hist_frames_local)
+                if usable_local <= 0:
+                    return None, "no_usable_prev_G_frames"
+                label_ov = min(int(ov), usable_local)
+                labels = (
+                    labels_full[-usable_local:]
+                    .reshape(1, usable_local, int(tokens_per_frame))
+                    .expand(batch_size, -1, -1)[:, -label_ov:, :]
+                    .reshape(batch_size, label_ov * int(tokens_per_frame))
+                )
+                if int(labels.shape[1]) < int(sn):
+                    return None, "short_prev_overlap_G_labels"
+                if int(labels.shape[1]) != int(sn):
+                    labels = labels[:, -sn:]
+                return labels, layout
+
+            def _current_head_groups() -> Tuple[Optional[torch.Tensor], str]:
+                raw = hmc_control.get("G_sem_tok") if hmc_control else None
+                if raw is None:
+                    return None, "missing_G_sem_tok"
+                flat = raw.to(device=device, dtype=torch.long)
+                if int(flat.numel()) != int(batch_size * frame_num * tokens_per_frame):
+                    return None, "shape_mismatch_G_sem_tok"
+                labels = flat.reshape(batch_size, frame_num, tokens_per_frame)[:, :ov, :].reshape(
+                    batch_size, ov * tokens_per_frame
+                )
+                if int(labels.shape[1]) < int(sn):
+                    return None, "short_current_head_G_labels"
+                if int(labels.shape[1]) != int(sn):
+                    labels = labels[:, :sn]
+                return labels, "current_head_G_sem_tok"
+
+            Gs, source_group_layout = _prev_overlap_groups()
+            Gq, query_group_layout = _current_head_groups()
+            if Gs is None or Gq is None:
+                score = torch.zeros_like(Ds_aligned, dtype=torch.float32)
+                semantic_mask = torch.zeros_like(Ds_aligned, dtype=torch.bool)
+                missing_semantic_groups = True
+            else:
+                allowed_groups = (
+                    (Gs == int(_CONTEXT_SEM_GROUP_STRUCTURE))
+                    | (Gs == int(_CONTEXT_SEM_GROUP_STATIC))
+                    | (Gs == int(_CONTEXT_SEM_GROUP_LOWSTUFF))
+                )
+                semantic_mask = (Gs == Gq) & allowed_groups
+                score = (1.0 - torch.maximum(Dq_aligned, Ds_aligned)).clamp(0.0, 1.0)
+                score = score * semantic_mask.float()
+                missing_semantic_groups = False
+            selected_before_random = int((score > 0.0).sum().item())
+            if random_same_mass and selected_before_random > 0:
+                score = self._randomize_swa_overlap_score_same_distribution(
+                    score,
+                    hmc_control,
+                    swa_layer_idx=int(swa_layer_idx),
+                    salt_offset=7000.0,
+                )
+            factor = (1.0 + score).clamp_min(1.0)
+            keep = factor.unsqueeze(1).expand(batch_size, qn, sn)
+            selected_after_random = int((score > 0.0).sum().item())
+            stats.update({
+                "swa_overlap_bias_geometric_mode": mode_l,
+                "swa_overlap_bias_geometric_base_mode": base_mode,
+                "swa_overlap_bias_geometric_action": "semantic_same_group_stable_agreement_boost",
+                "swa_overlap_bias_geometric_random_same_mass": bool(random_same_mass),
+                "swa_overlap_bias_mass_preserving_logit_reweight": True,
+                "swa_overlap_bias_semantic_group_source": source_group_layout,
+                "swa_overlap_bias_semantic_group_query": query_group_layout,
+                "swa_overlap_bias_semantic_group_missing": bool(missing_semantic_groups),
+                "swa_overlap_bias_semantic_group_selected_before_random": int(selected_before_random),
+                "swa_overlap_bias_semantic_group_selected_after_random": int(selected_after_random),
+                "swa_overlap_bias_semantic_group_selected_ratio": float(
+                    selected_after_random / max(int(batch_size * sn), 1)
+                ),
+                "swa_overlap_bias_geometric_factor_mean": float(factor.detach().float().mean().item()),
+                "swa_overlap_bias_geometric_factor_p10": float(torch.quantile(factor.detach().float(), 0.10).item()),
+                "swa_overlap_bias_geometric_factor_p90": float(torch.quantile(factor.detach().float(), 0.90).item()),
+            })
+            stats.update(self._dump_swa_overlap_feature_map(
+                hmc_control,
+                kind="source_bias_geometric_semantic",
+                mode=mode,
+                swa_layer_idx=int(swa_layer_idx),
+                batch_size=batch_size,
+                frame_num=frame_num,
+                tokens_per_frame=tokens_per_frame,
+                history_tokens=history_tokens,
+                source_start=source_start,
+                source_end=source_end,
+                overlap_frames=ov,
+                Dq=Dq_aligned,
+                Ds=Ds_aligned,
+                score=score,
+                control=factor,
+            ))
+        elif mode_l in {
+            "boost_stable",
+            "boost_stable_agreement",
+            "boost_low_dyn_agreement",
+            "boost_stable_random_same_mass",
+            "boost_stable_agreement_random_same_mass",
+            "boost_low_dyn_agreement_random_same_mass",
+            "boost_stable_agreement_topq80",
+            "boost_stable_agreement_topq80_random_same_mass",
+            "boost_stable_agreement_topq80_aligned",
+            "boost_stable_agreement_topq80_aligned_random_same_mass",
+            "boost_stable_agreement_topq90",
+            "boost_stable_agreement_topq90_random_same_mass",
+        }:
+            score_mode = mode_l[len("boost_"):]
+            random_same_mass = score_mode.endswith("_random_same_mass")
+            base_mode = score_mode[:-len("_random_same_mass")] if random_same_mass else score_mode
+            aligned_route = False
+            if base_mode.endswith("_aligned"):
+                aligned_route = True
+                base_mode = base_mode[:-len("_aligned")]
+            top_quantile = None
+            if base_mode.endswith("_topq80"):
+                top_quantile = 0.80
+                base_mode = base_mode[:-len("_topq80")]
+            if base_mode.endswith("_topq90"):
+                top_quantile = 0.90
+                base_mode = base_mode[:-len("_topq90")]
+            score = 1.0 - torch.maximum(Dq_aligned, Ds_aligned)
+            score = score.clamp(0.0, 1.0)
+            if top_quantile is not None:
+                top_mask = torch.zeros_like(score, dtype=torch.bool)
+                for b in range(int(batch_size)):
+                    thr = torch.quantile(score[b].float(), float(top_quantile))
+                    top_mask[b] = score[b] >= thr
+                score = torch.where(top_mask, score, torch.zeros_like(score))
+            if random_same_mass:
+                score = self._randomize_swa_overlap_score_same_distribution(
+                    score,
+                    hmc_control,
+                    swa_layer_idx=int(swa_layer_idx),
+                    salt_offset=5000.0,
+                )
+            factor = (1.0 + score).clamp_min(1.0)
+            if aligned_route:
+                keep = torch.ones(batch_size, qn, sn, device=device, dtype=torch.float32)
+                diag_n = min(int(qn), int(sn))
+                if diag_n > 0:
+                    diag_idx = torch.arange(diag_n, device=device)
+                    keep[:, diag_idx, diag_idx] = factor[:, :diag_n]
+            else:
+                keep = factor.unsqueeze(1).expand(batch_size, qn, sn)
+            stats.update({
+                "swa_overlap_bias_geometric_mode": mode_l,
+                "swa_overlap_bias_geometric_base_mode": base_mode,
+                "swa_overlap_bias_geometric_action": "stable_agreement_boost",
+                "swa_overlap_bias_geometric_random_same_mass": bool(random_same_mass),
+                "swa_overlap_bias_geometric_aligned_route": bool(aligned_route),
+                "swa_overlap_bias_geometric_top_quantile": (
+                    float(top_quantile) if top_quantile is not None else None
+                ),
+                "swa_overlap_bias_geometric_selected_tokens": int((score > 0.0).sum().item()),
+                "swa_overlap_bias_geometric_selected_ratio": float(
+                    int((score > 0.0).sum().item()) / max(int(batch_size * sn), 1)
+                ),
+                "swa_overlap_bias_mass_preserving_logit_reweight": True,
+                "swa_overlap_bias_geometric_factor_mean": float(factor.detach().float().mean().item()),
+                "swa_overlap_bias_geometric_factor_p10": float(torch.quantile(factor.detach().float(), 0.10).item()),
+                "swa_overlap_bias_geometric_factor_p90": float(torch.quantile(factor.detach().float(), 0.90).item()),
+            })
+            stats.update(self._dump_swa_overlap_feature_map(
+                hmc_control,
+                kind="source_bias_geometric",
+                mode=mode,
+                swa_layer_idx=int(swa_layer_idx),
+                batch_size=batch_size,
+                frame_num=frame_num,
+                tokens_per_frame=tokens_per_frame,
+                history_tokens=history_tokens,
+                source_start=source_start,
+                source_end=source_end,
+                overlap_frames=ov,
+                Dq=Dq_aligned,
+                Ds=Ds_aligned,
+                score=score,
+                control=factor,
+            ))
+        elif mode_l == "source":
             keep = (1.0 - Ds_c).unsqueeze(1).expand(batch_size, qn, sn)
-        elif mode == "union":
+        elif mode_l == "union":
             keep = 1.0 - torch.maximum(Dq_c.unsqueeze(-1), Ds_c.unsqueeze(1))
-        elif mode == "intersection":
+        elif mode_l == "intersection":
             keep = 1.0 - torch.minimum(Dq_c.unsqueeze(-1), Ds_c.unsqueeze(1))
         else:
             keep = 1.0 - (1.0 - Dq_c).unsqueeze(-1) * Ds_c.unsqueeze(1)
@@ -1950,6 +2620,23 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             "bias_values": bias_values.to(dtype=dtype),
             "query_block_size": int(query_block),
         }
+        head_indices: List[int] = []
+        for raw_part in str(hmc_control.get("swa_overlap_bias_head_indices", "") or "").split(","):
+            part = raw_part.strip()
+            if not part:
+                continue
+            try:
+                head_indices.append(int(part))
+            except ValueError:
+                continue
+        if head_indices:
+            compact_bias["head_indices"] = head_indices
+        if bool(hmc_control.get("swa_overlap_bias_record_attention_mass", False)):
+            compact_bias["attention_mass_stats"] = []
+            compact_bias["attention_mass_max_queries"] = int(
+                hmc_control.get("swa_overlap_bias_attention_mass_max_queries", 64) or 64
+            )
+            compact_bias["attention_mass_metric"] = "swa_overlap_bias_selected_mass"
         stats.update({
             "swa_overlap_bias_applied": True,
             "swa_overlap_bias_mode": mode,
@@ -1962,6 +2649,9 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             "swa_overlap_bias_mean_abs": float(bias_values.abs().mean().detach().cpu().item()),
             "swa_overlap_bias_max_abs": float(bias_values.abs().max().detach().cpu().item()),
             "swa_overlap_bias_compact": True,
+            "swa_overlap_bias_head_masked": bool(head_indices),
+            "swa_overlap_bias_head_count_requested": int(len(head_indices)),
+            "swa_overlap_bias_head_indices": ",".join(str(v) for v in head_indices),
         })
         return compact_bias, stats
 
@@ -1977,7 +2667,9 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         if not hmc_control.get("enable_swa_overlap_source_gate", False):
             return False
         gate_mode = str(hmc_control.get("swa_overlap_source_gate_mode", "source")).lower()
-        if gate_mode.startswith("semantic_") and not bool(hmc_control.get("semantic_action_chunk_gate_active", True)):
+        if Pi3._swa_overlap_source_mode_requires_semantic_action(gate_mode) and not bool(
+            hmc_control.get("semantic_action_chunk_gate_active", True)
+        ):
             return False
         mode = str(hmc_control.get("swa_overlap_source_gate_layer_mode", "last"))
         if mode == "all":
@@ -2002,7 +2694,9 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         if not hmc_control.get("enable_swa_overlap_source_replace", False):
             return False
         replace_mode = str(hmc_control.get("swa_overlap_source_replace_mode", "union")).lower()
-        if replace_mode.startswith("semantic_") and not bool(hmc_control.get("semantic_action_chunk_gate_active", True)):
+        if Pi3._swa_overlap_source_mode_requires_semantic_action(replace_mode) and not bool(
+            hmc_control.get("semantic_action_chunk_gate_active", True)
+        ):
             return False
         mode = str(hmc_control.get("swa_overlap_source_replace_layer_mode", "last"))
         if mode == "all":
@@ -2036,6 +2730,32 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 modes.add(base)
                 modes.add(f"{base}_random_same_mass")
         return modes
+
+    @staticmethod
+    def _swa_overlap_source_role_modes() -> set:
+        modes = {
+            "semantic_role_negative",
+            "semantic_role_source_skip",
+            "semrole_negative",
+            "semantic_role_positive",
+            "semantic_role_stable",
+            "semantic_role_anchor",
+            "semantic_role_protect",
+            "semantic_role_protected",
+        }
+        random_modes = {f"random_same_mass_{mode}" for mode in modes}
+        random_modes.update({f"{mode}_random_same_mass" for mode in modes})
+        return modes | random_modes
+
+    @staticmethod
+    def _swa_overlap_source_mode_requires_semantic_action(mode: str) -> bool:
+        mode_l = str(mode or "").strip().lower()
+        return (
+            mode_l.startswith("semantic_")
+            or mode_l.startswith("semrole_")
+            or mode_l.startswith("random_same_mass_semantic_")
+            or mode_l.startswith("random_same_mass_semrole_")
+        )
 
     @staticmethod
     def _randomize_swa_overlap_score_same_distribution(
@@ -2225,6 +2945,113 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         })
         return score.clamp(0.0, 1.0), stats
 
+    def _make_swa_overlap_source_role_score(
+        self,
+        hmc_control: Optional[Dict[str, Any]],
+        *,
+        mode: str,
+        batch_size: int,
+        frame_num: int,
+        tokens_per_frame: int,
+        source_tokens: int,
+        ov: int,
+        Dq: torch.Tensor,
+        device: torch.device,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
+        stats: Dict[str, Any] = {}
+        mode_l = str(mode or "").strip().lower()
+        if mode_l not in self._swa_overlap_source_role_modes():
+            return None, stats
+
+        random_same_mass = mode_l.startswith("random_same_mass_") or mode_l.endswith("_random_same_mass")
+        base_mode = mode_l
+        if base_mode.startswith("random_same_mass_"):
+            base_mode = base_mode[len("random_same_mass_"):]
+        if base_mode.endswith("_random_same_mass"):
+            base_mode = base_mode[:-len("_random_same_mass")]
+
+        role_values = {
+            "semantic_role_negative": {_SEMANTIC_ROLE_NEGATIVE_SHORT},
+            "semantic_role_source_skip": {_SEMANTIC_ROLE_NEGATIVE_SHORT},
+            "semrole_negative": {_SEMANTIC_ROLE_NEGATIVE_SHORT},
+            "semantic_role_positive": {_SEMANTIC_ROLE_POSITIVE_LONG},
+            "semantic_role_anchor": {_SEMANTIC_ROLE_POSITIVE_LONG},
+            "semantic_role_protect": {_SEMANTIC_ROLE_PROTECT_NEUTRAL},
+            "semantic_role_protected": {_SEMANTIC_ROLE_PROTECT_NEUTRAL},
+            "semantic_role_stable": {_SEMANTIC_ROLE_POSITIVE_LONG, _SEMANTIC_ROLE_PROTECT_NEUTRAL},
+        }
+        selected_roles = role_values.get(base_mode)
+        if selected_roles is None:
+            return None, stats
+
+        raw = hmc_control.get("R_swa_tok") if hmc_control else None
+        role_source = "current_head_R_swa_tok"
+        missing = False
+        if raw is None:
+            score = torch.zeros(batch_size, source_tokens, device=device, dtype=torch.float32)
+            missing = True
+            role_source = "missing_R_swa_tok"
+        else:
+            flat = raw.to(device=device, dtype=torch.long)
+            if int(flat.numel()) != int(batch_size * frame_num * tokens_per_frame):
+                score = torch.zeros(batch_size, source_tokens, device=device, dtype=torch.float32)
+                missing = True
+                role_source = "shape_mismatch_R_swa_tok"
+            else:
+                roles = flat.reshape(batch_size, frame_num, tokens_per_frame)[:, :ov, :].reshape(
+                    batch_size, ov * tokens_per_frame
+                )
+                if int(roles.shape[1]) < int(source_tokens):
+                    score = torch.zeros(batch_size, source_tokens, device=device, dtype=torch.float32)
+                    missing = True
+                    role_source = "short_current_head_R_swa_tok"
+                else:
+                    if int(roles.shape[1]) != int(source_tokens):
+                        roles = roles[:, :source_tokens]
+                    score = torch.zeros(batch_size, source_tokens, device=device, dtype=torch.float32)
+                    for role_id in sorted(int(v) for v in selected_roles):
+                        score = torch.maximum(score, (roles == int(role_id)).float())
+
+        selected_tokens_before_random = int((score > 0.0).sum().item())
+        if random_same_mass and selected_tokens_before_random > 0:
+            randomized = torch.zeros_like(score)
+            chunk = float(hmc_control.get("semantic_action_chunk_idx", -1) if hmc_control else -1)
+            base_idx = torch.arange(int(source_tokens), device=device, dtype=torch.float32)
+            for b in range(int(batch_size)):
+                k_select = min(int((score[b] > 0.0).sum().item()), int(source_tokens))
+                if k_select <= 0:
+                    continue
+                salt = chunk * 149.0 + float(b) * 17.0 + 3000.0
+                rand = torch.frac(torch.sin((base_idx + 1.0 + salt) * 12.9898) * 43758.5453)
+                top = torch.topk(rand, k_select).indices
+                randomized[b, top] = 1.0
+            score = randomized
+
+        selected_tokens = int((score > 0.0).sum().item())
+        selected_mask = score > 0.0
+        if selected_tokens > 0:
+            local_idx = torch.arange(int(source_tokens), device=device, dtype=torch.float32).reshape(1, source_tokens)
+            selected_index_mean = float(local_idx.expand(batch_size, -1)[selected_mask].mean().item())
+            selected_d_mean = float(Dq.float()[selected_mask].mean().item())
+        else:
+            selected_index_mean = 0.0
+            selected_d_mean = 0.0
+
+        stats.update({
+            "swa_overlap_source_semantic_role_mode": mode_l,
+            "swa_overlap_source_semantic_role_base_mode": base_mode,
+            "swa_overlap_source_semantic_role_label_source": role_source,
+            "swa_overlap_source_semantic_role_missing_labels": bool(missing),
+            "swa_overlap_source_semantic_role_random_same_mass": bool(random_same_mass),
+            "swa_overlap_source_semantic_role_tokens_before_random": int(selected_tokens_before_random),
+            "swa_overlap_source_semantic_role_selected_tokens": int(selected_tokens),
+            "swa_overlap_source_semantic_role_selected_ratio": float(selected_tokens / max(int(batch_size * source_tokens), 1)),
+            "swa_overlap_source_semantic_role_selected_index_mean": selected_index_mean,
+            "swa_overlap_source_semantic_role_selected_D_mean": selected_d_mean,
+            "swa_overlap_source_semantic_role_value_ids": sorted(int(v) for v in selected_roles),
+        })
+        return score.clamp(0.0, 1.0), stats
+
     @staticmethod
     def _dump_swa_overlap_feature_map(
         hmc_control: Optional[Dict[str, Any]],
@@ -2364,8 +3191,16 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
 
         mode = str(hmc_control.get("swa_overlap_source_gate_mode", "source"))
         mode_l = mode.lower()
-        random_same_mass = mode_l.endswith("_random_same_mass")
-        base_mode = mode_l[:-len("_random_same_mass")] if random_same_mass else mode_l
+        boost_mode = mode_l.startswith("boost_")
+        score_mode = mode_l[len("boost_"):] if boost_mode else mode_l
+        random_same_mass = score_mode.endswith("_random_same_mass")
+        base_mode = score_mode[:-len("_random_same_mass")] if random_same_mass else score_mode
+        top_quantile = None
+        for suffix, quantile in (("_topq80", 0.80), ("_topq90", 0.90)):
+            if base_mode.endswith(suffix):
+                top_quantile = quantile
+                base_mode = base_mode[: -len(suffix)]
+                break
         Dq = Dq.clamp(0.0, 1.0)
         Ds = Ds.clamp(0.0, 1.0)
         if base_mode in {"source", "prev", "previous"}:
@@ -2380,10 +3215,12 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             score = (Dq - Ds).abs()
         elif base_mode in {"agree_dyn", "product"}:
             score = Dq * Ds
-        elif mode_l in self._swa_overlap_source_semantic_modes():
+        elif base_mode in {"stable", "stable_agreement", "low_dyn_agreement"}:
+            score = 1.0 - torch.maximum(Dq, Ds)
+        elif score_mode in self._swa_overlap_source_semantic_modes():
             semantic_score, semantic_stats = self._make_swa_overlap_source_semantic_score(
                 hmc_control,
-                mode=mode,
+                mode=score_mode,
                 batch_size=batch_size,
                 frame_num=frame_num,
                 tokens_per_frame=tokens_per_frame,
@@ -2397,9 +3234,39 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 return None, stats
             score = semantic_score
             stats.update(semantic_stats)
+        elif score_mode in self._swa_overlap_source_role_modes():
+            semantic_role_score, semantic_role_stats = self._make_swa_overlap_source_role_score(
+                hmc_control,
+                mode=score_mode,
+                batch_size=batch_size,
+                frame_num=frame_num,
+                tokens_per_frame=tokens_per_frame,
+                source_tokens=source_tokens,
+                ov=ov,
+                Dq=Dq,
+                device=device,
+            )
+            if semantic_role_score is None:
+                return None, stats
+            score = semantic_role_score
+            stats.update(semantic_role_stats)
         else:
             raise ValueError(f"Unsupported SWA overlap source gate mode: {mode}")
-        if random_same_mass and mode_l not in self._swa_overlap_source_semantic_modes():
+        score = score.clamp(0.0, 1.0)
+        if top_quantile is not None:
+            cutoff = torch.quantile(score.detach().float(), float(top_quantile), dim=1, keepdim=True)
+            selected = score.detach().float() >= cutoff
+            score = torch.where(selected, score, torch.zeros_like(score))
+            stats.update({
+                "swa_overlap_source_geometric_topq": float(top_quantile),
+                "swa_overlap_source_geometric_topq_base_mode": base_mode,
+                "swa_overlap_source_geometric_topq_selected_tokens": int(selected.sum().item()),
+            })
+        if (
+            random_same_mass
+            and score_mode not in self._swa_overlap_source_semantic_modes()
+            and score_mode not in self._swa_overlap_source_role_modes()
+        ):
             score = self._randomize_swa_overlap_score_same_distribution(
                 score,
                 hmc_control,
@@ -2412,7 +3279,12 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             })
 
         min_gate = min(max(float(hmc_control.get("swa_overlap_source_gate_min", 0.85)), 0.0), 1.0)
-        gate_slice = (1.0 - rho * score).clamp(min_gate, 1.0).to(dtype=dtype)
+        if boost_mode:
+            gate_max = max(1.0, 1.0 + abs(rho))
+            gate_slice = (1.0 + abs(rho) * score).clamp(1.0, gate_max).to(dtype=dtype)
+        else:
+            gate_max = 1.0
+            gate_slice = (1.0 - rho * score).clamp(min_gate, 1.0).to(dtype=dtype)
         gate = torch.ones(batch_size, 1, history_tokens, 1, device=device, dtype=dtype)
         gate[:, :, source_start:source_end, :] = gate_slice.reshape(batch_size, 1, source_tokens, 1)
         gate_delta = (1.0 - gate_slice.detach().float()).abs()
@@ -2436,8 +3308,11 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         stats.update({
             "swa_overlap_source_gate_applied": True,
             "swa_overlap_source_gate_mode": mode,
+            "swa_overlap_source_gate_score_mode": score_mode,
+            "swa_overlap_source_gate_boost": bool(boost_mode),
             "swa_overlap_source_gate_rho": rho,
             "swa_overlap_source_gate_min": min_gate,
+            "swa_overlap_source_gate_max": float(gate_max),
             "swa_overlap_source_gate_tokens": int(source_tokens),
             "swa_overlap_source_gate_source_start": int(source_start),
             "swa_overlap_source_gate_source_end": int(source_end),
@@ -2520,6 +3395,12 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         mode_l = mode.lower()
         random_same_mass = mode_l.endswith("_random_same_mass")
         base_mode = mode_l[:-len("_random_same_mass")] if random_same_mass else mode_l
+        top_quantile = None
+        for suffix, quantile in (("_topq80", 0.80), ("_topq90", 0.90)):
+            if base_mode.endswith(suffix):
+                top_quantile = quantile
+                base_mode = base_mode[: -len(suffix)]
+                break
         Dq = Dq.clamp(0.0, 1.0)
         Ds = Ds.clamp(0.0, 1.0)
         if base_mode in {"source", "prev", "previous"}:
@@ -2534,6 +3415,8 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             score = (Dq - Ds).abs()
         elif base_mode in {"agree_dyn", "product"}:
             score = Dq * Ds
+        elif base_mode in {"stable", "stable_agreement", "low_dyn_agreement"}:
+            score = 1.0 - torch.maximum(Dq, Ds)
         elif mode_l in self._swa_overlap_source_semantic_modes():
             semantic_score, semantic_stats = self._make_swa_overlap_source_semantic_score(
                 hmc_control,
@@ -2551,9 +3434,35 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 return None, stats
             score = semantic_score
             stats.update(semantic_stats)
+        elif mode_l in self._swa_overlap_source_role_modes():
+            semantic_role_score, semantic_role_stats = self._make_swa_overlap_source_role_score(
+                hmc_control,
+                mode=mode,
+                batch_size=batch_size,
+                frame_num=frame_num,
+                tokens_per_frame=tokens_per_frame,
+                source_tokens=source_tokens,
+                ov=ov,
+                Dq=Dq,
+                device=device,
+            )
+            if semantic_role_score is None:
+                return None, stats
+            score = semantic_role_score
+            stats.update(semantic_role_stats)
         else:
             raise ValueError(f"Unsupported SWA overlap source replace mode: {mode}")
-        if random_same_mass and mode_l not in self._swa_overlap_source_semantic_modes():
+        score = score.clamp(0.0, 1.0)
+        if top_quantile is not None:
+            cutoff = torch.quantile(score.detach().float(), float(top_quantile), dim=1, keepdim=True)
+            selected = score.detach().float() >= cutoff
+            score = torch.where(selected, score, torch.zeros_like(score))
+            stats.update({
+                "swa_overlap_source_geometric_topq": float(top_quantile),
+                "swa_overlap_source_geometric_topq_base_mode": base_mode,
+                "swa_overlap_source_geometric_topq_selected_tokens": int(selected.sum().item()),
+            })
+        if random_same_mass and mode_l not in self._swa_overlap_source_semantic_modes() and mode_l not in self._swa_overlap_source_role_modes():
             score = self._randomize_swa_overlap_score_same_distribution(
                 score,
                 hmc_control,
@@ -2618,6 +3527,25 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         dyn4d_global_parts: List[Tuple[int, dict]] = []
         frame_attn_cosine_query_parts: List[Tuple[int, torch.Tensor]] = []
         frame_attn_cosine_key_parts: List[Tuple[int, torch.Tensor]] = []
+        pca_attn_frame_q_parts: List[Tuple[int, torch.Tensor]] = []
+        pca_attn_frame_k_parts: List[Tuple[int, torch.Tensor]] = []
+        pca_attn_frame_v_parts: List[Tuple[int, torch.Tensor]] = []
+        pca_attn_global_q_parts: List[Tuple[int, torch.Tensor]] = []
+        pca_attn_global_k_parts: List[Tuple[int, torch.Tensor]] = []
+        pca_attn_global_v_parts: List[Tuple[int, torch.Tensor]] = []
+        pca_swa_current_q_parts: List[Tuple[int, torch.Tensor]] = []
+        pca_swa_current_k_parts: List[Tuple[int, torch.Tensor]] = []
+        pca_swa_current_v_parts: List[Tuple[int, torch.Tensor]] = []
+        pca_swa_cache_k_parts: List[Tuple[int, torch.Tensor]] = []
+        pca_swa_cache_v_parts: List[Tuple[int, torch.Tensor]] = []
+        pca_ttt_q_parts: List[Tuple[int, torch.Tensor]] = []
+        pca_ttt_k_parts: List[Tuple[int, torch.Tensor]] = []
+        pca_ttt_v_parts: List[Tuple[int, torch.Tensor]] = []
+        pca_ttt_input_parts: List[Tuple[int, torch.Tensor]] = []
+        pca_ttt_apply_raw_parts: List[Tuple[int, torch.Tensor]] = []
+        pca_ttt_operator_output_parts: List[Tuple[int, torch.Tensor]] = []
+        pca_ttt_update_term_parts: List[Tuple[int, torch.Tensor]] = []
+        pca_ttt_final_output_parts: List[Tuple[int, torch.Tensor]] = []
         frame_attn_key_cosine_l0 = None
         frame_attn_key_cosine_l4 = None
         
@@ -2676,6 +3604,34 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 hidden_for_block = hidden
                 pos_for_block = pos_reshaped
                 hmc_attn_path = "chunk_attention"
+
+            if self._pca_debug_enabled():
+                pca_qkv = self._extract_pca_attention_qkv_patchvec(
+                    blk,
+                    hidden_for_block,
+                    pos_for_block,
+                    batch_size=B,
+                    frame_num=N,
+                    tokens_per_frame=hw,
+                    patch_h=H // self.patch_size,
+                    patch_w=W // self.patch_size,
+                    layout=("frame" if i % 2 == 0 else "global"),
+                )
+                if pca_qkv is not None:
+                    if i % 2 == 0:
+                        if pca_qkv.get("q") is not None:
+                            pca_attn_frame_q_parts.append((i, pca_qkv["q"]))
+                        if pca_qkv.get("k") is not None:
+                            pca_attn_frame_k_parts.append((i, pca_qkv["k"]))
+                        if pca_qkv.get("v") is not None:
+                            pca_attn_frame_v_parts.append((i, pca_qkv["v"]))
+                    else:
+                        if pca_qkv.get("q") is not None:
+                            pca_attn_global_q_parts.append((i, pca_qkv["q"]))
+                        if pca_qkv.get("k") is not None:
+                            pca_attn_global_k_parts.append((i, pca_qkv["k"]))
+                        if pca_qkv.get("v") is not None:
+                            pca_attn_global_v_parts.append((i, pca_qkv["v"]))
 
             # Save pre-block hidden for the fixed no-skip-residual path.
             # With skip0 config removed, default behavior is skip0=False.
@@ -2773,10 +3729,16 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                     )
                 hook_key = "enable_frame_read_control"
             else:
-                # Dense chunk-attention bias is intentionally not materialized
-                # for identity/G2.  Non-identity chunk control should use a
-                # sparse/block implementation before Phase C.
                 layer_enabled = self._hmc_read_layer_enabled(hmc_control, layer=i, total_layers=total_decoder_layers)
+                if layer_enabled:
+                    attn_mask = self._make_chunk_attention_source_bias(
+                        hmc_control,
+                        batch_size=B,
+                        frame_num=N,
+                        tokens_per_frame=hw,
+                        device=hidden_for_block.device,
+                        dtype=hidden_for_block.dtype,
+                    )
                 hook_key = "enable_chunk_read_control"
 
             context_skip_layer_enabled = self._hmc_context_source_skip_layer_enabled(
@@ -2876,6 +3838,16 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 x_for_residual = hidden.view(B, N, hw, -1)
                 tokens_post = x_for_residual
                 tokens_in = tokens_post
+                if self._pca_debug_enabled():
+                    pca_ttt_input = self._pca_tokens_to_patchvec(
+                        tokens_in,
+                        batch_size=B,
+                        frame_num=N,
+                        patch_h=H // self.patch_size,
+                        patch_w=W // self.patch_size,
+                    )
+                    if pca_ttt_input is not None:
+                        pca_ttt_input_parts.append((i, pca_ttt_input))
 
                 gate_scale = torch.nn.functional.silu(self.ttt_gate_projs[layer_idx](tokens_in))
                 if turn_off_ttt: gate_scale = torch.zeros_like(gate_scale)
@@ -2886,9 +3858,45 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                     "w1": ttt_state["w1"][layer_idx],
                     "w2": ttt_state["w2"][layer_idx],
                 }
+                cache_ttt_for_pca = bool(cache_ttt_primitives or self._pca_debug_enabled())
                 ttt_output, output = self.ttt_layers[layer_idx](
-                    tokens_in, info, cache_primitives=cache_ttt_primitives,
+                    tokens_in, info, cache_primitives=cache_ttt_for_pca,
                 )
+                if self._pca_debug_enabled():
+                    for key, parts in (
+                        ("q", pca_ttt_q_parts),
+                        ("k", pca_ttt_k_parts),
+                        ("v", pca_ttt_v_parts),
+                    ):
+                        pca_ttt = self._pca_ttt_heads_to_patchvec(
+                            output.get(key),
+                            batch_size=B,
+                            frame_num=N,
+                            tokens_per_frame=hw,
+                            patch_h=H // self.patch_size,
+                            patch_w=W // self.patch_size,
+                        )
+                        if pca_ttt is not None:
+                            parts.append((i, pca_ttt))
+                    pca_ttt_apply_raw = self._pca_ttt_heads_to_patchvec(
+                        output.get("apply_output_raw"),
+                        batch_size=B,
+                        frame_num=N,
+                        tokens_per_frame=hw,
+                        patch_h=H // self.patch_size,
+                        patch_w=W // self.patch_size,
+                    )
+                    if pca_ttt_apply_raw is not None:
+                        pca_ttt_apply_raw_parts.append((i, pca_ttt_apply_raw))
+                    pca_ttt_operator = self._pca_tokens_to_patchvec(
+                        ttt_output,
+                        batch_size=B,
+                        frame_num=N,
+                        patch_h=H // self.patch_size,
+                        patch_w=W // self.patch_size,
+                    )
+                    if pca_ttt_operator is not None:
+                        pca_ttt_operator_output_parts.append((i, pca_ttt_operator))
 
                 ttt_apply_gate = self._make_ttt_apply_gate(
                     hmc_control,
@@ -2914,6 +3922,25 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                     update_term = update_term * ttt_apply_gate
 
                 tokens_out = update_term + tokens_post
+                if self._pca_debug_enabled():
+                    pca_ttt_update = self._pca_tokens_to_patchvec(
+                        update_term,
+                        batch_size=B,
+                        frame_num=N,
+                        patch_h=H // self.patch_size,
+                        patch_w=W // self.patch_size,
+                    )
+                    if pca_ttt_update is not None:
+                        pca_ttt_update_term_parts.append((i, pca_ttt_update))
+                    pca_ttt_final = self._pca_tokens_to_patchvec(
+                        tokens_out,
+                        batch_size=B,
+                        frame_num=N,
+                        patch_h=H // self.patch_size,
+                        patch_w=W // self.patch_size,
+                    )
+                    if pca_ttt_final is not None:
+                        pca_ttt_final_output_parts.append((i, pca_ttt_final))
 
                 hidden = tokens_out
 
@@ -2970,6 +3997,25 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 else:
                     pos_current = None
 
+                if self._pca_debug_enabled():
+                    swa_qkv = self._extract_pca_swa_current_qkv_patchvec(
+                        self.swa_layers[layer_idx],
+                        x_in_for_layer.reshape(B, N * hw, -1),
+                        pos_current,
+                        batch_size=B,
+                        frame_num=N,
+                        tokens_per_frame=hw,
+                        patch_h=H // self.patch_size,
+                        patch_w=W // self.patch_size,
+                    )
+                    if swa_qkv is not None:
+                        if swa_qkv.get("q") is not None:
+                            pca_swa_current_q_parts.append((i, swa_qkv["q"]))
+                        if swa_qkv.get("k") is not None:
+                            pca_swa_current_k_parts.append((i, swa_qkv["k"]))
+                        if swa_qkv.get("v") is not None:
+                            pca_swa_current_v_parts.append((i, swa_qkv["v"]))
+
                 # Check if we have KV cache from history
                 use_kv_cache = (
                     history is not None 
@@ -3022,6 +4068,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                             current_tokens=int(N * hw),
                             device=x_curr_flat.device,
                             dtype=x_curr_flat.dtype,
+                            swa_layer_idx=layer_idx,
                         )
                     d_prev = hmc_control.get("D_prev_patch") if hmc_control else None
                     d_prev_tokens = int(d_prev.numel()) if hasattr(d_prev, "numel") else 0
@@ -3110,6 +4157,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                                 v_cache_controlled = _blend_source(v_cache_controlled, v_cur_cache)
                             if target in {"k", "key", "kv", "both"}:
                                 k_cache_controlled = _blend_source(k_cache_controlled, k_cur_cache)
+                    swa_trace_record: Optional[Dict[str, Any]] = None
                     if (
                         self._hmc_hook_requested(hmc_control, "enable_swa_read_control")
                         or self._hmc_hook_requested(hmc_control, "enable_swa_overlap_bias")
@@ -3144,7 +4192,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                                 "mean_abs_gate_delta": 0.0,
                                 "max_abs_gate_delta": 0.0,
                             }
-                        self._append_hmc_trace(hmc_trace, "swa_read", {
+                        swa_trace_record = {
                             "layer": int(i),
                             "swa_layer": int(layer_idx),
                             "identity": bool(hmc_control.get("identity_hooks", False)) if hmc_control else False,
@@ -3158,12 +4206,21 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                             **swa_overlap_bias_stats,
                             **swa_overlap_source_gate_stats,
                             **swa_overlap_source_replace_stats,
-                        })
+                        }
                     swa_output_flat = self.swa_layers[layer_idx].forward_with_kv_cache(
                         x_curr_flat, k_cache_controlled, v_cache_controlled,
                         xpos=pos_current,
                         attn_mask=swa_attn_mask,
                     )
+                    if (
+                        swa_trace_record is not None
+                        and isinstance(swa_attn_mask, dict)
+                        and isinstance(swa_attn_mask.get("attention_mass_stats"), list)
+                        and swa_attn_mask["attention_mass_stats"]
+                    ):
+                        swa_trace_record.update(swa_attn_mask["attention_mass_stats"][-1])
+                    if swa_trace_record is not None:
+                        self._append_hmc_trace(hmc_trace, "swa_read", swa_trace_record)
                     swa_output = swa_output_flat.reshape(B, N, hw, -1)
                 else:
                     # Original path (no history or legacy format)
@@ -3252,6 +4309,29 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                     pos_for_cache = None
 
                 k_new, v_new = self.swa_layers[layer_idx].compute_kv_cache(x_for_cache_flat, xpos=pos_for_cache)
+                if self._pca_debug_enabled():
+                    pca_swa_cache_k = self._pca_heads_to_patchvec(
+                        k_new,
+                        batch_size=B,
+                        frame_num=N,
+                        tokens_per_frame=hw,
+                        patch_h=H // self.patch_size,
+                        patch_w=W // self.patch_size,
+                        layout="global",
+                    )
+                    pca_swa_cache_v = self._pca_heads_to_patchvec(
+                        v_new,
+                        batch_size=B,
+                        frame_num=N,
+                        tokens_per_frame=hw,
+                        patch_h=H // self.patch_size,
+                        patch_w=W // self.patch_size,
+                        layout="global",
+                    )
+                    if pca_swa_cache_k is not None:
+                        pca_swa_cache_k_parts.append((i, pca_swa_cache_k))
+                    if pca_swa_cache_v is not None:
+                        pca_swa_cache_v_parts.append((i, pca_swa_cache_v))
 
                 history_entry = {"k": k_new, "v": v_new}
                 if hmc_control and hmc_control.get("swa_write_cache_store_post", False):
@@ -3313,8 +4393,10 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         dyn4d_kk_mean_patch = None
         global_q_raw_patchvec = None
         global_k_raw_patchvec = None
+        global_v_raw_patchvec = None
         global_q_raw_patchvec_layers = None
         global_k_raw_patchvec_layers = None
+        global_v_raw_patchvec_layers = None
         dyn4d_global_layer_ids = None
         if dyn4d_outputs is not None:
             dyn4d_patch = dyn4d_outputs.get("dyn4d_patch")
@@ -3323,8 +4405,10 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             dyn4d_kk_mean_patch = dyn4d_outputs.get("dyn4d_kk_mean_patch")
             global_q_raw_patchvec = dyn4d_outputs.get("global_q_raw_patchvec")
             global_k_raw_patchvec = dyn4d_outputs.get("global_k_raw_patchvec")
+            global_v_raw_patchvec = dyn4d_outputs.get("global_v_raw_patchvec")
             global_q_raw_patchvec_layers = dyn4d_outputs.get("global_q_raw_patchvec_layers")
             global_k_raw_patchvec_layers = dyn4d_outputs.get("global_k_raw_patchvec_layers")
+            global_v_raw_patchvec_layers = dyn4d_outputs.get("global_v_raw_patchvec_layers")
             dyn4d_global_layer_ids = dyn4d_outputs.get("dyn4d_global_layer_ids")
 
         frame_attn_cosine_layer_ids = None
@@ -3371,6 +4455,46 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 frame_attn_key_cosine_deep = selected_key_parts[-1]
                 frame_attn_key_cosine_avg = torch.stack(selected_key_parts, dim=0).mean(dim=0)
 
+        def _stack_pca_parts(parts: List[Tuple[int, torch.Tensor]]) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+            if not parts:
+                return None, None
+            return (
+                torch.stack([part for _, part in parts], dim=2),
+                torch.tensor([int(layer_id) for layer_id, _ in parts], device=hidden.device, dtype=torch.long),
+            )
+
+        pca_debug_outputs: Dict[str, Any] = {}
+
+        def _put_pca(name: str, parts: List[Tuple[int, torch.Tensor]], layer_key: Optional[str] = None) -> None:
+            tensor, ids = _stack_pca_parts(parts)
+            if tensor is None:
+                return
+            pca_debug_outputs[name] = tensor
+            if layer_key and ids is not None and layer_key not in pca_debug_outputs:
+                pca_debug_outputs[layer_key] = ids
+
+        if self._pca_debug_enabled():
+            pca_debug_outputs["pca_debug_schema"] = "loger_full_layer_qkv_pca_debug_v1"
+            _put_pca("pca_attn_frame_q_layers", pca_attn_frame_q_parts, "pca_attn_frame_layer_ids")
+            _put_pca("pca_attn_frame_k_layers", pca_attn_frame_k_parts, "pca_attn_frame_layer_ids")
+            _put_pca("pca_attn_frame_v_layers", pca_attn_frame_v_parts, "pca_attn_frame_layer_ids")
+            _put_pca("pca_attn_global_q_layers", pca_attn_global_q_parts, "pca_attn_global_layer_ids")
+            _put_pca("pca_attn_global_k_layers", pca_attn_global_k_parts, "pca_attn_global_layer_ids")
+            _put_pca("pca_attn_global_v_layers", pca_attn_global_v_parts, "pca_attn_global_layer_ids")
+            _put_pca("pca_swa_current_q_layers", pca_swa_current_q_parts, "pca_swa_layer_ids")
+            _put_pca("pca_swa_current_k_layers", pca_swa_current_k_parts, "pca_swa_layer_ids")
+            _put_pca("pca_swa_current_v_layers", pca_swa_current_v_parts, "pca_swa_layer_ids")
+            _put_pca("pca_swa_cache_k_layers", pca_swa_cache_k_parts, "pca_swa_layer_ids")
+            _put_pca("pca_swa_cache_v_layers", pca_swa_cache_v_parts, "pca_swa_layer_ids")
+            _put_pca("pca_ttt_q_layers", pca_ttt_q_parts, "pca_ttt_layer_ids")
+            _put_pca("pca_ttt_k_layers", pca_ttt_k_parts, "pca_ttt_layer_ids")
+            _put_pca("pca_ttt_v_layers", pca_ttt_v_parts, "pca_ttt_layer_ids")
+            _put_pca("pca_ttt_input_layers", pca_ttt_input_parts, "pca_ttt_layer_ids")
+            _put_pca("pca_ttt_apply_raw_layers", pca_ttt_apply_raw_parts, "pca_ttt_layer_ids")
+            _put_pca("pca_ttt_operator_output_layers", pca_ttt_operator_output_parts, "pca_ttt_layer_ids")
+            _put_pca("pca_ttt_update_term_layers", pca_ttt_update_term_parts, "pca_ttt_layer_ids")
+            _put_pca("pca_ttt_final_output_layers", pca_ttt_final_output_parts, "pca_ttt_layer_ids")
+
         return (
             torch.cat([final_output[0], final_output[1]], dim=-1),
             (pos.reshape(B*N, hw, -1) if pos is not None else None),
@@ -3386,8 +4510,10 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             dyn4d_kk_mean_patch,
             global_q_raw_patchvec,
             global_k_raw_patchvec,
+            global_v_raw_patchvec,
             global_q_raw_patchvec_layers,
             global_k_raw_patchvec_layers,
+            global_v_raw_patchvec_layers,
             dyn4d_global_layer_ids,
             frame_attn_cosine_shallow,
             frame_attn_cosine_deep,
@@ -3401,6 +4527,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             frame_attn_cosine_key_layers,
             frame_attn_cosine_layer_ids,
             hmc_trace,
+            pca_debug_outputs,
         )
     
     def forward(self, imgs, *args, **kwargs):
@@ -3574,6 +4701,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             frame_attn_cosine_key_layers = None
             frame_attn_cosine_layer_ids = None
             hmc_trace = None
+            pca_debug_outputs = None
 
             for _ in range(num_iterations):
                 if self.ttt_layers is not None and w0 is None:
@@ -3623,7 +4751,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                         "ttt": ttt_state,
                         "attn": attn_state,
                     }
-                hidden, pos, ttt_output_info, decode_avg_gate_scale, decode_avg_attn_gate_scale, _decode_gate_scales, frame_attention_prior, attn_dynamic_patch, dyn4d_patch, dyn4d_qq_mean_patch, dyn4d_qk_var_patch, dyn4d_kk_mean_patch, global_q_raw_patchvec, global_k_raw_patchvec, global_q_raw_patchvec_layers, global_k_raw_patchvec_layers, dyn4d_global_layer_ids, frame_attn_cosine_shallow, frame_attn_cosine_deep, frame_attn_cosine_avg, frame_attn_key_cosine_l0, frame_attn_key_cosine_l4, frame_attn_key_cosine_shallow, frame_attn_key_cosine_deep, frame_attn_key_cosine_avg, frame_attn_cosine_query_layers, frame_attn_cosine_key_layers, frame_attn_cosine_layer_ids, hmc_trace = self.decode(
+                hidden, pos, ttt_output_info, decode_avg_gate_scale, decode_avg_attn_gate_scale, _decode_gate_scales, frame_attention_prior, attn_dynamic_patch, dyn4d_patch, dyn4d_qq_mean_patch, dyn4d_qk_var_patch, dyn4d_kk_mean_patch, global_q_raw_patchvec, global_k_raw_patchvec, global_v_raw_patchvec, global_q_raw_patchvec_layers, global_k_raw_patchvec_layers, global_v_raw_patchvec_layers, dyn4d_global_layer_ids, frame_attn_cosine_shallow, frame_attn_cosine_deep, frame_attn_cosine_avg, frame_attn_key_cosine_l0, frame_attn_key_cosine_l4, frame_attn_key_cosine_shallow, frame_attn_key_cosine_deep, frame_attn_key_cosine_avg, frame_attn_cosine_query_layers, frame_attn_cosine_key_layers, frame_attn_cosine_layer_ids, hmc_trace, pca_debug_outputs = self.decode(
                     hidden_input, Nw, H, W,
                     ttt_dict=ttt_dict,
                     window_size=window_size,
@@ -3746,8 +4874,10 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 dyn4d_kk_mean_patch=maybe_detach(dyn4d_kk_mean_patch, no_detach=no_detach),
                 global_q_raw_patchvec=maybe_detach(global_q_raw_patchvec, no_detach=no_detach),
                 global_k_raw_patchvec=maybe_detach(global_k_raw_patchvec, no_detach=no_detach),
+                global_v_raw_patchvec=maybe_detach(global_v_raw_patchvec, no_detach=no_detach),
                 global_q_raw_patchvec_layers=maybe_detach(global_q_raw_patchvec_layers, no_detach=no_detach),
                 global_k_raw_patchvec_layers=maybe_detach(global_k_raw_patchvec_layers, no_detach=no_detach),
+                global_v_raw_patchvec_layers=maybe_detach(global_v_raw_patchvec_layers, no_detach=no_detach),
                 dyn4d_global_layer_ids=maybe_detach(dyn4d_global_layer_ids, no_detach=no_detach),
                 frame_attn_cosine_shallow=maybe_detach(frame_attn_cosine_shallow, no_detach=no_detach),
                 frame_attn_cosine_deep=maybe_detach(frame_attn_cosine_deep, no_detach=no_detach),
@@ -3764,6 +4894,9 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 _window_start=start_idx,
                 _window_end=end_idx,
             )
+            if isinstance(pca_debug_outputs, dict):
+                for key, value in pca_debug_outputs.items():
+                    pred_dict[key] = maybe_detach(value, no_detach=no_detach) if torch.is_tensor(value) else value
             all_predictions.append(pred_dict)
 
             if not self.training:
@@ -3781,6 +4914,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 del frame_attn_key_cosine_shallow, frame_attn_key_cosine_deep, frame_attn_key_cosine_avg
                 del frame_attn_cosine_query_layers, frame_attn_cosine_key_layers, frame_attn_cosine_layer_ids
                 del hmc_trace
+                del pca_debug_outputs
                 if metric_hidden is not None:
                     del metric_hidden
                 if camera_qvec is not None:
@@ -3852,8 +4986,10 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             "dyn4d_kk_mean_patch",
             "global_q_raw_patchvec",
             "global_k_raw_patchvec",
+            "global_v_raw_patchvec",
             "global_q_raw_patchvec_layers",
             "global_k_raw_patchvec_layers",
+            "global_v_raw_patchvec_layers",
             "frame_attn_cosine_shallow",
             "frame_attn_cosine_deep",
             "frame_attn_cosine_avg",
@@ -3878,7 +5014,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 merged_prior = self._merge_windowed_frame_priors(all_predictions, key)
                 if merged_prior is not None:
                     merged_predictions[key] = merged_prior
-            elif key in sequence_keys:
+            elif key in sequence_keys or (str(key).startswith("pca_") and str(key).endswith("_layers")):
                 # Filter out None windows safely while preserving positions for slicing
                 result_parts = []
 

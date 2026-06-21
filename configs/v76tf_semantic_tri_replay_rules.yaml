@@ -1,0 +1,77 @@
+# ACL2 v76-TF semantic tri-replay memory-control rules.
+# This file records frozen training-free candidate definitions and the
+# existing LoGeR control surfaces they map to. It is not a learned selector.
+
+training_free_constraints:
+  no_gt_runtime_action: true
+  no_learned_selector: true
+  no_chunk_id_policy: true
+  no_per_chunk_parameter_search: true
+
+existing_hook_mapping:
+  TTT_TRI_REPLAY_ENABLE: "TTT_WRITE_GRADIENT_REVERSAL_MODE=tri_replay"
+  TTT_TRI_REPLAY_PRESET: "TTT_WRITE_TRI_REPLAY_POSITIVE_FRAC, TTT_WRITE_TRI_REPLAY_NEGATIVE_FRAC, TTT_WRITE_TRI_REPLAY_NEUTRAL_LAMBDA"
+  TTT_TRI_GAMMA: "TTT_WRITE_GRADIENT_REVERSAL_GAMMA or TTT_WRITE_GRADIENT_REVERSAL_CHUNK_GAMMAS"
+  TTT_COMMIT_EMA_ENABLE: "TTT_WRITE_COMMIT_EMA_CHUNKS"
+  TTT_COMMIT_EMA_ALPHA: "TTT_WRITE_COMMIT_EMA_ALPHA"
+  TTT_TRI_REPLAY_DIAG_CHUNKS: "TTT_WRITE_TRI_REPLAY_CHUNK_PARAMS"
+  TTT_TRI_REPLAY_ROLE_SOURCE: "TTT_WRITE_TRI_REPLAY_ROLE_MODE"
+  TTT_TRI_REPLAY_TRIGGER_MODE: "candidate wrapper responsibility"
+  READ_TTT_ROLE_ALIGNMENT_LOG: "report-level audit output"
+  SWA_ROUTE_PRESERVE_MASS: "not yet a dedicated core env alias"
+
+fixed_rule_families:
+  R1_semantic_stability:
+    source_features:
+      - stable_structure_ratio
+      - sky_context_ratio
+      - radio_static_mean
+    positive_role: stable_anchor
+    neutral_role: unknown_or_low_confidence
+    negative_role: dynamic_or_high_residual
+    deployment_status: frozen_candidate_not_promoted
+  R2_geometry_semantic_disagreement:
+    source_features:
+      - raw_overlap_residual_rmse
+      - dynamic_thing_ratio
+      - stable_structure_ratio
+    positive_role: stable_low_residual
+    neutral_role: mixed
+    negative_role: dynamic_high_residual
+    deployment_status: frozen_candidate_not_promoted
+  R3_read_ttt_handshake:
+    source_features:
+      - read_attention_proxy
+      - ttt_role_mass
+      - semantic_stability
+    positive_role: read_supported_stable
+    neutral_role: read_uncertain
+    negative_role: read_conflict_dynamic
+    deployment_status: frozen_candidate_not_promoted
+  R4_commit_ema_bridge:
+    source_features:
+      - ttt_post_zp_delta
+      - state_hash_change
+      - future_overlap_support
+    positive_role: persistent_stable
+    neutral_role: no_bridge
+    negative_role: unstable_persistent
+    deployment_status: frozen_candidate_not_promoted
+  R5_swa_tri_handoff:
+    source_features:
+      - swa_overlap_source_keep_ratio
+      - tri_replay_role_mass
+      - boundary_window_support
+    positive_role: preserve_supported_source
+    neutral_role: keep_native
+    negative_role: suppress_unsupported_source
+    deployment_status: frozen_candidate_not_promoted
+
+gate_thresholds:
+  mechanism_gain_min_relative: 0.10
+  j_scale_median_gain_min_relative: 0.05
+  full_ate_gain_min_m: 0.3
+  tri_replay_applied_count_min: 1
+  role_mass_required: true
+  post_zp_delta_required: true
+  state_hash_change_required: true

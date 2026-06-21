@@ -1,0 +1,36 @@
+{
+  "label": "mirror",
+  "notes": "Taylor backstage mirror/opening negative seed. Coordinates are in processed 720x405 frame space and were selected from the audited raw contact sheet.",
+  "prompts": [
+    {
+      "frame": 179,
+      "box": [500, 0, 650, 405],
+      "positive_points": [[585, 95], [600, 250], [625, 340]],
+      "negative_points": [[470, 215], [530, 120]]
+    },
+    {
+      "frame": 210,
+      "box": [315, 0, 560, 405],
+      "positive_points": [[410, 80], [465, 230], [535, 145]],
+      "negative_points": [[285, 190], [575, 220]]
+    },
+    {
+      "frame": 240,
+      "box": [150, 0, 430, 405],
+      "positive_points": [[235, 85], [315, 230], [390, 145]],
+      "negative_points": [[120, 205], [455, 210]]
+    },
+    {
+      "frame": 270,
+      "box": [140, 0, 440, 405],
+      "positive_points": [[230, 85], [320, 235], [400, 140]],
+      "negative_points": [[112, 210], [470, 230]]
+    },
+    {
+      "frame": 299,
+      "box": [180, 0, 450, 405],
+      "positive_points": [[245, 90], [325, 245], [415, 150]],
+      "negative_points": [[155, 220], [470, 235]]
+    }
+  ]
+}

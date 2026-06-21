@@ -49,6 +49,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--checkpoint", default="")
     parser.add_argument("--lang-model", default="siglip2")
+    parser.add_argument("--radseg-slide-crop", type=int, default=336)
+    parser.add_argument("--radseg-slide-stride", type=int, default=224)
     parser.add_argument("--seed", type=int, default=7002)
     parser.add_argument("--max-fit-tokens", type=int, default=120000)
     parser.add_argument("--max-frames-per-chunk", type=int, default=0, help="Debug only. 0 means all manifest frames.")
@@ -134,7 +136,15 @@ def main() -> None:
         raise FileNotFoundError(f"RADIO-ViPE root missing: {args.radio_vipe_root}")
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    model = load_radseg_encoder(args.radio_vipe_root, checkpoint, args.device, args.lang_model, amp=False)
+    model = load_radseg_encoder(
+        args.radio_vipe_root,
+        checkpoint,
+        args.device,
+        args.lang_model,
+        amp=False,
+        slide_crop=int(args.radseg_slide_crop),
+        slide_stride=int(args.radseg_slide_stride),
+    )
     chunk_payloads: list[dict[str, Any]] = []
     pca_samples: list[np.ndarray] = []
     per_chunk_sample_cap = max(4096, int(args.max_fit_tokens // max(len(target_chunks), 1)))
@@ -154,6 +164,10 @@ def main() -> None:
         {
             "format": "radio_sidecar_pca_v1",
             "source": "third_party/RADIO-ViPE/RADSeg",
+            "encoder": "RADSegEncoder",
+            "radseg_slide_crop": int(args.radseg_slide_crop),
+            "radseg_slide_stride": int(args.radseg_slide_stride),
+            "radseg_sliding_window_enabled": bool(int(args.radseg_slide_crop) > 0),
             "seq": str(args.seq),
             "target_chunks": target_chunks,
             "pca_dim_requested": int(args.pca_dim),
@@ -168,6 +182,10 @@ def main() -> None:
                 "radio_vipe_root": str(args.radio_vipe_root),
                 "max_fit_tokens": int(args.max_fit_tokens),
                 "pca_basis_source": "v70_fit_on_kitti01_sampled_frames",
+                "encoder": "RADSegEncoder",
+                "radseg_slide_crop": int(args.radseg_slide_crop),
+                "radseg_slide_stride": int(args.radseg_slide_stride),
+                "radseg_sliding_window_enabled": bool(int(args.radseg_slide_crop) > 0),
             },
         },
         pca_path,
@@ -226,6 +244,10 @@ def main() -> None:
         payload = {
             "format": "radio_sidecar_v1",
             "source": "third_party/RADIO-ViPE/RADSeg",
+            "encoder": "RADSegEncoder",
+            "radseg_slide_crop": int(args.radseg_slide_crop),
+            "radseg_slide_stride": int(args.radseg_slide_stride),
+            "radseg_sliding_window_enabled": bool(int(args.radseg_slide_crop) > 0),
             "seq": str(args.seq),
             "chunk_id": int(chunk.chunk_id),
             "global_start_frame": int(chunk.start_frame),
@@ -254,6 +276,10 @@ def main() -> None:
                 "cmd": " ".join(sys.argv),
                 "checkpoint": checkpoint,
                 "radio_vipe_root": str(args.radio_vipe_root),
+                "encoder": "RADSegEncoder",
+                "radseg_slide_crop": int(args.radseg_slide_crop),
+                "radseg_slide_stride": int(args.radseg_slide_stride),
+                "radseg_sliding_window_enabled": bool(int(args.radseg_slide_crop) > 0),
                 "image_dir": str(args.image_dir),
                 "stage_c_cache": str(args.stage_c_cache),
                 "stage_chunk_dir": str(chunk.chunk_dir),
@@ -289,6 +315,10 @@ def main() -> None:
                 "end_frame": int(chunk.end_frame),
                 "frames_saved": len(frame_ids),
                 "sidecar_path": str(sidecar_path),
+                "encoder": "RADSegEncoder",
+                "radseg_slide_crop": int(args.radseg_slide_crop),
+                "radseg_slide_stride": int(args.radseg_slide_stride),
+                "radseg_sliding_window_enabled": bool(int(args.radseg_slide_crop) > 0),
                 "component_count_min": payload["debug"]["component_count_min"],
                 "component_count_max": payload["debug"]["component_count_max"],
                 "object_boundary_contrast_mean": payload["debug"]["object_boundary_contrast_mean"],
@@ -305,6 +335,11 @@ def main() -> None:
         "seq": str(args.seq),
         "target_chunks": target_chunks,
         "out_dir": str(args.out_dir),
+        "source": "third_party/RADIO-ViPE/RADSeg",
+        "encoder": "RADSegEncoder",
+        "radseg_slide_crop": int(args.radseg_slide_crop),
+        "radseg_slide_stride": int(args.radseg_slide_stride),
+        "radseg_sliding_window_enabled": bool(int(args.radseg_slide_crop) > 0),
         "pca_basis": str(pca_path),
         "pca_basis_sha256": pca_sha,
         "pca_dim_requested": int(args.pca_dim),
@@ -314,9 +349,22 @@ def main() -> None:
         "chunks": manifest_chunks,
     }
     write_json(args.out_dir / "sidecar_manifest.json", manifest)
-    print(json.dumps({"out_dir": str(args.out_dir), "chunks": len(manifest_chunks), "pca_basis_sha256": pca_sha}, indent=2, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "out_dir": str(args.out_dir),
+                "chunks": len(manifest_chunks),
+                "pca_basis_sha256": pca_sha,
+                "encoder": "RADSegEncoder",
+                "radseg_slide_crop": int(args.radseg_slide_crop),
+                "radseg_slide_stride": int(args.radseg_slide_stride),
+                "radseg_sliding_window_enabled": bool(int(args.radseg_slide_crop) > 0),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
 
 
 if __name__ == "__main__":
     main()
-

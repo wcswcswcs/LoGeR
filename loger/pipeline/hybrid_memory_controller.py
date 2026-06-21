@@ -23,6 +23,7 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
@@ -434,6 +435,8 @@ def _stable_semantic_score(
     groups: Optional[torch.Tensor],
     trust: Optional[torch.Tensor],
     n_patch: int,
+    *,
+    missing_trust_policy: str = "zero",
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
     score = torch.zeros((n_patch,), dtype=torch.float32)
     debug: Dict[str, Any] = {
@@ -480,8 +483,12 @@ def _stable_semantic_score(
         })
     if trust is not None and int(trust.numel()) == n_patch:
         score = score * trust.detach().cpu().float().reshape(-1).clamp(0.0, 1.0)
+        debug["semantic_anchor_trust_missing_policy"] = "provided"
+    elif str(missing_trust_policy or "zero").strip().lower() in {"neutral", "one", "ones", "unit"}:
+        debug["semantic_anchor_trust_missing_policy"] = "neutral"
     else:
         score = torch.zeros_like(score)
+        debug["semantic_anchor_trust_missing_policy"] = "zero"
     return score.clamp(0.0, 1.0), debug
 
 
@@ -902,6 +909,19 @@ def _parse_v67_semantic_cue(read_cue_source: str) -> Optional[Dict[str, Any]]:
 def _strip_v68_control_suffix(body: str) -> Tuple[str, str]:
     control = "none"
     suffixes = (
+        ("same_composition_and_dg_random", "same_composition_and_dg_random"),
+        ("same_composition_dg_random", "same_composition_and_dg_random"),
+        ("random_same_composition_and_dg", "same_composition_and_dg_random"),
+        ("same_attention_mass_random", "same_attention_mass_random"),
+        ("random_same_attention_mass", "same_attention_mass_random"),
+        ("group_stratified_random", "group_stratified_random"),
+        ("random_group_stratified", "group_stratified_random"),
+        ("lowstuff_within_group_random", "lowstuff_within_group_random"),
+        ("random_lowstuff_within_group", "lowstuff_within_group_random"),
+        ("high_d_within_group_random", "high_d_within_group_random"),
+        ("highd_within_group_random", "high_d_within_group_random"),
+        ("random_high_d_within_group", "high_d_within_group_random"),
+        ("random_highd_within_group", "high_d_within_group_random"),
         ("same_cue_distribution_random", "same_cue_distribution_random"),
         ("random_same_distribution", "same_cue_distribution_random"),
         ("random_same_mass", "same_cue_distribution_random"),
@@ -929,6 +949,231 @@ def _strip_v68_control_suffix(body: str) -> Tuple[str, str]:
             if changed:
                 break
     return body, control
+
+
+def _deterministic_permutation(indices: torch.Tensor, *, seed: float) -> torch.Tensor:
+    idx = indices.detach().cpu().long().reshape(-1)
+    if int(idx.numel()) <= 1:
+        return idx
+    noise = _deterministic_patch_noise(int(idx.numel()), seed=float(seed))
+    return idx[torch.argsort(noise, stable=True)]
+
+
+def _shuffle_values_within_strata(values: torch.Tensor, strata: Optional[torch.Tensor], *, seed: float) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    vals = values.detach().cpu().float().reshape(-1)
+    n = int(vals.numel())
+    out = vals.clone()
+    debug: Dict[str, Any] = {
+        "v68_read_control_shuffle_mode": "strata",
+        "v68_read_control_shuffle_tokens": int(n),
+        "v68_read_control_shuffle_groups": 0,
+        "v68_read_control_shuffle_fallback": False,
+    }
+    if n <= 1:
+        debug["v68_read_control_shuffle_reason"] = "too_few_tokens"
+        return out, debug
+    if strata is None or int(strata.numel()) != n:
+        perm = _deterministic_permutation(torch.arange(n), seed=seed)
+        debug.update({
+            "v68_read_control_shuffle_mode": "global_fallback",
+            "v68_read_control_shuffle_fallback": True,
+            "v68_read_control_shuffle_reason": "missing_or_mismatched_strata",
+        })
+        return vals[perm], debug
+    labels = strata.detach().cpu().long().reshape(-1)
+    groups = torch.unique(labels)
+    shuffled_groups = 0
+    for group in groups.tolist():
+        idx = torch.nonzero(labels == int(group), as_tuple=False).reshape(-1)
+        if int(idx.numel()) <= 1:
+            continue
+        perm = _deterministic_permutation(idx, seed=seed + float(int(group) + 1009))
+        out[idx] = vals[perm]
+        shuffled_groups += 1
+    debug.update({
+        "v68_read_control_shuffle_groups": int(shuffled_groups),
+        "v68_read_control_shuffle_reason": "ok" if shuffled_groups > 0 else "all_strata_singleton",
+    })
+    return out, debug
+
+
+def _shuffle_values_in_eligible_strata(
+    values: torch.Tensor,
+    eligible: torch.Tensor,
+    strata: Optional[torch.Tensor],
+    *,
+    seed: float,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    vals = values.detach().cpu().float().reshape(-1)
+    n = int(vals.numel())
+    mask = eligible.detach().cpu().bool().reshape(-1) if eligible is not None else torch.zeros((n,), dtype=torch.bool)
+    if int(mask.numel()) != n:
+        mask = torch.zeros((n,), dtype=torch.bool)
+    out = vals.clone()
+    debug: Dict[str, Any] = {
+        "v68_read_control_shuffle_mode": "eligible_strata",
+        "v68_read_control_eligible_tokens": int(mask.sum().item()),
+        "v68_read_control_shuffle_fallback": False,
+    }
+    if n <= 1 or int(mask.sum().item()) <= 1:
+        debug["v68_read_control_shuffle_reason"] = "too_few_eligible_tokens"
+        return out, debug
+    labels = strata.detach().cpu().long().reshape(-1) if strata is not None and int(strata.numel()) == n else torch.zeros((n,), dtype=torch.long)
+    shuffled_groups = 0
+    for group in torch.unique(labels[mask]).tolist():
+        idx = torch.nonzero(mask & (labels == int(group)), as_tuple=False).reshape(-1)
+        if int(idx.numel()) <= 1:
+            continue
+        perm = _deterministic_permutation(idx, seed=seed + float(int(group) + 2027))
+        out[idx] = vals[perm]
+        shuffled_groups += 1
+    debug.update({
+        "v68_read_control_shuffle_groups": int(shuffled_groups),
+        "v68_read_control_shuffle_reason": "ok" if shuffled_groups > 0 else "all_eligible_strata_singleton",
+    })
+    return out, debug
+
+
+def _v68_control_patch_metadata(
+    *,
+    token_type: torch.Tensor,
+    prior_output: Optional[PriorOutput],
+    motion: torch.Tensor,
+) -> Dict[str, Optional[torch.Tensor]]:
+    token_type_cpu = token_type.detach().cpu().long().reshape(-1)
+    patch_mask = token_type_cpu == TOKEN_TYPE_PATCH
+    n_patch = int(patch_mask.sum().item())
+    groups = None
+    labels = None
+    if prior_output is not None:
+        groups = _patch_labels_from_token_labels(getattr(prior_output, "G_sem_tok", None), token_type_cpu)
+        labels = _patch_labels_from_token_labels(getattr(prior_output, "L_sem_tok", None), token_type_cpu)
+    groups = groups.detach().cpu().long().reshape(-1) if groups is not None and int(groups.numel()) == n_patch else None
+    labels = labels.detach().cpu().long().reshape(-1) if labels is not None and int(labels.numel()) == n_patch else None
+    lowstuff = torch.zeros((n_patch,), dtype=torch.bool)
+    if groups is not None:
+        lowstuff |= groups == int(SEMANTIC_GROUP_LOW_VALUE_STUFF)
+    if labels is not None:
+        for label_id in SEMANTIC_FINE_VEGETATION_IDS:
+            lowstuff |= labels == int(label_id)
+        for label_id in _V68_LOWOBS_FINE_IDS:
+            lowstuff |= labels == int(label_id)
+    mot = torch.nan_to_num(motion.detach().cpu().float().reshape(-1), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+    if int(mot.numel()) != n_patch:
+        mot = torch.zeros((n_patch,), dtype=torch.float32)
+    high_d = torch.zeros((n_patch,), dtype=torch.bool)
+    if int(mot.numel()) > 0:
+        high_d = mot >= torch.quantile(mot, 0.75)
+    return {
+        "groups": groups,
+        "labels": labels,
+        "lowstuff": lowstuff,
+        "high_d": high_d,
+        "motion": mot,
+    }
+
+
+def _apply_v68_read_output_control(
+    values: torch.Tensor,
+    *,
+    control: str,
+    token_type: torch.Tensor,
+    prior_output: Optional[PriorOutput],
+    motion: torch.Tensor,
+    num_frames: int,
+    chunk_idx: int,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    vals = values.detach().cpu().float().reshape(-1)
+    control_l = str(control or "none").strip().lower()
+    seed = 6817000.0 + max(int(chunk_idx), 0) * 101.0
+    debug: Dict[str, Any] = {
+        "v68_read_control_applied": False,
+        "v68_read_control_effective": control_l,
+    }
+    if control_l not in {
+        "same_cue_distribution_random",
+        "same_attention_mass_random",
+        "group_stratified_random",
+        "lowstuff_within_group_random",
+        "high_d_within_group_random",
+        "same_composition_and_dg_random",
+    }:
+        return vals, debug
+
+    meta = _v68_control_patch_metadata(token_type=token_type, prior_output=prior_output, motion=motion)
+    groups = meta.get("groups")
+    lowstuff = meta.get("lowstuff")
+    high_d = meta.get("high_d")
+    mot = meta.get("motion")
+    if control_l == "same_cue_distribution_random":
+        perm = _deterministic_permutation(torch.arange(int(vals.numel())), seed=seed)
+        out = vals[perm]
+        debug.update({
+            "v68_read_control_applied": True,
+            "v68_read_control_shuffle_mode": "global_same_distribution",
+            "v68_read_control_eligible_tokens": int(vals.numel()),
+        })
+        return out, debug
+    if control_l == "same_attention_mass_random":
+        n = int(vals.numel())
+        T = max(int(num_frames), 1)
+        if n > 1 and n % T == 0:
+            per_frame = n // T
+            out = vals.clone()
+            for frame_idx in range(T):
+                idx = torch.arange(frame_idx * per_frame, (frame_idx + 1) * per_frame, dtype=torch.long)
+                perm = _deterministic_permutation(idx, seed=seed + 31.0 * frame_idx)
+                out[idx] = vals[perm]
+            debug.update({
+                "v68_read_control_applied": True,
+                "v68_read_control_shuffle_mode": "per_frame_same_distribution",
+                "v68_read_control_frames": int(T),
+                "v68_read_control_tokens_per_frame": int(per_frame),
+            })
+            return out, debug
+        out, sub_debug = _shuffle_values_within_strata(vals, None, seed=seed)
+        debug.update(sub_debug)
+        debug["v68_read_control_applied"] = True
+        return out, debug
+    if control_l == "group_stratified_random":
+        out, sub_debug = _shuffle_values_within_strata(vals, groups, seed=seed)
+        debug.update(sub_debug)
+        debug["v68_read_control_applied"] = True
+        return out, debug
+    if control_l == "lowstuff_within_group_random":
+        eligible = lowstuff if lowstuff is not None else torch.zeros_like(vals, dtype=torch.bool)
+        out, sub_debug = _shuffle_values_in_eligible_strata(vals, eligible, groups, seed=seed)
+        debug.update(sub_debug)
+        debug["v68_read_control_applied"] = True
+        debug["v68_read_control_lowstuff_tokens"] = int(eligible.sum().item()) if eligible is not None else 0
+        return out, debug
+    if control_l == "high_d_within_group_random":
+        eligible = high_d if high_d is not None else torch.zeros_like(vals, dtype=torch.bool)
+        out, sub_debug = _shuffle_values_in_eligible_strata(vals, eligible, groups, seed=seed)
+        debug.update(sub_debug)
+        debug["v68_read_control_applied"] = True
+        debug["v68_read_control_high_d_tokens"] = int(eligible.sum().item()) if eligible is not None else 0
+        return out, debug
+    if control_l == "same_composition_and_dg_random":
+        n = int(vals.numel())
+        if mot is not None and int(mot.numel()) == n:
+            q1 = torch.quantile(mot, 0.25)
+            q2 = torch.quantile(mot, 0.50)
+            q3 = torch.quantile(mot, 0.75)
+            d_bin = torch.zeros((n,), dtype=torch.long)
+            d_bin += (mot > q1).long()
+            d_bin += (mot > q2).long()
+            d_bin += (mot > q3).long()
+        else:
+            d_bin = torch.zeros((n,), dtype=torch.long)
+        base_group = groups if groups is not None and int(groups.numel()) == n else torch.zeros((n,), dtype=torch.long)
+        strata = (base_group + 10).long() * 4 + d_bin.long()
+        out, sub_debug = _shuffle_values_within_strata(vals, strata, seed=seed)
+        debug.update(sub_debug)
+        debug["v68_read_control_applied"] = True
+        debug["v68_read_control_shuffle_mode"] = "semantic_group_x_dquartile"
+        return out, debug
+    return vals, debug
 
 
 def _parse_v68_layer_list(body: str) -> List[int]:
@@ -968,7 +1213,9 @@ def _parse_v68_read_cue(read_cue_source: str) -> Optional[Dict[str, Any]]:
     body = src[len("v68.read."):]
     body, control = _strip_v68_control_suffix(body)
     tap = "global_k_raw_patchvec_layers"
-    if ".q" in body or "_q" in body or "global_q" in body:
+    if ".v" in body or "_v" in body or "global_v" in body or "value" in body:
+        tap = "global_v_raw_patchvec_layers"
+    elif ".q" in body or "_q" in body or "global_q" in body:
         tap = "global_q_raw_patchvec_layers"
     if "semantic_only" in body or "sem_only" in body:
         fusion = "semantic_only"
@@ -987,6 +1234,231 @@ def _parse_v68_read_cue(read_cue_source: str) -> Optional[Dict[str, Any]]:
         "fusion": fusion,
         "control": control,
     }
+
+
+def _parse_v78_l07_l13_read_cue(read_cue_source: str) -> Optional[Dict[str, Any]]:
+    src = str(read_cue_source or "").strip().lower()
+    if not src.startswith("v78.l07_l13."):
+        return None
+    body = src[len("v78.l07_l13."):]
+    body, control = _strip_v68_control_suffix(body)
+    aliases = {
+        "l13_only": "l13_only",
+        "g1_l13_only": "l13_only",
+        "l07_action_only": "l07_action_only",
+        "g2_l07_action_only": "l07_action_only",
+        "mask_neg": "l07_mask_l13_neg",
+        "l07_mask_l13_neg": "l07_mask_l13_neg",
+        "g3_l07_mask_l13_neg": "l07_mask_l13_neg",
+        "mask_stable": "l07_mask_l13_stable",
+        "l07_mask_l13_stable": "l07_mask_l13_stable",
+        "g4_l07_mask_l13_stable": "l07_mask_l13_stable",
+        "mask_neg_plus_stable": "l07_mask_l13_neg_plus_stable",
+        "l07_mask_l13_neg_plus_stable": "l07_mask_l13_neg_plus_stable",
+        "g5_l07_mask_l13_neg_plus_stable": "l07_mask_l13_neg_plus_stable",
+        "contrast": "l07_mask_l13_contrast",
+        "l07_mask_l13_contrast": "l07_mask_l13_contrast",
+        "g6_l07_mask_l13_contrast": "l07_mask_l13_contrast",
+    }
+    mode = aliases.get(body)
+    if mode is None:
+        return None
+    return {
+        "body": body,
+        "mode": mode,
+        "control": control,
+        "l07_layer": 7,
+        "l13_layer": 13,
+    }
+
+
+def _strip_v70_radio_control_suffix(body: str) -> Tuple[str, str]:
+    control = "none"
+    suffixes = (
+        ("same_cue_distribution_random", "same_cue_distribution_random"),
+        ("random_same_distribution", "same_cue_distribution_random"),
+        ("random_same_mass", "same_cue_distribution_random"),
+        ("radio_feature_shuffle", "radio_feature_shuffle"),
+        ("feature_shuffle", "radio_feature_shuffle"),
+        ("radio_risk_shuffle", "radio_risk_shuffle"),
+        ("risk_shuffle", "radio_risk_shuffle"),
+        ("radio_component_shuffle", "radio_component_shuffle"),
+        ("component_shuffle", "radio_component_shuffle"),
+        ("geometry_only", "geometry_only"),
+        ("geo_only", "geometry_only"),
+    )
+    changed = True
+    while changed:
+        changed = False
+        for suffix, name in suffixes:
+            for sep in (".", "_"):
+                token = f"{sep}{suffix}"
+                if body.endswith(token):
+                    control = name
+                    body = body[: -len(token)]
+                    changed = True
+                    break
+            if changed:
+                break
+    return body, control
+
+
+def _parse_v70_radio_read_cue(read_cue_source: str) -> Optional[Dict[str, Any]]:
+    src = str(read_cue_source or "").strip().lower()
+    if not src.startswith("v70.radio."):
+        return None
+    body = src[len("v70.radio."):]
+    body, control = _strip_v70_radio_control_suffix(body)
+    if body in {"object_interior_floor", "object_interior", "interior_floor", "read_r3"}:
+        mode = "object_interior_floor"
+    elif body in {"cross_object_risk_veto", "risk_veto", "cross_object_veto", "read_r4"}:
+        mode = "cross_object_risk_veto"
+    else:
+        return {
+            "body": body,
+            "mode": "unknown",
+            "control": control,
+        }
+    return {
+        "body": body,
+        "mode": mode,
+        "control": control,
+    }
+
+
+def _v70_radio_sidecar_path(sidecar_dir: str, chunk_idx: int) -> Optional[Path]:
+    root = Path(str(sidecar_dir or "")).expanduser()
+    if not root.is_dir():
+        return None
+    hits = sorted(root.glob(f"chunk_{int(chunk_idx):03d}_*/radio_sidecar.pt"))
+    return hits[0] if hits else None
+
+
+def _v70_radio_resize_map(value: Any, *, num_frames: int, patch_grid: Tuple[int, int]) -> torch.Tensor:
+    tensor = value.detach().cpu().float() if torch.is_tensor(value) else torch.as_tensor(value, dtype=torch.float32)
+    tensor = torch.nan_to_num(tensor.float(), nan=0.0, posinf=1.0, neginf=0.0)
+    if tensor.ndim != 3:
+        return torch.zeros((max(int(num_frames), 0) * max(int(patch_grid[0]), 0) * max(int(patch_grid[1]), 0),), dtype=torch.float32)
+    target_t = max(int(num_frames), 1)
+    target_h, target_w = max(int(patch_grid[0]), 1), max(int(patch_grid[1]), 1)
+    if tuple(int(x) for x in tensor.shape) != (target_t, target_h, target_w):
+        tensor = F.interpolate(
+            tensor[None, None],
+            size=(target_t, target_h, target_w),
+            mode="trilinear",
+            align_corners=False,
+        )[0, 0]
+    return tensor.reshape(-1).clamp(0.0, 1.0)
+
+
+def _v70_radio_read_cue_patch(
+    *,
+    sidecar_dir: str,
+    cfg: Dict[str, Any],
+    default: torch.Tensor,
+    num_frames: int,
+    patch_grid: Tuple[int, int],
+    chunk_idx: int,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    control = str(cfg.get("control", "none"))
+    mode = str(cfg.get("mode", "unknown"))
+    debug: Dict[str, Any] = {
+        "v70_radio_read_available": False,
+        "v70_radio_read_reason": "not_run",
+        "v70_radio_read_cue_source": f"v70.radio.{cfg.get('body', '')}",
+        "v70_radio_read_mode": mode,
+        "v70_radio_read_control": control,
+        "v70_radio_sidecar_dir": str(sidecar_dir or ""),
+        "v70_radio_chunk_idx": int(chunk_idx),
+    }
+    if mode == "unknown":
+        debug["v70_radio_read_reason"] = f"unknown_mode:{cfg.get('body', '')}"
+        return torch.zeros_like(default), debug
+    sidecar_path = _v70_radio_sidecar_path(sidecar_dir, chunk_idx)
+    if sidecar_path is None:
+        debug["v70_radio_read_reason"] = "missing_sidecar"
+        return torch.zeros_like(default), debug
+    try:
+        try:
+            payload = torch.load(sidecar_path, map_location="cpu", weights_only=False)
+        except TypeError:
+            payload = torch.load(sidecar_path, map_location="cpu")
+    except Exception as exc:  # noqa: BLE001
+        debug["v70_radio_read_reason"] = f"sidecar_load_error:{type(exc).__name__}:{exc}"
+        debug["v70_radio_sidecar_path"] = str(sidecar_path)
+        return torch.zeros_like(default), debug
+    required = (
+        "object_interior_score",
+        "object_boundary_score",
+        "radio_dynamic_score",
+        "radio_sky_context_score",
+        "radio_lowtrust_score",
+        "temporal_stability",
+    )
+    missing = [key for key in required if key not in payload]
+    if missing:
+        debug["v70_radio_read_reason"] = f"missing_fields:{','.join(missing)}"
+        debug["v70_radio_sidecar_path"] = str(sidecar_path)
+        return torch.zeros_like(default), debug
+
+    interior = _v70_radio_resize_map(payload["object_interior_score"], num_frames=num_frames, patch_grid=patch_grid)
+    boundary = _v70_radio_resize_map(payload["object_boundary_score"], num_frames=num_frames, patch_grid=patch_grid)
+    dynamic = _v70_radio_resize_map(payload["radio_dynamic_score"], num_frames=num_frames, patch_grid=patch_grid)
+    sky = _v70_radio_resize_map(payload["radio_sky_context_score"], num_frames=num_frames, patch_grid=patch_grid)
+    lowtrust = _v70_radio_resize_map(payload["radio_lowtrust_score"], num_frames=num_frames, patch_grid=patch_grid)
+    stability = _v70_radio_resize_map(payload["temporal_stability"], num_frames=num_frames, patch_grid=patch_grid)
+    geom_default = default.detach().cpu().float().reshape(-1).clamp(0.0, 1.0)
+    risk = torch.maximum(boundary, torch.maximum(dynamic, torch.maximum(sky, lowtrust))).clamp(0.0, 1.0)
+    interior_static = (interior * stability).clamp(0.0, 1.0)
+    if control in {"radio_feature_shuffle", "same_cue_distribution_random"}:
+        noise = _deterministic_patch_noise(int(interior_static.numel()), seed=7003000 + max(int(chunk_idx), 0) * 101.0)
+        perm = torch.argsort(noise, stable=True)
+        interior_static = interior_static[perm]
+        risk = risk[perm]
+    elif control == "radio_risk_shuffle":
+        noise = _deterministic_patch_noise(int(risk.numel()), seed=7003100 + max(int(chunk_idx), 0) * 101.0)
+        risk = risk[torch.argsort(noise, stable=True)]
+    elif control == "radio_component_shuffle":
+        noise = _deterministic_patch_noise(int(interior_static.numel()), seed=7003200 + max(int(chunk_idx), 0) * 101.0)
+        interior_static = interior_static[torch.argsort(noise, stable=True)]
+    if mode == "cross_object_risk_veto":
+        out = risk
+    elif control == "geometry_only":
+        out = geom_default
+    else:
+        # Geometry-first READ treats D as source risk.  Keep the stage-C
+        # geometry risk as the base signal, then lower risk only on stable
+        # RADIO interiors while retaining boundary/dynamic/sky/low-trust risk.
+        stable_interior = (interior_static * (1.0 - risk)).clamp(0.0, 1.0)
+        risk_boost = (risk * (1.0 - interior_static)).clamp(0.0, 1.0)
+        out = (geom_default * (1.0 - 0.55 * stable_interior) + 0.25 * risk_boost).clamp(0.0, 1.0)
+    out_before_norm = out.detach().cpu().float().reshape(-1)
+    out = _robust_quantile01(out_before_norm, num_frames=max(int(num_frames), 1))
+    out = _flatten_or_default(out, default).clamp(0.0, 1.0)
+    sidecar_grid = payload.get("patch_grid", None)
+    debug.update({
+        "v70_radio_read_available": True,
+        "v70_radio_read_reason": "ok",
+        "v70_radio_sidecar_path": str(sidecar_path),
+        "v70_radio_sidecar_patch_grid": list(sidecar_grid) if isinstance(sidecar_grid, (list, tuple)) else None,
+        "v70_radio_target_patch_grid": [int(patch_grid[0]), int(patch_grid[1])],
+        "v70_radio_sidecar_frames": int(payload["object_interior_score"].shape[0]),
+        "v70_radio_target_frames": int(num_frames),
+        "v70_radio_interior_mean": float(interior.mean().item()) if interior.numel() else 0.0,
+        "v70_radio_interior_static_mean": float(interior_static.mean().item()) if interior_static.numel() else 0.0,
+        "v70_radio_risk_mean": float(risk.mean().item()) if risk.numel() else 0.0,
+        "v70_radio_risk_q90": float(torch.quantile(risk, 0.90).item()) if risk.numel() else 0.0,
+        "v70_radio_geom_default_mean": float(geom_default.mean().item()) if geom_default.numel() else 0.0,
+        "v70_radio_geom_default_q90": float(torch.quantile(geom_default, 0.90).item()) if geom_default.numel() else 0.0,
+        "v70_radio_output_mean_before_norm": float(out_before_norm.mean().item()) if out_before_norm.numel() else 0.0,
+        "v70_radio_output_q90_before_norm": float(torch.quantile(out_before_norm, 0.90).item()) if out_before_norm.numel() else 0.0,
+        "v70_radio_output_mean": float(out.mean().item()) if out.numel() else 0.0,
+        "v70_radio_output_q90": float(torch.quantile(out, 0.90).item()) if out.numel() else 0.0,
+        "v70_radio_output_gt050_mass": float((out > 0.50).float().mean().item()) if out.numel() else 0.0,
+        "v70_radio_corr_output_risk": _pearson_corr(out, risk),
+        "v70_radio_corr_output_interior_static": _pearson_corr(out, interior_static),
+    })
+    return out, debug
 
 
 def _v68_patch_semantic_support_risk(
@@ -1099,13 +1571,19 @@ def _v68_patch_semantic_support_risk(
 def _v68_grammotion_patch(
     q_layers: Optional[torch.Tensor],
     k_layers: Optional[torch.Tensor],
+    v_layers: Optional[torch.Tensor],
     default: torch.Tensor,
     *,
     tap: str,
     layers: List[int],
     num_frames: int,
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-    tensor = k_layers if str(tap) == "global_k_raw_patchvec_layers" else q_layers
+    if str(tap) == "global_v_raw_patchvec_layers":
+        tensor = v_layers
+    elif str(tap) == "global_q_raw_patchvec_layers":
+        tensor = q_layers
+    else:
+        tensor = k_layers
     debug: Dict[str, Any] = {
         "v68_read_gram_available": False,
         "v68_read_gram_tap": str(tap),
@@ -1172,6 +1650,7 @@ def _v68_read_cue_patch(
     cfg: Dict[str, Any],
     q_layers: Optional[torch.Tensor],
     k_layers: Optional[torch.Tensor],
+    v_layers: Optional[torch.Tensor],
     default: torch.Tensor,
     num_frames: int,
     chunk_idx: int,
@@ -1183,6 +1662,7 @@ def _v68_read_cue_patch(
     motion, gram_debug = _v68_grammotion_patch(
         q_layers,
         k_layers,
+        v_layers,
         default,
         tap=tap,
         layers=layers,
@@ -1224,9 +1704,16 @@ def _v68_read_cue_patch(
     if not bool(gram_debug.get("v68_read_gram_available", False)) and fusion not in {"semantic_only"} and control != "semantic_only":
         debug["v68_read_reason"] = "grammotion_unavailable"
         return torch.zeros_like(default), debug
-    if control == "same_cue_distribution_random" and int(out.numel()) > 1:
-        noise = _deterministic_patch_noise(int(out.numel()), seed=6817000 + max(int(chunk_idx), 0) * 101.0)
-        out = out[torch.argsort(noise, stable=True)]
+    out, control_debug = _apply_v68_read_output_control(
+        out,
+        control=control,
+        token_type=token_type,
+        prior_output=prior_output,
+        motion=motion,
+        num_frames=num_frames,
+        chunk_idx=chunk_idx,
+    )
+    debug.update(control_debug)
 
     out = torch.nan_to_num(out.detach().cpu().float().reshape(-1), nan=0.0, posinf=1.0, neginf=0.0)
     out = _flatten_or_default(out, default).clamp(0.0, 1.0)
@@ -1244,6 +1731,129 @@ def _v68_read_cue_patch(
         "v68_read_corr_output_sem_support": _pearson_corr(out, support),
         "v68_read_corr_output_sem_risk": _pearson_corr(out, risk),
         "v68_read_corr_output_sem_lowobs": _pearson_corr(out, lowobs),
+    })
+    return out, debug
+
+
+def _v78_l07_l13_read_cue_patch(
+    *,
+    token_type: torch.Tensor,
+    prior_output: Optional[PriorOutput],
+    cfg: Dict[str, Any],
+    q_layers: Optional[torch.Tensor],
+    k_layers: Optional[torch.Tensor],
+    v_layers: Optional[torch.Tensor],
+    default: torch.Tensor,
+    num_frames: int,
+    chunk_idx: int,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    mode = str(cfg.get("mode", "l07_mask_l13_neg"))
+    control = str(cfg.get("control", "none"))
+    l07_layer = int(cfg.get("l07_layer", 7))
+    l13_layer = int(cfg.get("l13_layer", 13))
+    debug: Dict[str, Any] = {
+        "v78_l07_l13_available": False,
+        "v78_l07_l13_body": str(cfg.get("body", "")),
+        "v78_l07_l13_mode": mode,
+        "v78_l07_l13_control": control,
+        "v78_l07_l13_l07_layer": int(l07_layer),
+        "v78_l07_l13_l13_layer": int(l13_layer),
+        "v78_l07_l13_l07_tap": "global_k_raw_patchvec_layers",
+        "v78_l07_l13_l13_tap": "global_v_raw_patchvec_layers",
+    }
+    l07_motion, l07_debug = _v68_grammotion_patch(
+        q_layers,
+        k_layers,
+        v_layers,
+        default,
+        tap="global_k_raw_patchvec_layers",
+        layers=[l07_layer],
+        num_frames=num_frames,
+    )
+    l13_motion, l13_debug = _v68_grammotion_patch(
+        q_layers,
+        k_layers,
+        v_layers,
+        default,
+        tap="global_v_raw_patchvec_layers",
+        layers=[l13_layer],
+        num_frames=num_frames,
+    )
+    debug.update({f"v78_l07_{k}": v for k, v in l07_debug.items()})
+    debug.update({f"v78_l13_{k}": v for k, v in l13_debug.items()})
+    support, risk, lowobs, sem_debug = _v68_patch_semantic_support_risk(
+        token_type=token_type,
+        prior_output=prior_output,
+        control=control,
+        chunk_idx=chunk_idx,
+    )
+    debug.update({f"v78_l07_l13_{k}": v for k, v in sem_debug.items()})
+    if not bool(l07_debug.get("v68_read_gram_available", False)):
+        debug["v78_l07_l13_reason"] = "l07_layout_motion_unavailable"
+        return torch.zeros_like(default), debug
+    if not bool(l13_debug.get("v68_read_gram_available", False)):
+        debug["v78_l07_l13_reason"] = "l13_value_motion_unavailable"
+        return torch.zeros_like(default), debug
+    if not bool(sem_debug.get("v68_read_semantic_available", False)):
+        debug["v78_l07_l13_reason"] = "semantic_required_but_unavailable"
+        return torch.zeros_like(default), debug
+
+    l07_motion = _flatten_or_default(l07_motion, default).clamp(0.0, 1.0)
+    l13_motion = _flatten_or_default(l13_motion, default).clamp(0.0, 1.0)
+    support = _flatten_or_default(support, default).clamp(0.0, 1.0)
+    risk = _flatten_or_default(risk, default).clamp(0.0, 1.0)
+    lowobs = _flatten_or_default(lowobs, default).clamp(0.0, 1.0)
+
+    l13_neg = _robust_quantile01((l13_motion * risk).clamp(0.0, 1.0), num_frames=max(int(num_frames), 1))
+    l07_layout = _robust_quantile01(
+        (l07_motion * (0.30 + 0.50 * support + 0.20 * (1.0 - lowobs))).clamp(0.0, 1.0),
+        num_frames=max(int(num_frames), 1),
+    )
+    l07_nonlayout = (1.0 - l07_layout).clamp(0.0, 1.0)
+    if mode == "l13_only":
+        out = l13_neg
+    elif mode == "l07_action_only":
+        out = _robust_quantile01((l07_motion * risk).clamp(0.0, 1.0), num_frames=max(int(num_frames), 1))
+    elif mode == "l07_mask_l13_stable":
+        out = (l13_neg * l07_nonlayout).clamp(0.0, 1.0)
+    elif mode == "l07_mask_l13_neg_plus_stable":
+        suppress_stable = (1.0 - 0.50 * support * l07_layout).clamp(0.0, 1.0)
+        out = (l13_neg * (0.50 + 0.50 * l07_layout) * suppress_stable).clamp(0.0, 1.0)
+    elif mode == "l07_mask_l13_contrast":
+        contrast = (l13_neg - l07_layout).abs().clamp(0.0, 1.0)
+        out = _robust_quantile01((l13_neg * contrast).clamp(0.0, 1.0), num_frames=max(int(num_frames), 1))
+    else:
+        out = (l13_neg * l07_layout).clamp(0.0, 1.0)
+    out_before_control = out.clone()
+    out, control_debug = _apply_v68_read_output_control(
+        out,
+        control=control,
+        token_type=token_type,
+        prior_output=prior_output,
+        motion=l13_motion,
+        num_frames=num_frames,
+        chunk_idx=chunk_idx,
+    )
+    debug.update({f"v78_l07_l13_{k}": v for k, v in control_debug.items()})
+    out = torch.nan_to_num(out.detach().cpu().float().reshape(-1), nan=0.0, posinf=1.0, neginf=0.0)
+    out = _flatten_or_default(out, default).clamp(0.0, 1.0)
+    debug.update({
+        "v78_l07_l13_available": True,
+        "v78_l07_l13_reason": "ok",
+        "v78_l07_l13_l07_layout_mean": float(l07_layout.mean().item()) if l07_layout.numel() else 0.0,
+        "v78_l07_l13_l07_layout_q90": float(torch.quantile(l07_layout, 0.90).item()) if l07_layout.numel() else 0.0,
+        "v78_l07_l13_l07_layout_gt050_mass": float((l07_layout > 0.50).float().mean().item()) if l07_layout.numel() else 0.0,
+        "v78_l07_l13_l13_neg_mean": float(l13_neg.mean().item()) if l13_neg.numel() else 0.0,
+        "v78_l07_l13_l13_neg_q90": float(torch.quantile(l13_neg, 0.90).item()) if l13_neg.numel() else 0.0,
+        "v78_l07_l13_output_mean_before_control": float(out_before_control.mean().item()) if out_before_control.numel() else 0.0,
+        "v78_l07_l13_output_q90_before_control": float(torch.quantile(out_before_control, 0.90).item()) if out_before_control.numel() else 0.0,
+        "v78_l07_l13_output_gt050_mass_before_control": float((out_before_control > 0.50).float().mean().item()) if out_before_control.numel() else 0.0,
+        "v78_l07_l13_output_mean": float(out.mean().item()) if out.numel() else 0.0,
+        "v78_l07_l13_output_q90": float(torch.quantile(out, 0.90).item()) if out.numel() else 0.0,
+        "v78_l07_l13_output_gt050_mass": float((out > 0.50).float().mean().item()) if out.numel() else 0.0,
+        "v78_l07_l13_corr_output_l07_layout": _pearson_corr(out, l07_layout),
+        "v78_l07_l13_corr_output_l13_neg": _pearson_corr(out, l13_neg),
+        "v78_l07_l13_corr_l07_l13": _pearson_corr(l07_layout, l13_neg),
     })
     return out, debug
 
@@ -2418,6 +3028,9 @@ class HybridMemoryController:
         swa_overlap_bias_mode: str = "pair",
         swa_overlap_bias_layer_mode: str = "last",
         swa_overlap_bias_single_layer: int = -1,
+        swa_overlap_bias_head_indices: str = "",
+        swa_overlap_bias_record_attention_mass: bool = False,
+        swa_overlap_bias_attention_mass_max_queries: int = 64,
         enable_swa_overlap_source_gate: bool = False,
         swa_overlap_source_gate_rho: float = 0.0,
         swa_overlap_source_gate_min: float = 0.85,
@@ -2438,6 +3051,7 @@ class HybridMemoryController:
         context_source_skip_scope: str = "frame",
         context_source_skip_mode: str = "hard",
         context_source_skip_mask: str = "dg_q90",
+        context_source_skip_frame_region: str = "all",
         context_source_skip_layer_mode: str = "early",
         context_source_skip_single_layer: int = -1,
         context_source_skip_soft_rho: float = 0.5,
@@ -2467,11 +3081,25 @@ class HybridMemoryController:
         semantic_anchor_min_score: float = 0.02,
         semantic_anchor_grid_rows: int = 4,
         semantic_anchor_grid_cols: int = 4,
+        semantic_anchor_missing_trust_policy: str = "zero",
+        semantic_anchor_value_fallback: str = "off",
         enable_semantic_anchor_ttt_floor: bool = False,
         rho_ttt_apply: float = 0.0,
         read_layer_mode: str = "all",
         read_single_layer: int = -1,
         read_cue_source: str = "dyn",
+        v70_radio_sidecar_dir: str = "",
+        enable_v70_radio_ttt_write_prior: bool = False,
+        v70_radio_ttt_mode: str = "static_object_write_floor",
+        v70_radio_ttt_control: str = "none",
+        v70_radio_ttt_static_boost: float = 0.35,
+        v70_radio_ttt_suppress: float = 0.50,
+        v70_radio_ttt_min_confidence: float = 0.45,
+        v70_radio_ttt_min_stability: float = 0.35,
+        v70_radio_ttt_min_interior: float = 0.25,
+        v70_radio_ttt_max_activity_risk: float = 0.85,
+        v70_radio_ttt_boundary_threshold: float = 0.85,
+        v70_radio_ttt_renorm_mean: bool = True,
         read_topk_frac: float = 0.0,
         frame_bias_mode: str = "pair",
         chunk_bias_mode: str = "key",
@@ -2550,6 +3178,9 @@ class HybridMemoryController:
         self.swa_overlap_bias_mode = str(swa_overlap_bias_mode)
         self.swa_overlap_bias_layer_mode = str(swa_overlap_bias_layer_mode)
         self.swa_overlap_bias_single_layer = int(swa_overlap_bias_single_layer)
+        self.swa_overlap_bias_head_indices = str(swa_overlap_bias_head_indices or "")
+        self.swa_overlap_bias_record_attention_mass = bool(swa_overlap_bias_record_attention_mass)
+        self.swa_overlap_bias_attention_mass_max_queries = int(swa_overlap_bias_attention_mass_max_queries)
         self.enable_swa_overlap_source_gate = bool(enable_swa_overlap_source_gate)
         self.swa_overlap_source_gate_rho = float(swa_overlap_source_gate_rho)
         self.swa_overlap_source_gate_min = float(swa_overlap_source_gate_min)
@@ -2570,6 +3201,7 @@ class HybridMemoryController:
         self.context_source_skip_scope = str(context_source_skip_scope)
         self.context_source_skip_mode = str(context_source_skip_mode)
         self.context_source_skip_mask = str(context_source_skip_mask)
+        self.context_source_skip_frame_region = str(context_source_skip_frame_region)
         self.context_source_skip_layer_mode = str(context_source_skip_layer_mode)
         self.context_source_skip_single_layer = int(context_source_skip_single_layer)
         self.context_source_skip_soft_rho = float(context_source_skip_soft_rho)
@@ -2603,6 +3235,8 @@ class HybridMemoryController:
         self.semantic_anchor_min_score = float(semantic_anchor_min_score)
         self.semantic_anchor_grid_rows = max(int(semantic_anchor_grid_rows), 1)
         self.semantic_anchor_grid_cols = max(int(semantic_anchor_grid_cols), 1)
+        self.semantic_anchor_missing_trust_policy = str(semantic_anchor_missing_trust_policy or "zero").strip().lower()
+        self.semantic_anchor_value_fallback = str(semantic_anchor_value_fallback or "off").strip().lower()
         self.enable_semantic_anchor_ttt_floor = bool(enable_semantic_anchor_ttt_floor)
         self.semantic_condition_conflict_level = "unavailable"
         self.semantic_condition_conflict_source = "none"
@@ -2620,6 +3254,18 @@ class HybridMemoryController:
         self.read_layer_mode = str(read_layer_mode)
         self.read_single_layer = int(read_single_layer)
         self.read_cue_source = str(read_cue_source)
+        self.v70_radio_sidecar_dir = str(v70_radio_sidecar_dir or "")
+        self.enable_v70_radio_ttt_write_prior = bool(enable_v70_radio_ttt_write_prior)
+        self.v70_radio_ttt_mode = str(v70_radio_ttt_mode or "static_object_write_floor")
+        self.v70_radio_ttt_control = str(v70_radio_ttt_control or "none")
+        self.v70_radio_ttt_static_boost = float(v70_radio_ttt_static_boost)
+        self.v70_radio_ttt_suppress = float(v70_radio_ttt_suppress)
+        self.v70_radio_ttt_min_confidence = float(v70_radio_ttt_min_confidence)
+        self.v70_radio_ttt_min_stability = float(v70_radio_ttt_min_stability)
+        self.v70_radio_ttt_min_interior = float(v70_radio_ttt_min_interior)
+        self.v70_radio_ttt_max_activity_risk = float(v70_radio_ttt_max_activity_risk)
+        self.v70_radio_ttt_boundary_threshold = float(v70_radio_ttt_boundary_threshold)
+        self.v70_radio_ttt_renorm_mean = bool(v70_radio_ttt_renorm_mean)
         self.read_topk_frac = float(read_topk_frac)
         self.frame_bias_mode = str(frame_bias_mode)
         self.chunk_bias_mode = str(chunk_bias_mode)
@@ -2925,6 +3571,8 @@ class HybridMemoryController:
         G_sem_tok: Optional[torch.Tensor],
         Q_sem_tok: Optional[torch.Tensor],
         L_sem_tok: Optional[torch.Tensor],
+        S_tok: Optional[torch.Tensor],
+        V_sem_tok: Optional[torch.Tensor],
         conf_patch: Optional[torch.Tensor],
         key_avg_patch: Optional[torch.Tensor],
         num_frames: int,
@@ -2964,8 +3612,39 @@ class HybridMemoryController:
             q = Q_sem_tok.detach().cpu().float().reshape(-1)
             if int(q.numel()) == L_tok:
                 trust_patch = q[patch_mask].clamp(0.0, 1.0)
-        sem_score, sem_debug = _stable_semantic_score(label_patch, group_patch, trust_patch, n_patch)
+        sem_score, sem_debug = _stable_semantic_score(
+            label_patch,
+            group_patch,
+            trust_patch,
+            n_patch,
+            missing_trust_policy=self.semantic_anchor_missing_trust_policy,
+        )
         debug.update(sem_debug)
+        value_fallback_used = False
+        value_patch = None
+        if V_sem_tok is not None:
+            v = V_sem_tok.detach().cpu().float().reshape(-1)
+            if int(v.numel()) == L_tok:
+                value_patch = v[patch_mask].clamp(0.0, 1.0)
+        if value_patch is None and S_tok is not None:
+            s = S_tok.detach().cpu().float().reshape(-1)
+            if int(s.numel()) == L_tok:
+                value_patch = s[patch_mask].clamp(0.0, 1.0)
+        if (
+            str(self.semantic_anchor_value_fallback).lower() in {"semantic_value", "v_sem", "value"}
+            and value_patch is not None
+            and int(value_patch.numel()) == n_patch
+            and (not bool((sem_score > 0.0).any()))
+        ):
+            sem_score = value_patch.clamp(0.0, 1.0)
+            value_fallback_used = True
+        debug.update({
+            "semantic_anchor_value_fallback": self.semantic_anchor_value_fallback,
+            "semantic_anchor_value_fallback_used": bool(value_fallback_used),
+            "semantic_anchor_value_fallback_available": value_patch is not None,
+            "semantic_anchor_sem_score_max": float(sem_score.max().item()) if sem_score.numel() else 0.0,
+            "semantic_anchor_sem_score_mean_all": float(sem_score.mean().item()) if sem_score.numel() else 0.0,
+        })
 
         stage_missing = P_ttt_write is None or int(P_ttt_write.numel()) != L_tok
         if stage_missing:
@@ -2989,6 +3668,14 @@ class HybridMemoryController:
 
         geo_score = (torch.sqrt((1.0 - D_patch).clamp(0.0, 1.0)) * stage_score * conf_score).clamp(0.0, 1.0)
         raw_score = (sem_score * geo_score * source_score).clamp(0.0, 1.0)
+        debug.update({
+            "semantic_anchor_raw_score_max": float(raw_score.max().item()) if raw_score.numel() else 0.0,
+            "semantic_anchor_raw_score_mean_all": float(raw_score.mean().item()) if raw_score.numel() else 0.0,
+            "semantic_anchor_geo_score_max": float(geo_score.max().item()) if geo_score.numel() else 0.0,
+            "semantic_anchor_geo_score_mean_all": float(geo_score.mean().item()) if geo_score.numel() else 0.0,
+            "semantic_anchor_source_score_max": float(source_score.max().item()) if source_score.numel() else 0.0,
+            "semantic_anchor_source_score_mean_all": float(source_score.mean().item()) if source_score.numel() else 0.0,
+        })
         base_mask, select_debug = _select_spatially_diverse_anchors(
             raw_score,
             num_frames=num_frames,
@@ -3066,6 +3753,9 @@ class HybridMemoryController:
             "semantic_anchor_geo_score_mean": float(geo_score[selected].mean().item()) if anchor_count > 0 else 0.0,
             "semantic_anchor_sem_score_mean": float(sem_score[selected].mean().item()) if anchor_count > 0 else 0.0,
             "semantic_anchor_source_score_mean": float(source_score[selected].mean().item()) if anchor_count > 0 else 0.0,
+            "semantic_anchor_missing_trust_policy": self.semantic_anchor_missing_trust_policy,
+            "semantic_anchor_value_fallback": self.semantic_anchor_value_fallback,
+            "semantic_anchor_value_fallback_used": bool(value_fallback_used),
         })
         return A_tok.clamp(0.0, 1.0), M_tok.clamp(0.0, 1.0), debug
 
@@ -3124,6 +3814,172 @@ class HybridMemoryController:
             "non_anchor_write_mass_delta": float((P_new[non_anchor] - P[non_anchor]).mean().item()) if bool(non_anchor.any()) else None,
         })
         return P_new.to(dtype=P_ttt_write.dtype), debug
+
+    def _apply_v70_radio_ttt_write_prior(
+        self,
+        *,
+        token_type: torch.Tensor,
+        P_ttt_write: Optional[torch.Tensor],
+        num_frames: int,
+        patch_grid: Tuple[int, int],
+        chunk_idx: int,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
+        debug: Dict[str, Any] = {
+            "v70_radio_ttt_write_prior_enabled": bool(self.enable_v70_radio_ttt_write_prior),
+            "v70_radio_ttt_write_prior_applied": False,
+            "v70_radio_ttt_mode": str(self.v70_radio_ttt_mode),
+            "v70_radio_ttt_control": str(self.v70_radio_ttt_control),
+            "v70_radio_chunk_idx": int(chunk_idx),
+        }
+        if not self.enable_v70_radio_ttt_write_prior:
+            return P_ttt_write, debug
+        if P_ttt_write is None:
+            debug["v70_radio_ttt_reason"] = "missing_write_prior"
+            return P_ttt_write, debug
+        sidecar_path = _v70_radio_sidecar_path(self.v70_radio_sidecar_dir, int(chunk_idx))
+        if sidecar_path is None:
+            debug["v70_radio_ttt_reason"] = "missing_sidecar"
+            debug["v70_radio_sidecar_dir"] = str(self.v70_radio_sidecar_dir or "")
+            return P_ttt_write, debug
+        try:
+            try:
+                payload = torch.load(sidecar_path, map_location="cpu", weights_only=False)
+            except TypeError:
+                payload = torch.load(sidecar_path, map_location="cpu")
+        except Exception as exc:  # noqa: BLE001
+            debug["v70_radio_ttt_reason"] = f"sidecar_load_error:{type(exc).__name__}:{exc}"
+            debug["v70_radio_sidecar_path"] = str(sidecar_path)
+            return P_ttt_write, debug
+        required = (
+            "radio_confidence",
+            "temporal_stability",
+            "object_interior_score",
+            "object_boundary_score",
+            "radio_dynamic_score",
+            "radio_sky_context_score",
+            "radio_lowtrust_score",
+        )
+        missing = [key for key in required if key not in payload]
+        if missing:
+            debug["v70_radio_ttt_reason"] = f"missing_fields:{','.join(missing)}"
+            debug["v70_radio_sidecar_path"] = str(sidecar_path)
+            return P_ttt_write, debug
+
+        token_type_cpu = token_type.detach().cpu().long().reshape(-1)
+        P = P_ttt_write.detach().cpu().float().reshape(-1).clone()
+        if int(P.numel()) != int(token_type_cpu.numel()):
+            debug["v70_radio_ttt_reason"] = "shape_mismatch"
+            debug["v70_radio_ttt_prior_tokens"] = int(P.numel())
+            debug["v70_radio_ttt_token_type_tokens"] = int(token_type_cpu.numel())
+            return P_ttt_write, debug
+        patch_mask = token_type_cpu == TOKEN_TYPE_PATCH
+        n_patch = int(patch_mask.sum().item())
+        if n_patch <= 0:
+            debug["v70_radio_ttt_reason"] = "empty_patch_tokens"
+            return P_ttt_write, debug
+
+        conf = _v70_radio_resize_map(payload["radio_confidence"], num_frames=num_frames, patch_grid=patch_grid)
+        stability = _v70_radio_resize_map(payload["temporal_stability"], num_frames=num_frames, patch_grid=patch_grid)
+        interior = _v70_radio_resize_map(payload["object_interior_score"], num_frames=num_frames, patch_grid=patch_grid)
+        boundary = _v70_radio_resize_map(payload["object_boundary_score"], num_frames=num_frames, patch_grid=patch_grid)
+        dynamic = _v70_radio_resize_map(payload["radio_dynamic_score"], num_frames=num_frames, patch_grid=patch_grid)
+        sky = _v70_radio_resize_map(payload["radio_sky_context_score"], num_frames=num_frames, patch_grid=patch_grid)
+        lowtrust = _v70_radio_resize_map(payload["radio_lowtrust_score"], num_frames=num_frames, patch_grid=patch_grid)
+        maps = [conf, stability, interior, boundary, dynamic, sky, lowtrust]
+        if any(int(x.numel()) != n_patch for x in maps):
+            debug["v70_radio_ttt_reason"] = "radio_patch_count_mismatch"
+            debug["v70_radio_ttt_patch_tokens"] = int(n_patch)
+            debug["v70_radio_ttt_radio_tokens"] = [int(x.numel()) for x in maps]
+            return P_ttt_write, debug
+
+        activity = torch.maximum(dynamic, torch.maximum(sky, lowtrust)).clamp(0.0, 1.0)
+        static = (
+            (conf >= float(self.v70_radio_ttt_min_confidence))
+            & (stability >= float(self.v70_radio_ttt_min_stability))
+            & (interior >= float(self.v70_radio_ttt_min_interior))
+            & (activity <= float(self.v70_radio_ttt_max_activity_risk))
+        ).float()
+        dynamic_lowstable = (
+            (activity > float(self.v70_radio_ttt_max_activity_risk))
+            | (stability < float(self.v70_radio_ttt_min_stability))
+            | (conf < float(self.v70_radio_ttt_min_confidence))
+        ).float()
+        cross_object = (
+            (boundary >= float(self.v70_radio_ttt_boundary_threshold))
+            & (interior < float(self.v70_radio_ttt_min_interior))
+        ).float()
+        control = str(self.v70_radio_ttt_control).strip().lower()
+        if control == "spatial_shuffle":
+            seed = 7017000 + max(int(chunk_idx), 0) * 101 + int(n_patch)
+            perm = torch.argsort(_deterministic_patch_noise(n_patch, seed=seed), stable=True)
+            static = static[perm]
+            dynamic_lowstable = dynamic_lowstable[perm]
+            cross_object = cross_object[perm]
+        elif control == "geometry_only":
+            static = torch.zeros_like(static)
+            dynamic_lowstable = torch.zeros_like(dynamic_lowstable)
+            cross_object = torch.zeros_like(cross_object)
+
+        mode = str(self.v70_radio_ttt_mode).strip().lower()
+        scale = torch.ones(n_patch, dtype=torch.float32)
+        group = torch.zeros(n_patch, dtype=torch.float32)
+        if mode == "static_object_write_floor":
+            scale = scale + float(self.v70_radio_ttt_static_boost) * static
+            group = static
+        elif mode == "dynamic_lowstable_no_persistent":
+            scale = torch.clamp(scale - float(self.v70_radio_ttt_suppress) * dynamic_lowstable, min=0.0)
+            group = dynamic_lowstable
+        elif mode == "cross_object_conflict_veto":
+            scale = torch.clamp(scale - float(self.v70_radio_ttt_suppress) * cross_object, min=0.0)
+            group = cross_object
+        elif mode == "combined_static_dynamic_cross":
+            scale = scale + float(self.v70_radio_ttt_static_boost) * static
+            scale = scale * torch.clamp(torch.ones_like(scale) - float(self.v70_radio_ttt_suppress) * dynamic_lowstable, min=0.0)
+            scale = scale * torch.clamp(torch.ones_like(scale) - float(self.v70_radio_ttt_suppress) * cross_object, min=0.0)
+            group = torch.maximum(dynamic_lowstable, torch.maximum(cross_object, static)).clamp(0.0, 1.0)
+        else:
+            debug["v70_radio_ttt_reason"] = f"unknown_mode:{mode}"
+            return P_ttt_write, debug
+
+        P_patch = P[patch_mask].clone()
+        P_new_patch = (P_patch * scale).clamp(0.0, 2.0)
+        if self.v70_radio_ttt_renorm_mean and P_new_patch.numel():
+            old_mean = float(P_patch.mean().item())
+            new_mean = float(P_new_patch.mean().item())
+            if math.isfinite(old_mean) and math.isfinite(new_mean) and new_mean > 1e-12:
+                P_new_patch = (P_new_patch * (old_mean / new_mean)).clamp(0.0, 2.0)
+        P_new = P.clone()
+        P_new[patch_mask] = P_new_patch
+        group_mass = group > 0.5
+        if bool(group_mass.any()):
+            before = float(P_patch[group_mass].mean().item())
+            after = float(P_new_patch[group_mass].mean().item())
+            rel = float((after - before) / max(abs(before), 1e-12))
+        else:
+            before = None
+            after = None
+            rel = None
+        changed = (P_new_patch - P_patch).abs() > 1e-8
+        debug.update({
+            "v70_radio_ttt_write_prior_applied": bool(changed.any()),
+            "v70_radio_ttt_reason": "ok",
+            "v70_radio_sidecar_path": str(sidecar_path),
+            "v70_radio_sidecar_patch_grid": list(payload.get("patch_grid", [])) if isinstance(payload.get("patch_grid", None), (list, tuple)) else None,
+            "v70_radio_target_patch_grid": [int(patch_grid[0]), int(patch_grid[1])],
+            "v70_radio_ttt_patch_tokens": int(n_patch),
+            "v70_radio_ttt_changed_patch_frac": float(changed.float().mean().item()) if changed.numel() else 0.0,
+            "v70_radio_ttt_static_mask_mean": float(static.mean().item()) if static.numel() else 0.0,
+            "v70_radio_ttt_dynamic_lowstable_mask_mean": float(dynamic_lowstable.mean().item()) if dynamic_lowstable.numel() else 0.0,
+            "v70_radio_ttt_cross_object_mask_mean": float(cross_object.mean().item()) if cross_object.numel() else 0.0,
+            "v70_radio_ttt_activity_risk_mean": float(activity.mean().item()) if activity.numel() else 0.0,
+            "v70_radio_ttt_group_prior_before": before,
+            "v70_radio_ttt_group_prior_after": after,
+            "v70_radio_ttt_group_prior_relative_change": rel,
+            "v70_radio_ttt_prior_mean_before": float(P_patch.mean().item()) if P_patch.numel() else 1.0,
+            "v70_radio_ttt_prior_mean_after": float(P_new_patch.mean().item()) if P_new_patch.numel() else 1.0,
+            "v70_radio_ttt_prior_abs_change_ratio": float((P_new_patch - P_patch).abs().mean().item() / max(float(P_patch.mean().item()), 1e-12)) if P_patch.numel() else 0.0,
+        })
+        return P_new.to(device=P_ttt_write.device, dtype=P_ttt_write.dtype), debug
 
     def _phase_e_write_prior(
         self,
@@ -3798,6 +4654,30 @@ class HybridMemoryController:
                 R_ttt[patch_mask & high_trust & high_risk] = int(SEMANTIC_ROLE_NEGATIVE_SHORT)
                 R_ttt[structure & high_trust & (~high_risk)] = int(SEMANTIC_ROLE_POSITIVE_LONG)
 
+        if policy in {"v76_ttt_sky_neutral_only", "v76_ttt_sky_only"}:
+            R_ttt = torch.full_like(R_ttt, int(SEMANTIC_ROLE_FALLBACK), dtype=torch.long)
+            R_ttt[(stable_structure | risky_structure) & high_trust] = int(SEMANTIC_ROLE_POSITIVE_LONG)
+            R_ttt[sky & high_trust] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+            R_ttt[(vegetation | movable) & high_d & high_trust] = int(SEMANTIC_ROLE_NEGATIVE_SHORT)
+        elif policy in {
+            "v76_ttt_vegetation_neutral_only",
+            "v76_ttt_tree_neutral_only",
+            "v76_ttt_vegetation_only",
+            "v76_ttt_tree_only",
+        }:
+            R_ttt = torch.full_like(R_ttt, int(SEMANTIC_ROLE_FALLBACK), dtype=torch.long)
+            R_ttt[(stable_structure | risky_structure) & high_trust] = int(SEMANTIC_ROLE_POSITIVE_LONG)
+            R_ttt[vegetation & high_trust] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+            R_ttt[movable & high_d & high_trust] = int(SEMANTIC_ROLE_NEGATIVE_SHORT)
+        elif policy in {
+            "v76_ttt_structure_neutral_only",
+            "v76_ttt_layout_neutral_only",
+            "v76_ttt_structure_only",
+        }:
+            R_ttt = torch.full_like(R_ttt, int(SEMANTIC_ROLE_FALLBACK), dtype=torch.long)
+            R_ttt[(stable_structure | risky_structure) & high_trust] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+            R_ttt[(vegetation | movable) & high_d & high_trust] = int(SEMANTIC_ROLE_NEGATIVE_SHORT)
+
         v57_group_level_source = torch.zeros_like(patch_mask, dtype=torch.bool)
         if policy in {
             "v57_forced_any_semantic_source_skip",
@@ -3968,7 +4848,12 @@ class HybridMemoryController:
         high_trust = Q >= float(self.semantic_role_low_trust)
 
         path_role_override_policy = policy in {"v29c_masklet_override", "v36_synthetic_override"}
-        fine_policy = policy.startswith("fine_") or policy.startswith("causal_") or path_role_override_policy
+        fine_policy = (
+            policy.startswith("fine_")
+            or policy.startswith("causal_")
+            or policy.startswith("v76_")
+            or path_role_override_policy
+        )
         fine_debug: Dict[str, Any] = {}
         if path_role_override_policy:
             def _valid_or_fallback(stream: Optional[torch.Tensor]) -> torch.Tensor:
@@ -4079,9 +4964,15 @@ class HybridMemoryController:
                 patch_mask=patch_mask,
             )
 
+        ttt_write_adjust_debug: Dict[str, Any] = {
+            "ttt_semantic_write_role_stats": {},
+            "ttt_semantic_write_role_max_abs_rel_change": 0.0,
+            "ttt_semantic_write_role_intended_change_ge20": False,
+        }
         P_out = P_ttt_write
         if (ttt_on or lifecycle_on) and P_ttt_write is not None:
-            P = P_ttt_write.detach().cpu().float().reshape(-1).clone()
+            P_before = P_ttt_write.detach().cpu().float().reshape(-1).clone()
+            P = P_before.clone()
             pos = R_ttt == int(SEMANTIC_ROLE_POSITIVE_LONG)
             neu = R_ttt == int(SEMANTIC_ROLE_NEUTRAL_KEEP)
             neg = R_ttt == int(SEMANTIC_ROLE_NEGATIVE_SHORT)
@@ -4089,6 +4980,37 @@ class HybridMemoryController:
             P[neu] = (P[neu] * float(self.semantic_role_neutral_scale)).clamp(0.0, 1.5)
             P[neg] = (P[neg] * float(self.semantic_role_negative_scale)).clamp(0.0, 1.5)
             P_out = P
+            role_specs = (
+                ("positive", pos, float(self.semantic_role_positive_scale)),
+                ("neutral", neu, float(self.semantic_role_neutral_scale)),
+                ("negative", neg, float(self.semantic_role_negative_scale)),
+            )
+            role_stats: Dict[str, Any] = {}
+            max_abs_rel = 0.0
+            for name, mask, scale_value in role_specs:
+                mask = mask & patch_mask
+                count = int(mask.sum().item())
+                before_mean = float(P_before[mask].mean().item()) if count > 0 else None
+                after_mean = float(P[mask].mean().item()) if count > 0 else None
+                rel_change = (
+                    float((after_mean - before_mean) / max(abs(before_mean), 1e-8))
+                    if before_mean is not None and after_mean is not None
+                    else None
+                )
+                if rel_change is not None:
+                    max_abs_rel = max(max_abs_rel, abs(float(rel_change)))
+                role_stats[name] = {
+                    "count": count,
+                    "scale": scale_value,
+                    "before_mean": before_mean,
+                    "after_mean": after_mean,
+                    "relative_change": rel_change,
+                }
+            ttt_write_adjust_debug = {
+                "ttt_semantic_write_role_stats": role_stats,
+                "ttt_semantic_write_role_max_abs_rel_change": float(max_abs_rel),
+                "ttt_semantic_write_role_intended_change_ge20": bool(max_abs_rel >= 0.20),
+            }
 
         D_swa_out = D_swa_write_tok
         swa_adjust_debug: Dict[str, Any] = {
@@ -4174,6 +5096,7 @@ class HybridMemoryController:
         debug.update(role_control_debug)
         debug.update(swa_role_control_debug)
         debug.update(swa_adjust_debug)
+        debug.update(ttt_write_adjust_debug)
         return R, R_frame, R_global, R_swa, R_ttt, P_out, D_swa_out, debug
 
     def _apply_swa_history_write_gate(
@@ -4861,6 +5784,8 @@ class HybridMemoryController:
                     G_sem_tok=G_sem_tok,
                     Q_sem_tok=Q_sem_tok,
                     L_sem_tok=L_sem_tok,
+                    S_tok=S_tok,
+                    V_sem_tok=V_sem_tok,
                     conf_patch=conf_patch,
                     key_avg_patch=key_avg_patch_anchor,
                     num_frames=num_frames,
@@ -4873,6 +5798,14 @@ class HybridMemoryController:
                 )
                 patch_debug.update(anchor_debug)
                 patch_debug.update(anchor_floor_debug)
+                P_ttt_write, v70_ttt_debug = self._apply_v70_radio_ttt_write_prior(
+                    token_type=token_type,
+                    P_ttt_write=P_ttt_write,
+                    num_frames=num_frames,
+                    patch_grid=(int(geo.patch_grid[0]), int(geo.patch_grid[1])),
+                    chunk_idx=int(getattr(self, "current_chunk_idx", -1)),
+                )
+                patch_debug.update(v70_ttt_debug)
 
                 return HybridMemoryControlPrior(
                     D_tok=D_tok,
@@ -5217,13 +6150,49 @@ class HybridMemoryController:
                     cfg=v68_cfg,
                     q_layers=geo.global_q_raw_patchvec_layers,
                     k_layers=geo.global_k_raw_patchvec_layers,
+                    v_layers=getattr(geo, "global_v_raw_patchvec_layers", None),
                     default=dyn_patch,
                     num_frames=num_frames,
                     chunk_idx=current_chunk_idx,
                 )
                 cue_extra_debug.update(v68_debug)
+            v78_l07_l13_cfg = _parse_v78_l07_l13_read_cue(self.read_cue_source)
+            v78_l07_l13_patch = None
+            if v78_l07_l13_cfg is not None:
+                current_chunk_idx = int(getattr(self, "current_chunk_idx", -1))
+                v78_l07_l13_patch, v78_debug = _v78_l07_l13_read_cue_patch(
+                    token_type=token_type,
+                    prior_output=prior_output,
+                    cfg=v78_l07_l13_cfg,
+                    q_layers=geo.global_q_raw_patchvec_layers,
+                    k_layers=geo.global_k_raw_patchvec_layers,
+                    v_layers=getattr(geo, "global_v_raw_patchvec_layers", None),
+                    default=dyn_patch,
+                    num_frames=num_frames,
+                    chunk_idx=current_chunk_idx,
+                )
+                cue_extra_debug.update(v78_debug)
+            v70_radio_cfg = _parse_v70_radio_read_cue(self.read_cue_source)
+            v70_radio_patch = None
+            if v70_radio_cfg is not None:
+                current_chunk_idx = int(getattr(self, "current_chunk_idx", -1))
+                v70_radio_patch, v70_radio_debug = _v70_radio_read_cue_patch(
+                    sidecar_dir=self.v70_radio_sidecar_dir,
+                    cfg=v70_radio_cfg,
+                    default=dyn_patch,
+                    num_frames=num_frames,
+                    patch_grid=(int(geo.patch_grid[0]), int(geo.patch_grid[1])),
+                    chunk_idx=current_chunk_idx,
+                )
+                cue_extra_debug.update(v70_radio_debug)
 
-            if v68_patch is not None:
+            if v78_l07_l13_patch is not None:
+                read_patch = v78_l07_l13_patch
+                cue_source_effective = self.read_cue_source
+            elif v70_radio_patch is not None:
+                read_patch = v70_radio_patch
+                cue_source_effective = self.read_cue_source
+            elif v68_patch is not None:
                 read_patch = v68_patch
                 cue_source_effective = self.read_cue_source
             elif acl2_patch is not None:
@@ -5905,6 +6874,8 @@ class HybridMemoryController:
             G_sem_tok=G_sem_tok,
             Q_sem_tok=Q_sem_tok,
             L_sem_tok=L_sem_tok,
+            S_tok=S_tok,
+            V_sem_tok=V_sem_tok,
             conf_patch=conf_patch if cue is not None and cue.E_cue_patch is not None else None,
             key_avg_patch=key_avg_patch if cue is not None and cue.E_cue_patch is not None else None,
             num_frames=num_frames,
@@ -5917,6 +6888,14 @@ class HybridMemoryController:
         )
         patch_debug.update(anchor_debug)
         patch_debug.update(anchor_floor_debug)
+        P_ttt_write, v70_ttt_debug = self._apply_v70_radio_ttt_write_prior(
+            token_type=token_type,
+            P_ttt_write=P_ttt_write,
+            num_frames=num_frames,
+            patch_grid=(int(geo.patch_grid[0]), int(geo.patch_grid[1])),
+            chunk_idx=int(getattr(self, "current_chunk_idx", -1)),
+        )
+        patch_debug.update(v70_ttt_debug)
 
         return HybridMemoryControlPrior(
             D_tok=D_tok,
@@ -5980,6 +6959,7 @@ class HybridMemoryController:
                 "safe_patch_token_count": int((P_safe > 0.5).sum().item()),
                 "patch_token_count": int(patch_mask.sum().item()),
                 "read_cue_source": self.read_cue_source,
+                "v70_radio_sidecar_dir": self.v70_radio_sidecar_dir,
                 "read_topk_frac": self.read_topk_frac,
                 "read_calib_mode": self.read_calib_mode,
                 "read_target_mass": self.read_target_mass,
@@ -6315,6 +7295,15 @@ class HybridMemoryController:
                 "swa_overlap_source_semantic_selected_ratio",
                 "swa_overlap_source_semantic_selected_index_mean",
                 "swa_overlap_source_semantic_selected_D_mean",
+                "swa_overlap_attention_mass_source_before",
+                "swa_overlap_attention_mass_source_after",
+                "swa_overlap_attention_mass_source_lift",
+                "swa_overlap_attention_mass_selected_before",
+                "swa_overlap_attention_mass_selected_after",
+                "swa_overlap_attention_mass_selected_lift",
+                "swa_overlap_attention_mass_selected_head_max_before",
+                "swa_overlap_attention_mass_selected_head_max_after",
+                "swa_overlap_attention_mass_selected_head_max_lift",
                 "source_control_score_mean",
                 "source_control_score_max",
                 "source_weight_mean",
@@ -6330,6 +7319,58 @@ class HybridMemoryController:
                 if vals:
                     extra_numeric_summary[f"mean_{extra_key}"] = float(torch.tensor(vals).mean().item())
                     extra_numeric_summary[f"max_{extra_key}"] = max(vals)
+            extra_array_summary: Dict[str, Any] = {}
+            for extra_key in (
+                "swa_overlap_attention_mass_source_before_by_head",
+                "swa_overlap_attention_mass_source_after_by_head",
+                "swa_overlap_attention_mass_source_lift_by_head",
+                "swa_overlap_attention_mass_selected_before_by_head",
+                "swa_overlap_attention_mass_selected_after_by_head",
+                "swa_overlap_attention_mass_selected_lift_by_head",
+            ):
+                arrays: List[List[float]] = []
+                for rec in records:
+                    if not isinstance(rec, dict):
+                        continue
+                    raw = rec.get(extra_key)
+                    if not isinstance(raw, (list, tuple)):
+                        continue
+                    vals: List[float] = []
+                    valid = True
+                    for item in raw:
+                        try:
+                            value = float(item)
+                        except (TypeError, ValueError):
+                            valid = False
+                            break
+                        if not math.isfinite(value):
+                            valid = False
+                            break
+                        vals.append(value)
+                    if valid and vals:
+                        arrays.append(vals)
+                if arrays:
+                    head_count = min(len(arr) for arr in arrays)
+                    if head_count > 0:
+                        tensor = torch.tensor([arr[:head_count] for arr in arrays], dtype=torch.float32)
+                        mean_by_head = tensor.mean(dim=0)
+                        max_by_head = tensor.max(dim=0).values
+                        extra_array_summary[extra_key] = [float(v) for v in mean_by_head.tolist()]
+                        extra_array_summary[f"max_{extra_key}"] = [float(v) for v in max_by_head.tolist()]
+            selected_lift_by_head = extra_array_summary.get("swa_overlap_attention_mass_selected_lift_by_head")
+            if isinstance(selected_lift_by_head, list) and selected_lift_by_head:
+                selected_top_head = int(max(range(len(selected_lift_by_head)), key=lambda idx: selected_lift_by_head[idx]))
+                extra_array_summary["swa_overlap_attention_mass_selected_top_head_by_lift"] = selected_top_head
+                extra_array_summary["swa_overlap_attention_mass_selected_top_head_lift"] = float(
+                    selected_lift_by_head[selected_top_head]
+                )
+            source_lift_by_head = extra_array_summary.get("swa_overlap_attention_mass_source_lift_by_head")
+            if isinstance(source_lift_by_head, list) and source_lift_by_head:
+                source_top_head = int(max(range(len(source_lift_by_head)), key=lambda idx: source_lift_by_head[idx]))
+                extra_array_summary["swa_overlap_attention_mass_source_top_head_by_lift"] = source_top_head
+                extra_array_summary["swa_overlap_attention_mass_source_top_head_lift"] = float(
+                    source_lift_by_head[source_top_head]
+                )
             extra_bool_summary: Dict[str, float] = {}
             for extra_key in (
                 "v40_r2_source_mass_proxy_gate_pass",
@@ -6426,6 +7467,7 @@ class HybridMemoryController:
                 "max_d_prev_tokens": max(d_prev_token_vals) if d_prev_token_vals else 0,
             }
             hook_effect_summary[path_name].update(extra_numeric_summary)
+            hook_effect_summary[path_name].update(extra_array_summary)
             hook_effect_summary[path_name].update(extra_bool_summary)
         implemented_paths: List[str] = []
         if mode == "identity_hooks":
@@ -6629,6 +7671,9 @@ class HybridMemoryController:
             "swa_overlap_bias_mode": self.swa_overlap_bias_mode,
             "swa_overlap_bias_layer_mode": self.swa_overlap_bias_layer_mode,
             "swa_overlap_bias_single_layer": self.swa_overlap_bias_single_layer,
+            "swa_overlap_bias_head_indices": "" if is_identity else self.swa_overlap_bias_head_indices,
+            "swa_overlap_bias_record_attention_mass": False if is_identity else self.swa_overlap_bias_record_attention_mass,
+            "swa_overlap_bias_attention_mass_max_queries": self.swa_overlap_bias_attention_mass_max_queries,
             "enable_swa_overlap_source_gate": False if is_identity else self.enable_swa_overlap_source_gate,
             "swa_overlap_source_gate_rho": 0.0 if is_identity else self.swa_overlap_source_gate_rho,
             "swa_overlap_source_gate_min": self.swa_overlap_source_gate_min,
@@ -6649,6 +7694,7 @@ class HybridMemoryController:
             "context_source_skip_scope": self.context_source_skip_scope,
             "context_source_skip_mode": self.context_source_skip_mode,
             "context_source_skip_mask": self.context_source_skip_mask,
+            "context_source_skip_frame_region": self.context_source_skip_frame_region,
             "context_source_skip_layer_mode": self.context_source_skip_layer_mode,
             "context_source_skip_single_layer": self.context_source_skip_single_layer,
             "context_source_skip_soft_rho": 0.0 if is_identity else self.context_source_skip_soft_rho,
@@ -6669,6 +7715,7 @@ class HybridMemoryController:
             "read_layer_mode": "all" if is_identity else self.read_layer_mode,
             "read_single_layer": -1 if is_identity else self.read_single_layer,
             "read_cue_source": self.read_cue_source,
+            "v70_radio_sidecar_dir": self.v70_radio_sidecar_dir,
             "read_topk_frac": self.read_topk_frac,
             "beta_policy": self.beta_policy,
             "beta_energy_target": self.beta_energy_target,

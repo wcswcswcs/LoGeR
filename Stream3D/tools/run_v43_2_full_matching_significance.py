@@ -20,8 +20,8 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def _variant(label: str, status: str, metrics: dict[str, Any], source: str) -> dict[str, Any]:
-    row = {"variant": label, "status": status, "source": source}
-    row.update(metrics)
+    row = dict(metrics)
+    row.update({"variant": label, "status": status, "source": source})
     return row
 
 

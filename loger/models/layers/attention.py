@@ -548,6 +548,156 @@ def _source_soft_sdpa(
         return scaled_dot_product_attention(q, k, v_eff, attn_mask=attn_mask)
 
 
+def _append_overlap_bias_mass_stats(
+    q: Tensor,
+    k: Tensor,
+    *,
+    source_start: int,
+    source_end: int,
+    bias_values: Tensor,
+    head_bias_scale: Tensor | None = None,
+    attention_mass_stats: list | None,
+    attention_mass_max_queries: int,
+    metric_type: str,
+) -> None:
+    """Record sampled attention mass on overlap-bias source tokens."""
+
+    if attention_mass_stats is None:
+        return
+    if not torch.is_tensor(bias_values) or bias_values.ndim != 3:
+        return
+    qn = min(int(bias_values.shape[1]), int(q.shape[2]))
+    sn = min(int(bias_values.shape[2]), max(0, int(source_end) - int(source_start)))
+    source_start = max(0, int(source_start))
+    source_end = min(int(source_end), int(k.shape[2]))
+    sn = min(sn, max(0, source_end - source_start))
+    if qn <= 0 or sn <= 0:
+        return
+
+    with torch.no_grad():
+        bias = bias_values[:, :qn, :sn].to(device=q.device, dtype=torch.float32)
+        head_dim = max(1, int(q.shape[-1]))
+        scale = 1.0 / math.sqrt(float(head_dim))
+        source_before_vals = []
+        source_after_vals = []
+        selected_before_vals = []
+        selected_after_vals = []
+        selected_head_max_before_vals = []
+        selected_head_max_after_vals = []
+        source_head_before_vals = []
+        source_head_after_vals = []
+        selected_head_before_vals = []
+        selected_head_after_vals = []
+        selected_tokens = []
+        query_samples = []
+        for b in range(int(q.shape[0])):
+            q_idx = _sample_query_indices(qn, int(attention_mass_max_queries), q.device)
+            if int(q_idx.numel()) <= 0:
+                continue
+            qb = q[b : b + 1, :, q_idx, :].float()
+            kb = k[b : b + 1].float()
+            logits = torch.matmul(qb, kb.transpose(-2, -1)) * scale
+            local_bias = torch.zeros_like(logits)
+            source_bias = bias[b : b + 1, q_idx, :].unsqueeze(1)
+            if torch.is_tensor(head_bias_scale):
+                source_bias = source_bias * head_bias_scale.to(device=q.device, dtype=torch.float32).view(1, -1, 1, 1)
+            local_bias[:, :, :, source_start:source_end] = source_bias
+            attn_before = torch.softmax(logits, dim=-1)
+            attn_after = torch.softmax(logits + local_bias, dim=-1)
+
+            source_before = attn_before[..., source_start:source_end].sum(dim=-1)
+            source_after = attn_after[..., source_start:source_end].sum(dim=-1)
+            selected_source = bias[b].abs().amax(dim=0) > 1e-12
+            if int(selected_source.sum().item()) > 0:
+                full_selected = torch.zeros(int(k.shape[2]), device=q.device, dtype=torch.bool)
+                full_selected[source_start:source_end] = selected_source[:sn]
+                selected_before = attn_before[..., full_selected].sum(dim=-1)
+                selected_after = attn_after[..., full_selected].sum(dim=-1)
+                selected_head_before = selected_before.mean(dim=2).reshape(-1)
+                selected_head_after = selected_after.mean(dim=2).reshape(-1)
+            else:
+                selected_before = torch.zeros_like(source_before)
+                selected_after = torch.zeros_like(source_after)
+                selected_head_before = torch.zeros(int(q.shape[1]), device=q.device, dtype=torch.float32)
+                selected_head_after = torch.zeros(int(q.shape[1]), device=q.device, dtype=torch.float32)
+
+            source_before_vals.append(float(source_before.mean().item()))
+            source_after_vals.append(float(source_after.mean().item()))
+            selected_before_vals.append(float(selected_before.mean().item()))
+            selected_after_vals.append(float(selected_after.mean().item()))
+            source_head_before_vals.append(source_before.mean(dim=2).reshape(-1).detach().cpu())
+            source_head_after_vals.append(source_after.mean(dim=2).reshape(-1).detach().cpu())
+            selected_head_before_vals.append(selected_head_before.detach().cpu())
+            selected_head_after_vals.append(selected_head_after.detach().cpu())
+            selected_head_max_before_vals.append(float(selected_head_before.max().item()))
+            selected_head_max_after_vals.append(float(selected_head_after.max().item()))
+            selected_tokens.append(int(selected_source.sum().item()))
+            query_samples.append(int(q_idx.numel()))
+
+        if selected_before_vals:
+            selected_before_mean = float(torch.tensor(selected_before_vals).mean().item())
+            selected_after_mean = float(torch.tensor(selected_after_vals).mean().item())
+            source_before_mean = float(torch.tensor(source_before_vals).mean().item())
+            source_after_mean = float(torch.tensor(source_after_vals).mean().item())
+            head_before_mean = float(torch.tensor(selected_head_max_before_vals).mean().item())
+            head_after_mean = float(torch.tensor(selected_head_max_after_vals).mean().item())
+            source_head_before = torch.stack(source_head_before_vals, dim=0).float().mean(dim=0)
+            source_head_after = torch.stack(source_head_after_vals, dim=0).float().mean(dim=0)
+            selected_head_before = torch.stack(selected_head_before_vals, dim=0).float().mean(dim=0)
+            selected_head_after = torch.stack(selected_head_after_vals, dim=0).float().mean(dim=0)
+            source_head_lift = source_head_after - source_head_before
+            selected_head_lift = selected_head_after - selected_head_before
+            selected_top_head = int(torch.argmax(selected_head_lift).item()) if selected_head_lift.numel() else -1
+            source_top_head = int(torch.argmax(source_head_lift).item()) if source_head_lift.numel() else -1
+            attention_mass_stats.append({
+                "attention_mass_metric": str(metric_type),
+                "attention_mass_removed_before": selected_before_mean,
+                "attention_mass_removed_after": selected_after_mean,
+                "attention_mass_actual_after": selected_after_mean,
+                "attention_mass_retained_before": source_before_mean,
+                "attention_mass_retained_after": source_after_mean,
+                "attention_mass_removed_tokens_mean": float(torch.tensor(selected_tokens, dtype=torch.float32).mean().item()),
+                "attention_mass_retained_tokens_mean": float(sn),
+                "attention_mass_query_sample_tokens_mean": float(torch.tensor(query_samples, dtype=torch.float32).mean().item()),
+                "attention_mass_sampled": bool(max(selected_tokens or [0]) > 0),
+                "swa_overlap_attention_mass_source_before": source_before_mean,
+                "swa_overlap_attention_mass_source_after": source_after_mean,
+                "swa_overlap_attention_mass_selected_before": selected_before_mean,
+                "swa_overlap_attention_mass_selected_after": selected_after_mean,
+                "swa_overlap_attention_mass_selected_lift": selected_after_mean - selected_before_mean,
+                "swa_overlap_attention_mass_source_lift": source_after_mean - source_before_mean,
+                "swa_overlap_attention_mass_selected_head_max_before": head_before_mean,
+                "swa_overlap_attention_mass_selected_head_max_after": head_after_mean,
+                "swa_overlap_attention_mass_selected_head_max_lift": head_after_mean - head_before_mean,
+                "swa_overlap_attention_mass_source_before_by_head": [
+                    float(v) for v in source_head_before.tolist()
+                ],
+                "swa_overlap_attention_mass_source_after_by_head": [
+                    float(v) for v in source_head_after.tolist()
+                ],
+                "swa_overlap_attention_mass_source_lift_by_head": [
+                    float(v) for v in source_head_lift.tolist()
+                ],
+                "swa_overlap_attention_mass_selected_before_by_head": [
+                    float(v) for v in selected_head_before.tolist()
+                ],
+                "swa_overlap_attention_mass_selected_after_by_head": [
+                    float(v) for v in selected_head_after.tolist()
+                ],
+                "swa_overlap_attention_mass_selected_lift_by_head": [
+                    float(v) for v in selected_head_lift.tolist()
+                ],
+                "swa_overlap_attention_mass_selected_top_head_by_lift": selected_top_head,
+                "swa_overlap_attention_mass_selected_top_head_lift": (
+                    float(selected_head_lift[selected_top_head].item()) if selected_top_head >= 0 else None
+                ),
+                "swa_overlap_attention_mass_source_top_head_by_lift": source_top_head,
+                "swa_overlap_attention_mass_source_top_head_lift": (
+                    float(source_head_lift[source_top_head].item()) if source_top_head >= 0 else None
+                ),
+            })
+
+
 def get_causal_block_mask(P, B, H, M, N, device="cuda", _compile=True):
     """
     Get causal block mask with efficient caching based on logical parameters.
@@ -1041,19 +1191,45 @@ class FlashAttentionRope(AttentionRope):
                 sn = source_end - source_start
                 bias_values = bias_values.to(device=q.device, dtype=q.dtype)
                 bias_values = bias_values[:, :qn, :sn]
+                head_bias_scale = None
+                head_indices = overlap_bias.get("head_indices")
+                if isinstance(head_indices, (list, tuple)) and len(head_indices) > 0:
+                    head_bias_scale = torch.zeros(int(q.shape[1]), device=q.device, dtype=q.dtype)
+                    for raw_head in head_indices:
+                        try:
+                            head_idx = int(raw_head)
+                        except (TypeError, ValueError):
+                            continue
+                        if 0 <= head_idx < int(q.shape[1]):
+                            head_bias_scale[head_idx] = 1.0
+                _append_overlap_bias_mass_stats(
+                    q,
+                    k_full,
+                    source_start=source_start,
+                    source_end=source_end,
+                    bias_values=bias_values,
+                    head_bias_scale=head_bias_scale,
+                    attention_mass_stats=overlap_bias.get("attention_mass_stats"),
+                    attention_mass_max_queries=int(overlap_bias.get("attention_mass_max_queries", 64) or 64),
+                    metric_type=str(overlap_bias.get("attention_mass_metric", "swa_overlap_bias")),
+                )
                 overlap_out = []
                 for q0 in range(0, qn, block_size):
                     q1 = min(q0 + block_size, qn)
                     q_chunk = q[:, :, q0:q1, :]
+                    local_bias_heads = int(q.shape[1]) if torch.is_tensor(head_bias_scale) else 1
                     local_bias = torch.zeros(
                         q.shape[0],
-                        1,
+                        local_bias_heads,
                         q1 - q0,
                         k_full.shape[2],
                         device=q.device,
                         dtype=q.dtype,
                     )
-                    local_bias[:, :, :, source_start:source_end] = bias_values[:, q0:q1, :].unsqueeze(1)
+                    source_bias = bias_values[:, q0:q1, :].unsqueeze(1)
+                    if torch.is_tensor(head_bias_scale):
+                        source_bias = source_bias * head_bias_scale.view(1, -1, 1, 1)
+                    local_bias[:, :, :, source_start:source_end] = source_bias
                     with nn.attention.sdpa_kernel([SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION]):
                         overlap_out.append(
                             scaled_dot_product_attention(q_chunk, k_full, v_full, attn_mask=local_bias)

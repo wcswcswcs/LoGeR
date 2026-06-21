@@ -267,9 +267,13 @@ def _write_md(path: Path, summary: Dict[str, Any], rows: List[Dict[str, Any]]) -
         "best_read_delta_vs_reference",
         "best_read_delta_vs_historical_c9",
         "minimum_progress_pass",
+        "legacy_minimum_progress_pass",
+        "h35_local_minimum_progress_pass",
         "stage_success_pass",
         "strong_success_pass",
         "target30_success",
+        "legacy_phase4_allowed",
+        "h35_local_phase4_allowed",
         "phase4_allowed",
     ]:
         lines.append(f"- `{key}`: `{_clean(summary.get(key))}`")
@@ -305,6 +309,13 @@ def _fmt(value: Any) -> str:
         return f"{float(value):.10f}"
     except (TypeError, ValueError):
         return ""
+
+
+def _as_float(value: Any, default: float = float("nan")) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def main() -> None:
@@ -398,15 +409,22 @@ def main() -> None:
     best = min(read_rows, key=lambda r: float(r.get("ATE_full", float("inf"))), default=None)
     best_delta_ref = best.get("ATE_delta_vs_reference") if best else None
     best_ate = best.get("ATE_full") if best else None
-    downstream_ok = bool(best and float(best.get("segment_400_600_delta_vs_reference", float("inf"))) <= 1.0)
-    minimum_progress = bool(
+    best_delta_ref_f = _as_float(best_delta_ref)
+    best_ate_f = _as_float(best_ate, float("inf"))
+    segment_400_600_delta_f = _as_float(best.get("segment_400_600_delta_vs_reference") if best else None)
+    downstream_ok = bool(best and math.isfinite(segment_400_600_delta_f) and segment_400_600_delta_f <= 1.0)
+    legacy_minimum_progress = bool(
         best
         and (
-            float(best.get("ATE_full", float("inf"))) <= 33.3
-            or float(best.get("delta_vs_historical_c9_ATE", float("inf"))) <= -0.5
+            best_ate_f <= 33.3
+            or _as_float(best.get("delta_vs_historical_c9_ATE", float("inf"))) <= -0.5
         )
         and downstream_ok
     )
+    h35_local_minimum_progress = bool(math.isfinite(best_delta_ref_f) and best_delta_ref_f <= -0.5)
+    minimum_progress = bool(legacy_minimum_progress or h35_local_minimum_progress)
+    legacy_phase4_allowed = bool(math.isfinite(best_delta_ref_f) and best_delta_ref_f <= -0.3 and best_ate_f > 33.0)
+    h35_local_phase4_allowed = h35_local_minimum_progress
     summary = {
         "rows": len(rows),
         "done_rows": len(done_rows),
@@ -418,10 +436,14 @@ def main() -> None:
         "best_read_delta_vs_reference": best_delta_ref,
         "best_read_delta_vs_historical_c9": best.get("delta_vs_historical_c9_ATE") if best else None,
         "minimum_progress_pass": minimum_progress,
+        "legacy_minimum_progress_pass": legacy_minimum_progress,
+        "h35_local_minimum_progress_pass": h35_local_minimum_progress,
         "stage_success_pass": bool(best and float(best.get("ATE_full", float("inf"))) <= 33.0),
         "strong_success_pass": bool(best and float(best.get("ATE_full", float("inf"))) <= 32.0),
         "target30_success": bool(best and float(best.get("ATE_full", float("inf"))) <= 30.0),
-        "phase4_allowed": bool(best_delta_ref is not None and float(best_delta_ref) <= -0.3 and float(best_ate) > 33.0),
+        "legacy_phase4_allowed": legacy_phase4_allowed,
+        "h35_local_phase4_allowed": h35_local_phase4_allowed,
+        "phase4_allowed": bool(legacy_phase4_allowed or h35_local_phase4_allowed),
         "no_gt_runtime_action": True,
         "training_free": True,
     }

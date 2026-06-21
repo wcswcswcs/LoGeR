@@ -69,6 +69,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--feature-dir", required=True, type=Path)
     parser.add_argument("--semantic-pt", default="", type=Path)
     parser.add_argument("--out-dir", required=True, type=Path)
+    parser.add_argument(
+        "--rgb-dir",
+        default="",
+        type=Path,
+        help="Optional RGB image directory; when set, contact sheets include an original-frame column.",
+    )
     parser.add_argument("--max-fit-tokens", type=int, default=30000)
     parser.add_argument("--visual-frames-per-chunk", type=int, default=3)
     parser.add_argument("--cell-scale", type=int, default=8)
@@ -154,7 +160,13 @@ def _load_feature_chunks(feature_dir: Path) -> List[Dict[str, Any]]:
 
 
 def _layer_ids_for_tap(payload: Mapping[str, Any], tap: str, tensor: torch.Tensor) -> List[int]:
+    direct = payload.get(f"layer_ids::{tap}")
+    if torch.is_tensor(direct) and int(direct.numel()) == int(tensor.shape[1]):
+        return [int(x) for x in direct.detach().cpu().reshape(-1).tolist()]
     meta = dict(dict(payload.get("taps") or {}).get(tap) or {})
+    selected_ids = meta.get("selected_layer_ids") or []
+    if selected_ids and len(selected_ids) == int(tensor.shape[1]):
+        return [int(x) for x in selected_ids]
     selected = meta.get("selected_layers") or []
     if selected and len(selected) == int(tensor.shape[1]):
         return [int(x) for x in selected]
@@ -411,6 +423,39 @@ def _semantic_rgb(labels: torch.Tensor, colours: np.ndarray) -> np.ndarray:
     return colours[safe]
 
 
+def _find_rgb_path(rgb_dir: Path, frame_idx: int) -> Optional[Path]:
+    if not rgb_dir or not rgb_dir.exists():
+        return None
+    stem = f"{int(frame_idx):06d}"
+    for suffix in (".png", ".jpg", ".jpeg", ".bmp"):
+        path = rgb_dir / f"{stem}{suffix}"
+        if path.exists():
+            return path
+    return None
+
+
+def _load_rgb_patch_frames(
+    rgb_dir: Path,
+    *,
+    start: int,
+    end: int,
+    patch_grid: Tuple[int, int],
+) -> Optional[np.ndarray]:
+    if not rgb_dir or not rgb_dir.exists():
+        return None
+    patch_h, patch_w = int(patch_grid[0]), int(patch_grid[1])
+    frames: List[np.ndarray] = []
+    for frame_idx in range(int(start), int(end)):
+        path = _find_rgb_path(rgb_dir, frame_idx)
+        if path is None:
+            return None
+        img = Image.open(path).convert("RGB").resize((patch_w, patch_h), Image.Resampling.BILINEAR)
+        frames.append(np.asarray(img, dtype=np.uint8))
+    if not frames:
+        return None
+    return np.stack(frames, axis=0)
+
+
 def _write_visuals(
     *,
     out_dir: Path,
@@ -418,6 +463,7 @@ def _write_visuals(
     layer_id: int,
     chunks: Sequence[Dict[str, Any]],
     rgb_by_chunk: Sequence[np.ndarray],
+    original_rgb_by_chunk: Sequence[Optional[np.ndarray]],
     semantic: Optional[Mapping[str, Any]],
     cell_scale: int,
     visual_frames_per_chunk: int,
@@ -432,13 +478,17 @@ def _write_visuals(
     film_panels: List[Image.Image] = []
     visual_rows: List[Dict[str, Any]] = []
     colours = semantic.get("colours") if semantic is not None else np.zeros((1, 3), dtype=np.uint8)
-    for row, rgb_frames in zip(chunks, rgb_by_chunk):
+    for row, rgb_frames, original_frames in zip(chunks, rgb_by_chunk, original_rgb_by_chunk):
         payload = row["payload"]
         start = int(payload["start_frame"])
         sem_patch = row.get("semantic_patch")
         frame_indices = _select_visual_indices(int(rgb_frames.shape[0]), visual_frames_per_chunk)
         for local_frame in frame_indices:
             global_frame = start + int(local_frame)
+            rgb_img = None
+            if original_frames is not None and int(local_frame) < int(original_frames.shape[0]):
+                rgb_img = _resize_panel(original_frames[int(local_frame)], cell_scale)
+                rgb_img = _label_panel(rgb_img, f"rgb c{payload['chunk_idx']:03d} f{global_frame:06d}")
             pca_img = _resize_panel(rgb_frames[int(local_frame)], cell_scale)
             pca_img = _label_panel(pca_img, f"pca {tap} L{layer_id} c{payload['chunk_idx']:03d} f{global_frame:06d}")
             heat_path = heat_dir / f"{_slug(tap)}_L{int(layer_id):02d}_chunk{int(payload['chunk_idx']):03d}_f{global_frame:06d}.png"
@@ -452,10 +502,12 @@ def _write_visuals(
                 trust_img = _resize_panel(_trust_rgb(sem_patch["trust"][int(local_frame)]), cell_scale)
             sem_img = _label_panel(sem_img, f"semantic c{payload['chunk_idx']:03d} f{global_frame:06d}")
             trust_img = _label_panel(trust_img, "semantic trust")
-            row_img = Image.new("RGB", (sem_img.width + trust_img.width + pca_img.width, sem_img.height), (0, 0, 0))
-            row_img.paste(sem_img, (0, 0))
-            row_img.paste(trust_img, (sem_img.width, 0))
-            row_img.paste(pca_img, (sem_img.width + trust_img.width, 0))
+            panels = [p for p in (rgb_img, sem_img, trust_img, pca_img) if p is not None]
+            row_img = Image.new("RGB", (sum(p.width for p in panels), max(p.height for p in panels)), (0, 0, 0))
+            x0 = 0
+            for panel in panels:
+                row_img.paste(panel, (x0, 0))
+                x0 += panel.width
             rows.append(row_img)
             visual_rows.append(
                 {
@@ -463,6 +515,7 @@ def _write_visuals(
                     "layer": int(layer_id),
                     "chunk_idx": int(payload["chunk_idx"]),
                     "global_frame": int(global_frame),
+                    "rgb_available": bool(rgb_img is not None),
                     "pc_heatmap": str(heat_path),
                 }
             )
@@ -613,6 +666,12 @@ def main() -> None:
             end=int(payload["end_frame"]),
             patch_grid=(int(patch_grid[0]), int(patch_grid[1])),
         )
+        row["rgb_patch_frames"] = _load_rgb_patch_frames(
+            args.rgb_dir,
+            start=int(payload["start_frame"]),
+            end=int(payload["end_frame"]),
+            patch_grid=(int(patch_grid[0]), int(patch_grid[1])),
+        ) if str(args.rgb_dir) else None
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     available_taps: Dict[str, Dict[str, Any]] = {}
@@ -658,10 +717,12 @@ def main() -> None:
             lo, hi = _percentile_bounds(z_sample)
             z_chunks: List[Tuple[Dict[str, Any], torch.Tensor]] = []
             rgb_chunks: List[np.ndarray] = []
+            original_rgb_chunks: List[Optional[np.ndarray]] = []
             for row, tensor in zip(valid_chunks, tensors):
                 z = _project_pca(tensor[:, layer_pos], basis)
                 z_chunks.append((row, z))
                 rgb_chunks.append(_project_to_rgb(z, lo, hi))
+                original_rgb_chunks.append(row.get("rgb_patch_frames"))
             sem_metrics = _semantic_metrics(z_chunks, semantic)
             explained = basis["explained"]
             support_risk = _safe_float(sem_metrics.get("support_risk_z_dist")) or 0.0
@@ -693,6 +754,7 @@ def main() -> None:
                     layer_id=int(layer_id),
                     chunks=valid_chunks,
                     rgb_by_chunk=rgb_chunks,
+                    original_rgb_by_chunk=original_rgb_chunks,
                     semantic=semantic,
                     cell_scale=int(args.cell_scale),
                     visual_frames_per_chunk=int(args.visual_frames_per_chunk),
@@ -747,7 +809,7 @@ def main() -> None:
     _write_csv(
         args.out_dir / "pc_heatmaps_manifest.csv",
         visual_rows,
-        ["tap", "layer", "chunk_idx", "global_frame", "pc_heatmap"],
+        ["tap", "layer", "chunk_idx", "global_frame", "rgb_available", "pc_heatmap"],
     )
 
     selections = _write_selection_jsons(
@@ -766,6 +828,8 @@ def main() -> None:
         "feature_chunk_files": [str(x["path"]) for x in chunks],
         "semantic_pt": str(args.semantic_pt) if str(args.semantic_pt) else "",
         "semantic_available": bool(semantic is not None),
+        "rgb_dir": str(args.rgb_dir) if str(args.rgb_dir) else "",
+        "rgb_available": bool(str(args.rgb_dir) and all(row.get("rgb_patch_frames") is not None for row in chunks)),
         "available_taps": available_taps,
         "unavailable_taps": unavailable_taps,
         "num_pca_units": int(len(metric_rows)),

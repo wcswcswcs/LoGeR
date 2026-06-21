@@ -406,7 +406,16 @@ def import_status(module: str, extra_path: Path | None = None) -> dict[str, Any]
         sys.path[:] = old_path
 
 
-def load_radseg_encoder(radio_root: Path, checkpoint: str | None, device: str, lang_model: str, *, amp: bool = False) -> Any:
+def load_radseg_encoder(
+    radio_root: Path,
+    checkpoint: str | None,
+    device: str,
+    lang_model: str,
+    *,
+    amp: bool = False,
+    slide_crop: int = 336,
+    slide_stride: int = 224,
+) -> Any:
     if str(radio_root) not in sys.path:
         sys.path.insert(0, str(radio_root))
     os.environ["CONDA_PREFIX"] = sys.prefix
@@ -433,8 +442,8 @@ def load_radseg_encoder(radio_root: Path, checkpoint: str | None, device: str, l
             compile=False,
             amp=bool(amp),
             predict=False,
-            slide_crop=0,
-            slide_stride=224,
+            slide_crop=int(slide_crop),
+            slide_stride=int(slide_stride),
             sam_refinement=False,
         )
     finally:

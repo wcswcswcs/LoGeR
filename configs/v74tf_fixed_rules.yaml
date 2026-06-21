@@ -1,0 +1,65 @@
+schema: acl2_v74tf_fixed_rules_v1
+training_free: true
+threshold_source: sequence_robust_median_or_quantile_from_no_gt_runtime_features
+forbidden_runtime_fields:
+  - local_sim3_ate
+  - oracle_gap
+  - future_after_overlap_label
+  - target_chunk_positive_label
+failure_mode_priority:
+  - low_observability_overrides_refresh
+  - over_refresh_beats_under_refresh_when_residual_and_harm_high
+  - nonuniform_short_term_is_auxiliary
+  - native_when_no_rule_fires
+rules:
+  under_refresh:
+    trigger:
+      merge_transform_translation_norm: below_sequence_p25
+      boundary_jump: above_sequence_p75
+      stable_mass: above_sequence_median
+      raw_overlap_residual: not_above_sequence_p90
+    actions:
+      - U-A1_native_transform_amplification_alpha_1p10
+      - U-A2_stable_evidence_refresh_alpha_0p10
+      - U-A3_swa_stable_protect_alpha_0p10
+  over_refresh:
+    trigger:
+      raw_overlap_residual: above_sequence_p75
+      harm_mass: above_sequence_p75
+      stable_mass: below_sequence_median
+    actions:
+      - O-A1_risk_veto_lambda_0p10
+      - O-A2_hold_damp_alpha_0p05
+      - O-A3_semantic_robust_kernel_fixed_sigma_sequence_median
+  low_observability:
+    trigger:
+      context_mass: above_sequence_p75
+      stable_mass: below_sequence_median
+      radio_temporal_stability: below_sequence_median_or_unavailable
+    actions:
+      - L-A1_carry_scale_side_state
+      - L-A2_conservative_swa_alpha_x0p25
+  nonuniform:
+    trigger:
+      global_k_layer5_gram_motion: above_sequence_p75
+      raw_overlap_residual: not_over_refresh_dominant
+      stable_mass: below_sequence_median
+    actions:
+      - N-A1_tail_stable_attention_floor_lambda_0p10
+      - N-A2_head_tail_rebalance_alpha_0p10
+fixed_ablations:
+  U-A1_alpha: [1.10, 1.25]
+  U-A2_alpha: [0.10]
+  O-A1_lambda: [0.10]
+  O-A2_hold_alpha: [0.05]
+  N-A1_lambda: [0.10]
+controls:
+  - native
+  - geometry_only_fixed_rule
+  - semantic_only_fixed_rule
+  - label_shuffled
+  - confidence_shuffled
+  - radio_shuffled
+  - same_action_magnitude_random
+  - same_affected_mass_random
+  - same_weight_distribution_random

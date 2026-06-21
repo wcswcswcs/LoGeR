@@ -69,8 +69,10 @@ class GeometryOutput:
     dyn4d_kk_mean_patch: Optional[torch.Tensor] = None
     global_q_raw_patchvec: Optional[torch.Tensor] = None
     global_k_raw_patchvec: Optional[torch.Tensor] = None
+    global_v_raw_patchvec: Optional[torch.Tensor] = None
     global_q_raw_patchvec_layers: Optional[torch.Tensor] = None
     global_k_raw_patchvec_layers: Optional[torch.Tensor] = None
+    global_v_raw_patchvec_layers: Optional[torch.Tensor] = None
     dyn4d_global_layer_ids: Optional[torch.Tensor] = None
 
     # MUT3R-style frame-attention cosine response maps: [T, H_tok, W_tok]
@@ -646,8 +648,10 @@ class LoGeRGeometryBackbone:
         dyn4d_kk_mean_patch = _sq(raw.get("dyn4d_kk_mean_patch"))  # [T, H_tok, W_tok]
         global_q_raw_patchvec = _sq(raw.get("global_q_raw_patchvec"))  # [T, H_tok, W_tok, D]
         global_k_raw_patchvec = _sq(raw.get("global_k_raw_patchvec"))  # [T, H_tok, W_tok, D]
+        global_v_raw_patchvec = _sq(raw.get("global_v_raw_patchvec"))  # [T, H_tok, W_tok, D]
         global_q_raw_patchvec_layers = _sq(raw.get("global_q_raw_patchvec_layers"))  # [T, L, H_tok, W_tok, D]
         global_k_raw_patchvec_layers = _sq(raw.get("global_k_raw_patchvec_layers"))  # [T, L, H_tok, W_tok, D]
+        global_v_raw_patchvec_layers = _sq(raw.get("global_v_raw_patchvec_layers"))  # [T, L, H_tok, W_tok, D]
         dyn4d_global_layer_ids = raw.get("dyn4d_global_layer_ids")
         if dyn4d_global_layer_ids is not None:
             dyn4d_global_layer_ids = dyn4d_global_layer_ids.squeeze(0).detach().cpu().long()
@@ -719,8 +723,10 @@ class LoGeRGeometryBackbone:
             dyn4d_kk_mean_patch=dyn4d_kk_mean_patch,
             global_q_raw_patchvec=global_q_raw_patchvec,
             global_k_raw_patchvec=global_k_raw_patchvec,
+            global_v_raw_patchvec=global_v_raw_patchvec,
             global_q_raw_patchvec_layers=global_q_raw_patchvec_layers,
             global_k_raw_patchvec_layers=global_k_raw_patchvec_layers,
+            global_v_raw_patchvec_layers=global_v_raw_patchvec_layers,
             dyn4d_global_layer_ids=dyn4d_global_layer_ids,
             frame_attn_cosine_shallow=frame_attn_cosine_shallow,
             frame_attn_cosine_deep=frame_attn_cosine_deep,

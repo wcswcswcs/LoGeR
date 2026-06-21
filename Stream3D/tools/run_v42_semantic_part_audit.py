@@ -113,10 +113,11 @@ def _npz_source_masks(
     frame_ids: list[int],
     min_area: int,
     sample_count: int,
+    mode: str = "sample8",
 ) -> dict[int, list[tuple[int, np.ndarray]]]:
     out: dict[int, list[tuple[int, np.ndarray]]] = {}
-    scene_source_dir = root / str(scene) / source / "sample8"
-    flat_source_dir = root / source / "sample8"
+    scene_source_dir = root / str(scene) / source / str(mode)
+    flat_source_dir = root / source / str(mode)
     source_dir = scene_source_dir if scene_source_dir.exists() else flat_source_dir
     requested = [source_dir / f"{source}_frame{int(frame_id):06d}_masks.npz" for frame_id in frame_ids]
     paths = [path for path in requested if path.exists()]
@@ -398,6 +399,8 @@ def main() -> None:
     parser.add_argument("--scene", default="scene0081_01")
     parser.add_argument("--sources", default="prepared,watershed,dinov2_maskcut")
     parser.add_argument("--external-source-root", default="outputs/audit/v42_source_audit_external")
+    parser.add_argument("--external-npz-source", default="dinov2_maskcut")
+    parser.add_argument("--external-npz-mode", default="sample8")
     parser.add_argument("--feature-backend", choices=["rgb_stats", "dinov2_timm", "radio_radseg"], default="radio_radseg")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--checkpoint", default=None)
@@ -521,6 +524,18 @@ def main() -> None:
             )
             source_frame_ids = frame_ids
             repair_strategy = "boundary_feature_cluster_split"
+        elif source == "external_npz":
+            masks_by_frame = _npz_source_masks(
+                external_root,
+                str(args.scene),
+                str(args.external_npz_source),
+                frame_ids,
+                int(args.min_area),
+                int(args.sample_frames),
+                mode=str(args.external_npz_mode),
+            )
+            source_frame_ids = sorted(masks_by_frame)
+            repair_strategy = f"external_npz:{args.external_npz_source}:{args.external_npz_mode}"
         elif source == "dinov2_maskcut_material_split":
             base_masks = _npz_source_masks(
                 external_root,

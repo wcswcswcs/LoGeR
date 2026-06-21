@@ -348,6 +348,7 @@ class TTTWriteController:
                         transient_delta[branch_name][li] = value
             debug_info[f"layer_{li}"] = layer_debug
 
+        self._summarize_replay_feature_gate_debug(debug_info)
         self._summarize_ttt_self_cues(debug_info, n_layers)
         self._apply_native_delta_gate(write_cache, w0_new, w1_new, w2_new, debug_info)
         self._mix_with_native_provisional(write_cache, w0_new, w1_new, w2_new, debug_info)
@@ -399,6 +400,83 @@ class TTTWriteController:
             transient_delta=transient_delta_out,
             debug=debug_info,
         )
+
+    def _summarize_replay_feature_gate_debug(self, debug_info: Dict[str, Any]) -> None:
+        """Lift per-layer replay feature-gate diagnostics to top-level audit fields."""
+        layer_rows = [
+            value
+            for key, value in debug_info.items()
+            if str(key).startswith("layer_") and isinstance(value, dict)
+        ]
+        feature_rows = [
+            row
+            for row in layer_rows
+            if "ttt_replay_feature_gate_applied" in row
+            or "ttt_replay_feature_gate_mode" in row
+        ]
+        if not feature_rows:
+            return
+        applied_rows = [
+            row for row in feature_rows if bool(row.get("ttt_replay_feature_gate_applied"))
+        ]
+        debug_info["ttt_replay_feature_gate_applied"] = bool(applied_rows)
+        debug_info["ttt_replay_feature_gate_layer_count"] = int(len(feature_rows))
+        debug_info["ttt_replay_feature_gate_applied_layer_count"] = int(len(applied_rows))
+        debug_info["ttt_replay_feature_gate_applied_layer_frac"] = float(
+            len(applied_rows) / max(1, len(feature_rows))
+        )
+        modes = sorted(
+            {
+                str(row.get("ttt_replay_feature_gate_mode"))
+                for row in feature_rows
+                if row.get("ttt_replay_feature_gate_mode") is not None
+            }
+        )
+        if modes:
+            debug_info["ttt_replay_feature_gate_modes"] = modes
+        targets = sorted(
+            {
+                str(target)
+                for row in applied_rows
+                for target in (row.get("ttt_replay_feature_gate_targets") or [])
+            }
+        )
+        if targets:
+            debug_info["ttt_replay_feature_gate_targets"] = targets
+        debug_info["ttt_replay_feature_gate_frame_static"] = bool(
+            any(bool(row.get("ttt_replay_feature_gate_frame_static")) for row in applied_rows)
+        )
+        debug_info["ttt_replay_feature_branch_mask"] = list(self.replay_feature_gate_branch_mask)
+
+        def _values(name: str) -> List[float]:
+            out: List[float] = []
+            for row in applied_rows:
+                value = row.get(name)
+                if value is None:
+                    continue
+                try:
+                    out.append(float(value))
+                except (TypeError, ValueError):
+                    continue
+            return out
+
+        for name in (
+            "ttt_replay_feature_gate_mean",
+            "ttt_replay_feature_gate_p10",
+            "ttt_replay_feature_gate_p50",
+            "ttt_replay_feature_gate_p90",
+            "ttt_replay_feature_gate_mean_abs_delta",
+            "ttt_replay_feature_risk_mean",
+            "ttt_replay_feature_risk_q90",
+            "ttt_replay_feature_prior_min",
+            "ttt_replay_feature_prior_max",
+        ):
+            vals = _values(name)
+            if vals:
+                debug_info[name] = float(sum(vals) / len(vals))
+        vals = _values("ttt_replay_feature_gate_max_abs_delta")
+        if vals:
+            debug_info["ttt_replay_feature_gate_max_abs_delta"] = float(max(vals))
 
     # -- per-layer replay --------------------------------------------------
 
@@ -4282,6 +4360,8 @@ class TTTWriteController:
             "tail_state_selective_commit",
             "selective_commit_ema",
             "tail_state_continuity_selective_commit",
+            "tail_state_soft_directional_commit",
+            "tail_state_soft_directional_guard",
         }:
             raise ValueError(f"Unsupported TTT commit filter mode: {self.commit_filter_mode}")
 
@@ -4303,6 +4383,8 @@ class TTTWriteController:
             "tail_state_selective_commit",
             "selective_commit_ema",
             "tail_state_continuity_selective_commit",
+            "tail_state_soft_directional_commit",
+            "tail_state_soft_directional_guard",
         }:
             branches = (
                 ("w0", 0, w0_new, write_cache.w0_provisional, "w0_old"),
@@ -4364,6 +4446,12 @@ class TTTWriteController:
                 "tail_state_selective_commit",
                 "selective_commit_ema",
                 "tail_state_continuity_selective_commit",
+                "tail_state_soft_directional_commit",
+                "tail_state_soft_directional_guard",
+            }
+            tail_soft_directional = mode in {
+                "tail_state_soft_directional_commit",
+                "tail_state_soft_directional_guard",
             }
             risk_mean = 0.0
             risk_mad = 0.0
@@ -4401,7 +4489,20 @@ class TTTWriteController:
             cos_values: List[float] = []
             energy_ratios: List[float] = []
             for li, name, _branch_idx, values, native_t, candidate, cos, energy_ratio, cand_norm, nat_norm in records:
-                if tail_selective:
+                if tail_soft_directional:
+                    a_cos = (cos - tau_c) / max(1.0 - tau_c, 1e-6)
+                    a_cos = max(0.0, min(1.0, float(a_cos)))
+                    a_energy = (u_max - energy_ratio) / max(u_max - 1.0, 1e-6)
+                    a_energy = max(0.0, min(1.0, float(a_energy)))
+                    directional_alpha = max(lo, min(hi, float(a_cos * a_energy)))
+                    anchor_ok = bool(anchor_mass > 0.02)
+                    risk_gate = max(0.0, min(1.0, risk_mean + risk_high_mass))
+                    if not (risk_high and anchor_ok):
+                        risk_gate = 0.0
+                    alpha = 1.0 - float(risk_gate) * (1.0 - directional_alpha)
+                    alpha = max(lo, min(hi, float(alpha)))
+                    triggered = alpha < 0.999999
+                elif tail_selective:
                     ema_key = f"layer_{int(li)}_{name}"
                     prev_energy = self.tail_commit_energy_ema.get(ema_key)
                     envelope = float(prev_energy) if prev_energy is not None else float(energy_ratio)
@@ -4451,6 +4552,9 @@ class TTTWriteController:
                         layer_debug[f"ttt_write_commit_filter_{name}_tail_risk_high_mass"] = float(risk_high_mass)
                         layer_debug[f"ttt_write_commit_filter_{name}_tail_risk_high"] = bool(risk_high)
                         layer_debug[f"ttt_write_commit_filter_{name}_tail_anchor_mass"] = float(anchor_mass)
+                        if tail_soft_directional:
+                            layer_debug[f"ttt_write_commit_filter_{name}_tail_soft_directional"] = True
+                            layer_debug[f"ttt_write_commit_filter_{name}_tail_soft_gate"] = float(risk_gate)
 
             debug_info.update({
                 "ttt_write_commit_filter_applied": bool(applied),
@@ -4477,6 +4581,7 @@ class TTTWriteController:
             if tail_selective:
                 debug_info.update({
                     "ttt_write_commit_filter_tail_selective": True,
+                    "ttt_write_commit_filter_tail_soft_directional": bool(tail_soft_directional),
                     "ttt_write_commit_filter_tail_risk_mean": float(risk_mean),
                     "ttt_write_commit_filter_tail_risk_mad": float(risk_mad),
                     "ttt_write_commit_filter_tail_risk_high_mass": float(risk_high_mass),

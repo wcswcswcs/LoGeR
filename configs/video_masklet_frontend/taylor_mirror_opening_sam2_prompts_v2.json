@@ -1,0 +1,36 @@
+{
+  "label": "mirror",
+  "notes": "Taylor backstage mirror/opening negative seed v2. Positive points are moved to mirror, beige wall, counter, and floor/opening surfaces; negative points mark red curtain and foreground/body regions.",
+  "prompts": [
+    {
+      "frame": 179,
+      "box": [500, 0, 650, 405],
+      "positive_points": [[610, 125], [590, 215], [545, 350]],
+      "negative_points": [[485, 210], [647, 150], [625, 365]]
+    },
+    {
+      "frame": 210,
+      "box": [315, 0, 560, 405],
+      "positive_points": [[540, 65], [355, 205], [455, 292]],
+      "negative_points": [[405, 110], [520, 190], [285, 190], [575, 220]]
+    },
+    {
+      "frame": 240,
+      "box": [150, 0, 430, 405],
+      "positive_points": [[410, 75], [210, 145], [260, 300]],
+      "negative_points": [[345, 170], [310, 245], [125, 205], [455, 210]]
+    },
+    {
+      "frame": 270,
+      "box": [140, 0, 440, 405],
+      "positive_points": [[395, 80], [205, 130], [260, 275]],
+      "negative_points": [[325, 210], [365, 175], [120, 210], [470, 230]]
+    },
+    {
+      "frame": 299,
+      "box": [180, 0, 450, 405],
+      "positive_points": [[210, 100], [250, 225], [405, 85]],
+      "negative_points": [[320, 160], [330, 260], [165, 220], [470, 235]]
+    }
+  ]
+}
