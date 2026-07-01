@@ -170,6 +170,7 @@ class D4RTCarrierProjectionProvider:
         debug_root: str | Path,
         mode: str,
         nn_radius: float = 0.05,
+        nn_k: int = 1,
         min_visibility: float = 0.5,
         min_confidence: float = 0.5,
         max_anchors: int = 8000,
@@ -178,13 +179,20 @@ class D4RTCarrierProjectionProvider:
         local_outlier_filter: bool = False,
         min_mask_interior_px: float = 0.0,
         overlap_policy: str = "all_window_union",
+        stitch_uv_radius: float = 0.01,
+        stitch_max_matches_per_frame: int = 512,
+        stitch_fit_trim_percentile: float = 0.0,
     ) -> None:
         if mode not in {
             "raw",
             "self_stitched",
             "self_stitched_density",
+            "self_stitched_eval_sim3",
+            "self_stitched_eval_sim3_density",
             "self_stitched_scale_normalized",
             "self_stitched_scale_normalized_density",
+            "self_stitched_scale_normalized_eval_sim3",
+            "self_stitched_scale_normalized_eval_sim3_density",
             "eval_sim3",
             "eval_sim3_density",
         }:
@@ -193,6 +201,7 @@ class D4RTCarrierProjectionProvider:
         self.mode = mode
         self.name = f"d4rt_carrier_{mode}"
         self.nn_radius = float(nn_radius)
+        self.nn_k = max(1, int(nn_k))
         self.min_visibility = float(min_visibility)
         self.min_confidence = float(min_confidence)
         self.max_anchors = int(max_anchors)
@@ -200,12 +209,15 @@ class D4RTCarrierProjectionProvider:
         self.density_alpha = float(density_alpha)
         self.local_outlier_filter = bool(local_outlier_filter)
         self.min_mask_interior_px = float(min_mask_interior_px)
+        self.stitch_uv_radius = float(stitch_uv_radius)
+        self.stitch_max_matches_per_frame = int(stitch_max_matches_per_frame)
+        self.stitch_fit_trim_percentile = float(stitch_fit_trim_percentile)
         aliases = {"all": "all_window_union"}
         overlap_policy = aliases.get(str(overlap_policy), str(overlap_policy))
         if overlap_policy not in {"all_window_union", "best_confidence", "lowest_residual", "newest_window"}:
             raise ValueError(f"Unsupported overlap_policy: {overlap_policy}")
         self.overlap_policy = overlap_policy
-        self.uses_gt_sim3_for_prediction = mode.startswith("eval_sim3")
+        self.uses_gt_sim3_for_prediction = mode.startswith("eval_sim3") or "eval_sim3" in mode
         self.uses_d4rt_self_sim3 = mode.startswith("self_stitched")
         self.frame_diagnostics: list[dict[str, Any]] = []
         self._scene_cache: dict[str, dict[str, Any]] = {}
@@ -331,6 +343,60 @@ class D4RTCarrierProjectionProvider:
             target = target[keep]
         return source, target, {"anchor_candidates": int(total), "anchor_valid": int(valid_total)}
 
+    def _collect_eval_anchors_from_windows(
+        self,
+        stream: ScanNetStream,
+        windows: list[_WindowData],
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, int]]:
+        source_parts: list[np.ndarray] = []
+        target_parts: list[np.ndarray] = []
+        total = 0
+        valid_total = 0
+        for window in windows:
+            for local_idx, frame_id in enumerate(window.frame_ids):
+                h, w = stream.load_depth(int(frame_id)).shape[:2]
+                xyz = _apply_fit(window.xyz[local_idx], window.transform)
+                uv = window.uv[local_idx]
+                ok = (
+                    window.valid[local_idx]
+                    & np.isfinite(xyz).all(axis=1)
+                    & np.isfinite(uv).all(axis=1)
+                    & (uv[:, 0] >= 0.0)
+                    & (uv[:, 0] <= 1.0)
+                    & (uv[:, 1] >= 0.0)
+                    & (uv[:, 1] <= 1.0)
+                    & (window.visibility[local_idx] >= self.min_visibility)
+                    & (window.confidence[local_idx] >= self.min_confidence)
+                )
+                total += int(ok.shape[0])
+                if not np.any(ok):
+                    continue
+                xy = np.stack(
+                    [
+                        uv[ok, 0] * float(max(w - 1, 1)),
+                        uv[ok, 1] * float(max(h - 1, 1)),
+                    ],
+                    axis=1,
+                )
+                world, world_ok = backproject_xy_world(stream, int(frame_id), xy)
+                if not np.any(world_ok):
+                    continue
+                source_parts.append(xyz[ok][world_ok])
+                target_parts.append(world[world_ok])
+                valid_total += int(np.count_nonzero(world_ok))
+        if not source_parts:
+            return np.empty((0, 3), dtype=np.float32), np.empty((0, 3), dtype=np.float32), {
+                "anchor_candidates": int(total),
+                "anchor_valid": 0,
+            }
+        source = np.concatenate(source_parts, axis=0)
+        target = np.concatenate(target_parts, axis=0)
+        if source.shape[0] > self.max_anchors:
+            keep = np.linspace(0, source.shape[0] - 1, num=self.max_anchors, dtype=np.int64)
+            source = source[keep]
+            target = target[keep]
+        return source, target, {"anchor_candidates": int(total), "anchor_valid": int(valid_total)}
+
     def _self_stitch_transforms(self, windows: list[_WindowData]) -> tuple[list[dict[str, Any] | None], dict[str, Any]]:
         if "scale_normalized" in self.mode:
             return self._self_stitch_scale_normalized_transforms(windows)
@@ -348,6 +414,8 @@ class D4RTCarrierProjectionProvider:
                 self._window_match_payload(curr),
                 min_visibility=self.min_visibility,
                 min_confidence=self.min_confidence,
+                uv_radius=self.stitch_uv_radius,
+                max_matches_per_frame=self.stitch_max_matches_per_frame,
             )
             match_stats.append(match.stats)
             if match.curr_xyz.shape[0] == 0:
@@ -360,6 +428,7 @@ class D4RTCarrierProjectionProvider:
                 continue
             try:
                 fit = fit_sim3_with_diagnostics(src, dst)
+                fit = self._trim_pair_fit(src, dst, fit)
             except Exception:
                 fail_count += 1
                 continue
@@ -370,11 +439,31 @@ class D4RTCarrierProjectionProvider:
         return transforms, {
             "self_stitch_pair_count": int(max(len(windows) - 1, 0)),
             "self_stitch_fail_count": int(fail_count),
+            "self_stitch_uv_radius": float(self.stitch_uv_radius),
+            "self_stitch_max_matches_per_frame": int(self.stitch_max_matches_per_frame),
+            "self_stitch_fit_trim_percentile": float(self.stitch_fit_trim_percentile),
             "self_stitch_scale_std": float(np.std(pair_scales)) if pair_scales else None,
             "self_stitch_residual_p90_mean": float(np.mean(pair_p90)) if pair_p90 else None,
             "self_stitch_inlier_ratio_abs010_mean": float(np.mean(pair_inlier_abs010)) if pair_inlier_abs010 else None,
             **self._aggregate_match_stats(match_stats),
         }
+
+    def _trim_pair_fit(self, source: np.ndarray, target: np.ndarray, fit: dict[str, Any]) -> dict[str, Any]:
+        trim = float(self.stitch_fit_trim_percentile)
+        if not (0.0 < trim < 100.0):
+            return fit
+        residual = np.asarray(fit.get("residual", []), dtype=np.float64)
+        if residual.size < 16:
+            return fit
+        keep = residual <= float(np.percentile(residual, trim))
+        kept = int(np.count_nonzero(keep))
+        if kept < 4 or kept >= residual.size:
+            return fit
+        trimmed = fit_sim3_with_diagnostics(source[keep], target[keep])
+        trimmed["fit_trim_percentile"] = trim
+        trimmed["fit_anchor_count"] = int(residual.size)
+        trimmed["fit_kept_anchor_count"] = kept
+        return trimmed
 
     @staticmethod
     def _window_match_payload(window: _WindowData) -> dict[str, Any]:
@@ -426,6 +515,8 @@ class D4RTCarrierProjectionProvider:
             self._window_match_payload(curr),
             min_visibility=self.min_visibility,
             min_confidence=self.min_confidence,
+            uv_radius=self.stitch_uv_radius,
+            max_matches_per_frame=self.stitch_max_matches_per_frame,
         )
         return match.curr_xyz.reshape(-1, 3), match.prev_xyz.reshape(-1, 3), match.stats
 
@@ -442,6 +533,7 @@ class D4RTCarrierProjectionProvider:
                 continue
             try:
                 fit = fit_sim3_with_diagnostics(src, dst)
+                fit = self._trim_pair_fit(src, dst, fit)
             except Exception:
                 fail_count += 1
                 continue
@@ -470,6 +562,9 @@ class D4RTCarrierProjectionProvider:
         return transforms, {
             "self_stitch_pair_count": int(max(len(windows) - 1, 0)),
             "self_stitch_fail_count": int(fail_count),
+            "self_stitch_uv_radius": float(self.stitch_uv_radius),
+            "self_stitch_max_matches_per_frame": int(self.stitch_max_matches_per_frame),
+            "self_stitch_fit_trim_percentile": float(self.stitch_fit_trim_percentile),
             "self_stitch_scale_normalized": True,
             "self_stitch_scale_bias_removed": scale_bias,
             "self_stitch_original_scale_std": float(np.std(scales)) if scales else None,
@@ -534,6 +629,11 @@ class D4RTCarrierProjectionProvider:
             transforms, stitch_diag = self._self_stitch_transforms(windows)
             for window, transform in zip(windows, transforms):
                 window.transform = transform
+            if "eval_sim3" in self.mode:
+                source, target, anchor_diag = self._collect_eval_anchors_from_windows(stream, windows)
+                scene_fit = fit_transform(source, target, robust_trim_percentile=self.robust_trim_percentile)
+                for window in windows:
+                    window.transform = scene_fit if window.transform is None else _compose_fits(scene_fit, window.transform)
 
         all_points = [_apply_fit(window.xyz.reshape(-1, 3), window.transform) for window in windows]
         spacing = _spacing_q75(np.concatenate(all_points, axis=0)) if all_points else None
@@ -670,21 +770,30 @@ class D4RTCarrierProjectionProvider:
                 if not np.any(keep_interior):
                     continue
                 positive_idx = positive_idx[keep_interior]
-            dist, nn_idx = scene_tree.query(points[positive_idx], k=1, distance_upper_bound=radius)
+            dist, nn_idx = scene_tree.query(points[positive_idx], k=self.nn_k, distance_upper_bound=radius)
+            dist = np.asarray(dist)
+            nn_idx = np.asarray(nn_idx)
+            if self.nn_k == 1:
+                dist = dist[:, None]
+                nn_idx = nn_idx[:, None]
             hit = np.isfinite(dist) & (nn_idx < scene_points_np.shape[0])
             if self.local_outlier_filter and np.any(hit):
-                dist_hit = dist[hit]
+                hit_any = np.any(hit, axis=1)
+                nearest_hit_dist = np.min(np.where(hit, dist, np.inf), axis=1)
+                dist_hit = nearest_hit_dist[hit_any]
                 cutoff = min(float(radius), float(np.percentile(dist_hit, 90)))
-                hit_indices = np.flatnonzero(hit)
-                keep = dist_hit <= cutoff
-                hit = np.zeros_like(hit, dtype=bool)
-                hit[hit_indices[keep]] = True
-            hit_points += int(np.count_nonzero(hit))
-            for mask_id, point_id in zip(mask_ids[positive_idx][hit].tolist(), nn_idx[hit].tolist()):
+                hit &= dist <= cutoff
+            hit_any = np.any(hit, axis=1)
+            hit_points += int(np.count_nonzero(hit_any))
+            for row_idx, mask_id in enumerate(mask_ids[positive_idx].tolist()):
+                cols = nn_idx[row_idx][hit[row_idx]]
+                if cols.size == 0:
+                    continue
                 mid = int(mask_id)
-                pid = int(point_id)
-                mask_info[mid].add(pid)
-                frame_point_ids.add(pid)
+                for point_id in cols.tolist():
+                    pid = int(point_id)
+                    mask_info[mid].add(pid)
+                    frame_point_ids.add(pid)
 
         diag = {
             "provider": self.name,
@@ -705,6 +814,9 @@ class D4RTCarrierProjectionProvider:
             "mask_projection_empty_rate": float(1.0 - len(mask_info) / max(len(np.unique(mask_np[mask_np > 0])), 1)),
             "mean_points_per_2d_mask": float(hit_points / max(len(mask_info), 1)),
             "nn_radius": float(radius),
+            "nn_k": int(self.nn_k),
+            "assigned_vertex_count": int(sum(len(v) for v in mask_info.values())),
+            "unique_assigned_vertex_count": int(len(frame_point_ids)),
             "min_mask_interior_px": float(self.min_mask_interior_px),
             **cache.get("scene_fit", {}),
             **cache.get("anchor_diag", {}),

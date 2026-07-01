@@ -55,6 +55,7 @@ def main() -> None:
     parser.add_argument("--native-history-mask-semantic-device", default="cpu")
     parser.add_argument("--native-history-mask-semantic-checkpoint", default=None)
     parser.add_argument("--native-history-mask-semantic-short-side", type=int, default=518)
+    parser.add_argument("--objectlet-variant-override", default=None)
     args = parser.parse_args()
     payload = build_v55_history_update(
         history_evidence_roles=tuple(role.strip() for role in args.history_evidence_roles.split(",") if role.strip()),
@@ -103,6 +104,7 @@ def main() -> None:
         native_history_mask_semantic_device=args.native_history_mask_semantic_device,
         native_history_mask_semantic_checkpoint=args.native_history_mask_semantic_checkpoint,
         native_history_mask_semantic_short_side=args.native_history_mask_semantic_short_side,
+        objectlet_variant_override=args.objectlet_variant_override,
     )
     write_v55_history_update(args.output_root, payload, visualization_root=args.visualization_root)
     summary = payload["summary"]

@@ -67,6 +67,66 @@ MERGE_CASES: Dict[str, Dict[str, Any]] = {
         "strategy": "V68_OVERLAP_SUPPORT_WEIGHT_SHUFFLED",
         "ttt_tail_drop": False,
     },
+    "robust_semoverlap": {
+        "semantic_merge": True,
+        "strategy": "V68_ROBUST_SEMOVERLAP_WEIGHT",
+        "ttt_tail_drop": False,
+    },
+    "robust_semoverlap_random": {
+        "semantic_merge": True,
+        "strategy": "V68_ROBUST_SEMOVERLAP_WEIGHT_RANDOM",
+        "ttt_tail_drop": False,
+    },
+    "robust_semoverlap_shuffled": {
+        "semantic_merge": True,
+        "strategy": "V68_ROBUST_SEMOVERLAP_WEIGHT_SHUFFLED",
+        "ttt_tail_drop": False,
+    },
+    "overlap_outlier": {
+        "semantic_merge": True,
+        "strategy": "V80_OVERLAP_OUTLIER_DOWNWEIGHT",
+        "ttt_tail_drop": False,
+    },
+    "overlap_outlier_random": {
+        "semantic_merge": True,
+        "strategy": "V80_OVERLAP_OUTLIER_DOWNWEIGHT_RANDOM",
+        "ttt_tail_drop": False,
+    },
+    "overlap_outlier_shuffled": {
+        "semantic_merge": True,
+        "strategy": "V80_OVERLAP_OUTLIER_DOWNWEIGHT_SHUFFLED",
+        "ttt_tail_drop": False,
+    },
+    "retrieval_static": {
+        "semantic_merge": True,
+        "strategy": "V81_RETRIEVAL_STATIC_OVERLAP",
+        "ttt_tail_drop": False,
+    },
+    "retrieval_static_random": {
+        "semantic_merge": True,
+        "strategy": "V81_RETRIEVAL_STATIC_OVERLAP_RANDOM",
+        "ttt_tail_drop": False,
+    },
+    "retrieval_static_shuffled": {
+        "semantic_merge": True,
+        "strategy": "V81_RETRIEVAL_STATIC_OVERLAP_SHUFFLED",
+        "ttt_tail_drop": False,
+    },
+    "latent_kalman": {
+        "semantic_merge": True,
+        "strategy": "V81_LATENT_KALMAN_OVERLAP",
+        "ttt_tail_drop": False,
+    },
+    "latent_kalman_random": {
+        "semantic_merge": True,
+        "strategy": "V81_LATENT_KALMAN_OVERLAP_RANDOM",
+        "ttt_tail_drop": False,
+    },
+    "latent_kalman_shuffled": {
+        "semantic_merge": True,
+        "strategy": "V81_LATENT_KALMAN_OVERLAP_SHUFFLED",
+        "ttt_tail_drop": False,
+    },
     "radio_component": {
         "semantic_merge": True,
         "strategy": "V73_RADIO_COMPONENT_HANDOFF",
@@ -307,6 +367,27 @@ def _build_command(args: argparse.Namespace, *, chunk: int, case: str, out_dir: 
                     str(args.native_overlap_tolerance),
                 ]
             )
+            if bool(args.semantic_merge_residual_safe_projection):
+                cmd.extend(
+                    [
+                        "--semantic_merge_residual_safe_projection",
+                        "1",
+                        "--semantic_merge_residual_safe_projection_steps",
+                        str(args.semantic_merge_residual_safe_projection_steps),
+                    ]
+                )
+        promotion_gate_policy = str(args.semantic_merge_promotion_gate_policy or "none").strip().lower()
+        if promotion_gate_policy not in {"", "none", "off"}:
+            cmd.extend(
+                [
+                    "--semantic_merge_promotion_gate_policy",
+                    promotion_gate_policy,
+                    "--semantic_merge_promotion_qscale_min",
+                    str(args.semantic_merge_promotion_qscale_min),
+                    "--semantic_merge_promotion_random_qscale_gap_min",
+                    str(args.semantic_merge_promotion_random_qscale_gap_min),
+                ]
+            )
         if bool(args.qscale_hold_refresh):
             cmd.extend(
                 [
@@ -334,6 +415,18 @@ def _build_command(args: argparse.Namespace, *, chunk: int, case: str, out_dir: 
                 str(args.online_scale_state_max),
             ]
         )
+        if bool(args.online_scale_state_pre_guard):
+            cmd.extend(["--online_scale_state_pre_guard", "1"])
+        gate_policy = str(args.online_scale_state_gate_policy or "none").strip().lower()
+        if gate_policy not in {"", "none", "off"}:
+            cmd.extend(
+                [
+                    "--online_scale_state_gate_policy",
+                    gate_policy,
+                    "--online_scale_state_qscale_min",
+                    str(args.online_scale_state_qscale_min),
+                ]
+            )
     cmd.extend(
         [
             "--fast_cue_eval",
@@ -353,10 +446,10 @@ def _run_job(job: Dict[str, Any]) -> Dict[str, Any]:
     env["CUDA_VISIBLE_DEVICES"] = str(job["gpu"])
     if str(job.get("cuda_alloc_conf") or "").strip():
         env["PYTORCH_CUDA_ALLOC_CONF"] = str(job["cuda_alloc_conf"]).strip()
+    if bool(job.get("disable_ttt_compile", False)):
+        env["LOGER_TTT_DISABLE_COMPILE"] = "1"
     if bool(job.get("ttt_tail_drop", False)):
         env["TTT_WRITE_POST_ZP_SUMMARY"] = "1"
-        if bool(job.get("disable_ttt_compile", False)):
-            env["LOGER_TTT_DISABLE_COMPILE"] = "1"
     out_dir = Path(job["out_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
     run_log = out_dir / "run.log"
@@ -411,6 +504,11 @@ def main() -> None:
     parser.add_argument("--radio-sidecar-dir", default="results/kitti_preprocess/01/radio_sidecar_chunks_r5_overlap")
     parser.add_argument("--reject-worse-than-native-overlap", action="store_true")
     parser.add_argument("--native-overlap-tolerance", type=float, default=0.0)
+    parser.add_argument("--semantic-merge-residual-safe-projection", action="store_true")
+    parser.add_argument("--semantic-merge-residual-safe-projection-steps", type=int, default=16)
+    parser.add_argument("--semantic-merge-promotion-gate-policy", default="none")
+    parser.add_argument("--semantic-merge-promotion-qscale-min", type=float, default=0.0)
+    parser.add_argument("--semantic-merge-promotion-random-qscale-gap-min", type=float, default=0.02)
     parser.add_argument("--qscale-hold-refresh", action="store_true")
     parser.add_argument("--qscale-reference", type=float, default=0.35)
     parser.add_argument("--qscale-min-factor", type=float, default=0.35)
@@ -419,6 +517,13 @@ def main() -> None:
     parser.add_argument("--online-scale-state-mode", default="none")
     parser.add_argument("--online-scale-state-min", type=float, default=0.80)
     parser.add_argument("--online-scale-state-max", type=float, default=1.25)
+    parser.add_argument(
+        "--online-scale-state-pre-guard",
+        action="store_true",
+        help="Pass --online_scale_state_pre_guard=1 so scale-state is applied before the native-overlap rejection guard.",
+    )
+    parser.add_argument("--online-scale-state-gate-policy", default="none")
+    parser.add_argument("--online-scale-state-qscale-min", type=float, default=0.50)
     parser.add_argument(
         "--disable-ttt-compile",
         action="store_true",

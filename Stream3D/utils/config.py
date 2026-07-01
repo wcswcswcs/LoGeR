@@ -25,9 +25,29 @@ def get_args():
     parser.add_argument('--backbone', type=str, default='Cropformer')  # Cropformer SAM2 SAM FastSAM EfficientSAM
     parser.add_argument('--debug', action="store_true")
     parser.add_argument('--para', type=float)
+    parser.add_argument('--frame-stride', dest='frame_stride', type=int, default=None)
+    parser.add_argument('--frame-id-allowlist', type=str, default=None)
+    parser.add_argument('--export-local-stage', action="store_true")
+    parser.add_argument('--local-stage-output-dir', type=str, default=None)
+    parser.add_argument('--segmentation-dir-override', type=str, default=None)
 
+    cli_overrides = {}
     args = parser.parse_args()
+    for key in ("frame_stride", "frame_id_allowlist", "local_stage_output_dir", "segmentation_dir_override"):
+        value = getattr(args, key, None)
+        if value is not None:
+            cli_overrides[key] = value
+    if bool(getattr(args, "export_local_stage", False)):
+        cli_overrides["export_local_stage"] = True
     args = update_args(args)
+    for key, value in cli_overrides.items():
+        setattr(args, key, value)
+    if isinstance(getattr(args, "frame_id_allowlist", None), str):
+        args.frame_id_allowlist = [
+            int(part.strip())
+            for part in args.frame_id_allowlist.split(",")
+            if part.strip()
+        ]
     return args
 
 def get_dataset(args, model):
@@ -44,4 +64,7 @@ def get_dataset(args, model):
     else:
         print(args.dataset)
         raise NotImplementedError
+    override = getattr(args, "segmentation_dir_override", None)
+    if override:
+        dataset.segmentation_dir = str(override).format(seq_name=args.seq_name)
     return dataset

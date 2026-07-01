@@ -46,7 +46,8 @@ def main(args, para):
         frame_step_2D_mask = 1
 
         if args.dataset == 'scannet':
-            frame_id = datasets[0].get_frame_list(10) # [0, 10, 20, 30, 40...]
+            scannet_frame_stride = int(getattr(args, "frame_stride", 10))
+            frame_id = datasets[0].get_frame_list(scannet_frame_stride) # default [0, 10, 20, 30, 40...]
             Point_ratio = 0.05   # 
             Isolated_dis = 0.05  # 
             Overlap_ratio = 0.2  # 

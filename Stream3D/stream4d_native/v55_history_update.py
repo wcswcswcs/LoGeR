@@ -451,6 +451,7 @@ def build_v55_history_update(
     native_history_mask_semantic_device: str = "cpu",
     native_history_mask_semantic_checkpoint: str | None = None,
     native_history_mask_semantic_short_side: int = 518,
+    objectlet_variant_override: str | None = None,
 ) -> dict[str, Any]:
     role_rows = read_csv(_project(chunk_role_rows_path))
     chunk_rows = read_csv(_project(chunk_rows_path))
@@ -459,7 +460,7 @@ def build_v55_history_update(
     local_summary = read_json(_project(local_summary_path))
     component_atom_rows = read_csv(_project(component_atom_rows_path))
     component_to_atom = _component_atom_map(component_atom_rows)
-    best_variant = str(local_summary.get("best_method_variant") or "")
+    best_variant = str(objectlet_variant_override or local_summary.get("best_method_variant") or "")
     update_chunks = {str(row.get("chunk_id")) for row in role_rows if str(row.get("role")) == "update"}
     scenes = {str(row.get("scene")) for row in role_rows}
     component_gt = _support_component_gt(_project(support_rows_path), support_variant=support_variant, scenes=scenes)
@@ -1535,6 +1536,8 @@ def build_v55_history_update(
             "component_atom_rows_path": _rel(component_atom_rows_path),
             "support_rows_path": _rel(support_rows_path),
         },
+        "objectlet_variant": best_variant,
+        "objectlet_variant_override": objectlet_variant_override,
         "history_object_count": len(histories),
         "update_chunk_count": len(update_chunks),
         "history_evidence_roles": sorted(evidence_roles),

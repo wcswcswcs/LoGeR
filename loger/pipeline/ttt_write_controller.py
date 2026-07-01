@@ -24,10 +24,12 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 
-from loger.models.ttt import fast_weight_replay_update
+from loger.models.ttt import fast_weight_replay_update, silu_backprop, zeropower_via_newtonschulz5
 from .geometry_backbone import WriteCacheOutput, TTTLayerCache
 from .geometry_backbone import TOKEN_TYPE_PATCH
+from .semantic_prior_generator import SEMANTIC_ROLE_NEGATIVE_SHORT
 
 
 # ---------------------------------------------------------------------------
@@ -42,6 +44,7 @@ class WriteResult:
     w2: List[Optional[torch.Tensor]]    # per-layer branch-2 weights
     history: Optional[List[Optional[Dict[str, torch.Tensor]]]] = None
     transient_delta: Optional[Dict[str, Any]] = None
+    token_contribution_diagnostic: Optional[Dict[str, Any]] = None
 
     debug: Dict[str, Any] = field(default_factory=dict)
 
@@ -138,6 +141,7 @@ class TTTWriteController:
         scale_state_branch_mask: str = "0",
         scale_state_chunks: Optional[str] = None,
         scale_state_sample_tokens: int = 0,
+        record_token_contribution_diagnostic: bool = False,
     ):
         self.lambda_min = lambda_min
         self.lambda_max = lambda_max
@@ -232,6 +236,7 @@ class TTTWriteController:
         self.scale_state_log_ratio = 0.0
         self.scale_state_reason = "not_configured"
         self.scale_state_payload: Dict[str, Any] = {}
+        self.record_token_contribution_diagnostic = bool(record_token_contribution_diagnostic)
         self.v11_projection_action_mode = "none"
         self.v11_projection_action_active = False
         self.v11_projection_chunk_idx = -1
@@ -265,6 +270,7 @@ class TTTWriteController:
         num_frames: Optional[int] = None,
         overlap_frames: int = 0,
         risk_tok: Optional[torch.Tensor] = None,
+        role_tok: Optional[torch.Tensor] = None,
         prev_transient_delta: Optional[Dict[str, Any]] = None,
     ) -> WriteResult:
         """Perform delayed write-back: W_m → W_{m+1}.
@@ -328,11 +334,19 @@ class TTTWriteController:
             else:
                 effective_prior = A_tok
                 effective_budget = B_chunk_geo
-            w0_li, w1_li, w2_li, layer_debug, layer_transient_delta = self._replay_layer(
+            (
+                w0_li,
+                w1_li,
+                w2_li,
+                layer_debug,
+                layer_transient_delta,
+                layer_token_contribution_diagnostic,
+            ) = self._replay_layer(
                 lc, effective_prior, effective_budget, dev,
                 layer_idx=int(li),
                 token_type=token_type,
                 risk_tok=risk_tok,
+                role_tok=role_tok,
                 active_branch_mask=active_branch_mask,
                 layer_prior_enabled=bool(layer_prior_enabled),
                 num_frames=num_frames,
@@ -347,8 +361,13 @@ class TTTWriteController:
                     if value is not None:
                         transient_delta[branch_name][li] = value
             debug_info[f"layer_{li}"] = layer_debug
+            if layer_token_contribution_diagnostic is not None:
+                debug_info.setdefault("_token_contribution_diagnostic_layers", []).append(
+                    layer_token_contribution_diagnostic
+                )
 
         self._summarize_replay_feature_gate_debug(debug_info)
+        self._summarize_replay_token_filter_debug(debug_info)
         self._summarize_ttt_self_cues(debug_info, n_layers)
         self._apply_native_delta_gate(write_cache, w0_new, w1_new, w2_new, debug_info)
         self._mix_with_native_provisional(write_cache, w0_new, w1_new, w2_new, debug_info)
@@ -391,6 +410,28 @@ class TTTWriteController:
             "ttt_transient_delta_ttl": int(self.transient_delta_ttl),
             "ttt_transient_delta_ttl_out": int(transient_delta_out.get("_ttl_remaining", 0)) if isinstance(transient_delta_out, dict) else 0,
         })
+        token_contribution_diagnostic = self._aggregate_token_contribution_diagnostics(
+            debug_info.pop("_token_contribution_diagnostic_layers", [])
+        )
+        debug_info["ttt_token_contribution_diagnostic_available"] = bool(
+            token_contribution_diagnostic is not None
+        )
+        if token_contribution_diagnostic is not None:
+            debug_info["ttt_token_contribution_diagnostic_layer_count"] = int(
+                token_contribution_diagnostic.get("layer_count", 0)
+            )
+            debug_info["ttt_token_contribution_diagnostic_source"] = str(
+                token_contribution_diagnostic.get("source", "")
+            )
+            debug_info["ttt_token_contribution_diagnostic_conflict_mean"] = float(
+                token_contribution_diagnostic.get("conflict_mean", 0.0)
+            )
+            debug_info["ttt_token_contribution_diagnostic_energy_mean"] = float(
+                token_contribution_diagnostic.get("energy_mean", 0.0)
+            )
+            debug_info["ttt_token_contribution_diagnostic_scale_available"] = bool(
+                token_contribution_diagnostic.get("S_scale_risk_replay_contribution_tok") is not None
+            )
 
         return WriteResult(
             w0=w0_new,
@@ -398,6 +439,7 @@ class TTTWriteController:
             w2=w2_new,
             history=history,
             transient_delta=transient_delta_out,
+            token_contribution_diagnostic=token_contribution_diagnostic,
             debug=debug_info,
         )
 
@@ -478,6 +520,164 @@ class TTTWriteController:
         if vals:
             debug_info["ttt_replay_feature_gate_max_abs_delta"] = float(max(vals))
 
+    def _summarize_replay_token_filter_debug(self, debug_info: Dict[str, Any]) -> None:
+        """Lift per-layer replay token-filter diagnostics to top-level audit fields."""
+        layer_rows = [
+            value
+            for key, value in debug_info.items()
+            if str(key).startswith("layer_") and isinstance(value, dict)
+        ]
+        token_rows = [
+            row
+            for row in layer_rows
+            if "ttt_replay_token_filter_applied" in row
+            or "ttt_replay_token_filter_mode" in row
+        ]
+        if not token_rows:
+            return
+        applied_rows = [
+            row for row in token_rows if bool(row.get("ttt_replay_token_filter_applied"))
+        ]
+        debug_info["ttt_replay_token_filter_applied"] = bool(applied_rows)
+        debug_info["ttt_replay_token_filter_layer_count"] = int(len(token_rows))
+        debug_info["ttt_replay_token_filter_applied_layer_count"] = int(len(applied_rows))
+        debug_info["ttt_replay_token_filter_applied_layer_frac"] = float(
+            len(applied_rows) / max(1, len(token_rows))
+        )
+        debug_info["ttt_replay_token_filter_branch_mask"] = list(self.replay_token_filter_branch_mask)
+        debug_info["ttt_replay_token_filter_blend"] = min(max(float(self.replay_token_filter_blend), 0.0), 1.0)
+        debug_info["ttt_replay_token_filter_blend_mode"] = str(
+            self.replay_token_filter_blend_mode or "linear"
+        ).strip().lower()
+
+        modes = sorted(
+            {
+                str(row.get("ttt_replay_token_filter_mode"))
+                for row in token_rows
+                if row.get("ttt_replay_token_filter_mode") is not None
+            }
+        )
+        if modes:
+            debug_info["ttt_replay_token_filter_modes"] = modes
+        scopes = sorted(
+            {
+                str(row.get("ttt_replay_token_filter_scope"))
+                for row in token_rows
+                if row.get("ttt_replay_token_filter_scope") is not None
+            }
+        )
+        if scopes:
+            debug_info["ttt_replay_token_filter_scopes"] = scopes
+        role_modes = sorted(
+            {
+                str(row.get("ttt_role_alignment_mode"))
+                for row in token_rows
+                if row.get("ttt_role_alignment_mode") is not None
+            }
+        )
+        if role_modes:
+            debug_info["ttt_role_alignment_modes"] = role_modes
+
+        def _values(name: str) -> List[float]:
+            out: List[float] = []
+            for row in token_rows:
+                value = row.get(name)
+                if value is None:
+                    continue
+                try:
+                    out.append(float(value))
+                except (TypeError, ValueError):
+                    continue
+            return out
+
+        for name in (
+            "ttt_replay_token_filter_ratio",
+            "ttt_replay_token_filter_threshold",
+            "ttt_replay_token_filter_tokens_before",
+            "ttt_replay_token_filter_tokens_after",
+            "ttt_replay_token_filter_keep_mass",
+            "ttt_replay_token_filter_prior_mean_before",
+            "ttt_replay_token_filter_prior_min_before",
+            "ttt_replay_token_filter_prior_q10_before",
+            "ttt_replay_token_filter_prior_q50_before",
+            "ttt_replay_token_filter_prior_q90_before",
+            "ttt_replay_token_filter_prior_max_before",
+            "ttt_replay_token_filter_prior_mean_after",
+            "ttt_replay_token_filter_prior_min_after",
+            "ttt_replay_token_filter_prior_q10_after",
+            "ttt_replay_token_filter_scoped_prior_mean_before",
+            "ttt_replay_token_filter_scoped_prior_min_before",
+            "ttt_replay_token_filter_scoped_prior_q10_before",
+            "ttt_replay_token_filter_scoped_prior_q50_before",
+            "ttt_replay_token_filter_scoped_prior_q90_before",
+            "ttt_replay_token_filter_scoped_prior_max_before",
+            "ttt_replay_token_filter_scope_tokens",
+            "ttt_replay_token_filter_scope_mass",
+            "ttt_replay_token_filter_overlap_frames",
+            "ttt_replay_token_filter_tokens_per_frame",
+            "ttt_replay_token_filter_semantic_harm_tokens",
+            "ttt_replay_token_filter_semantic_harm_scope_tokens",
+            "ttt_replay_token_filter_semantic_harm_veto_tokens",
+            "ttt_role_alignment_cache_tokens",
+            "ttt_role_alignment_full_tokens",
+            "ttt_role_alignment_patch_tokens",
+            "ttt_role_alignment_special_tokens",
+            "ttt_role_alignment_token_type_tokens",
+        ):
+            vals = _values(name)
+            if vals:
+                debug_info[name] = float(sum(vals) / len(vals))
+
+        for name in (
+            "ttt_replay_token_filter_layer_disabled",
+            "ttt_replay_token_filter_invalid_frame_layout",
+            "ttt_replay_token_filter_scope_valid",
+            "ttt_replay_token_filter_branch_isolated",
+            "ttt_replay_token_filter_noop_all_tokens_kept",
+            "ttt_replay_token_filter_semantic_role_missing",
+            "ttt_role_alignment_available",
+            "ttt_role_alignment_token_type_mismatch",
+            "ttt_role_alignment_padded",
+        ):
+            vals = [row.get(name) for row in token_rows if row.get(name) is not None]
+            if vals:
+                true_count = int(sum(1 for value in vals if bool(value)))
+                debug_info[f"{name}_true_count"] = true_count
+                debug_info[f"{name}_true_frac"] = float(true_count / len(vals))
+
+        for branch_name in ("w0", "w1", "w2"):
+            stored_key = f"ttt_transient_delta_{branch_name}_stored"
+            stored_rows = [row for row in token_rows if bool(row.get(stored_key))]
+            debug_info[stored_key] = bool(stored_rows)
+            debug_info[f"{stored_key}_layer_count"] = int(len(stored_rows))
+            for suffix in ("norm_mean", "norm_max", "check_norm_mean"):
+                vals = _values(f"ttt_transient_delta_{branch_name}_{suffix}")
+                if vals:
+                    debug_info[f"ttt_transient_delta_{branch_name}_{suffix}"] = float(sum(vals) / len(vals))
+            for suffix in (
+                "ttl_mode",
+                "align_cos_mean",
+                "dyn_keep_mean",
+                "dyn_keep_max",
+                "proj_coeff_mean",
+                "anti_dyn_norm_mean",
+                "anti_dyn_fraction_mean",
+            ):
+                key = f"ttt_replay_token_filter_{branch_name}_{suffix}"
+                vals = _values(key)
+                if vals:
+                    debug_info[key] = float(sum(vals) / len(vals))
+                    continue
+                text_vals = sorted(
+                    {
+                        str(row.get(key))
+                        for row in token_rows
+                        if row.get(key) is not None
+                    }
+                )
+                if text_vals:
+                    debug_info[key] = text_vals
+
     # -- per-layer replay --------------------------------------------------
 
     def _replay_layer(
@@ -490,6 +690,7 @@ class TTTWriteController:
         layer_idx: int = -1,
         token_type: Optional[torch.Tensor] = None,
         risk_tok: Optional[torch.Tensor] = None,
+        role_tok: Optional[torch.Tensor] = None,
         active_branch_mask: Tuple[int, ...] = (0, 1, 2),
         layer_prior_enabled: bool = True,
         num_frames: Optional[int] = None,
@@ -500,6 +701,7 @@ class TTTWriteController:
         torch.Tensor,
         Dict[str, Any],
         Optional[Dict[str, Optional[torch.Tensor]]],
+        Optional[Dict[str, Any]],
     ]:
         """Replay one TTT layer's update with prior-weighted lr."""
         # Move cached tensors to device.  The original forward mixes
@@ -543,6 +745,11 @@ class TTTWriteController:
             align_mode=str(align_debug.get("ttt_prior_alignment_mode", "")),
         )
         prior_flat, transform_debug = self._apply_prior_transform(prior_flat)
+        role_flat, role_debug = self._align_role_to_replay_tokens(
+            role_tok,
+            token_type=token_type,
+            cache_l=int(l),
+        )
         token_prior = prior_flat.to(device).unsqueeze(0).unsqueeze(-1)  # [1, l, 1]
         unity_prior = torch.ones_like(token_prior)
         branch_enabled = tuple(bool(A_tok is not None and i in active_branch_mask) for i in range(3))
@@ -588,6 +795,7 @@ class TTTWriteController:
         debug.update(scope_debug)
         debug.update(special_debug)
         debug.update(transform_debug)
+        debug.update(role_debug)
 
         lam0 = lam if branch_enabled[0] else 1.0
         lam1 = lam if branch_enabled[1] else 1.0
@@ -662,6 +870,7 @@ class TTTWriteController:
             cache_l=int(l),
             num_frames=num_frames,
             overlap_frames=overlap_frames,
+            role_flat=role_flat,
         )
         if not (layer_prior_enabled and A_tok is not None and len(active_branch_mask) > 0):
             filter_idx = None
@@ -774,6 +983,62 @@ class TTTWriteController:
             token_filter_blend_mode = str(self.replay_token_filter_blend_mode or "linear").strip().lower()
             token_filter_blend_debug: Dict[str, Any] = {}
             transient_delta: Dict[str, Optional[torch.Tensor]] = {"w0": None, "w1": None, "w2": None}
+            token_contribution_diagnostic: Optional[Dict[str, Any]] = None
+            if self.record_token_contribution_diagnostic:
+                token_contribution_diagnostic = self._build_replay_token_contribution_diagnostic(
+                    k=k_gate_full,
+                    v=v_gate_full,
+                    write_hidden=lc.write_hidden,
+                    lr0=lr0 * lam0,
+                    lr1=lr1 * lam1,
+                    lr2=lr2 * lam2,
+                    w0_old=w0_old,
+                    w1_old=w1_old,
+                    w2_old=w2_old,
+                    token_prior0=token_prior0,
+                    token_prior1=token_prior1,
+                    token_prior2=token_prior2,
+                    replay_order=lc.ttt_op_order,
+                    muon_update_steps=lc.muon_update_steps,
+                    momentum=momentum,
+                    ttt_update_steps=lc.ttt_update_steps,
+                    active_branch_mask=active_branch_mask,
+                    token_type=token_type,
+                    cache_l=int(l),
+                    prior_flat=prior_flat,
+                    risk_flat=gradient_reversal_risk_flat,
+                    role_flat=role_flat,
+                    layer_idx=int(layer_idx),
+                    token_filter_active=filter_idx is not None,
+                )
+                if token_contribution_diagnostic is not None:
+                    summary = token_contribution_diagnostic.get("summary") or {}
+                    debug.update({
+                        "ttt_token_contribution_diagnostic_layer": int(layer_idx),
+                        "ttt_token_contribution_diagnostic_status": str(
+                            token_contribution_diagnostic.get("status", "")
+                        ),
+                        "ttt_token_contribution_diagnostic_source": str(
+                            token_contribution_diagnostic.get("source", "")
+                        ),
+                        "ttt_token_contribution_diagnostic_energy_mean": float(
+                            summary.get("energy_mean", 0.0)
+                        ),
+                        "ttt_token_contribution_diagnostic_conflict_mean": float(
+                            summary.get("conflict_mean", 0.0)
+                        ),
+                        "ttt_token_contribution_diagnostic_static_token_count": int(
+                            summary.get("static_token_count", 0)
+                        ),
+                        "ttt_token_contribution_diagnostic_branch_count": int(
+                            summary.get("branch_count", 0)
+                        ),
+                        "ttt_token_contribution_diagnostic_token_filter_active": bool(
+                            summary.get("token_filter_active", False)
+                        ),
+                    })
+                    if summary.get("error") is not None:
+                        debug["ttt_token_contribution_diagnostic_error"] = str(summary.get("error"))
 
             def renorm_like(reference: torch.Tensor, candidate: torch.Tensor) -> torch.Tensor:
                 ref_norm = reference.detach().float().norm(dim=1, keepdim=True)
@@ -2358,7 +2623,661 @@ class TTTWriteController:
                 w2_new = self._scale_delta_and_renorm(w2_old, w2_new, s2)
 
         transient_out = transient_delta if any(v is not None for v in transient_delta.values()) else None
-        return w0_new.cpu(), w1_new.cpu(), w2_new.cpu(), debug, transient_out
+        return w0_new.cpu(), w1_new.cpu(), w2_new.cpu(), debug, transient_out, token_contribution_diagnostic
+
+    def _build_replay_token_contribution_diagnostic(
+        self,
+        *,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        write_hidden: Optional[torch.Tensor],
+        lr0: torch.Tensor,
+        lr1: torch.Tensor,
+        lr2: torch.Tensor,
+        w0_old: torch.Tensor,
+        w1_old: torch.Tensor,
+        w2_old: torch.Tensor,
+        token_prior0: torch.Tensor,
+        token_prior1: torch.Tensor,
+        token_prior2: torch.Tensor,
+        replay_order: Any,
+        muon_update_steps: int,
+        momentum: Optional[torch.Tensor],
+        ttt_update_steps: int,
+        active_branch_mask: Tuple[int, ...],
+        token_type: Optional[torch.Tensor],
+        cache_l: int,
+        prior_flat: torch.Tensor,
+        risk_flat: Optional[torch.Tensor],
+        role_flat: Optional[torch.Tensor],
+        layer_idx: int,
+        token_filter_active: bool,
+    ) -> Optional[Dict[str, Any]]:
+        """Diagnostic-only token contribution map for Track F.
+
+        The map decomposes the replay pre-zeropower outer-product terms per
+        token and compares them with a low-risk/static aggregate direction.
+        It is not used for runtime control and is intentionally stored outside
+        ``debug`` so full token vectors do not enter JSON logs.
+        """
+        l = int(cache_l)
+        if l <= 0:
+            return None
+        summary: Dict[str, Any] = {
+            "layer_idx": int(layer_idx),
+            "token_count": int(l),
+            "token_filter_active": bool(token_filter_active),
+            "source": "pre_zp_replay_token_contribution",
+        }
+        try:
+            device = k.device
+            patch_mask = torch.ones(l, dtype=torch.bool, device=device)
+            if token_type is not None:
+                tt = token_type.detach().cpu().long().reshape(-1)
+                if int(tt.numel()) == l:
+                    patch_mask = (tt.to(device=device) == int(TOKEN_TYPE_PATCH))
+                    summary["patch_mask_source"] = "direct_token_type"
+                elif int((tt == int(TOKEN_TYPE_PATCH)).sum().item()) == l:
+                    summary["patch_mask_source"] = "patch_only_replay"
+                else:
+                    summary["patch_mask_source"] = "fallback_all"
+            else:
+                summary["patch_mask_source"] = "missing_token_type_fallback_all"
+
+            if risk_flat is not None and int(risk_flat.numel()) == l:
+                risk = risk_flat.detach().float().reshape(-1).to(device=device).clamp(0.0, 1.0)
+                summary["static_risk_source"] = "gradient_reversal_risk"
+            else:
+                p = prior_flat.detach().float().reshape(-1)
+                if int(p.numel()) != l:
+                    p_aligned = torch.ones(l, dtype=torch.float32)
+                    n = min(int(p.numel()), l)
+                    if n > 0:
+                        p_aligned[:n] = p[:n]
+                    p = p_aligned
+                risk = (1.0 - self._normalize01_vec(p)).to(device=device).clamp(0.0, 1.0)
+                summary["static_risk_source"] = "fallback_inverse_prior"
+
+            static_role = torch.ones(l, dtype=torch.bool, device=device)
+            if role_flat is not None and int(role_flat.numel()) == l:
+                role = role_flat.detach().long().reshape(-1).to(device=device)
+                static_role = (role != int(SEMANTIC_ROLE_NEGATIVE_SHORT)) & (role > 0)
+                if not bool(static_role.any()):
+                    static_role = torch.ones(l, dtype=torch.bool, device=device)
+                    summary["static_role_source"] = "empty_role_fallback_all"
+                else:
+                    summary["static_role_source"] = "non_negative_semantic_roles"
+            else:
+                summary["static_role_source"] = "missing_role_fallback_all"
+
+            scoped = risk[patch_mask] if bool(patch_mask.any()) else risk
+            if scoped.numel() > 0:
+                low_thr = torch.quantile(scoped, 0.40)
+            else:
+                low_thr = risk.new_tensor(1.0)
+            static_mask = patch_mask & static_role & (risk <= low_thr)
+            if int(static_mask.sum().item()) <= 0:
+                static_mask = patch_mask & (risk <= low_thr)
+                summary["static_mask_fallback"] = "patch_low_risk"
+            if int(static_mask.sum().item()) <= 0:
+                static_mask = patch_mask
+                summary["static_mask_fallback"] = "patch_all"
+
+            energy = torch.zeros(l, dtype=torch.float32, device=device)
+            conflict_weighted = torch.zeros(l, dtype=torch.float32, device=device)
+            energy_by_branch: Dict[int, torch.Tensor] = {
+                idx: torch.zeros(l, dtype=torch.float32, device=device)
+                for idx in (0, 1, 2)
+            }
+            conflict_weighted_by_branch: Dict[int, torch.Tensor] = {
+                idx: torch.zeros(l, dtype=torch.float32, device=device)
+                for idx in (0, 1, 2)
+            }
+            branch_count = 0
+            branch_total_count = 0
+            segment_count = 0
+            w0 = w0_old.clone()
+            w1 = w1_old.clone()
+            w2 = w2_old.clone()
+            w0_norm = w0.detach().norm(dim=1, keepdim=True)
+            w1_norm = w1.detach().norm(dim=1, keepdim=True)
+            w2_norm = w2.detach().norm(dim=1, keepdim=True)
+            if momentum is not None:
+                dw0_momentum = torch.zeros_like(w0)
+                dw1_momentum = torch.zeros_like(w1)
+                dw2_momentum = torch.zeros_like(w2)
+
+            def accumulate_branch(
+                branch_idx: int,
+                a: torch.Tensor,
+                b: torch.Tensor,
+                start: int,
+                end: int,
+            ) -> None:
+                nonlocal branch_count, branch_total_count
+                if end <= start:
+                    return
+                branch_total_count += 1
+                active_branch = branch_idx in active_branch_mask
+                if active_branch:
+                    branch_count += 1
+                af = a.detach().float()
+                bf = b.detach().float()
+                e = af.norm(dim=-1) * bf.norm(dim=-1)
+                conflict = torch.zeros_like(e)
+                local_static = static_mask[start:end]
+                if bool(local_static.any()):
+                    a_static = af[:, local_static, :]
+                    b_static = bf[:, local_static, :]
+                    direction = torch.einsum("bld,blh->bdh", a_static, b_static)
+                    dir_norm = direction.flatten(1).norm(dim=1).clamp_min(1e-6)
+                    dot = torch.einsum("bld,bdh,blh->bl", af, direction, bf)
+                    denom = (e * dir_norm[:, None]).clamp_min(1e-6)
+                    cos = (dot / denom).clamp(-1.0, 1.0)
+                    conflict = (0.5 * (1.0 - cos)).clamp(0.0, 1.0)
+                branch_energy = e.sum(dim=0)
+                branch_conflict = (conflict * e).sum(dim=0)
+                if branch_idx in energy_by_branch:
+                    energy_by_branch[branch_idx][start:end] += branch_energy
+                    conflict_weighted_by_branch[branch_idx][start:end] += branch_conflict
+                if active_branch:
+                    conflict_weighted[start:end] += branch_conflict
+                    energy[start:end] += branch_energy
+
+            for start, end, update, _apply in replay_order:
+                if not update:
+                    continue
+                start_i = 0 if start is None else int(start)
+                end_i = l if end is None else int(end)
+                if end_i <= start_i:
+                    continue
+                segment_count += 1
+                ki = k[:, start_i:end_i, :]
+                vi = v[:, start_i:end_i, :]
+                lr0i = lr0[:, start_i:end_i, :] * token_prior0[:, start_i:end_i, :]
+                lr1i = lr1[:, start_i:end_i, :] * token_prior1[:, start_i:end_i, :]
+                lr2i = lr2[:, start_i:end_i, :] * token_prior2[:, start_i:end_i, :]
+                w0_now, w1_now, w2_now = w0, w1, w2
+                gate_before_act = ki @ w0_now
+                hidden_before_mul = ki @ w2_now
+                hidden = F.silu(gate_before_act, inplace=False) * hidden_before_mul
+                for _step in range(int(ttt_update_steps)):
+                    dhidden = vi @ w1_now.transpose(-1, -2)
+                    dhidden_before_mul = dhidden * F.silu(gate_before_act, inplace=False)
+                    dgate = dhidden * hidden_before_mul
+                    dgate_before_act = silu_backprop(dgate, gate_before_act)
+                    accumulate_branch(1, hidden * lr1i, vi, start_i, end_i)
+                    accumulate_branch(0, ki * lr0i, dgate_before_act, start_i, end_i)
+                    accumulate_branch(2, ki * lr2i, dhidden_before_mul, start_i, end_i)
+                    w1_grad = zeropower_via_newtonschulz5(
+                        (hidden * lr1i).transpose(-1, -2) @ vi, muon_update_steps
+                    )
+                    w0_grad = zeropower_via_newtonschulz5(
+                        (ki * lr0i).transpose(-1, -2) @ dgate_before_act, muon_update_steps
+                    )
+                    w2_grad = zeropower_via_newtonschulz5(
+                        (ki * lr2i).transpose(-1, -2) @ dhidden_before_mul, muon_update_steps
+                    )
+                    if momentum is not None:
+                        m_i = momentum[:, start_i:end_i, :].mean(dim=1, keepdim=True)
+                        w0_grad = w0_grad + dw0_momentum * m_i
+                        w1_grad = w1_grad + dw1_momentum * m_i
+                        w2_grad = w2_grad + dw2_momentum * m_i
+                        dw0_momentum = w0_grad
+                        dw1_momentum = w1_grad
+                        dw2_momentum = w2_grad
+                    w1_now = w1_now + w1_grad
+                    w0_now = w0_now + w0_grad
+                    w2_now = w2_now + w2_grad
+                    w0_now = w0_now / (w0_now.norm(dim=1, keepdim=True) + 1e-5) * w0_norm
+                    w1_now = w1_now / (w1_now.norm(dim=1, keepdim=True) + 1e-5) * w1_norm
+                    w2_now = w2_now / (w2_now.norm(dim=1, keepdim=True) + 1e-5) * w2_norm
+                w0, w1, w2 = w0_now, w1_now, w2_now
+
+            conflict = torch.zeros_like(energy)
+            nz = energy > 1e-12
+            if bool(nz.any()):
+                conflict[nz] = (conflict_weighted[nz] / energy[nz].clamp_min(1e-12)).clamp(0.0, 1.0)
+            energy01 = self._normalize01_vec(energy.detach().cpu()).to(dtype=torch.float32)
+            conflict_cpu = torch.nan_to_num(conflict.detach().cpu().float(), nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
+            stable_mask_cpu = static_mask.detach().cpu().bool()
+            z_write_key_norm_cpu: Optional[torch.Tensor] = None
+            z_write_key_vec_cpu: Optional[torch.Tensor] = None
+            z_write_key_sketch_cpu: Optional[torch.Tensor] = None
+            z_write_hidden_vec_cpu: Optional[torch.Tensor] = None
+            try:
+                k_mean = k.detach().float().mean(dim=0)
+                z_write_key_norm_cpu = k.detach().float().norm(dim=-1).mean(dim=0).detach().cpu().float()
+                k_unit = F.normalize(k_mean, dim=-1)
+                z_write_key_vec_cpu = k_unit.detach().cpu().float()
+                summary["z_write_key_vec_dim"] = int(k_unit.shape[-1])
+                summary["z_write_key_vec_source"] = "mean_normalized_pre_zp_replay_key_full"
+                sketch_dim = min(16, int(k_unit.shape[-1]))
+                if sketch_dim > 0:
+                    chunks = torch.chunk(k_unit, sketch_dim, dim=-1)
+                    z_write_key_sketch_cpu = torch.stack(
+                        [chunk.mean(dim=-1) for chunk in chunks],
+                        dim=-1,
+                    ).detach().cpu().float()
+                    summary["z_write_key_sketch_dim"] = int(z_write_key_sketch_cpu.shape[-1])
+                    summary["z_write_key_sketch_source"] = "mean_normalized_pre_zp_replay_key_chunk_mean"
+                if torch.is_tensor(write_hidden):
+                    hidden_f = torch.nan_to_num(
+                        write_hidden.detach().float(),
+                        nan=0.0,
+                        posinf=0.0,
+                        neginf=0.0,
+                    )
+                    if hidden_f.ndim == 3 and int(hidden_f.shape[1]) == l:
+                        hidden_mean = hidden_f.mean(dim=0)
+                    elif hidden_f.ndim == 2 and int(hidden_f.shape[0]) == l:
+                        hidden_mean = hidden_f
+                    else:
+                        hidden_mean = None
+                    if hidden_mean is not None and int(hidden_mean.shape[0]) == l:
+                        z_write_hidden_vec_cpu = F.normalize(hidden_mean, dim=-1).detach().cpu().float()
+                        summary["z_write_hidden_vec_dim"] = int(z_write_hidden_vec_cpu.shape[-1])
+                        summary["z_write_hidden_vec_source"] = "ttt_write_tokens_out_hidden_mean_normalized"
+            except RuntimeError as exc:
+                summary["z_write_key_sketch_error"] = str(exc)
+            retention_cpu: Optional[torch.Tensor] = None
+            residual_cpu: Optional[torch.Tensor] = None
+            try:
+                def fast_weight_response(
+                    x: torch.Tensor,
+                    ww0: torch.Tensor,
+                    ww1: torch.Tensor,
+                    ww2: torch.Tensor,
+                ) -> torch.Tensor:
+                    xf = x.detach().float()
+                    w0f = ww0.detach().float()
+                    w1f = ww1.detach().float()
+                    w2f = ww2.detach().float()
+                    return (F.silu(xf @ w0f, inplace=False) * (xf @ w2f)) @ w1f
+
+                before = fast_weight_response(k, w0_old, w1_old, w2_old)
+                after = fast_weight_response(k, w0, w1, w2)
+                cos = F.cosine_similarity(before, after, dim=-1).mean(dim=0)
+                retention_cpu = torch.nan_to_num(
+                    (0.5 * (cos.detach().cpu().float() + 1.0)).clamp(0.0, 1.0),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+                denom = before.detach().float().norm(dim=-1).clamp_min(1e-6)
+                residual_cpu = torch.nan_to_num(
+                    ((after.detach().float() - before.detach().float()).norm(dim=-1) / denom)
+                    .mean(dim=0)
+                    .detach()
+                    .cpu()
+                    .float(),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+            except RuntimeError as exc:
+                summary["stable_anchor_retention_error"] = str(exc)
+            energy_by_branch_cpu: Dict[str, torch.Tensor] = {}
+            conflict_by_branch_cpu: Dict[str, torch.Tensor] = {}
+            scale_tok: Optional[torch.Tensor] = None
+            scale_by_branch_cpu: Dict[str, torch.Tensor] = {}
+            scale_weight = 0.0
+            for branch_idx, branch_energy_raw in energy_by_branch.items():
+                if float(branch_energy_raw.max().detach().item()) <= 1e-12:
+                    continue
+                branch_energy01 = self._normalize01_vec(branch_energy_raw.detach().cpu()).to(dtype=torch.float32)
+                branch_conflict = torch.zeros_like(branch_energy_raw)
+                branch_nz = branch_energy_raw > 1e-12
+                if bool(branch_nz.any()):
+                    branch_conflict[branch_nz] = (
+                        conflict_weighted_by_branch[branch_idx][branch_nz]
+                        / branch_energy_raw[branch_nz].clamp_min(1e-12)
+                    ).clamp(0.0, 1.0)
+                branch_conflict_cpu = torch.nan_to_num(
+                    branch_conflict.detach().cpu().float(),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                ).clamp(0.0, 1.0)
+                key = str(int(branch_idx))
+                energy_by_branch_cpu[key] = branch_energy01.cpu()
+                conflict_by_branch_cpu[key] = branch_conflict_cpu.cpu()
+            if bool(getattr(self, "scale_state_active", False)):
+                scale_weight = min(
+                    1.0,
+                    abs(float(getattr(self, "scale_state_log_ratio", 0.0) or 0.0))
+                    * max(float(getattr(self, "scale_state_alpha", 0.0) or 0.0), 0.0),
+                )
+                if scale_weight > 0.0:
+                    scale_tok = (energy01 * float(scale_weight)).clamp(0.0, 1.0)
+                    for key, branch_energy01 in energy_by_branch_cpu.items():
+                        scale_by_branch_cpu[key] = (
+                            branch_energy01.detach().float() * float(scale_weight)
+                        ).clamp(0.0, 1.0).cpu()
+            summary.update({
+                "status": "complete",
+                "segment_count": int(segment_count),
+                "branch_count": int(branch_count),
+                "branch_total_count": int(branch_total_count),
+                "branch_diagnostic_keys": sorted(energy_by_branch_cpu.keys()),
+                "static_token_count": int(static_mask.sum().item()),
+                "stable_anchor_retention_available": bool(
+                    retention_cpu is not None and residual_cpu is not None and bool(stable_mask_cpu.any())
+                ),
+                "stable_anchor_retention_source": "fast_weight_response_cosine_on_replay_key_tokens",
+                "stable_anchor_token_count": int(stable_mask_cpu.sum().item()),
+                "stable_anchor_retention_mean": float(retention_cpu[stable_mask_cpu].mean().item())
+                if retention_cpu is not None and bool(stable_mask_cpu.any())
+                else None,
+                "stable_anchor_residual_mean": float(residual_cpu[stable_mask_cpu].mean().item())
+                if residual_cpu is not None and bool(stable_mask_cpu.any())
+                else None,
+                "stable_anchor_write_energy_mean": float(energy01[stable_mask_cpu].mean().item())
+                if bool(stable_mask_cpu.any())
+                else None,
+                "nonstable_anchor_retention_mean": float(retention_cpu[~stable_mask_cpu].mean().item())
+                if retention_cpu is not None and bool((~stable_mask_cpu).any())
+                else None,
+                "static_low_risk_threshold": float(low_thr.detach().float().item()),
+                "energy_mean": float(energy01.mean().item()) if energy01.numel() else 0.0,
+                "energy_max": float(energy01.max().item()) if energy01.numel() else 0.0,
+                "conflict_mean": float(conflict_cpu.mean().item()) if conflict_cpu.numel() else 0.0,
+                "conflict_max": float(conflict_cpu.max().item()) if conflict_cpu.numel() else 0.0,
+                "scale_state_active": bool(getattr(self, "scale_state_active", False)),
+                "scale_state_weight": float(scale_weight),
+                "scale_available": scale_tok is not None,
+            })
+            return {
+                "schema": "acl2_v96_ttt_replay_token_contribution_layer_v1",
+                "status": "complete",
+                "source": "pre_zp_replay_token_contribution",
+                "layer_idx": int(layer_idx),
+                "U_ttt_write_replay_contribution_tok": energy01.cpu(),
+                "C_ttt_conflict_replay_contribution_tok": conflict_cpu.cpu(),
+                "S_scale_risk_replay_contribution_tok": scale_tok.cpu() if scale_tok is not None else None,
+                "stable_anchor_retention_tok": retention_cpu.cpu() if retention_cpu is not None else None,
+                "stable_anchor_residual_tok": residual_cpu.cpu() if residual_cpu is not None else None,
+                "stable_anchor_mask_tok": stable_mask_cpu.cpu(),
+                "z_write_key_norm_tok": z_write_key_norm_cpu.cpu() if z_write_key_norm_cpu is not None else None,
+                "z_write_key_vec_tok": z_write_key_vec_cpu.cpu() if z_write_key_vec_cpu is not None else None,
+                "z_write_key_sketch_tok": z_write_key_sketch_cpu.cpu() if z_write_key_sketch_cpu is not None else None,
+                "z_write_hidden_vec_tok": z_write_hidden_vec_cpu.cpu() if z_write_hidden_vec_cpu is not None else None,
+                "U_ttt_write_replay_contribution_tok_by_branch": energy_by_branch_cpu,
+                "C_ttt_conflict_replay_contribution_tok_by_branch": conflict_by_branch_cpu,
+                "S_scale_risk_replay_contribution_tok_by_branch": scale_by_branch_cpu,
+                "summary": summary,
+            }
+        except Exception as exc:  # diagnostic must never alter runtime write replay
+            summary.update({"status": "error", "error": str(exc)})
+            return {
+                "schema": "acl2_v96_ttt_replay_token_contribution_layer_v1",
+                "status": "error",
+                "source": "pre_zp_replay_token_contribution",
+                "layer_idx": int(layer_idx),
+                "summary": summary,
+            }
+
+    def _aggregate_token_contribution_diagnostics(
+        self,
+        layers: List[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        valid = [
+            row for row in layers
+            if isinstance(row, dict)
+            and row.get("status") == "complete"
+            and isinstance(row.get("U_ttt_write_replay_contribution_tok"), torch.Tensor)
+            and isinstance(row.get("C_ttt_conflict_replay_contribution_tok"), torch.Tensor)
+        ]
+        if not valid:
+            return None
+        l = int(valid[0]["U_ttt_write_replay_contribution_tok"].numel())
+        energy_sum = torch.zeros(l, dtype=torch.float32)
+        conflict_num = torch.zeros(l, dtype=torch.float32)
+        scale_num = torch.zeros(l, dtype=torch.float32)
+        scale_den = torch.zeros(l, dtype=torch.float32)
+        retention_sum = torch.zeros(l, dtype=torch.float32)
+        retention_count = torch.zeros(l, dtype=torch.float32)
+        residual_sum = torch.zeros(l, dtype=torch.float32)
+        residual_count = torch.zeros(l, dtype=torch.float32)
+        stable_mask_votes = torch.zeros(l, dtype=torch.float32)
+        z_write_key_norm_sum = torch.zeros(l, dtype=torch.float32)
+        z_write_key_norm_count = torch.zeros(l, dtype=torch.float32)
+        z_write_key_vec_sum: Optional[torch.Tensor] = None
+        z_write_key_vec_count = 0
+        z_write_key_sketch_sum: Optional[torch.Tensor] = None
+        z_write_key_sketch_count = 0
+        z_write_hidden_vec_sum: Optional[torch.Tensor] = None
+        z_write_hidden_vec_count = 0
+        branch_energy_sum: Dict[str, torch.Tensor] = {}
+        branch_conflict_num: Dict[str, torch.Tensor] = {}
+        branch_scale_num: Dict[str, torch.Tensor] = {}
+        branch_scale_den: Dict[str, torch.Tensor] = {}
+        for row in valid:
+            energy = row["U_ttt_write_replay_contribution_tok"].detach().float().reshape(-1)
+            conflict = row["C_ttt_conflict_replay_contribution_tok"].detach().float().reshape(-1)
+            if int(energy.numel()) != l or int(conflict.numel()) != l:
+                continue
+            energy = torch.nan_to_num(energy, nan=0.0, posinf=0.0, neginf=0.0).clamp_min(0.0)
+            conflict = torch.nan_to_num(conflict, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
+            energy_sum += energy
+            conflict_num += conflict * energy.clamp_min(1e-6)
+            scale = row.get("S_scale_risk_replay_contribution_tok")
+            if isinstance(scale, torch.Tensor) and int(scale.numel()) == l:
+                scale_f = torch.nan_to_num(scale.detach().float().reshape(-1), nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
+                scale_num += scale_f * energy.clamp_min(1e-6)
+                scale_den += energy.clamp_min(1e-6)
+            retention = row.get("stable_anchor_retention_tok")
+            if isinstance(retention, torch.Tensor) and int(retention.numel()) == l:
+                ret_f = retention.detach().float().reshape(-1)
+                ret_ok = torch.isfinite(ret_f)
+                retention_sum[ret_ok] += ret_f[ret_ok].clamp(0.0, 1.0)
+                retention_count[ret_ok] += 1.0
+            residual = row.get("stable_anchor_residual_tok")
+            if isinstance(residual, torch.Tensor) and int(residual.numel()) == l:
+                res_f = residual.detach().float().reshape(-1)
+                res_ok = torch.isfinite(res_f)
+                residual_sum[res_ok] += res_f[res_ok].clamp_min(0.0)
+                residual_count[res_ok] += 1.0
+            stable_mask = row.get("stable_anchor_mask_tok")
+            if isinstance(stable_mask, torch.Tensor) and int(stable_mask.numel()) == l:
+                stable_mask_votes += stable_mask.detach().bool().reshape(-1).float()
+            z_write_key_norm = row.get("z_write_key_norm_tok")
+            if isinstance(z_write_key_norm, torch.Tensor) and int(z_write_key_norm.numel()) == l:
+                z_norm = z_write_key_norm.detach().float().reshape(-1)
+                z_ok = torch.isfinite(z_norm)
+                z_write_key_norm_sum[z_ok] += z_norm[z_ok].clamp_min(0.0)
+                z_write_key_norm_count[z_ok] += 1.0
+            z_write_key_vec = row.get("z_write_key_vec_tok")
+            if isinstance(z_write_key_vec, torch.Tensor) and int(z_write_key_vec.shape[0]) == l:
+                z_vec = torch.nan_to_num(
+                    z_write_key_vec.detach().float().reshape(l, -1),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+                if z_write_key_vec_sum is None:
+                    z_write_key_vec_sum = torch.zeros_like(z_vec)
+                if tuple(z_write_key_vec_sum.shape) == tuple(z_vec.shape):
+                    z_write_key_vec_sum += z_vec
+                    z_write_key_vec_count += 1
+            z_write_key_sketch = row.get("z_write_key_sketch_tok")
+            if isinstance(z_write_key_sketch, torch.Tensor) and int(z_write_key_sketch.shape[0]) == l:
+                sketch = torch.nan_to_num(
+                    z_write_key_sketch.detach().float().reshape(l, -1),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+                if z_write_key_sketch_sum is None:
+                    z_write_key_sketch_sum = torch.zeros_like(sketch)
+                if tuple(z_write_key_sketch_sum.shape) == tuple(sketch.shape):
+                    z_write_key_sketch_sum += sketch
+                    z_write_key_sketch_count += 1
+            z_write_hidden_vec = row.get("z_write_hidden_vec_tok")
+            if isinstance(z_write_hidden_vec, torch.Tensor) and int(z_write_hidden_vec.shape[0]) == l:
+                hidden_vec = torch.nan_to_num(
+                    z_write_hidden_vec.detach().float().reshape(l, -1),
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
+                if z_write_hidden_vec_sum is None:
+                    z_write_hidden_vec_sum = torch.zeros_like(hidden_vec)
+                if tuple(z_write_hidden_vec_sum.shape) == tuple(hidden_vec.shape):
+                    z_write_hidden_vec_sum += hidden_vec
+                    z_write_hidden_vec_count += 1
+            branch_energy = row.get("U_ttt_write_replay_contribution_tok_by_branch")
+            branch_conflict = row.get("C_ttt_conflict_replay_contribution_tok_by_branch")
+            branch_scale = row.get("S_scale_risk_replay_contribution_tok_by_branch")
+            if isinstance(branch_energy, dict) and isinstance(branch_conflict, dict):
+                for key, value in branch_energy.items():
+                    c_value = branch_conflict.get(key)
+                    if not isinstance(value, torch.Tensor) or not isinstance(c_value, torch.Tensor):
+                        continue
+                    e_branch = torch.nan_to_num(
+                        value.detach().float().reshape(-1),
+                        nan=0.0,
+                        posinf=0.0,
+                        neginf=0.0,
+                    ).clamp_min(0.0)
+                    c_branch = torch.nan_to_num(
+                        c_value.detach().float().reshape(-1),
+                        nan=0.0,
+                        posinf=0.0,
+                        neginf=0.0,
+                    ).clamp(0.0, 1.0)
+                    if int(e_branch.numel()) != l or int(c_branch.numel()) != l:
+                        continue
+                    k = str(key)
+                    branch_energy_sum.setdefault(k, torch.zeros(l, dtype=torch.float32))
+                    branch_conflict_num.setdefault(k, torch.zeros(l, dtype=torch.float32))
+                    branch_scale_num.setdefault(k, torch.zeros(l, dtype=torch.float32))
+                    branch_scale_den.setdefault(k, torch.zeros(l, dtype=torch.float32))
+                    branch_energy_sum[k] += e_branch
+                    branch_conflict_num[k] += c_branch * e_branch.clamp_min(1e-6)
+                    if isinstance(branch_scale, dict) and isinstance(branch_scale.get(key), torch.Tensor):
+                        s_branch = torch.nan_to_num(
+                            branch_scale[key].detach().float().reshape(-1),
+                            nan=0.0,
+                            posinf=0.0,
+                            neginf=0.0,
+                        ).clamp(0.0, 1.0)
+                        if int(s_branch.numel()) == l:
+                            branch_scale_num[k] += s_branch * e_branch.clamp_min(1e-6)
+                            branch_scale_den[k] += e_branch.clamp_min(1e-6)
+        conflict_out = torch.zeros(l, dtype=torch.float32)
+        nz = energy_sum > 1e-12
+        if bool(nz.any()):
+            conflict_out[nz] = (conflict_num[nz] / energy_sum[nz].clamp_min(1e-12)).clamp(0.0, 1.0)
+        energy_out = self._normalize01_vec(energy_sum)
+        scale_out: Optional[torch.Tensor] = None
+        scale_nz = scale_den > 1e-12
+        if bool(scale_nz.any()):
+            tmp = torch.zeros(l, dtype=torch.float32)
+            tmp[scale_nz] = (scale_num[scale_nz] / scale_den[scale_nz].clamp_min(1e-12)).clamp(0.0, 1.0)
+            scale_out = tmp
+        retention_out: Optional[torch.Tensor] = None
+        retention_nz = retention_count > 0
+        if bool(retention_nz.any()):
+            retention_out = torch.zeros(l, dtype=torch.float32)
+            retention_out[retention_nz] = (
+                retention_sum[retention_nz] / retention_count[retention_nz].clamp_min(1.0)
+            ).clamp(0.0, 1.0)
+        residual_out: Optional[torch.Tensor] = None
+        residual_nz = residual_count > 0
+        if bool(residual_nz.any()):
+            residual_out = torch.zeros(l, dtype=torch.float32)
+            residual_out[residual_nz] = (
+                residual_sum[residual_nz] / residual_count[residual_nz].clamp_min(1.0)
+            ).clamp_min(0.0)
+        stable_mask_out: Optional[torch.Tensor] = None
+        if bool((stable_mask_votes > 0).any()):
+            stable_mask_out = stable_mask_votes > 0
+        z_write_key_norm_out: Optional[torch.Tensor] = None
+        z_write_norm_nz = z_write_key_norm_count > 0
+        if bool(z_write_norm_nz.any()):
+            z_write_key_norm_out = torch.zeros(l, dtype=torch.float32)
+            z_write_key_norm_out[z_write_norm_nz] = (
+                z_write_key_norm_sum[z_write_norm_nz]
+                / z_write_key_norm_count[z_write_norm_nz].clamp_min(1.0)
+            ).clamp_min(0.0)
+        z_write_key_sketch_out: Optional[torch.Tensor] = None
+        z_write_key_vec_out: Optional[torch.Tensor] = None
+        z_write_hidden_vec_out: Optional[torch.Tensor] = None
+        if z_write_key_vec_sum is not None and z_write_key_vec_count > 0:
+            z_write_key_vec_out = F.normalize(z_write_key_vec_sum / float(z_write_key_vec_count), dim=-1)
+        if z_write_key_sketch_sum is not None and z_write_key_sketch_count > 0:
+            z_write_key_sketch_out = z_write_key_sketch_sum / float(z_write_key_sketch_count)
+        if z_write_hidden_vec_sum is not None and z_write_hidden_vec_count > 0:
+            z_write_hidden_vec_out = F.normalize(
+                z_write_hidden_vec_sum / float(z_write_hidden_vec_count),
+                dim=-1,
+            )
+        energy_by_branch_out: Dict[str, torch.Tensor] = {}
+        conflict_by_branch_out: Dict[str, torch.Tensor] = {}
+        scale_by_branch_out: Dict[str, torch.Tensor] = {}
+        for key, branch_energy in sorted(branch_energy_sum.items()):
+            branch_conflict_out = torch.zeros(l, dtype=torch.float32)
+            branch_nz = branch_energy > 1e-12
+            if bool(branch_nz.any()):
+                branch_conflict_out[branch_nz] = (
+                    branch_conflict_num[key][branch_nz]
+                    / branch_energy[branch_nz].clamp_min(1e-12)
+                ).clamp(0.0, 1.0)
+            energy_by_branch_out[key] = self._normalize01_vec(branch_energy).cpu()
+            conflict_by_branch_out[key] = branch_conflict_out.cpu()
+            scale_den_b = branch_scale_den.get(key)
+            scale_num_b = branch_scale_num.get(key)
+            if scale_den_b is not None and scale_num_b is not None:
+                scale_nz_b = scale_den_b > 1e-12
+                if bool(scale_nz_b.any()):
+                    tmp_b = torch.zeros(l, dtype=torch.float32)
+                    tmp_b[scale_nz_b] = (
+                        scale_num_b[scale_nz_b] / scale_den_b[scale_nz_b].clamp_min(1e-12)
+                    ).clamp(0.0, 1.0)
+                    scale_by_branch_out[key] = tmp_b.cpu()
+        return {
+            "schema": "acl2_v96_ttt_replay_token_contribution_aggregate_v1",
+            "status": "complete",
+            "source": "pre_zp_replay_token_contribution",
+            "layer_count": int(len(valid)),
+            "U_ttt_write_replay_contribution_tok": energy_out.cpu(),
+            "C_ttt_conflict_replay_contribution_tok": conflict_out.cpu(),
+            "S_scale_risk_replay_contribution_tok": scale_out.cpu() if scale_out is not None else None,
+            "stable_anchor_retention_tok": retention_out.cpu() if retention_out is not None else None,
+            "stable_anchor_residual_tok": residual_out.cpu() if residual_out is not None else None,
+            "stable_anchor_mask_tok": stable_mask_out.cpu() if stable_mask_out is not None else None,
+            "z_write_key_norm_tok": z_write_key_norm_out.cpu() if z_write_key_norm_out is not None else None,
+            "z_write_key_vec_tok": z_write_key_vec_out.cpu() if z_write_key_vec_out is not None else None,
+            "z_write_key_sketch_tok": z_write_key_sketch_out.cpu() if z_write_key_sketch_out is not None else None,
+            "z_write_hidden_vec_tok": z_write_hidden_vec_out.cpu() if z_write_hidden_vec_out is not None else None,
+            "U_ttt_write_replay_contribution_tok_by_branch": energy_by_branch_out,
+            "C_ttt_conflict_replay_contribution_tok_by_branch": conflict_by_branch_out,
+            "S_scale_risk_replay_contribution_tok_by_branch": scale_by_branch_out,
+            "conflict_mean": float(conflict_out.mean().item()) if conflict_out.numel() else 0.0,
+            "energy_mean": float(energy_out.mean().item()) if energy_out.numel() else 0.0,
+            "stable_anchor_retention_available": bool(
+                retention_out is not None and stable_mask_out is not None and bool(stable_mask_out.any())
+            ),
+            "stable_anchor_retention_source": "diagnostic_fast_weight_response_cosine_on_replay_key_tokens",
+            "stable_anchor_token_count": int(stable_mask_out.sum().item())
+            if stable_mask_out is not None
+            else 0,
+            "stable_anchor_retention_mean": float(retention_out[stable_mask_out].mean().item())
+            if retention_out is not None and stable_mask_out is not None and bool(stable_mask_out.any())
+            else None,
+            "stable_anchor_residual_mean": float(residual_out[stable_mask_out].mean().item())
+            if residual_out is not None and stable_mask_out is not None and bool(stable_mask_out.any())
+            else None,
+            "stable_anchor_write_energy_mean": float(energy_out[stable_mask_out].mean().item())
+            if stable_mask_out is not None and bool(stable_mask_out.any())
+            else None,
+            "nonstable_anchor_retention_mean": float(retention_out[~stable_mask_out].mean().item())
+            if retention_out is not None and stable_mask_out is not None and bool((~stable_mask_out).any())
+            else None,
+            "branch_keys": sorted(energy_by_branch_out.keys()),
+            "layer_summaries": [dict(row.get("summary") or {}) for row in valid],
+        }
 
     def _align_prior_to_replay_tokens(
         self,
@@ -2407,6 +3326,51 @@ class TTTWriteController:
         if prior.numel() > 0:
             out[: int(prior.numel())] = prior
         debug["ttt_prior_alignment_padded"] = True
+        return out, debug
+
+    def _align_role_to_replay_tokens(
+        self,
+        R_tok: Optional[torch.Tensor],
+        *,
+        token_type: Optional[torch.Tensor],
+        cache_l: int,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
+        """Align semantic role labels to the replay-token layout."""
+        debug: Dict[str, Any] = {
+            "ttt_role_alignment_available": R_tok is not None,
+            "ttt_role_alignment_cache_tokens": int(cache_l),
+            "ttt_role_alignment_full_tokens": int(R_tok.numel()) if R_tok is not None else 0,
+        }
+        if R_tok is None:
+            debug["ttt_role_alignment_mode"] = "missing"
+            return None, debug
+        role = R_tok.detach().cpu().long().reshape(-1)
+        if role.numel() == cache_l:
+            debug["ttt_role_alignment_mode"] = "direct_length"
+            return role.clone(), debug
+        if token_type is not None:
+            tt = token_type.detach().cpu().long().reshape(-1)
+            if tt.numel() == role.numel():
+                patch_mask = tt == TOKEN_TYPE_PATCH
+                patch_role = role[patch_mask]
+                debug.update({
+                    "ttt_role_alignment_patch_tokens": int(patch_mask.sum().item()),
+                    "ttt_role_alignment_special_tokens": int((~patch_mask).sum().item()),
+                })
+                if patch_role.numel() == cache_l:
+                    debug["ttt_role_alignment_mode"] = "patch_token_type"
+                    return patch_role.clone(), debug
+            debug.update({
+                "ttt_role_alignment_token_type_mismatch": True,
+                "ttt_role_alignment_token_type_tokens": int(tt.numel()),
+            })
+        if role.numel() >= cache_l:
+            debug["ttt_role_alignment_mode"] = "legacy_prefix"
+            return role[:cache_l].clone(), debug
+        out = torch.zeros(int(cache_l), dtype=torch.long)
+        if role.numel() > 0:
+            out[: int(role.numel())] = role
+        debug["ttt_role_alignment_mode"] = "padded"
         return out, debug
 
     def _apply_special_token_policy(
@@ -3814,6 +4778,7 @@ class TTTWriteController:
         cache_l: int,
         num_frames: Optional[int],
         overlap_frames: int,
+        role_flat: Optional[torch.Tensor] = None,
     ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
         """Select a hard replay token subset before Muon/zeropower aggregation.
 
@@ -3843,6 +4808,15 @@ class TTTWriteController:
             if n > 0:
                 tmp[:n] = prior[:n]
             prior = tmp
+        if prior.numel():
+            debug.update({
+                "ttt_replay_token_filter_prior_mean_before": float(prior.mean().item()),
+                "ttt_replay_token_filter_prior_min_before": float(prior.min().item()),
+                "ttt_replay_token_filter_prior_q10_before": float(torch.quantile(prior, 0.10).item()),
+                "ttt_replay_token_filter_prior_q50_before": float(torch.quantile(prior, 0.50).item()),
+                "ttt_replay_token_filter_prior_q90_before": float(torch.quantile(prior, 0.90).item()),
+                "ttt_replay_token_filter_prior_max_before": float(prior.max().item()),
+            })
         if mode in {"static_topk", "top_static", "topk"}:
             k_keep = max(1, int(round(cache_l * ratio)))
             idx = torch.topk(prior, k=min(k_keep, cache_l), largest=True).indices
@@ -3882,11 +4856,56 @@ class TTTWriteController:
             outside = torch.nonzero(~scope_mask, as_tuple=False).reshape(-1)
             scoped_prior = prior[scope_mask]
             scoped_idx = torch.nonzero(scope_mask, as_tuple=False).reshape(-1)
+            if scoped_prior.numel():
+                debug.update({
+                    "ttt_replay_token_filter_scoped_prior_mean_before": float(scoped_prior.mean().item()),
+                    "ttt_replay_token_filter_scoped_prior_min_before": float(scoped_prior.min().item()),
+                    "ttt_replay_token_filter_scoped_prior_q10_before": float(torch.quantile(scoped_prior, 0.10).item()),
+                    "ttt_replay_token_filter_scoped_prior_q50_before": float(torch.quantile(scoped_prior, 0.50).item()),
+                    "ttt_replay_token_filter_scoped_prior_q90_before": float(torch.quantile(scoped_prior, 0.90).item()),
+                    "ttt_replay_token_filter_scoped_prior_max_before": float(scoped_prior.max().item()),
+                })
             kept_scoped = scoped_idx[scoped_prior >= threshold]
             if kept_scoped.numel() == 0 and scoped_idx.numel() > 0:
                 best = torch.topk(scoped_prior, k=1, largest=True).indices
                 kept_scoped = scoped_idx.index_select(0, best)
             idx = torch.cat([outside, kept_scoped], dim=0)
+        elif mode in {
+            "scoped_semantic_harm_veto",
+            "scoped_role_harm_veto",
+            "scoped_ttt_harm_veto",
+            "overlap_semantic_harm_veto",
+        }:
+            scope_mask, scope_debug = self._replay_token_filter_scope_mask(
+                cache_l=int(cache_l),
+                num_frames=num_frames,
+                overlap_frames=overlap_frames,
+                scope=scope,
+            )
+            debug.update(scope_debug)
+            if not bool(scope_debug.get("ttt_replay_token_filter_scope_valid", True)):
+                return None, debug
+            if role_flat is None or role_flat.numel() == 0:
+                debug["ttt_replay_token_filter_semantic_role_missing"] = True
+                return None, debug
+            role = role_flat.detach().cpu().long().reshape(-1)
+            if role.numel() != cache_l:
+                n = min(int(role.numel()), int(cache_l))
+                tmp = torch.zeros(int(cache_l), dtype=torch.long)
+                if n > 0:
+                    tmp[:n] = role[:n]
+                role = tmp
+            harm = role == int(SEMANTIC_ROLE_NEGATIVE_SHORT)
+            veto = scope_mask & harm & (prior < threshold)
+            debug.update({
+                "ttt_replay_token_filter_semantic_harm_tokens": int(harm.sum().item()),
+                "ttt_replay_token_filter_semantic_harm_scope_tokens": int((scope_mask & harm).sum().item()),
+                "ttt_replay_token_filter_semantic_harm_veto_tokens": int(veto.sum().item()),
+            })
+            if int(veto.sum().item()) == 0:
+                idx = torch.arange(int(cache_l), dtype=torch.long)
+            else:
+                idx = torch.nonzero(~veto, as_tuple=False).reshape(-1)
         elif mode in {
             "scoped_static_topk",
             "overlap_static_topk",
@@ -3907,6 +4926,15 @@ class TTTWriteController:
             scoped_idx = torch.nonzero(scope_mask, as_tuple=False).reshape(-1)
             if scoped_idx.numel() == 0:
                 return None, debug
+            if scoped_prior.numel():
+                debug.update({
+                    "ttt_replay_token_filter_scoped_prior_mean_before": float(scoped_prior.mean().item()),
+                    "ttt_replay_token_filter_scoped_prior_min_before": float(scoped_prior.min().item()),
+                    "ttt_replay_token_filter_scoped_prior_q10_before": float(torch.quantile(scoped_prior, 0.10).item()),
+                    "ttt_replay_token_filter_scoped_prior_q50_before": float(torch.quantile(scoped_prior, 0.50).item()),
+                    "ttt_replay_token_filter_scoped_prior_q90_before": float(torch.quantile(scoped_prior, 0.90).item()),
+                    "ttt_replay_token_filter_scoped_prior_max_before": float(scoped_prior.max().item()),
+                })
             k_keep = max(1, int(round(int(scoped_idx.numel()) * ratio)))
             local = torch.topk(scoped_prior, k=min(k_keep, int(scoped_idx.numel())), largest=True).indices
             kept_scoped = scoped_idx.index_select(0, local)
@@ -3915,6 +4943,8 @@ class TTTWriteController:
             raise ValueError(f"Unsupported TTT replay token filter mode: {self.replay_token_filter_mode}")
         idx = torch.sort(idx.to(dtype=torch.long)).values
         if idx.numel() >= cache_l:
+            debug["ttt_replay_token_filter_keep_mass"] = 1.0
+            debug["ttt_replay_token_filter_noop_all_tokens_kept"] = True
             return None, debug
         kept_prior = prior.index_select(0, idx)
         debug.update({

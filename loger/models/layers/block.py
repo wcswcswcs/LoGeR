@@ -319,6 +319,13 @@ class BlockRope(nn.Module):
         """
         x_normed = self.norm1(x)
         return self.attn.compute_kv(x_normed, xpos=xpos)
+
+    def compute_qkv_cache(self, x: Tensor, xpos=None) -> tuple[Tensor, Tensor, Tensor]:
+        """Compute Q, K, V for diagnostic cache traces from input x."""
+        x_normed = self.norm1(x)
+        if not hasattr(self.attn, "compute_qkv"):
+            raise AttributeError("attention module does not expose compute_qkv")
+        return self.attn.compute_qkv(x_normed, xpos=xpos)
     
     def forward_with_kv_cache(
         self, 

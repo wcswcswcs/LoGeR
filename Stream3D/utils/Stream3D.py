@@ -3,6 +3,7 @@ import os
 import torch
 import open3d as o3d
 import heapq
+import csv
 import warnings
 warnings.filterwarnings("ignore")
 warnings.simplefilter(action='ignore', category=FutureWarning)
@@ -12,6 +13,311 @@ from collections import defaultdict
 from sklearn.neighbors import NearestNeighbors
 from scipy.spatial import KDTree
 from itertools import chain
+
+
+def _append_csv_rows(path, rows, fieldnames):
+    if not rows:
+        return
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    exists = os.path.exists(path)
+    with open(path, "a", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        if not exists:
+            writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def _local_stage_object_id(scene_id, source_step, window_index, local_index):
+    return f"{scene_id}|{source_step}|w{int(window_index):04d}|o{int(local_index):05d}"
+
+
+def _build_local_stage_rows(
+    *,
+    scene_id,
+    backbone,
+    source_step,
+    window_index,
+    local_masks,
+    support_points,
+    support_frames,
+):
+    object_rows = []
+    object_point_records = []
+    candidate_rows = []
+    support_sets = [set(points) for points in support_points]
+    support_frame_rows = []
+    for idx, item in enumerate(support_frames):
+        if item:
+            frame_id, mask_id, coverage = item[0]
+        else:
+            frame_id, mask_id, coverage = (-1, -1, 0.0)
+        support_frame_rows.append((int(frame_id), int(mask_id), float(coverage)))
+
+    for local_index, mask in enumerate(local_masks):
+        point_ids = list(dict.fromkeys(int(value) for value in mask))
+        point_set = set(point_ids)
+        if not point_set:
+            continue
+        object_id = _local_stage_object_id(scene_id, source_step, window_index, local_index)
+        score = float(len(point_set))
+        object_point_records.append((object_id, np.asarray(point_ids, dtype=np.int64)))
+        matched_supports = 0
+        for support_index, support_set in enumerate(support_sets):
+            if not support_set:
+                continue
+            inter = len(point_set & support_set)
+            if inter <= 0:
+                continue
+            frame_id, mask_id, stream3d_coverage = support_frame_rows[support_index]
+            if frame_id < 0 or mask_id < 0:
+                continue
+            matched_supports += 1
+            coverage = float(inter / max(1, len(point_set)))
+            candidate_rows.append(
+                {
+                    "baseline_name": source_step,
+                    "scene_id": scene_id,
+                    "window_index": int(window_index),
+                    "stream3d_local_object_id": object_id,
+                    "frame_id": int(frame_id),
+                    "mask_id": int(mask_id),
+                    "object_score": score,
+                    "score_source": "stream3d_local_point_count",
+                    "uses_history": False,
+                    "uses_gt_for_prediction": False,
+                    "uses_rgbd_pose_mesh": True,
+                    "materializable": True,
+                    "source_step": source_step,
+                    "source_mask_type": backbone,
+                    "support_intersection_points": int(inter),
+                    "support_coverage_of_object": coverage,
+                    "stream3d_internal_coverage": float(stream3d_coverage),
+                    "support_candidate_index": int(support_index),
+                }
+            )
+        object_rows.append(
+            {
+                "baseline_name": source_step,
+                "scene_id": scene_id,
+                "window_index": int(window_index),
+                "stream3d_local_object_id": object_id,
+                "point_count": int(len(point_set)),
+                "matched_support_candidate_count": int(matched_supports),
+                "object_score": score,
+                "score_source": "stream3d_local_point_count",
+                "uses_history": False,
+                "uses_gt_for_prediction": False,
+                "uses_rgbd_pose_mesh": True,
+                "source_step": source_step,
+                "source_mask_type": backbone,
+                "point_ids_exported": True,
+            }
+        )
+
+    best_by_frame_mask = {}
+    for row in candidate_rows:
+        key = (int(row["frame_id"]), int(row["mask_id"]))
+        current = best_by_frame_mask.get(key)
+        rank = (
+            float(row["support_coverage_of_object"]),
+            int(row["support_intersection_points"]),
+            -int(row["window_index"]),
+            str(row["stream3d_local_object_id"]),
+        )
+        if current is None or rank > current[0]:
+            best_by_frame_mask[key] = (rank, row)
+
+    frame_rows = []
+    for _, row in best_by_frame_mask.values():
+        frame_rows.append(row)
+    frame_rows.sort(
+        key=lambda row: (
+            str(row["baseline_name"]),
+            str(row["scene_id"]),
+            int(row["window_index"]),
+            int(row["frame_id"]),
+            int(row["mask_id"]),
+            str(row["stream3d_local_object_id"]),
+        )
+    )
+    return object_rows, frame_rows, len(candidate_rows) - len(frame_rows), object_point_records
+
+
+def _write_local_stage_object_points(output_dir, source_step, window_index, object_point_records):
+    if not object_point_records:
+        return []
+    point_dir = os.path.join(output_dir, "stream3d_local_object_points")
+    os.makedirs(point_dir, exist_ok=True)
+    safe_step = str(source_step).replace("/", "_")
+    npz_path = os.path.join(point_dir, f"{safe_step}_w{int(window_index):04d}.npz")
+    offsets = [0]
+    flat = []
+    object_ids = []
+    for object_id, point_ids in object_point_records:
+        point_ids = np.asarray(point_ids, dtype=np.int64)
+        object_ids.append(str(object_id))
+        flat.append(point_ids)
+        offsets.append(offsets[-1] + int(point_ids.shape[0]))
+    flat_ids = np.concatenate(flat).astype(np.int64, copy=False) if flat else np.zeros((0,), dtype=np.int64)
+    offsets_arr = np.asarray(offsets, dtype=np.int64)
+    np.savez_compressed(
+        npz_path,
+        object_ids=np.asarray(object_ids),
+        point_offsets=offsets_arr,
+        point_ids=flat_ids,
+        source_step=str(source_step),
+        window_index=np.asarray([int(window_index)], dtype=np.int64),
+    )
+    rows = []
+    for idx, object_id in enumerate(object_ids):
+        start = int(offsets_arr[idx])
+        end = int(offsets_arr[idx + 1])
+        rows.append(
+            {
+                "baseline_name": source_step,
+                "window_index": int(window_index),
+                "stream3d_local_object_id": object_id,
+                "point_npz_path": npz_path,
+                "point_slice_start": start,
+                "point_slice_end": end,
+                "point_count": end - start,
+            }
+        )
+    return rows
+
+
+def _export_local_stage(
+    *,
+    args,
+    scene_id,
+    source_step,
+    window_index,
+    local_masks,
+    support_points,
+    support_frames,
+):
+    output_dir = getattr(args, "local_stage_output_dir", None)
+    if not getattr(args, "export_local_stage", False) or not output_dir:
+        return
+    object_rows, frame_rows, wta_drop_count, object_point_records = _build_local_stage_rows(
+        scene_id=scene_id,
+        backbone=getattr(args, "backbone", "unknown"),
+        source_step=source_step,
+        window_index=window_index,
+        local_masks=local_masks,
+        support_points=support_points,
+        support_frames=support_frames,
+    )
+    point_rows = _write_local_stage_object_points(
+        output_dir=output_dir,
+        source_step=source_step,
+        window_index=window_index,
+        object_point_records=object_point_records,
+    )
+    point_by_object = {str(row["stream3d_local_object_id"]): row for row in point_rows}
+    for row in object_rows:
+        point_row = point_by_object.get(str(row["stream3d_local_object_id"]))
+        if point_row:
+            row.update(
+                {
+                    "point_npz_path": point_row["point_npz_path"],
+                    "point_slice_start": point_row["point_slice_start"],
+                    "point_slice_end": point_row["point_slice_end"],
+                }
+            )
+    object_fields = [
+        "baseline_name",
+        "scene_id",
+        "window_index",
+        "stream3d_local_object_id",
+        "point_count",
+        "matched_support_candidate_count",
+        "object_score",
+        "score_source",
+        "uses_history",
+        "uses_gt_for_prediction",
+        "uses_rgbd_pose_mesh",
+        "source_step",
+        "source_mask_type",
+        "point_ids_exported",
+        "point_npz_path",
+        "point_slice_start",
+        "point_slice_end",
+    ]
+    frame_fields = [
+        "baseline_name",
+        "scene_id",
+        "window_index",
+        "stream3d_local_object_id",
+        "frame_id",
+        "mask_id",
+        "object_score",
+        "score_source",
+        "uses_history",
+        "uses_gt_for_prediction",
+        "uses_rgbd_pose_mesh",
+        "materializable",
+        "source_step",
+        "source_mask_type",
+        "support_intersection_points",
+        "support_coverage_of_object",
+        "stream3d_internal_coverage",
+        "support_candidate_index",
+    ]
+    diag_fields = [
+        "scene_id",
+        "window_index",
+        "source_step",
+        "local_object_count",
+        "frame_mask_candidate_count_before_wta",
+        "frame_mask_row_count_after_wta",
+        "same_frame_duplicate_wta_drop_count",
+        "uses_history",
+        "uses_gt_for_prediction",
+        "uses_rgbd_pose_mesh",
+    ]
+    _append_csv_rows(
+        os.path.join(output_dir, "stream3d_local_object_rows.csv"),
+        object_rows,
+        object_fields,
+    )
+    _append_csv_rows(
+        os.path.join(output_dir, "stream3d_local_frame_mask_rows.csv"),
+        frame_rows,
+        frame_fields,
+    )
+    _append_csv_rows(
+        os.path.join(output_dir, "stream3d_local_object_point_index_rows.csv"),
+        point_rows,
+        [
+            "baseline_name",
+            "window_index",
+            "stream3d_local_object_id",
+            "point_npz_path",
+            "point_slice_start",
+            "point_slice_end",
+            "point_count",
+        ],
+    )
+    _append_csv_rows(
+        os.path.join(output_dir, "stream3d_local_export_diag_rows.csv"),
+        [
+            {
+                "scene_id": scene_id,
+                "window_index": int(window_index),
+                "source_step": source_step,
+                "local_object_count": int(len(object_rows)),
+                "frame_mask_candidate_count_before_wta": int(len(frame_rows) + wta_drop_count),
+                "frame_mask_row_count_after_wta": int(len(frame_rows)),
+                "same_frame_duplicate_wta_drop_count": int(wta_drop_count),
+                "uses_history": False,
+                "uses_gt_for_prediction": False,
+                "uses_rgbd_pose_mesh": True,
+            }
+        ],
+        diag_fields,
+    )
 
 
 def merge_overlapping_objects(total_point_ids_list, total_bbox_list, total_mask_list, overlapping_ratio):
@@ -933,6 +1239,8 @@ def Stream3D(
     
     all_detected_points = []
     step_frames_masks = []
+    step_support_points = []
+    step_support_frames = []
     max_iter = len(frames)
     count = 0
 
@@ -964,6 +1272,8 @@ def Stream3D(
                 point_ids_list_, _, mask_list = filter_point_new(point_frame_matrix[mask_idx][iter], single_node, [pcld], [np.array(point_ids)], mask_point_clouds[mask_idx][iter], frame_list[iter], args, flag=flags[0])
                 all_masks_points.extend(point_ids_list_)
                 all_masks_frames.extend(mask_list)
+                step_support_points.extend(point_ids_list_)
+                step_support_frames.extend(mask_list)
 
             for node in mask_point_clouds[mask_idx][iter]:
                 point_ids_list = list(mask_point_clouds[mask_idx][iter][node])
@@ -1002,6 +1312,11 @@ def Stream3D(
             count += 1
             total_point_ids_list = step_frames_masks
             step_frames_masks = []
+            raw_local_mask_list = [list(mask) for mask in total_point_ids_list]
+            local_support_points = step_support_points
+            local_support_frames = step_support_frames
+            step_support_points = []
+            step_support_frames = []
 
         # local_merged_set = list(dict.fromkeys(chain.from_iterable(total_point_ids_list)))
         # local_merged_set = list(set(local_merged_set))
@@ -1199,6 +1514,26 @@ def Stream3D(
         else:
             local_merged_mask_list = total_point_ids_list
         # --------------------------------------------
+        if getattr(args, "export_local_stage", False):
+            scene_id = _scene_id_from_dataset(dataset)
+            _export_local_stage(
+                args=args,
+                scene_id=scene_id,
+                source_step="S3D_L0_raw_local_masks",
+                window_index=iter,
+                local_masks=raw_local_mask_list,
+                support_points=local_support_points,
+                support_frames=local_support_frames,
+            )
+            _export_local_stage(
+                args=args,
+                scene_id=scene_id,
+                source_step="S3D_L1_local_merged_masks",
+                window_index=iter,
+                local_masks=local_merged_mask_list,
+                support_points=local_support_points,
+                support_frames=local_support_frames,
+            )
         currentframe_point_ids_list_full.extend(local_merged_mask_list)
         currentframe_point_ids_list.extend(local_merged_mask_list)
 

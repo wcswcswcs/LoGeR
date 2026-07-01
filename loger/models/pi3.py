@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import csv
+import math
 from functools import partial
 from copy import deepcopy
 from pathlib import Path
@@ -32,6 +34,17 @@ _SEMANTIC_ROLE_POSITIVE_LONG = 1
 _SEMANTIC_ROLE_NEUTRAL_KEEP = 2
 _SEMANTIC_ROLE_NEGATIVE_SHORT = 3
 _SEMANTIC_ROLE_PROTECT_NEUTRAL = 4
+_V102_STATE_MACHINE_ACTIONS = {
+    "TRANSMIT_SUPPORTED_ANCHORS",
+    "REJECT_UNRELIABLE_ANCHORS",
+    "DELAY_UPDATE",
+    "HOLD_PREV_REFERENCE",
+    "CONTEXT_ONLY_DEMOTION",
+    "WRITE_CONFIRMED_ANCHORS_ONLY",
+    "EXPIRE_UNSUPPORTED_STALE_ANCHORS",
+    "REFRESH_SUPPORTED_STALE_ANCHORS",
+    "WRITE_CONTEXT_ONLY",
+}
 
 class Pi3(nn.Module, PyTorchModelHubMixin):
     def __init__(
@@ -1152,6 +1165,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         batch_size: int,
         frame_num: int,
         tokens_per_frame: int,
+        num_heads: int = 0,
         device: torch.device,
         dtype: torch.dtype,
     ) -> Optional[torch.Tensor]:
@@ -1178,6 +1192,46 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         D = D.reshape(batch_size * frame_num, tokens_per_frame)
         Dq = D[:, :, None]
         Dk = D[:, None, :]
+
+        def _scope_bias(pair_bias: torch.Tensor) -> torch.Tensor:
+            query_region = str(hmc_control.get("frame_bias_query_region", "all")).strip().lower()
+            if query_region not in {"all", "head", "mid_tail", "tail"}:
+                query_region = "all"
+            if query_region != "all":
+                ov = max(int(hmc_control.get("read_overlap_frames", 0) or 0), 0)
+                if ov <= 0:
+                    ov = min(3, int(frame_num))
+                ov = min(int(ov), int(frame_num))
+                frame_ids = torch.arange(int(frame_num), device=device).reshape(1, int(frame_num), 1)
+                if query_region == "head":
+                    query_mask = frame_ids < ov
+                elif query_region == "tail":
+                    query_mask = frame_ids >= max(int(frame_num) - ov, 0)
+                else:
+                    query_mask = frame_ids >= ov
+                query_mask = query_mask.expand(batch_size, int(frame_num), int(tokens_per_frame))
+                query_mask = query_mask.reshape(batch_size * int(frame_num), int(tokens_per_frame))
+                pair_bias = pair_bias * query_mask[:, :, None].to(dtype=pair_bias.dtype)
+
+            raw_heads = str(hmc_control.get("frame_bias_head_indices", "") or "").strip()
+            if raw_heads and int(num_heads) > 0:
+                indices: list[int] = []
+                for part in raw_heads.split(","):
+                    part = part.strip()
+                    if not part:
+                        continue
+                    try:
+                        idx = int(part)
+                    except ValueError:
+                        continue
+                    if 0 <= idx < int(num_heads):
+                        indices.append(idx)
+                if indices:
+                    head_mask = torch.zeros((int(num_heads),), device=device, dtype=pair_bias.dtype)
+                    head_mask[torch.tensor(sorted(set(indices)), device=device, dtype=torch.long)] = 1.0
+                    return pair_bias.unsqueeze(1) * head_mask.reshape(1, int(num_heads), 1, 1)
+            return pair_bias.unsqueeze(1)
+
         mode = str(hmc_control.get("frame_bias_mode", "pair"))
         if mode == "key":
             keep = (1.0 - Dk).expand(-1, D.shape[1], -1)
@@ -1185,10 +1239,162 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             # A uniform per-query attention-logit shift cancels under softmax;
             # query weakening is handled as an output gate below instead.
             return None
+        elif mode in {"qk_pair_stable_harm", "read_qk_pair_bias", "qk_pair_key_stability"}:
+            q_risk = Dq.clamp(0.0, 1.0)
+            K_stable = hmc_control.get("K_stable_tok") if mode == "qk_pair_key_stability" else None
+            if K_stable is not None:
+                K = K_stable.to(device=device, dtype=torch.float32).reshape(batch_size, frame_num, tokens_per_frame)
+                if P_ref is not None:
+                    K = K * (1.0 - ref.clamp(0.0, 1.0))
+                k_stable = K.reshape(batch_size * frame_num, tokens_per_frame).clamp(0.0, 1.0)[:, None, :]
+                k_harm = (1.0 - k_stable).clamp(0.0, 1.0)
+            else:
+                k_harm = Dk.clamp(0.0, 1.0)
+                k_stable = (1.0 - k_harm).clamp(0.0, 1.0)
+            pair_score = q_risk * (k_stable - k_harm)
+            return _scope_bias((beta * pair_score).to(dtype=dtype))
+        elif mode in {"qk_pair_random_same_mass", "qk_pair_key_stability_random_same_mass"}:
+            q_risk = Dq.clamp(0.0, 1.0)
+            K_stable = hmc_control.get("K_stable_tok") if mode == "qk_pair_key_stability_random_same_mass" else None
+            if K_stable is not None:
+                K = K_stable.to(device=device, dtype=torch.float32).reshape(batch_size, frame_num, tokens_per_frame)
+                if P_ref is not None:
+                    K = K * (1.0 - ref.clamp(0.0, 1.0))
+                k_stable = K.reshape(batch_size * frame_num, tokens_per_frame).clamp(0.0, 1.0)[:, None, :]
+                k_harm = (1.0 - k_stable).clamp(0.0, 1.0)
+            else:
+                k_harm = Dk.clamp(0.0, 1.0)
+                k_stable = (1.0 - k_harm).clamp(0.0, 1.0)
+            pair_score = q_risk * (k_stable - k_harm)
+            flat = pair_score.reshape(pair_score.shape[0], -1)
+            shuffled = torch.empty_like(flat)
+            base_seed = int(hmc_control.get("read_pair_random_seed", 1729))
+            for row_idx in range(flat.shape[0]):
+                gen = torch.Generator(device=flat.device)
+                gen.manual_seed(base_seed + int(row_idx) + 1009 * int(flat.shape[1]))
+                perm = torch.randperm(flat.shape[1], device=flat.device, generator=gen)
+                shuffled[row_idx] = flat[row_idx, perm]
+            return _scope_bias((beta * shuffled.reshape_as(pair_score)).to(dtype=dtype))
         else:
             keep = 1.0 - (1.0 - Dq) * Dk
         keep = keep.clamp_min(1e-4)
-        return (beta * torch.log(keep)).to(dtype=dtype).unsqueeze(1)
+        return _scope_bias((beta * torch.log(keep)).to(dtype=dtype))
+
+    def _sample_frame_bias_attention_mass_stats(
+        self,
+        blk: nn.Module,
+        hidden_for_block: torch.Tensor,
+        pos_for_block: Optional[torch.Tensor],
+        attn_mask: Optional[torch.Tensor],
+        *,
+        max_queries: int = 64,
+    ) -> Dict[str, Any]:
+        """Audit-only raw-QK attention mass before/after a dense frame bias.
+
+        The returned values are diagnostic summaries only. They are computed
+        from sampled query rows and never feed back into the model output.
+        """
+        if attn_mask is None or not torch.is_tensor(attn_mask) or not torch.is_floating_point(attn_mask):
+            return {}
+        try:
+            B, N, C = hidden_for_block.shape
+            attn = getattr(blk, "attn", None)
+            if attn is None or not hasattr(attn, "qkv"):
+                return {"frame_bias_attention_mass_error": "missing_attn_qkv"}
+            with torch.no_grad():
+                qkv = attn.qkv(hidden_for_block).reshape(
+                    B,
+                    N,
+                    3,
+                    int(attn.num_heads),
+                    C // int(attn.num_heads),
+                ).transpose(1, 3)
+                q, k, _v = [qkv[:, :, idx] for idx in range(3)]
+                q = attn.q_norm(q)
+                k = attn.k_norm(k).to(q.dtype)
+                if getattr(attn, "rope", None) is not None:
+                    q = attn.rope(q, pos_for_block)
+                    k = attn.rope(k, pos_for_block)
+                q = q.float()
+                k = k.float()
+                bias = attn_mask.detach().to(device=q.device, dtype=torch.float32)
+                if bias.ndim != 4 or int(bias.shape[0]) != int(B) or int(bias.shape[-2]) != int(N) or int(bias.shape[-1]) != int(N):
+                    return {
+                        "frame_bias_attention_mass_error": (
+                            f"bias_shape_mismatch bias={tuple(bias.shape)} hidden={(int(B), int(N), int(C))}"
+                        )
+                    }
+                if int(bias.shape[1]) not in {1, int(q.shape[1])}:
+                    return {
+                        "frame_bias_attention_mass_error": (
+                            f"bias_head_mismatch bias={tuple(bias.shape)} heads={int(q.shape[1])}"
+                        )
+                    }
+                max_q = max(1, int(max_queries))
+                if int(N) > max_q:
+                    q_idx = torch.linspace(0, int(N) - 1, steps=max_q, device=q.device).round().long().unique()
+                else:
+                    q_idx = torch.arange(int(N), device=q.device)
+                if int(q_idx.numel()) <= 0:
+                    return {"frame_bias_attention_mass_error": "empty_query_sample"}
+                qb = q[:, :, q_idx, :]
+                head_dim = max(1, int(q.shape[-1]))
+                scores = torch.matmul(qb, k.transpose(-2, -1)) * (float(head_dim) ** -0.5)
+                bias_sample = bias[:, :, q_idx, :]
+                if int(bias_sample.shape[1]) == 1 and int(q.shape[1]) != 1:
+                    bias_sample = bias_sample.expand(-1, int(q.shape[1]), -1, -1)
+                attn_before = torch.softmax(scores, dim=-1)
+                attn_after = torch.softmax(scores + bias_sample, dim=-1)
+                pos_mask = bias_sample > 1e-7
+                neg_mask = bias_sample < -1e-7
+
+                def _masked_mean_mass(attn_tensor: torch.Tensor, mask: torch.Tensor) -> Optional[float]:
+                    if not bool(mask.any().item()):
+                        return None
+                    mass = (attn_tensor * mask.to(dtype=attn_tensor.dtype)).sum(dim=-1)
+                    valid = mask.any(dim=-1)
+                    if not bool(valid.any().item()):
+                        return None
+                    return float(mass[valid].mean().item())
+
+                pos_before = _masked_mean_mass(attn_before, pos_mask)
+                pos_after = _masked_mean_mass(attn_after, pos_mask)
+                neg_before = _masked_mean_mass(attn_before, neg_mask)
+                neg_after = _masked_mean_mass(attn_after, neg_mask)
+                out: Dict[str, Any] = {
+                    "attention_mass_metric": "frame_bias_pair_sign_sampled_qk",
+                    "attention_mass_query_sample_tokens_mean": float(q_idx.numel()),
+                    "frame_bias_attention_mass_sampled": True,
+                    "frame_bias_attention_mass_query_count": int(q_idx.numel()),
+                    "frame_bias_positive_pair_count_mean": float(pos_mask.sum(dim=-1).float().mean().item()),
+                    "frame_bias_negative_pair_count_mean": float(neg_mask.sum(dim=-1).float().mean().item()),
+                    "frame_bias_positive_pair_fraction": float(pos_mask.float().mean().item()),
+                    "frame_bias_negative_pair_fraction": float(neg_mask.float().mean().item()),
+                }
+                if pos_before is not None and pos_after is not None:
+                    out.update({
+                        "frame_bias_positive_pair_mass_before": pos_before,
+                        "frame_bias_positive_pair_mass_after": pos_after,
+                        "frame_bias_positive_pair_mass_lift": pos_after - pos_before,
+                        "attention_mass_retained_before": pos_before,
+                        "attention_mass_retained_after": pos_after,
+                    })
+                if neg_before is not None and neg_after is not None:
+                    out.update({
+                        "frame_bias_negative_pair_mass_before": neg_before,
+                        "frame_bias_negative_pair_mass_after": neg_after,
+                        "frame_bias_negative_pair_mass_lift": neg_after - neg_before,
+                        "attention_mass_removed_before": neg_before,
+                        "attention_mass_removed_after": neg_after,
+                        "attention_mass_actual_after": neg_after,
+                    })
+                if bool(pos_mask.any().item()):
+                    out["frame_bias_positive_bias_mean"] = float(bias_sample[pos_mask].mean().item())
+                if bool(neg_mask.any().item()):
+                    out["frame_bias_negative_bias_mean"] = float(bias_sample[neg_mask].mean().item())
+                return out
+        except Exception as exc:  # pragma: no cover - diagnostic path must not break inference.
+            return {"frame_bias_attention_mass_error": f"{type(exc).__name__}: {exc}"}
 
     def _make_frame_attention_query_gate(
         self,
@@ -1355,6 +1561,37 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 "context_source_skip_frame_region_eligible_before": before_region,
                 "context_source_skip_frame_region_eligible_after": int(eligible.sum().item()),
             })
+        query_region = str(hmc_control.get("context_source_skip_query_region", "all")).strip().lower()
+        if query_region not in {"all", "head", "mid_tail", "tail"}:
+            query_region = "all"
+        query_mask_out = None
+        query_region_debug: Dict[str, Any] = {
+            "context_source_skip_query_region": query_region,
+            "context_source_skip_query_region_overlap_frames": 0,
+            "context_source_skip_query_region_tokens": None,
+        }
+        if query_region != "all":
+            ov = max(int(hmc_control.get("read_overlap_frames", 0) or 0), 0)
+            if ov <= 0:
+                ov = min(3, int(frame_num))
+            ov = min(int(ov), int(frame_num))
+            frame_ids = torch.arange(int(frame_num), device=device).reshape(1, int(frame_num), 1)
+            if query_region == "head":
+                query_region_mask = frame_ids < ov
+            elif query_region == "tail":
+                query_region_mask = frame_ids >= max(int(frame_num) - ov, 0)
+            else:
+                query_region_mask = frame_ids >= ov
+            query_region_mask = query_region_mask.expand(batch_size, int(frame_num), int(tokens_per_frame))
+            if path == "frame_attention":
+                query_mask_out = query_region_mask.reshape(batch_size * int(frame_num), int(tokens_per_frame)).detach()
+            else:
+                query_mask_out = query_region_mask.reshape(batch_size, int(frame_num) * int(tokens_per_frame)).detach()
+            query_region_debug.update({
+                "context_source_skip_query_region_overlap_frames": int(ov),
+                "context_source_skip_query_region_tokens": int(query_region_mask.sum().item()),
+            })
+        source_eligible_base = eligible.clone()
         mask_name = str(hmc_control.get("context_source_skip_mask", "dg_q90")).lower()
         anchor_boost_mask = mask_name in {
             "semantic_anchor",
@@ -1381,6 +1618,10 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             "v40_read_a2_high_influence_random_same_mass",
         }
         phase2_random_base_map = {
+            "dg_q90_random_same_mass": "dg_q90",
+            "dg_q90_anchor_rescue_random_same_mass": "dg_q90_anchor_rescue",
+            "dg_high_strict_random_same_mass": "dg_high_strict",
+            "highd_q90_random_same_mass": "highd_q90",
             "v67_carrier_highd_q80_random_same_mass": "v67_carrier_highd_q80",
             "v67_carrier_highd_q90_random_same_mass": "v67_carrier_highd_q90",
             "v67_source_attention_q90_random_same_mass": "v67_source_attention_q90",
@@ -1402,6 +1643,11 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             "v67_source_attention_structure_q95": ("structure", 0.95),
             "v67_source_attention_movable_q90": ("movable", 0.90),
             "v67_source_attention_movable_q95": ("movable", 0.95),
+            "v96_source_attention_lowstuff_q90_anchor_rescue": ("lowstuff", 0.90),
+        }
+        anchor_rescue_source_attention_masks = {
+            "dg_q90_anchor_rescue",
+            "v96_source_attention_lowstuff_q90_anchor_rescue",
         }
         for _source_attention_group_base in tuple(phase2_source_attention_group_specs.keys()):
             phase2_random_base_map[f"{_source_attention_group_base}_random_same_mass"] = _source_attention_group_base
@@ -1411,12 +1657,19 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             "v67_carrier_ground_highd_shuffled": "v67_carrier_ground_highd",
             "v67_carrier_vertical_static_highd_shuffled": "v67_carrier_vertical_static_highd",
         }
+        for _source_attention_group_base in tuple(phase2_source_attention_group_specs.keys()):
+            phase2_shuffled_base_map[f"{_source_attention_group_base}_shuffled"] = _source_attention_group_base
         random_same_mass_phase2 = mask_name in phase2_random_base_map
         random_same_mass = random_same_mass_semantic_role or random_same_mass_high_influence or random_same_mass_phase2
         sem_z_dg_soft = mask_name in {
             "sem_z_dg_soft_resid",
             "semantic_z_dg_soft_resid",
             "semantic_conditioned_dg_soft_resid",
+        }
+        explicit_source_attention_top_quantile = hmc_control.get("context_source_skip_source_attention_top_quantile", None)
+        swa_redirection_source_masks = {
+            "swa_redirection_source_positive",
+            "semantic_swa_redirection_source_positive",
         }
         if random_same_mass_semantic_role:
             base_mask_name = semantic_role_random_base_map[mask_name]
@@ -1467,13 +1720,15 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         semantic_extra_stats: Dict[str, Any] = {}
         source_attention_top_quantile = None
         source_attention_top_random_same_mass = False
+        source_attention_anchor_boost_mask = None
+        source_attention_anchor_boost_score = None
         if anchor_boost_mask:
             quantile = 0.0
         elif base_mask_name in {"dg_q80", "dg_high", "highd_q80"}:
             quantile = 0.80
         elif base_mask_name in {"dg_q85", "dg_high_q85", "highd_q85"}:
             quantile = 0.85
-        elif base_mask_name in {"dg_q90", "dg_high_strict", "highd_q90"}:
+        elif base_mask_name in {"dg_q90", "dg_q90_anchor_rescue", "dg_high_strict", "highd_q90"}:
             quantile = 0.90
         elif base_mask_name in {"lowstuff_highd", "semantic_lowstuff_highd", "sem_lowstuff_highd"}:
             quantile = 0.90
@@ -1488,6 +1743,8 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             "semantic_role_anchor",
             "semantic_role_protect",
             "semantic_role_protected",
+            "swa_redirection_source_positive",
+            "semantic_swa_redirection_source_positive",
             "v36_synthetic_role_negative",
             "sem_z_dg_soft_resid",
             "semantic_z_dg_soft_resid",
@@ -1511,11 +1768,26 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         source_attention_group_name = None
         if base_mask_name in phase2_source_attention_group_specs:
             source_attention_group_name = phase2_source_attention_group_specs[base_mask_name][0]
+            source_attention_group_shuffled = (
+                mask_name in phase2_shuffled_base_map
+                and phase2_shuffled_base_map.get(mask_name) == base_mask_name
+            )
+
+            def _shuffle_semantic_tensor(values: torch.Tensor) -> torch.Tensor:
+                flat = values.reshape(-1)
+                token_idx = torch.arange(int(flat.numel()), device=device, dtype=torch.float32)
+                chunk = float(hmc_control.get("semantic_action_chunk_idx", -1) if hmc_control else -1)
+                scores = torch.frac(torch.sin((token_idx + 1.0 + chunk * 131.0) * 12.9898) * 43758.5453)
+                order = torch.argsort(scores)
+                return flat[order].reshape_as(values)
+
             group_mask = torch.zeros_like(eligible, dtype=torch.bool)
             if source_attention_group_name == "sky":
                 L_sem_tok = hmc_control.get("L_sem_tok")
                 if L_sem_tok is not None:
                     L = L_sem_tok.to(device=device, dtype=torch.long).reshape(batch_size, frame_num, tokens_per_frame)
+                    if source_attention_group_shuffled:
+                        L = _shuffle_semantic_tensor(L)
                     for label_id in _CONTEXT_SKY_FINE_LABEL_IDS:
                         group_mask |= L == int(label_id)
             else:
@@ -1527,6 +1799,8 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 }
                 if G_sem_tok is not None and source_attention_group_name in group_id_map:
                     G = G_sem_tok.to(device=device, dtype=torch.long).reshape(batch_size, frame_num, tokens_per_frame)
+                    if source_attention_group_shuffled:
+                        G = _shuffle_semantic_tensor(G)
                     group_mask = G == int(group_id_map[source_attention_group_name])
             eligible = eligible & group_mask
             semantic_extra_stats.update({
@@ -1538,6 +1812,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 }.get(source_attention_group_name, -1)),
                 "v67_source_attention_group_eligible_tokens": float(eligible.sum().item()),
                 "v67_source_attention_group_missing_semantic": bool(not group_mask.any().item()),
+                "v67_source_attention_label_control": "shuffled" if source_attention_group_shuffled else "semantic",
             })
 
         eligible_scores = D[eligible]
@@ -1548,6 +1823,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 "context_source_skip_reason": "no_eligible_patch_tokens",
             })
             stats.update(frame_region_debug)
+            stats.update(query_region_debug)
             return None, stats
         thr = torch.quantile(eligible_scores.float(), float(quantile))
         skip = (D > thr) & eligible
@@ -1754,10 +2030,38 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 "v67_source_attention_top_quantile": float(source_attention_top_quantile),
                 "v67_source_attention_random_same_mass": bool(source_attention_top_random_same_mass),
             })
+        elif base_mask_name in swa_redirection_source_masks:
+            source_mask_tok = hmc_control.get("swa_redirection_source_mask_tok")
+            if source_mask_tok is None:
+                skip = torch.zeros_like(skip, dtype=torch.bool)
+                source_control_score = torch.zeros_like(D, dtype=torch.float32)
+                semantic_reason = "swa_redirection_source_mask_missing"
+            else:
+                source_mask = (
+                    source_mask_tok.to(device=device, dtype=torch.float32)
+                    .reshape(batch_size, frame_num, tokens_per_frame)
+                    > 0.5
+                )
+                skip = source_mask & eligible
+                source_control_score = torch.where(
+                    skip,
+                    torch.ones_like(D, dtype=torch.float32),
+                    torch.zeros_like(D, dtype=torch.float32),
+                )
+                semantic_reason = "swa_redirection_source_mask_tok"
+            semantic_extra_stats.update({
+                "swa_redirection_source_mask_requested": True,
+                "swa_redirection_source_mask_available": source_mask_tok is not None,
+            })
         elif base_mask_name in {
             "semantic_role_negative",
             "semantic_role_source_skip",
             "semrole_negative",
+            "semantic_role_positive",
+            "semantic_role_stable",
+            "semantic_role_anchor",
+            "semantic_role_protect",
+            "semantic_role_protected",
             "v36_synthetic_role_negative",
             "sem_z_dg_soft_resid",
             "semantic_z_dg_soft_resid",
@@ -1855,6 +2159,63 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             skip = skip_flat.reshape_as(skip)
             semantic_reason = f"random_same_mass_control_from_{base_mask_name}:n={base_selected}"
 
+        if base_mask_name in anchor_rescue_source_attention_masks:
+            A_anchor_tok = hmc_control.get("A_anchor_tok")
+            M_anchor_tok = hmc_control.get("A_anchor_mask_tok")
+            if A_anchor_tok is None:
+                anchor_mask_local = torch.zeros_like(skip, dtype=torch.bool)
+                anchor_score_local = torch.zeros_like(D, dtype=torch.float32)
+                anchor_reason = "semantic_anchor_missing"
+            else:
+                A_local = (
+                    A_anchor_tok.to(device=device, dtype=torch.float32)
+                    .reshape(batch_size, frame_num, tokens_per_frame)
+                    .clamp(0.0, 1.0)
+                )
+                if M_anchor_tok is None:
+                    M_local = A_local > 0.0
+                else:
+                    M_local = (
+                        M_anchor_tok.to(device=device, dtype=torch.float32)
+                        .reshape(batch_size, frame_num, tokens_per_frame)
+                        .clamp(0.0, 1.0)
+                        > 0.0
+                    )
+                anchor_mask_local = M_local & source_eligible_base
+                anchor_score_local = torch.where(anchor_mask_local, A_local, torch.zeros_like(A_local))
+                anchor_reason = f"semantic_anchor_bank:{hmc_control.get('semantic_anchor_mode', 'semantic')}"
+            skip = skip & (~anchor_mask_local)
+            source_attention_anchor_boost_mask = anchor_mask_local
+            source_attention_anchor_boost_score = anchor_score_local
+            anchor_count = int(anchor_mask_local.sum().item())
+            anchor_eligible_count = max(int(source_eligible_base.sum().item()), 1)
+            semantic_extra_stats.update({
+                "semantic_anchor_rescue_source_tokens": float(anchor_count),
+                "semantic_anchor_rescue_source_ratio": float(anchor_count / anchor_eligible_count),
+                "semantic_anchor_rescue_source_score_mean": (
+                    float(anchor_score_local[anchor_mask_local].mean().item()) if anchor_count > 0 else 0.0
+                ),
+                "semantic_anchor_rescue_source_score_max": float(anchor_score_local.max().item())
+                if anchor_score_local.numel() else 0.0,
+                "semantic_anchor_rescue_source_available": bool(anchor_count > 0),
+                "semantic_anchor_rescue_source_reason": anchor_reason,
+            })
+
+        if explicit_source_attention_top_quantile is not None:
+            try:
+                explicit_top_q = float(explicit_source_attention_top_quantile)
+            except (TypeError, ValueError):
+                explicit_top_q = -1.0
+            if explicit_top_q >= 0.0:
+                source_attention_top_quantile = min(max(explicit_top_q, 0.0), 1.0)
+                source_attention_top_random_same_mass = bool(
+                    hmc_control.get("context_source_skip_source_attention_top_random_same_mass", False)
+                )
+                semantic_extra_stats.update({
+                    "context_source_skip_source_attention_top_quantile": float(source_attention_top_quantile),
+                    "context_source_skip_source_attention_top_random_same_mass": bool(source_attention_top_random_same_mass),
+                })
+
         selected_for_stats = skip & eligible
         selected_count = int(selected_for_stats.sum().item())
         eligible_count = max(int(eligible.sum().item()), 1)
@@ -1904,18 +2265,25 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 "special_token_keep_ratio": special_keep,
             })
             stats.update(frame_region_debug)
+            stats.update(query_region_debug)
             stats.update(semantic_extra_stats)
             return None, stats
 
         mode = str(hmc_control.get("context_source_skip_mode", "hard")).lower()
         impl = str(hmc_control.get("context_source_skip_impl", "bias")).lower()
+        trace_only_impl = impl in {"trace_only", "raw_qk_trace", "attention_trace_only"}
         boost_action = mode in {"boost", "soft_boost", "anchor_boost"} or impl in {
             "boost",
             "bias_boost",
             "source_boost",
             "anchor_boost",
         }
-        soft_action = boost_action or mode == "soft" or impl in {"v_only", "vonly", "value", "value_only"}
+        soft_action = (
+            trace_only_impl
+            or boost_action
+            or mode == "soft"
+            or impl in {"v_only", "vonly", "value", "value_only"}
+        )
         source_keep_tensor = None
         source_bias_values = None
         source_weights = None
@@ -1952,6 +2320,31 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             source_weights = None
 
         def _attach_source_attention_top(control: Dict[str, Any], eligible_out: torch.Tensor) -> None:
+            if source_attention_anchor_boost_mask is not None:
+                if path == "frame_attention":
+                    anchor_mask_out = source_attention_anchor_boost_mask.reshape(
+                        batch_size * frame_num,
+                        tokens_per_frame,
+                    )
+                    anchor_score_out = source_attention_anchor_boost_score.reshape(
+                        batch_size * frame_num,
+                        tokens_per_frame,
+                    )
+                else:
+                    anchor_mask_out = source_attention_anchor_boost_mask.reshape(
+                        batch_size,
+                        frame_num * tokens_per_frame,
+                    )
+                    anchor_score_out = source_attention_anchor_boost_score.reshape(
+                        batch_size,
+                        frame_num * tokens_per_frame,
+                    )
+                control["source_attention_top_anchor_boost_mask"] = anchor_mask_out.detach()
+                control["source_attention_top_anchor_boost_score"] = anchor_score_out.detach()
+                control["source_attention_top_anchor_boost_rho"] = float(
+                    hmc_control.get("context_source_skip_soft_rho", 0.5) or 0.5
+                )
+                control["stable_anchor_mask"] = anchor_mask_out.detach()
             if source_attention_top_quantile is None:
                 return
             control["source_attention_top_quantile"] = float(source_attention_top_quantile)
@@ -1960,6 +2353,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             control["source_attention_top_rho"] = float(hmc_control.get("context_source_skip_soft_rho", 0.5) or 0.5)
             control["source_attention_top_min_keep"] = float(hmc_control.get("context_source_skip_soft_min_keep", 0.5) or 0.5)
             control["source_attention_top_eligible_mask"] = eligible_out.detach()
+            control["source_attention_top_boost_action"] = bool(boost_action)
 
         if impl == "compact_kv":
             bias = {
@@ -1987,6 +2381,10 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 "source_weights": source_weights_out.detach(),
                 "attention_mass_metric": "v_only_effective_value_mass",
             }
+            if anchor_boost_mask:
+                bias["stable_anchor_mask"] = affected_mask.detach()
+            if query_mask_out is not None:
+                bias["query_mask"] = query_mask_out
             _attach_source_attention_top(bias, affected_mask)
             if bool(hmc_control.get("context_source_skip_record_attention_mass", False)):
                 bias["attention_mass_stats"] = []
@@ -2001,12 +2399,16 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 if soft_action and bool(hmc_control.get("context_source_skip_record_attention_mass", False)):
                     bias = {
                         "type": "source_soft",
-                        "mode": "bias",
+                        "mode": "trace_only" if trace_only_impl else "bias",
                         "affected_mask": skip.reshape(batch_size * frame_num, tokens_per_frame).detach(),
                         "source_bias_values": source_bias.detach(),
                         "attention_mass_metric": attention_mass_metric,
                     }
-                    _attach_source_attention_top(bias, eligible.reshape(batch_size * frame_num, tokens_per_frame))
+                    if anchor_boost_mask:
+                        bias["stable_anchor_mask"] = bias["affected_mask"]
+                    if query_mask_out is not None:
+                        bias["query_mask"] = query_mask_out
+                    _attach_source_attention_top(bias, skip.reshape(batch_size * frame_num, tokens_per_frame))
                     bias["attention_mass_stats"] = []
                     bias["attention_mass_max_queries"] = int(
                         hmc_control.get("context_source_skip_attention_mass_max_queries", 512) or 512
@@ -2024,12 +2426,16 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 if soft_action and bool(hmc_control.get("context_source_skip_record_attention_mass", False)):
                     bias = {
                         "type": "source_soft",
-                        "mode": "bias",
+                        "mode": "trace_only" if trace_only_impl else "bias",
                         "affected_mask": skip.reshape(batch_size, frame_num * tokens_per_frame).detach(),
                         "source_bias_values": source_bias.detach(),
                         "attention_mass_metric": attention_mass_metric,
                     }
-                    _attach_source_attention_top(bias, eligible.reshape(batch_size, frame_num * tokens_per_frame))
+                    if anchor_boost_mask:
+                        bias["stable_anchor_mask"] = bias["affected_mask"]
+                    if query_mask_out is not None:
+                        bias["query_mask"] = query_mask_out
+                    _attach_source_attention_top(bias, skip.reshape(batch_size, frame_num * tokens_per_frame))
                     bias["attention_mass_stats"] = []
                     bias["attention_mass_max_queries"] = int(
                         hmc_control.get("context_source_skip_attention_mass_max_queries", 512) or 512
@@ -2055,6 +2461,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             "context_source_skip_impl": impl,
             "context_source_skip_mask": mask_name,
             **frame_region_debug,
+            **query_region_debug,
             "context_source_skip_threshold": float(thr.item()),
             "context_source_skip_quantile": float(quantile),
             "context_source_skip_semantic_reason": semantic_reason,
@@ -2070,6 +2477,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             "source_control_fraction": float(source_skip_tokens / max(source_tokens_before, 1)),
             "source_boost_fraction": float(source_skip_tokens / max(source_tokens_before, 1)) if boost_action else 0.0,
             "semantic_anchor_boost_applied": bool(boost_action),
+            "semantic_anchor_rescue_applied": bool(source_attention_anchor_boost_mask is not None),
             "attention_mass_metric": attention_mass_metric if soft_action else None,
             "attention_mass_requested": bool(hmc_control.get("context_source_skip_record_attention_mass", False))
             and (impl == "compact_kv" or isinstance(bias, dict)),
@@ -2088,6 +2496,10 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         }
         stats.update(semantic_extra_stats)
         if isinstance(bias, dict):
+            if bias.get("type") == "source_soft":
+                bias["source_attention_head_indices"] = str(
+                    hmc_control.get("context_source_skip_head_indices", "") or ""
+                )
             dump_dir = str(hmc_control.get("context_source_skip_attention_map_dump_dir", "") or "").strip()
             if dump_dir and bias.get("type") == "source_soft":
                 bias["source_attention_map_dump_dir"] = dump_dir
@@ -2103,6 +2515,9 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 )
                 bias["source_attention_map_dump_full_query_marginal"] = bool(
                     hmc_control.get("context_source_skip_attention_map_dump_full_query_marginal", False)
+                )
+                bias["source_attention_map_dump_head_marginal"] = bool(
+                    hmc_control.get("context_source_skip_attention_map_dump_head_marginal", False)
                 )
                 bias["source_attention_map_dump_query_block"] = int(
                     hmc_control.get("context_source_skip_attention_map_dump_query_block", 32) or 32
@@ -2173,6 +2588,409 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         return gate.reshape(1, 1, history_tokens, 1).to(dtype=dtype)
 
     @staticmethod
+    def _swa_prev_ttt_stable_anchor_layer_enabled(
+        hmc_control: Optional[Dict[str, Any]],
+        *,
+        layer_idx: int,
+        n_layers: int,
+    ) -> bool:
+        if not hmc_control or hmc_control.get("identity_hooks", False):
+            return False
+        if not hmc_control.get("enable_swa_prev_ttt_stable_anchor_gate", False):
+            return False
+        mode = str(hmc_control.get("swa_prev_ttt_stable_anchor_gate_layer_mode", "last"))
+        if mode == "all":
+            return True
+        if mode == "first":
+            return int(layer_idx) == 0
+        if mode == "last":
+            return int(layer_idx) == max(0, int(n_layers) - 1)
+        if mode == "single":
+            return int(layer_idx) == int(hmc_control.get("swa_prev_ttt_stable_anchor_gate_single_layer", -1))
+        return False
+
+    def _make_swa_prev_ttt_stable_anchor_gate(
+        self,
+        hmc_control: Optional[Dict[str, Any]],
+        *,
+        batch_size: int,
+        tokens_per_frame: int,
+        history_tokens: int,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
+        stats: Dict[str, Any] = {
+            "swa_prev_ttt_stable_anchor_gate_applied": False,
+            "swa_prev_ttt_stable_anchor_gate_tokens": 0,
+            "swa_prev_ttt_stable_anchor_gate_available": False,
+        }
+        if not hmc_control or hmc_control.get("identity_hooks", False):
+            return None, stats
+        if not hmc_control.get("enable_swa_prev_ttt_stable_anchor_gate", False):
+            return None, stats
+        rho = float(hmc_control.get("swa_prev_ttt_stable_anchor_gate_rho", 0.0))
+        if rho == 0.0 or history_tokens <= 0:
+            return None, stats
+        mask = Pi3._swa_trace_source_values(
+            hmc_control,
+            "prev_ttt_stable_anchor_mask_patch",
+            batch_size=batch_size,
+            history_tokens=history_tokens,
+            tokens_per_frame=tokens_per_frame,
+            device=device,
+            dtype=torch.float32,
+        )
+        if mask is None:
+            stats["swa_prev_ttt_stable_anchor_gate_reason"] = "missing_prev_ttt_stable_anchor_mask_patch"
+            return None, stats
+        score = (mask >= 0.5).to(device=device, dtype=torch.float32)
+        selected = score > 0.5
+        selected_count = int(selected.sum().item())
+        stats.update({
+            "swa_prev_ttt_stable_anchor_gate_available": True,
+            "swa_prev_ttt_stable_anchor_gate_source_token_count": int(score.numel()),
+            "swa_prev_ttt_stable_anchor_gate_selected_token_count": selected_count,
+            "swa_prev_ttt_stable_anchor_gate_selected_frac": float(score.mean().item()) if score.numel() else 0.0,
+        })
+        if selected_count <= 0:
+            stats["swa_prev_ttt_stable_anchor_gate_reason"] = "empty_prev_ttt_stable_anchor_mask"
+            return None, stats
+        min_gate = min(max(float(hmc_control.get("swa_prev_ttt_stable_anchor_gate_min", 0.85)), 0.0), 1.0)
+        gate_values = (1.0 - rho * score).clamp(min_gate, 1.0).to(dtype=dtype)
+        gate_delta = (1.0 - gate_values.detach().float()).abs()
+        stats.update({
+            "swa_prev_ttt_stable_anchor_gate_applied": True,
+            "swa_prev_ttt_stable_anchor_gate_rho": rho,
+            "swa_prev_ttt_stable_anchor_gate_min": min_gate,
+            "swa_prev_ttt_stable_anchor_gate_tokens": selected_count,
+            "swa_prev_ttt_stable_anchor_gate_mean": float(gate_values.detach().float().mean().item()),
+            "swa_prev_ttt_stable_anchor_gate_p10": float(torch.quantile(gate_values.detach().float(), 0.10).item()),
+            "swa_prev_ttt_stable_anchor_gate_p50": float(torch.quantile(gate_values.detach().float(), 0.50).item()),
+            "swa_prev_ttt_stable_anchor_gate_p90": float(torch.quantile(gate_values.detach().float(), 0.90).item()),
+            "swa_prev_ttt_stable_anchor_gate_mean_abs_delta": float(gate_delta.mean().item()),
+            "swa_prev_ttt_stable_anchor_gate_max_abs_delta": float(gate_delta.max().item()),
+        })
+        return gate_values.reshape(int(batch_size), 1, int(history_tokens), 1).to(dtype=dtype), stats
+
+    @staticmethod
+    def _swa_prev_ttt_anchor_query_soft_layer_enabled(
+        hmc_control: Optional[Dict[str, Any]],
+        *,
+        layer_idx: int,
+        n_layers: int,
+    ) -> bool:
+        if not hmc_control or hmc_control.get("identity_hooks", False):
+            return False
+        if not hmc_control.get("enable_swa_prev_ttt_anchor_query_soft", False):
+            return False
+        mode = str(hmc_control.get("swa_prev_ttt_anchor_query_soft_layer_mode", "last"))
+        if mode == "all":
+            return True
+        if mode == "first":
+            return int(layer_idx) == 0
+        if mode == "last":
+            return int(layer_idx) == max(0, int(n_layers) - 1)
+        if mode == "single":
+            return int(layer_idx) == int(hmc_control.get("swa_prev_ttt_anchor_query_soft_single_layer", -1))
+        return False
+
+    def _make_swa_prev_ttt_anchor_query_soft_control(
+        self,
+        hmc_control: Optional[Dict[str, Any]],
+        *,
+        batch_size: int,
+        tokens_per_frame: int,
+        history_tokens: int,
+        current_tokens: int,
+        device: torch.device,
+    ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        stats: Dict[str, Any] = {
+            "swa_prev_ttt_anchor_query_soft_available": False,
+            "swa_prev_ttt_anchor_query_soft_applied": False,
+            "swa_prev_ttt_anchor_query_soft_source_tokens": 0,
+        }
+        if not hmc_control or hmc_control.get("identity_hooks", False):
+            return None, stats
+        if not hmc_control.get("enable_swa_prev_ttt_anchor_query_soft", False):
+            return None, stats
+        rho = float(hmc_control.get("swa_prev_ttt_anchor_query_soft_rho", 0.0))
+        if rho == 0.0 or history_tokens <= 0:
+            stats["swa_prev_ttt_anchor_query_soft_reason"] = "rho_zero_or_empty_history"
+            return None, stats
+        mask = Pi3._swa_trace_source_values(
+            hmc_control,
+            "prev_ttt_stable_anchor_mask_patch",
+            batch_size=batch_size,
+            history_tokens=history_tokens,
+            tokens_per_frame=tokens_per_frame,
+            device=device,
+            dtype=torch.float32,
+        )
+        if mask is None:
+            stats["swa_prev_ttt_anchor_query_soft_reason"] = "missing_prev_ttt_stable_anchor_mask_patch"
+            return None, stats
+        stable_mask = (mask >= 0.5).reshape(int(batch_size), int(history_tokens))
+        selected_count = int(stable_mask.sum().item())
+        stats.update({
+            "swa_prev_ttt_anchor_query_soft_available": True,
+            "swa_prev_ttt_anchor_query_soft_source_token_count": int(stable_mask.numel()),
+            "swa_prev_ttt_anchor_query_soft_source_tokens": selected_count,
+            "swa_prev_ttt_anchor_query_soft_source_frac": float(stable_mask.float().mean().item())
+            if stable_mask.numel() else 0.0,
+            "swa_prev_ttt_anchor_query_soft_rho": float(rho),
+            "swa_prev_ttt_anchor_query_soft_min_keep": float(
+                hmc_control.get("swa_prev_ttt_anchor_query_soft_min_keep", 0.5)
+            ),
+            "swa_prev_ttt_anchor_query_soft_query_head_frac_threshold": float(
+                hmc_control.get("swa_prev_ttt_anchor_query_soft_query_head_frac_threshold", 0.75)
+            ),
+            "swa_prev_ttt_anchor_query_soft_topk": int(
+                hmc_control.get("swa_prev_ttt_anchor_query_soft_topk", 8)
+            ),
+            "swa_prev_ttt_anchor_query_soft_query_block_size": int(
+                hmc_control.get("swa_prev_ttt_anchor_query_soft_query_block_size", 64)
+            ),
+        })
+        if selected_count <= 0:
+            stats["swa_prev_ttt_anchor_query_soft_reason"] = "empty_prev_ttt_stable_anchor_mask"
+            return None, stats
+        attention_mass_stats: List[Dict[str, Any]] = []
+        control = {
+            "type": "prev_ttt_anchor_query_soft",
+            "stable_anchor_mask": stable_mask.to(device=device),
+            "history_tokens": int(history_tokens),
+            "rho": float(rho),
+            "min_keep": float(hmc_control.get("swa_prev_ttt_anchor_query_soft_min_keep", 0.5)),
+            "query_head_frac_threshold": float(
+                hmc_control.get("swa_prev_ttt_anchor_query_soft_query_head_frac_threshold", 0.75)
+            ),
+            "topk": int(hmc_control.get("swa_prev_ttt_anchor_query_soft_topk", 8)),
+            "query_block_size": int(hmc_control.get("swa_prev_ttt_anchor_query_soft_query_block_size", 64)),
+            "attention_mass_stats": attention_mass_stats,
+            "attention_mass_max_queries": int(
+                hmc_control.get("swa_prev_ttt_anchor_query_soft_attention_mass_max_queries", 64)
+            ),
+            "attention_mass_metric": "prev_ttt_anchor_query_soft",
+        }
+        return control, stats
+
+    @staticmethod
+    def _swa_prev_ttt_tracked_instance_query_soft_layer_enabled(
+        hmc_control: Optional[Dict[str, Any]],
+        *,
+        layer_idx: int,
+        n_layers: int,
+    ) -> bool:
+        if not hmc_control or hmc_control.get("identity_hooks", False):
+            return False
+        if not (
+            hmc_control.get("enable_swa_prev_ttt_tracked_instance_query_soft_trace", False)
+            or hmc_control.get("enable_swa_prev_ttt_tracked_instance_query_soft_action", False)
+        ):
+            return False
+        mode = str(hmc_control.get("swa_prev_ttt_tracked_instance_query_soft_layer_mode", "last"))
+        if mode == "all":
+            return True
+        if mode == "first":
+            return int(layer_idx) == 0
+        if mode == "last":
+            return int(layer_idx) == max(0, int(n_layers) - 1)
+        if mode == "single":
+            return int(layer_idx) == int(
+                hmc_control.get("swa_prev_ttt_tracked_instance_query_soft_single_layer", -1)
+            )
+        return False
+
+    def _make_swa_prev_ttt_tracked_instance_query_soft_trace_control(
+        self,
+        hmc_control: Optional[Dict[str, Any]],
+        *,
+        batch_size: int,
+        tokens_per_frame: int,
+        history_tokens: int,
+        current_tokens: int,
+        device: torch.device,
+    ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        stats: Dict[str, Any] = {
+            "swa_prev_ttt_tracked_instance_query_soft_available": False,
+            "swa_prev_ttt_tracked_instance_query_soft_applied": False,
+            "swa_prev_ttt_tracked_instance_query_soft_trace_only": True,
+            "swa_prev_ttt_tracked_instance_query_soft_action_requested": False,
+            "swa_prev_ttt_tracked_instance_query_soft_runtime_action_allowed": False,
+            "swa_prev_ttt_tracked_instance_query_soft_source_tokens": 0,
+        }
+        if not hmc_control or hmc_control.get("identity_hooks", False):
+            return None, stats
+        trace_requested = bool(
+            hmc_control.get("enable_swa_prev_ttt_tracked_instance_query_soft_trace", False)
+        )
+        action_requested = bool(
+            hmc_control.get("enable_swa_prev_ttt_tracked_instance_query_soft_action", False)
+        )
+        action_runtime_allowed = bool(
+            action_requested
+            and hmc_control.get(
+                "swa_prev_ttt_tracked_instance_query_soft_action_runtime_authorized",
+                False,
+            )
+        )
+        stats.update({
+            "swa_prev_ttt_tracked_instance_query_soft_trace_requested": trace_requested,
+            "swa_prev_ttt_tracked_instance_query_soft_action_requested": action_requested,
+            "swa_prev_ttt_tracked_instance_query_soft_runtime_action_allowed": action_runtime_allowed,
+            "swa_prev_ttt_tracked_instance_query_soft_trace_only": not action_runtime_allowed,
+        })
+        if not (trace_requested or action_requested):
+            return None, stats
+        if history_tokens <= 0:
+            stats["swa_prev_ttt_tracked_instance_query_soft_reason"] = "empty_history"
+            return None, stats
+        mask = Pi3._swa_trace_source_values(
+            hmc_control,
+            "prev_ttt_tracked_instance_anchor_mask_patch",
+            batch_size=batch_size,
+            history_tokens=history_tokens,
+            tokens_per_frame=tokens_per_frame,
+            device=device,
+            dtype=torch.float32,
+        )
+        if mask is None:
+            stats["swa_prev_ttt_tracked_instance_query_soft_reason"] = (
+                "missing_prev_ttt_tracked_instance_anchor_mask_patch"
+            )
+            return None, stats
+        seed_ids = Pi3._swa_trace_source_values(
+            hmc_control,
+            "prev_ttt_tracked_instance_anchor_seed_patch",
+            batch_size=batch_size,
+            history_tokens=history_tokens,
+            tokens_per_frame=tokens_per_frame,
+            device=device,
+            dtype=torch.int64,
+        )
+        source_instance_ids = Pi3._swa_trace_source_values(
+            hmc_control,
+            "prev_ttt_tracked_instance_anchor_id_patch",
+            batch_size=batch_size,
+            history_tokens=history_tokens,
+            tokens_per_frame=tokens_per_frame,
+            device=device,
+            dtype=torch.int64,
+        )
+
+        def _current_values(key: str) -> Optional[torch.Tensor]:
+            raw = hmc_control.get(key)
+            if not torch.is_tensor(raw) or int(current_tokens) <= 0:
+                return None
+            vals = raw.detach().to(device=device, dtype=torch.int64).reshape(-1)
+            needed = int(batch_size) * int(current_tokens)
+            if int(vals.numel()) < needed:
+                pad = torch.full(
+                    (needed - int(vals.numel()),),
+                    -1,
+                    device=device,
+                    dtype=torch.int64,
+                )
+                vals = torch.cat([vals, pad], dim=0)
+            return vals[:needed].reshape(int(batch_size), int(current_tokens))
+
+        query_seed_ids = _current_values("stage_c_seed_global_track_idx_tok")
+        query_instance_ids = _current_values("stage_c_masklet_instance_idx_tok")
+        direct_match_mode = str(
+            hmc_control.get("swa_prev_ttt_tracked_instance_query_soft_direct_match_mode", "any")
+        ).strip().lower()
+        if direct_match_mode not in {"any", "same_seed", "same_masklet"}:
+            direct_match_mode = "any"
+        tracked_mask = (mask >= 0.5).reshape(int(batch_size), int(history_tokens))
+        selected_count = int(tracked_mask.sum().item())
+        stats.update({
+            "swa_prev_ttt_tracked_instance_query_soft_available": True,
+            "swa_prev_ttt_tracked_instance_query_soft_source_token_count": int(tracked_mask.numel()),
+            "swa_prev_ttt_tracked_instance_query_soft_source_tokens": selected_count,
+            "swa_prev_ttt_tracked_instance_query_soft_source_frac": float(tracked_mask.float().mean().item())
+            if tracked_mask.numel() else 0.0,
+            "swa_prev_ttt_tracked_instance_query_soft_rho": float(
+                hmc_control.get("swa_prev_ttt_tracked_instance_query_soft_rho", 0.0)
+            ),
+            "swa_prev_ttt_tracked_instance_query_soft_min_keep": float(
+                hmc_control.get("swa_prev_ttt_tracked_instance_query_soft_min_keep", 0.5)
+            ),
+            "swa_prev_ttt_tracked_instance_query_soft_query_head_frac_threshold": float(
+                hmc_control.get("swa_prev_ttt_tracked_instance_query_soft_query_head_frac_threshold", 0.75)
+            ),
+            "swa_prev_ttt_tracked_instance_query_soft_topk": int(
+                hmc_control.get("swa_prev_ttt_tracked_instance_query_soft_topk", 4)
+            ),
+            "swa_prev_ttt_tracked_instance_query_soft_query_block_size": int(
+                hmc_control.get("swa_prev_ttt_tracked_instance_query_soft_query_block_size", 64)
+            ),
+            "swa_prev_ttt_tracked_instance_query_soft_min_direct_witness_seeds": int(
+                hmc_control.get("swa_prev_ttt_tracked_instance_query_soft_min_direct_witness_seeds", 4)
+            ),
+            "swa_prev_ttt_tracked_instance_query_soft_seed_ids_available": bool(seed_ids is not None),
+            "swa_prev_ttt_tracked_instance_query_soft_source_instance_ids_available": bool(
+                source_instance_ids is not None
+            ),
+            "swa_prev_ttt_tracked_instance_query_soft_query_seed_ids_available": bool(
+                query_seed_ids is not None
+            ),
+            "swa_prev_ttt_tracked_instance_query_soft_query_instance_ids_available": bool(
+                query_instance_ids is not None
+            ),
+            "swa_prev_ttt_tracked_instance_query_soft_direct_match_mode": direct_match_mode,
+            "swa_prev_ttt_tracked_instance_query_soft_trace_only": not action_runtime_allowed,
+            "swa_prev_ttt_tracked_instance_query_soft_runtime_action_allowed": action_runtime_allowed,
+        })
+        if action_requested and not action_runtime_allowed:
+            stats["swa_prev_ttt_tracked_instance_query_soft_action_blocker"] = (
+                "runtime_authorization_false"
+            )
+        if selected_count <= 0:
+            stats["swa_prev_ttt_tracked_instance_query_soft_reason"] = (
+                "empty_prev_ttt_tracked_instance_anchor_mask"
+            )
+            return None, stats
+        attention_mass_stats: List[Dict[str, Any]] = []
+        control = {
+            "type": "prev_ttt_anchor_query_soft",
+            "mode": "action" if action_runtime_allowed else "trace_only",
+            "trace_only": not action_runtime_allowed,
+            "diagnostic_only": not action_runtime_allowed,
+            "stat_prefix": "prev_ttt_tracked_instance_query_soft",
+            "stable_anchor_mask": tracked_mask.to(device=device),
+            "source_seed_ids": seed_ids.reshape(int(batch_size), int(history_tokens)).to(device=device)
+            if seed_ids is not None else None,
+            "source_instance_ids": source_instance_ids.reshape(int(batch_size), int(history_tokens)).to(device=device)
+            if source_instance_ids is not None else None,
+            "query_seed_ids": query_seed_ids,
+            "query_instance_ids": query_instance_ids,
+            "direct_match_mode": direct_match_mode,
+            "history_tokens": int(history_tokens),
+            "rho": float(hmc_control.get("swa_prev_ttt_tracked_instance_query_soft_rho", 0.0)),
+            "min_keep": float(hmc_control.get("swa_prev_ttt_tracked_instance_query_soft_min_keep", 0.5)),
+            "query_head_frac_threshold": float(
+                hmc_control.get("swa_prev_ttt_tracked_instance_query_soft_query_head_frac_threshold", 0.75)
+            ),
+            "topk": int(hmc_control.get("swa_prev_ttt_tracked_instance_query_soft_topk", 4)),
+            "query_block_size": int(
+                hmc_control.get("swa_prev_ttt_tracked_instance_query_soft_query_block_size", 64)
+            ),
+            "min_direct_witness_seeds": int(
+                hmc_control.get("swa_prev_ttt_tracked_instance_query_soft_min_direct_witness_seeds", 4)
+            ),
+            "attention_mass_stats": attention_mass_stats,
+            "attention_mass_max_queries": int(
+                hmc_control.get("swa_prev_ttt_tracked_instance_query_soft_attention_mass_max_queries", 64)
+            ),
+            "attention_mass_metric": (
+                "prev_ttt_tracked_instance_query_soft_action"
+                if action_runtime_allowed
+                else "prev_ttt_tracked_instance_query_soft_trace_only"
+            ),
+        }
+        return control, stats
+
+    @staticmethod
     def _swa_overlap_layer_enabled(
         hmc_control: Optional[Dict[str, Any]],
         *,
@@ -2193,6 +3011,244 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         if mode == "single":
             return int(layer_idx) == int(hmc_control.get("swa_overlap_bias_single_layer", -1))
         return False
+
+    def _make_external_v84_anchor_source_score(
+        self,
+        *,
+        mask_csv: str,
+        variant: str,
+        seq_filter: str,
+        curr_chunk: int,
+        batch_size: int,
+        source_tokens: int,
+        overlap_frames: int,
+        tokens_per_frame: int,
+        device: torch.device,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
+        stats: Dict[str, Any] = {
+            "swa_overlap_bias_external_mask_available": False,
+            "swa_overlap_bias_external_mask_reason": "",
+            "swa_overlap_bias_external_mask_csv": str(mask_csv or ""),
+            "swa_overlap_bias_external_mask_variant": str(variant or ""),
+            "swa_overlap_bias_external_mask_seq": str(seq_filter or ""),
+            "swa_overlap_bias_external_mask_curr_chunk": int(curr_chunk),
+            "swa_overlap_bias_external_mask_rows_matching": 0,
+            "swa_overlap_bias_external_mask_source_tokens_selected": 0,
+        }
+        if not mask_csv:
+            stats["swa_overlap_bias_external_mask_reason"] = "missing_mask_csv"
+            return None, stats
+        path = Path(mask_csv)
+        if not path.exists():
+            stats["swa_overlap_bias_external_mask_reason"] = "mask_csv_not_found"
+            return None, stats
+        if source_tokens <= 0 or overlap_frames <= 0 or tokens_per_frame <= 0:
+            stats["swa_overlap_bias_external_mask_reason"] = "invalid_window_shape"
+            return None, stats
+        try:
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+        except Exception as exc:  # noqa: BLE001
+            stats["swa_overlap_bias_external_mask_reason"] = f"mask_csv_read_error:{type(exc).__name__}"
+            return None, stats
+
+        seq_norm = str(seq_filter or "").zfill(2) if str(seq_filter or "").strip() else ""
+        selected_rows: List[Dict[str, str]] = []
+        for row in rows:
+            if str(row.get("side", "")).strip().lower() != "source":
+                continue
+            if str(row.get("variant", "")).strip() != str(variant):
+                continue
+            if seq_norm and str(row.get("seq", "")).zfill(2) != seq_norm:
+                continue
+            try:
+                row_curr_chunk = int(float(str(row.get("curr_chunk", "")).strip()))
+            except ValueError:
+                continue
+            if row_curr_chunk != int(curr_chunk):
+                continue
+            selected_rows.append(row)
+
+        score = torch.zeros((int(batch_size), int(source_tokens)), device=device, dtype=torch.float32)
+        stats["swa_overlap_bias_external_mask_rows_matching"] = int(len(selected_rows))
+        if not selected_rows:
+            stats.update({
+                "swa_overlap_bias_external_mask_available": True,
+                "swa_overlap_bias_external_mask_reason": "no_rows_for_current_chunk",
+                "swa_overlap_bias_external_mask_source_tokens_selected": 0,
+            })
+            return score, stats
+
+        local_frames: List[int] = []
+        for row in selected_rows:
+            try:
+                local_frames.append(int(float(str(row.get("local_frame", "")).strip())))
+            except ValueError:
+                continue
+        if not local_frames:
+            stats["swa_overlap_bias_external_mask_reason"] = "no_valid_local_frames"
+            return score, stats
+        source_frame_base = max(0, max(local_frames) - int(overlap_frames) + 1)
+        patch_start = int(getattr(self, "patch_start_idx", 0))
+        patch_tokens_per_frame = max(0, int(tokens_per_frame) - patch_start)
+        selected_token_indices: set[int] = set()
+        skipped_out_of_window = 0
+        skipped_bad_patch = 0
+        for row in selected_rows:
+            try:
+                local_frame = int(float(str(row.get("local_frame", "")).strip()))
+                patch_token_index = int(float(str(row.get("patch_token_index", "")).strip()))
+            except ValueError:
+                continue
+            if patch_token_index < 0 or (patch_tokens_per_frame > 0 and patch_token_index >= patch_tokens_per_frame):
+                skipped_bad_patch += 1
+                continue
+            window_frame = local_frame - source_frame_base
+            if window_frame < 0 or window_frame >= int(overlap_frames):
+                skipped_out_of_window += 1
+                continue
+            source_index = int(window_frame) * int(tokens_per_frame) + patch_start + patch_token_index
+            if 0 <= source_index < int(source_tokens):
+                selected_token_indices.add(source_index)
+            else:
+                skipped_out_of_window += 1
+        if selected_token_indices:
+            idx = torch.tensor(sorted(selected_token_indices), device=device, dtype=torch.long)
+            score[:, idx] = 1.0
+        stats.update({
+            "swa_overlap_bias_external_mask_available": True,
+            "swa_overlap_bias_external_mask_reason": "ok" if selected_token_indices else "empty_after_window_mapping",
+            "swa_overlap_bias_external_mask_source_frame_base": int(source_frame_base),
+            "swa_overlap_bias_external_mask_overlap_frames": int(overlap_frames),
+            "swa_overlap_bias_external_mask_patch_start_idx": int(patch_start),
+            "swa_overlap_bias_external_mask_patch_tokens_per_frame": int(patch_tokens_per_frame),
+            "swa_overlap_bias_external_mask_source_tokens_selected": int(len(selected_token_indices)),
+            "swa_overlap_bias_external_mask_rows_skipped_out_of_window": int(skipped_out_of_window),
+            "swa_overlap_bias_external_mask_rows_skipped_bad_patch": int(skipped_bad_patch),
+        })
+        return score, stats
+
+    def _make_external_v92_policy_side_score(
+        self,
+        *,
+        mask_csv: str,
+        variant: str,
+        seq_filter: str,
+        curr_chunk: int,
+        side: str,
+        batch_size: int,
+        token_count: int,
+        overlap_frames: int,
+        tokens_per_frame: int,
+        device: torch.device,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
+        side_norm = str(side or "").strip().lower()
+        prefix = f"swa_overlap_bias_external_v92_policy_{side_norm}"
+        stats: Dict[str, Any] = {
+            f"{prefix}_available": False,
+            f"{prefix}_reason": "",
+            f"{prefix}_mask_csv": str(mask_csv or ""),
+            f"{prefix}_variant": str(variant or ""),
+            f"{prefix}_seq": str(seq_filter or ""),
+            f"{prefix}_curr_chunk": int(curr_chunk),
+            f"{prefix}_rows_matching": 0,
+            f"{prefix}_tokens_selected": 0,
+        }
+        if side_norm not in {"query", "source"}:
+            stats[f"{prefix}_reason"] = "invalid_side"
+            return None, stats
+        if not mask_csv:
+            stats[f"{prefix}_reason"] = "missing_mask_csv"
+            return None, stats
+        path = Path(mask_csv)
+        if not path.exists():
+            stats[f"{prefix}_reason"] = "mask_csv_not_found"
+            return None, stats
+        if token_count <= 0 or overlap_frames <= 0 or tokens_per_frame <= 0:
+            stats[f"{prefix}_reason"] = "invalid_window_shape"
+            return None, stats
+        try:
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+        except Exception as exc:  # noqa: BLE001
+            stats[f"{prefix}_reason"] = f"mask_csv_read_error:{type(exc).__name__}"
+            return None, stats
+
+        seq_norm = str(seq_filter or "").zfill(2) if str(seq_filter or "").strip() else ""
+        selected_rows: List[Dict[str, str]] = []
+        for row in rows:
+            if str(row.get("side", "")).strip().lower() != side_norm:
+                continue
+            if str(row.get("variant", "")).strip() != str(variant):
+                continue
+            if seq_norm and str(row.get("seq", "")).zfill(2) != seq_norm:
+                continue
+            try:
+                row_curr_chunk = int(float(str(row.get("curr_chunk", "")).strip()))
+            except ValueError:
+                continue
+            if row_curr_chunk != int(curr_chunk):
+                continue
+            selected_rows.append(row)
+
+        score = torch.zeros((int(batch_size), int(token_count)), device=device, dtype=torch.float32)
+        stats[f"{prefix}_rows_matching"] = int(len(selected_rows))
+        if not selected_rows:
+            stats.update({
+                f"{prefix}_available": True,
+                f"{prefix}_reason": "no_rows_for_current_chunk",
+                f"{prefix}_tokens_selected": 0,
+            })
+            return score, stats
+
+        local_frames: List[int] = []
+        for row in selected_rows:
+            try:
+                local_frames.append(int(float(str(row.get("local_frame", "")).strip())))
+            except ValueError:
+                continue
+        if not local_frames:
+            stats[f"{prefix}_reason"] = "no_valid_local_frames"
+            return score, stats
+        frame_base = max(0, max(local_frames) - int(overlap_frames) + 1)
+        patch_start = int(getattr(self, "patch_start_idx", 0))
+        patch_tokens_per_frame = max(0, int(tokens_per_frame) - patch_start)
+        selected_token_indices: set[int] = set()
+        skipped_out_of_window = 0
+        skipped_bad_patch = 0
+        for row in selected_rows:
+            try:
+                local_frame = int(float(str(row.get("local_frame", "")).strip()))
+                patch_token_index = int(float(str(row.get("patch_token_index", "")).strip()))
+            except ValueError:
+                continue
+            if patch_token_index < 0 or (patch_tokens_per_frame > 0 and patch_token_index >= patch_tokens_per_frame):
+                skipped_bad_patch += 1
+                continue
+            window_frame = local_frame - frame_base
+            if window_frame < 0 or window_frame >= int(overlap_frames):
+                skipped_out_of_window += 1
+                continue
+            token_index = int(window_frame) * int(tokens_per_frame) + patch_start + patch_token_index
+            if 0 <= token_index < int(token_count):
+                selected_token_indices.add(token_index)
+            else:
+                skipped_out_of_window += 1
+        if selected_token_indices:
+            idx = torch.tensor(sorted(selected_token_indices), device=device, dtype=torch.long)
+            score[:, idx] = 1.0
+        stats.update({
+            f"{prefix}_available": True,
+            f"{prefix}_reason": "ok" if selected_token_indices else "empty_after_window_mapping",
+            f"{prefix}_frame_base": int(frame_base),
+            f"{prefix}_overlap_frames": int(overlap_frames),
+            f"{prefix}_patch_start_idx": int(patch_start),
+            f"{prefix}_patch_tokens_per_frame": int(patch_tokens_per_frame),
+            f"{prefix}_tokens_selected": int(len(selected_token_indices)),
+            f"{prefix}_rows_skipped_out_of_window": int(skipped_out_of_window),
+            f"{prefix}_rows_skipped_bad_patch": int(skipped_bad_patch),
+        })
+        return score, stats
 
     def _make_swa_overlap_attention_bias(
         self,
@@ -2326,6 +3382,179 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 score=score_for_dump,
                 control=factor,
             ))
+        elif mode_l in {
+            "external_v84_anchor_mask",
+            "external_v84_anchor_mask_random_same_mass",
+            "v84_anchor_external_mask",
+            "v84_anchor_external_mask_random_same_mass",
+        }:
+            random_same_mass = mode_l.endswith("_random_same_mass")
+            mask_csv = str(hmc_control.get("swa_overlap_external_mask_csv", "") or "")
+            variant = str(hmc_control.get("swa_overlap_external_mask_variant", "current_role_anchor") or "current_role_anchor")
+            seq_filter = str(hmc_control.get("swa_overlap_external_mask_seq", "") or "")
+            chunk_idx = int(hmc_control.get("semantic_action_chunk_idx", -1))
+            score, mask_stats = self._make_external_v84_anchor_source_score(
+                mask_csv=mask_csv,
+                variant=variant,
+                seq_filter=seq_filter,
+                curr_chunk=chunk_idx,
+                batch_size=batch_size,
+                source_tokens=sn,
+                overlap_frames=ov,
+                tokens_per_frame=tokens_per_frame,
+                device=device,
+            )
+            if score is None:
+                stats.update(mask_stats)
+                return None, stats
+            selected_before_random = int((score > 0.0).sum().item())
+            if random_same_mass and selected_before_random > 0:
+                score = self._randomize_swa_overlap_score_same_distribution(
+                    score,
+                    hmc_control,
+                    swa_layer_idx=int(swa_layer_idx),
+                    salt_offset=8400.0,
+                )
+            factor = (1.0 + score).clamp_min(1.0)
+            keep = factor.unsqueeze(1).expand(batch_size, qn, sn)
+            selected_after_random = int((score > 0.0).sum().item())
+            stats.update(mask_stats)
+            stats.update({
+                "swa_overlap_bias_external_mask_mode": mode_l,
+                "swa_overlap_bias_external_mask_variant": variant,
+                "swa_overlap_bias_external_mask_random_same_mass": bool(random_same_mass),
+                "swa_overlap_bias_external_mask_selected_before_random": int(selected_before_random),
+                "swa_overlap_bias_external_mask_selected_after_random": int(selected_after_random),
+                "swa_overlap_bias_external_mask_selected_ratio": float(
+                    selected_after_random / max(int(batch_size * sn), 1)
+                ),
+                "swa_overlap_bias_mass_preserving_logit_reweight": True,
+                "swa_overlap_bias_external_mask_factor_mean": float(factor.detach().float().mean().item()),
+                "swa_overlap_bias_external_mask_factor_p10": float(torch.quantile(factor.detach().float(), 0.10).item()),
+                "swa_overlap_bias_external_mask_factor_p90": float(torch.quantile(factor.detach().float(), 0.90).item()),
+            })
+            stats.update(self._dump_swa_overlap_feature_map(
+                hmc_control,
+                kind="source_bias_external_v84_anchor",
+                mode=mode,
+                swa_layer_idx=int(swa_layer_idx),
+                batch_size=batch_size,
+                frame_num=frame_num,
+                tokens_per_frame=tokens_per_frame,
+                history_tokens=history_tokens,
+                source_start=source_start,
+                source_end=source_end,
+                overlap_frames=ov,
+                Dq=Dq_aligned,
+                Ds=Ds_aligned,
+                score=score,
+                control=factor,
+            ))
+        elif mode_l in {
+            "external_v92_policy_query_mask",
+            "external_v92_policy_query_mask_random_same_mass",
+            "external_v92_policy_pair_mask",
+            "external_v92_policy_pair_mask_random_same_mass",
+            "external_v92_policy_qk_pair_mask",
+            "external_v92_policy_qk_pair_mask_random_same_mass",
+        }:
+            random_same_mass = mode_l.endswith("_random_same_mass")
+            pair_mode = "pair_mask" in mode_l or "qk_pair_mask" in mode_l
+            mask_csv = str(hmc_control.get("swa_overlap_external_mask_csv", "") or "")
+            variant = str(hmc_control.get("swa_overlap_external_mask_variant", "v92_policy_risk_pair_mask") or "v92_policy_risk_pair_mask")
+            seq_filter = str(hmc_control.get("swa_overlap_external_mask_seq", "") or "")
+            chunk_idx = int(hmc_control.get("semantic_action_chunk_idx", -1))
+            q_score, query_stats = self._make_external_v92_policy_side_score(
+                mask_csv=mask_csv,
+                variant=variant,
+                seq_filter=seq_filter,
+                curr_chunk=chunk_idx,
+                side="query",
+                batch_size=batch_size,
+                token_count=qn,
+                overlap_frames=ov,
+                tokens_per_frame=tokens_per_frame,
+                device=device,
+            )
+            if q_score is None:
+                stats.update(query_stats)
+                return None, stats
+            s_score: Optional[torch.Tensor] = None
+            source_stats: Dict[str, Any] = {}
+            if pair_mode:
+                s_score, source_stats = self._make_external_v92_policy_side_score(
+                    mask_csv=mask_csv,
+                    variant=variant,
+                    seq_filter=seq_filter,
+                    curr_chunk=chunk_idx,
+                    side="source",
+                    batch_size=batch_size,
+                    token_count=sn,
+                    overlap_frames=ov,
+                    tokens_per_frame=tokens_per_frame,
+                    device=device,
+                )
+                if s_score is None:
+                    stats.update(query_stats)
+                    stats.update(source_stats)
+                    return None, stats
+            q_selected_before_random = int((q_score > 0.0).sum().item())
+            s_selected_before_random = int((s_score > 0.0).sum().item()) if s_score is not None else 0
+            if random_same_mass and q_selected_before_random > 0:
+                q_score = self._randomize_swa_overlap_score_same_distribution(
+                    q_score,
+                    hmc_control,
+                    swa_layer_idx=int(swa_layer_idx),
+                    salt_offset=9200.0,
+                )
+            if random_same_mass and s_score is not None and s_selected_before_random > 0:
+                s_score = self._randomize_swa_overlap_score_same_distribution(
+                    s_score,
+                    hmc_control,
+                    swa_layer_idx=int(swa_layer_idx),
+                    salt_offset=9300.0,
+                )
+            q_selected_after_random = int((q_score > 0.0).sum().item())
+            s_selected_after_random = int((s_score > 0.0).sum().item()) if s_score is not None else 0
+            if pair_mode and s_score is not None:
+                pair_score = q_score.unsqueeze(2) * s_score.unsqueeze(1)
+                factor = (1.0 + pair_score).clamp_min(1.0)
+                keep = factor
+                factor_for_stats = factor.detach().float().reshape(-1)
+                selected_cells = int((pair_score > 0.0).sum().item())
+                route_kind = "pair"
+            else:
+                factor = (1.0 + q_score).clamp_min(1.0)
+                keep = factor.unsqueeze(2).expand(batch_size, qn, sn)
+                factor_for_stats = factor.detach().float().reshape(-1)
+                selected_cells = int(q_selected_after_random * sn)
+                route_kind = "query"
+            stats.update(query_stats)
+            stats.update(source_stats)
+            stats.update({
+                "swa_overlap_bias_external_v92_policy_mode": mode_l,
+                "swa_overlap_bias_external_v92_policy_variant": variant,
+                "swa_overlap_bias_external_v92_policy_route_kind": route_kind,
+                "swa_overlap_bias_external_v92_policy_random_same_mass": bool(random_same_mass),
+                "swa_overlap_bias_external_v92_policy_query_tokens_selected_before_random": int(q_selected_before_random),
+                "swa_overlap_bias_external_v92_policy_query_tokens_selected_after_random": int(q_selected_after_random),
+                "swa_overlap_bias_external_v92_policy_source_tokens_selected_before_random": int(s_selected_before_random),
+                "swa_overlap_bias_external_v92_policy_source_tokens_selected_after_random": int(s_selected_after_random),
+                "swa_overlap_bias_external_v92_policy_pair_cells_selected_after_random": int(selected_cells),
+                "swa_overlap_bias_external_v92_policy_query_selected_ratio": float(
+                    q_selected_after_random / max(int(batch_size * qn), 1)
+                ),
+                "swa_overlap_bias_external_v92_policy_source_selected_ratio": float(
+                    s_selected_after_random / max(int(batch_size * sn), 1)
+                ) if pair_mode else None,
+                "swa_overlap_bias_external_v92_policy_pair_selected_ratio": float(
+                    selected_cells / max(int(batch_size * qn * sn), 1)
+                ),
+                "swa_overlap_bias_mass_preserving_logit_reweight": True,
+                "swa_overlap_bias_external_v92_policy_factor_mean": float(factor_for_stats.mean().item()),
+                "swa_overlap_bias_external_v92_policy_factor_p10": float(torch.quantile(factor_for_stats, 0.10).item()),
+                "swa_overlap_bias_external_v92_policy_factor_p90": float(torch.quantile(factor_for_stats, 0.90).item()),
+            })
         elif mode_l in self._swa_overlap_source_role_modes():
             role_score, role_stats = self._make_swa_overlap_source_role_score(
                 hmc_control,
@@ -2383,9 +3612,15 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         elif mode_l in {
             "semantic_same_group_boost_stable_agreement",
             "semantic_same_group_boost_stable_agreement_random_same_mass",
+            "semantic_same_group_boost_stable_agreement_shuffled_semantic",
         }:
             random_same_mass = mode_l.endswith("_random_same_mass")
-            base_mode = mode_l[:-len("_random_same_mass")] if random_same_mass else mode_l
+            shuffled_semantic = mode_l.endswith("_shuffled_semantic")
+            base_mode = mode_l
+            if random_same_mass:
+                base_mode = base_mode[:-len("_random_same_mass")]
+            if shuffled_semantic:
+                base_mode = base_mode[:-len("_shuffled_semantic")]
 
             def _prev_overlap_groups() -> Tuple[Optional[torch.Tensor], str]:
                 raw = hmc_control.get("G_prev_patch") if hmc_control else None
@@ -2453,6 +3688,16 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 semantic_mask = torch.zeros_like(Ds_aligned, dtype=torch.bool)
                 missing_semantic_groups = True
             else:
+                if shuffled_semantic:
+                    shuffled = torch.empty_like(Gq)
+                    base_idx = torch.arange(int(Gq.shape[1]), device=device, dtype=torch.float32)
+                    chunk_idx = int((hmc_control or {}).get("semantic_action_chunk_idx", -1))
+                    for b in range(int(batch_size)):
+                        salt = 9000.0 + float(max(chunk_idx, 0)) * 101.0 + float(swa_layer_idx) * 17.0 + float(b) * 13.0
+                        rand = torch.frac(torch.sin((base_idx + 1.0 + salt) * 12.9898) * 43758.5453)
+                        perm = torch.argsort(rand, stable=True)
+                        shuffled[b] = Gq[b, perm]
+                    Gq = shuffled
                 allowed_groups = (
                     (Gs == int(_CONTEXT_SEM_GROUP_STRUCTURE))
                     | (Gs == int(_CONTEXT_SEM_GROUP_STATIC))
@@ -2478,6 +3723,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 "swa_overlap_bias_geometric_base_mode": base_mode,
                 "swa_overlap_bias_geometric_action": "semantic_same_group_stable_agreement_boost",
                 "swa_overlap_bias_geometric_random_same_mass": bool(random_same_mass),
+                "swa_overlap_bias_semantic_group_shuffled_semantic": bool(shuffled_semantic),
                 "swa_overlap_bias_mass_preserving_logit_reweight": True,
                 "swa_overlap_bias_semantic_group_source": source_group_layout,
                 "swa_overlap_bias_semantic_group_query": query_group_layout,
@@ -2708,6 +3954,765 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
         if mode == "single":
             return int(layer_idx) == int(hmc_control.get("swa_overlap_source_replace_single_layer", -1))
         return False
+
+    @staticmethod
+    def _v102_state_machine_trace_layer_enabled(
+        hmc_control: Optional[Dict[str, Any]],
+        *,
+        layer_idx: int,
+        n_layers: int,
+    ) -> bool:
+        if not hmc_control or hmc_control.get("identity_hooks", False):
+            return False
+        if not hmc_control.get("enable_v102_state_machine_trace", False):
+            return False
+        mode = str(hmc_control.get("v102_state_machine_layer_mode", "last"))
+        if mode == "all":
+            return True
+        if mode == "first":
+            return int(layer_idx) == 0
+        if mode == "last":
+            return int(layer_idx) == max(0, int(n_layers) - 1)
+        if mode == "single":
+            return int(layer_idx) == int(hmc_control.get("v102_state_machine_single_layer", -1))
+        return False
+
+    @staticmethod
+    def _make_v102_state_machine_trace_record(
+        hmc_control: Optional[Dict[str, Any]],
+        *,
+        history_tokens: int,
+        current_tokens: int,
+        swa_layer_idx: int,
+    ) -> Dict[str, Any]:
+        stats: Dict[str, Any] = {
+            "v102_swa_state_machine_trace_available": False,
+            "v102_swa_state_machine_trace_applied": False,
+            "v102_swa_state_machine_action": "",
+            "v102_swa_state_machine_reason": "disabled",
+        }
+        if not hmc_control or hmc_control.get("identity_hooks", False):
+            stats["v102_swa_state_machine_reason"] = "missing_hmc_or_identity_hooks"
+            return stats
+        if not hmc_control.get("enable_v102_state_machine_trace", False):
+            return stats
+        action = str(hmc_control.get("v102_state_machine_action", "") or "").strip().upper()
+        if action not in _V102_STATE_MACHINE_ACTIONS:
+            stats.update({
+                "v102_swa_state_machine_trace_available": True,
+                "v102_swa_state_machine_reason": f"unsupported_action:{action or 'empty'}",
+            })
+            return stats
+        strict_gate = bool(hmc_control.get("v102_state_machine_strict_gate_pass", False))
+        true_l3_gate = bool(hmc_control.get("v102_state_machine_true_l3_gate_pass", False))
+        stats.update({
+            "v102_swa_state_machine_trace_available": True,
+            "v102_swa_state_machine_trace_applied": False,
+            "v102_swa_state_machine_action": action,
+            "v102_swa_state_machine_scaffold_only": True,
+            "v102_swa_state_machine_reason": "diagnostic_scaffold_only_no_kv_or_attention_change",
+            "v102_swa_state_machine_swa_layer": int(swa_layer_idx),
+            "v102_swa_state_machine_history_tokens": int(history_tokens),
+            "v102_swa_state_machine_current_tokens": int(current_tokens),
+            "v102_swa_state_machine_strict_gate_pass": strict_gate,
+            "v102_swa_state_machine_true_l3_gate_pass": true_l3_gate,
+            "v102_swa_state_machine_runtime_action_allowed": False,
+            "v102_swa_state_machine_required_terms": (
+                "anchor_identity,current_support,O_scale,R_same,query_head_controls,true_L3_L4_evaluator"
+            ),
+        })
+        return stats
+
+    @staticmethod
+    def _make_v102_state_machine_action_probe(
+        hmc_control: Optional[Dict[str, Any]],
+        *,
+        batch_size: int,
+        tokens_per_frame: int,
+        history_tokens: int,
+        current_tokens: int,
+        device: torch.device,
+        swa_layer_idx: int,
+    ) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        stats = Pi3._make_v102_state_machine_trace_record(
+            hmc_control,
+            history_tokens=history_tokens,
+            current_tokens=current_tokens,
+            swa_layer_idx=swa_layer_idx,
+        )
+        stats["v102_swa_state_machine_action_probe_enabled"] = bool(
+            hmc_control and hmc_control.get("enable_v102_state_machine_action_probe", False)
+        )
+        stats["v102_swa_state_machine_probe_impl"] = str(
+            (hmc_control or {}).get("v102_state_machine_probe_impl", "compact_kv_reject_unreliable")
+        )
+        if not hmc_control or hmc_control.get("identity_hooks", False):
+            return None, stats
+        if not hmc_control.get("enable_v102_state_machine_trace", False):
+            return None, stats
+        if not hmc_control.get("enable_v102_state_machine_action_probe", False):
+            return None, stats
+
+        action = str(hmc_control.get("v102_state_machine_action", "") or "").strip().upper()
+        impl = str(hmc_control.get("v102_state_machine_probe_impl", "compact_kv_reject_unreliable") or "")
+        soft_supported_impl = impl == "source_soft_transmit_supported"
+        supported_impl = impl == "compact_kv_transmit_supported" or soft_supported_impl
+        reject_impl = impl == "compact_kv_reject_unreliable"
+        soft_hold_impl = impl == "source_soft_hold_prev_reference"
+        hold_impl = impl == "compact_kv_hold_prev_reference" or soft_hold_impl
+        soft_delay_impl = impl == "source_soft_delay_update"
+        delay_impl = impl == "compact_kv_delay_update" or soft_delay_impl
+        context_only_impl = impl == "source_soft_context_only_demotion"
+        if action == "TRANSMIT_SUPPORTED_ANCHORS" and not supported_impl:
+            stats.update({
+                "v102_swa_state_machine_scaffold_only": True,
+                "v102_swa_state_machine_reason": f"unsupported_probe_impl_for_transmit:{impl or 'empty'}",
+            })
+            return None, stats
+        if action == "REJECT_UNRELIABLE_ANCHORS" and not reject_impl:
+            stats.update({
+                "v102_swa_state_machine_scaffold_only": True,
+                "v102_swa_state_machine_reason": f"unsupported_probe_impl_for_reject:{impl or 'empty'}",
+            })
+            return None, stats
+        if action == "HOLD_PREV_REFERENCE" and not hold_impl:
+            stats.update({
+                "v102_swa_state_machine_scaffold_only": True,
+                "v102_swa_state_machine_reason": f"unsupported_probe_impl_for_hold:{impl or 'empty'}",
+            })
+            return None, stats
+        if action == "DELAY_UPDATE" and not delay_impl:
+            stats.update({
+                "v102_swa_state_machine_scaffold_only": True,
+                "v102_swa_state_machine_reason": f"unsupported_probe_impl_for_delay:{impl or 'empty'}",
+            })
+            return None, stats
+        if action == "CONTEXT_ONLY_DEMOTION" and not context_only_impl:
+            stats.update({
+                "v102_swa_state_machine_scaffold_only": True,
+                "v102_swa_state_machine_reason": f"unsupported_probe_impl_for_context_only:{impl or 'empty'}",
+            })
+            return None, stats
+        if action not in {
+            "TRANSMIT_SUPPORTED_ANCHORS",
+            "REJECT_UNRELIABLE_ANCHORS",
+            "HOLD_PREV_REFERENCE",
+            "DELAY_UPDATE",
+            "CONTEXT_ONLY_DEMOTION",
+        }:
+            stats.update({
+                "v102_swa_state_machine_scaffold_only": True,
+                "v102_swa_state_machine_reason": f"diagnostic_action_probe_not_implemented_for:{action or 'empty'}",
+            })
+            return None, stats
+
+        d_min = float(hmc_control.get("v102_state_machine_unreliable_d_min", 0.50) or 0.50)
+        g_min = float(hmc_control.get("v102_state_machine_unreliable_g_min", 0.50) or 0.50)
+        supported_d_max = float(hmc_control.get("v102_state_machine_supported_d_max", 0.25) or 0.25)
+        supported_k_min = float(hmc_control.get("v102_state_machine_supported_k_min", 0.0) or 0.0)
+        require_static_semantic = bool(hmc_control.get("v102_state_machine_supported_require_static_semantic", True))
+        soft_unsupported_min_keep = float(hmc_control.get("v102_state_machine_soft_unsupported_min_keep", 0.50) or 0.50)
+        soft_unsupported_min_keep = min(1.0, max(1.0e-4, soft_unsupported_min_keep))
+        hold_prev_frames = int(hmc_control.get("v102_state_machine_hold_prev_frames", 1) or 1)
+        hold_prev_frames = max(1, hold_prev_frames)
+        hold_soft_min_keep = float(hmc_control.get("v102_state_machine_hold_soft_min_keep", 0.50) or 0.50)
+        hold_soft_min_keep = min(1.0, max(1.0e-4, hold_soft_min_keep))
+        delay_current_soft_min_keep = float(hmc_control.get("v102_state_machine_delay_current_soft_min_keep", 0.50) or 0.50)
+        delay_current_soft_min_keep = min(1.0, max(1.0e-4, delay_current_soft_min_keep))
+        context_soft_min_keep = float(hmc_control.get("v102_state_machine_context_soft_min_keep", 0.50) or 0.50)
+        context_soft_min_keep = min(1.0, max(1.0e-4, context_soft_min_keep))
+        min_keep_frac = float(hmc_control.get("v102_state_machine_min_history_keep_frac", 0.05) or 0.05)
+        min_keep_frac = min(1.0, max(0.0, min_keep_frac))
+        d_prev = Pi3._swa_trace_source_values(
+            hmc_control,
+            "D_prev_patch",
+            batch_size=batch_size,
+            history_tokens=history_tokens,
+            tokens_per_frame=tokens_per_frame,
+            device=device,
+            dtype=torch.float32,
+        )
+        g_prev = Pi3._swa_trace_source_values(
+            hmc_control,
+            "G_prev_patch",
+            batch_size=batch_size,
+            history_tokens=history_tokens,
+            tokens_per_frame=tokens_per_frame,
+            device=device,
+            dtype=torch.float32,
+        )
+        g_prev_labels = Pi3._swa_trace_source_values(
+            hmc_control,
+            "G_prev_patch",
+            batch_size=batch_size,
+            history_tokens=history_tokens,
+            tokens_per_frame=tokens_per_frame,
+            device=device,
+            dtype=torch.long,
+        )
+        l_prev_labels = Pi3._swa_trace_source_values(
+            hmc_control,
+            "L_prev_patch",
+            batch_size=batch_size,
+            history_tokens=history_tokens,
+            tokens_per_frame=tokens_per_frame,
+            device=device,
+            dtype=torch.long,
+        )
+        k_stable = Pi3._swa_trace_source_values(
+            hmc_control,
+            "K_stable_tok",
+            batch_size=batch_size,
+            history_tokens=history_tokens,
+            tokens_per_frame=tokens_per_frame,
+            device=device,
+            dtype=torch.float32,
+        )
+
+        semantic_static = None
+        semantic_any = None
+        if g_prev_labels is not None:
+            semantic_static = (
+                (g_prev_labels == int(_CONTEXT_SEM_GROUP_STRUCTURE))
+                | (g_prev_labels == int(_CONTEXT_SEM_GROUP_STATIC))
+            )
+            semantic_any = (
+                semantic_static
+                | (g_prev_labels == int(_CONTEXT_SEM_GROUP_MOVABLE))
+                | (g_prev_labels == int(_CONTEXT_SEM_GROUP_LOWSTUFF))
+                | (g_prev_labels == int(_CONTEXT_SEM_GROUP_UNCERTAIN))
+            )
+        if l_prev_labels is not None:
+            fine_static = torch.zeros_like(l_prev_labels, dtype=torch.bool)
+            for label_id in set(_CONTEXT_GROUND_FINE_LABEL_IDS) | set(_CONTEXT_VERTICAL_STATIC_FINE_LABEL_IDS) | {15}:
+                fine_static |= l_prev_labels == int(label_id)
+            fine_context = torch.zeros_like(l_prev_labels, dtype=torch.bool)
+            for label_id in set(_CONTEXT_SKY_FINE_LABEL_IDS) | set(_CONTEXT_VEGETATION_FINE_LABEL_IDS):
+                fine_context |= l_prev_labels == int(label_id)
+            semantic_static = fine_static if semantic_static is None else (semantic_static | fine_static)
+            semantic_any = (
+                (fine_static | fine_context)
+                if semantic_any is None else (semantic_any | fine_static | fine_context)
+            )
+
+        if context_only_impl:
+            if semantic_any is None:
+                stats.update({
+                    "v102_swa_state_machine_scaffold_only": True,
+                    "v102_swa_state_machine_reason": "diagnostic_action_probe_context_only_missing_semantic_sources",
+                    "v102_swa_state_machine_context_semantic_tokens": 0,
+                    "v102_swa_state_machine_context_scale_observable_tokens": 0,
+                    "v102_swa_state_machine_context_demoted_tokens": 0,
+                    "v102_swa_state_machine_rejected_history_tokens": 0,
+                    "v102_swa_state_machine_kept_history_tokens": int(history_tokens) * int(batch_size),
+                })
+                return None, stats
+            if semantic_static is None:
+                semantic_static = torch.zeros_like(semantic_any, dtype=torch.bool)
+            scale_observable = semantic_static.to(device=device, dtype=torch.bool)
+            d_low_count = 0
+            if d_prev is not None:
+                d_low = d_prev <= supported_d_max
+                d_low_count = int(d_low.sum().item())
+                scale_observable = scale_observable & d_low.to(device=device, dtype=torch.bool)
+            if supported_k_min > 0.0 and k_stable is not None:
+                scale_observable = scale_observable & (k_stable >= supported_k_min).to(device=device, dtype=torch.bool)
+
+            semantic_any = semantic_any.to(device=device, dtype=torch.bool)
+            scale_observable = scale_observable.to(device=device, dtype=torch.bool)
+            context_only_mask = semantic_any & ~scale_observable
+            context_semantic_tokens = int(semantic_any.sum().item())
+            scale_observable_tokens = int(scale_observable.sum().item())
+            context_demoted_tokens = int(context_only_mask.sum().item())
+            if context_demoted_tokens <= 0:
+                history_keep = torch.ones(int(batch_size), int(history_tokens), device=device, dtype=torch.bool)
+                current_keep = torch.ones(int(batch_size), int(current_tokens), device=device, dtype=torch.bool)
+                source_keep_mask = torch.cat([history_keep, current_keep], dim=1)
+                stats.update({
+                    "v102_swa_state_machine_trace_applied": False,
+                    "v102_swa_state_machine_scaffold_only": True,
+                    "v102_swa_state_machine_reason": "diagnostic_action_probe_context_only_no_demotable_semantic_tokens",
+                    "v102_swa_state_machine_context_semantic_tokens": context_semantic_tokens,
+                    "v102_swa_state_machine_context_scale_observable_tokens": scale_observable_tokens,
+                    "v102_swa_state_machine_context_d_low_tokens": d_low_count,
+                    "v102_swa_state_machine_context_demoted_tokens": 0,
+                    "v102_swa_state_machine_context_soft_min_keep": context_soft_min_keep,
+                    "v102_swa_state_machine_rejected_history_tokens": 0,
+                    "v102_swa_state_machine_kept_history_tokens": int(history_keep.sum().item()),
+                    "v102_swa_state_machine_source_keep_tokens": int(source_keep_mask.sum().item()),
+                    "v102_swa_state_machine_source_total_tokens": int(source_keep_mask.numel()),
+                    "v102_swa_state_machine_rejected_history_frac": 0.0,
+                })
+                return None, stats
+
+            history_keep = ~context_only_mask
+            current_keep = torch.ones(int(batch_size), int(current_tokens), device=device, dtype=torch.bool)
+            source_keep_mask = torch.cat([history_keep, current_keep], dim=1)
+            affected_mask = torch.cat([context_only_mask, torch.zeros_like(current_keep)], dim=1)
+            source_bias_values = torch.zeros_like(source_keep_mask, dtype=torch.float32)
+            source_bias_values = source_bias_values.masked_fill(
+                affected_mask,
+                math.log(float(context_soft_min_keep)),
+            )
+            attention_mass_stats: List[Dict[str, Any]] = []
+            attn_mask = {
+                "type": "source_soft",
+                "affected_mask": affected_mask.detach(),
+                "source_bias_values": source_bias_values.detach(),
+                "stable_anchor_mask": source_keep_mask.detach(),
+                "attention_mass_stats": attention_mass_stats,
+                "attention_mass_max_queries": int(
+                    hmc_control.get("v102_state_machine_attention_mass_max_queries", 64) or 64
+                ),
+                "attention_mass_metric": "v102_source_soft_context_only_demotion",
+            }
+            kept_history_tokens = int(history_keep.sum().item())
+            stats.update({
+                "v102_swa_state_machine_trace_applied": True,
+                "v102_swa_state_machine_scaffold_only": False,
+                "v102_swa_state_machine_reason": "diagnostic_action_probe_source_soft_context_only_demotion",
+                "v102_swa_state_machine_runtime_action_allowed": False,
+                "v102_swa_state_machine_context_semantic_tokens": context_semantic_tokens,
+                "v102_swa_state_machine_context_scale_observable_tokens": scale_observable_tokens,
+                "v102_swa_state_machine_context_d_low_tokens": d_low_count,
+                "v102_swa_state_machine_context_demoted_tokens": context_demoted_tokens,
+                "v102_swa_state_machine_context_soft_min_keep": context_soft_min_keep,
+                "v102_swa_state_machine_rejected_history_tokens": context_demoted_tokens,
+                "v102_swa_state_machine_kept_history_tokens": kept_history_tokens,
+                "v102_swa_state_machine_source_keep_tokens": int(source_keep_mask.sum().item()),
+                "v102_swa_state_machine_source_total_tokens": int(source_keep_mask.numel()),
+                "v102_swa_state_machine_rejected_history_frac": float(
+                    context_demoted_tokens / max(1, int(batch_size) * int(history_tokens))
+                ),
+            })
+            return attn_mask, stats
+
+        if delay_impl:
+            history_keep = torch.ones(int(batch_size), int(history_tokens), device=device, dtype=torch.bool)
+            current_keep = torch.zeros(int(batch_size), int(current_tokens), device=device, dtype=torch.bool)
+            source_keep_mask = torch.cat([history_keep, current_keep], dim=1)
+            delayed_current_tokens = int((~current_keep).sum().item())
+            kept_history_tokens = int(history_keep.sum().item())
+            if delayed_current_tokens <= 0:
+                stats.update({
+                    "v102_swa_state_machine_trace_applied": False,
+                    "v102_swa_state_machine_scaffold_only": True,
+                    "v102_swa_state_machine_reason": "diagnostic_action_probe_delay_no_current_tokens",
+                    "v102_swa_state_machine_delay_current_tokens": 0,
+                    "v102_swa_state_machine_delay_current_frac": 0.0,
+                    "v102_swa_state_machine_rejected_history_tokens": 0,
+                    "v102_swa_state_machine_kept_history_tokens": kept_history_tokens,
+                    "v102_swa_state_machine_source_keep_tokens": int(source_keep_mask.sum().item()),
+                    "v102_swa_state_machine_source_total_tokens": int(source_keep_mask.numel()),
+                })
+                return None, stats
+
+            attention_mass_stats: List[Dict[str, Any]] = []
+            if soft_delay_impl:
+                affected_mask = ~source_keep_mask
+                source_bias_values = torch.zeros_like(source_keep_mask, dtype=torch.float32)
+                source_bias_values = source_bias_values.masked_fill(
+                    affected_mask,
+                    math.log(float(delay_current_soft_min_keep)),
+                )
+                attn_mask = {
+                    "type": "source_soft",
+                    "affected_mask": affected_mask.detach(),
+                    "source_bias_values": source_bias_values.detach(),
+                    "stable_anchor_mask": source_keep_mask.detach(),
+                    "attention_mass_stats": attention_mass_stats,
+                    "attention_mass_max_queries": int(
+                        hmc_control.get("v102_state_machine_attention_mass_max_queries", 64) or 64
+                    ),
+                    "attention_mass_metric": "v102_source_soft_delay_update",
+                }
+                reason = "diagnostic_action_probe_source_soft_delay_update"
+            else:
+                attn_mask = {
+                    "type": "compact_kv",
+                    "source_keep_mask": source_keep_mask.detach(),
+                    "attention_mass_stats": attention_mass_stats,
+                    "attention_mass_max_queries": int(
+                        hmc_control.get("v102_state_machine_attention_mass_max_queries", 64) or 64
+                    ),
+                }
+                reason = "diagnostic_action_probe_compact_kv_delay_update"
+            stats.update({
+                "v102_swa_state_machine_trace_applied": True,
+                "v102_swa_state_machine_scaffold_only": False,
+                "v102_swa_state_machine_reason": reason,
+                "v102_swa_state_machine_runtime_action_allowed": False,
+                "v102_swa_state_machine_delay_current_tokens": delayed_current_tokens,
+                "v102_swa_state_machine_delay_current_frac": float(
+                    delayed_current_tokens / max(1, int(batch_size) * int(current_tokens))
+                ),
+                "v102_swa_state_machine_delay_current_soft_min_keep": delay_current_soft_min_keep if soft_delay_impl else 0.0,
+                "v102_swa_state_machine_rejected_history_tokens": 0,
+                "v102_swa_state_machine_kept_history_tokens": kept_history_tokens,
+                "v102_swa_state_machine_source_keep_tokens": int(source_keep_mask.sum().item()),
+                "v102_swa_state_machine_source_total_tokens": int(source_keep_mask.numel()),
+                "v102_swa_state_machine_rejected_history_frac": 0.0,
+            })
+            return attn_mask, stats
+
+        if hold_impl:
+            if int(tokens_per_frame) <= 0 or int(history_tokens) < int(tokens_per_frame):
+                stats.update({
+                    "v102_swa_state_machine_scaffold_only": True,
+                    "v102_swa_state_machine_reason": "diagnostic_action_probe_hold_missing_frame_geometry",
+                    "v102_swa_state_machine_hold_prev_frames": hold_prev_frames,
+                    "v102_swa_state_machine_hold_history_frames": 0,
+                    "v102_swa_state_machine_hold_reference_tokens": 0,
+                    "v102_swa_state_machine_rejected_history_tokens": 0,
+                    "v102_swa_state_machine_kept_history_tokens": int(history_tokens) * int(batch_size),
+                })
+                return None, stats
+            history_frames = int(history_tokens) // int(tokens_per_frame)
+            hold_frames = min(int(hold_prev_frames), max(1, history_frames))
+            reference_tokens_per_sample = int(hold_frames) * int(tokens_per_frame)
+            history_keep = torch.zeros(int(batch_size), int(history_tokens), device=device, dtype=torch.bool)
+            history_keep[:, int(history_tokens) - reference_tokens_per_sample :] = True
+
+            reference_slice = slice(int(history_tokens) - reference_tokens_per_sample, int(history_tokens))
+            hold_d_low_count = 0
+            hold_semantic_static_count = 0
+            hold_k_stable_count = 0
+            if d_prev is not None:
+                hold_d_low_count = int((d_prev[:, reference_slice] <= supported_d_max).sum().item())
+            semantic_static = None
+            if g_prev_labels is not None:
+                semantic_static = (
+                    (g_prev_labels == int(_CONTEXT_SEM_GROUP_STRUCTURE))
+                    | (g_prev_labels == int(_CONTEXT_SEM_GROUP_STATIC))
+                )
+            if l_prev_labels is not None:
+                fine_static = torch.zeros_like(l_prev_labels, dtype=torch.bool)
+                for label_id in set(_CONTEXT_GROUND_FINE_LABEL_IDS) | set(_CONTEXT_VERTICAL_STATIC_FINE_LABEL_IDS) | {15}:
+                    fine_static |= l_prev_labels == int(label_id)
+                semantic_static = fine_static if semantic_static is None else (semantic_static | fine_static)
+            if semantic_static is not None:
+                hold_semantic_static_count = int(semantic_static[:, reference_slice].sum().item())
+            if k_stable is not None:
+                hold_k_stable_count = int((k_stable[:, reference_slice] >= supported_k_min).sum().item())
+
+            current_keep = torch.ones(int(batch_size), int(current_tokens), device=device, dtype=torch.bool)
+            source_keep_mask = torch.cat([history_keep, current_keep], dim=1)
+            rejected_history_tokens = int((~history_keep).sum().item())
+            kept_history_tokens = int(history_keep.sum().item())
+            if rejected_history_tokens <= 0:
+                stats.update({
+                    "v102_swa_state_machine_trace_applied": False,
+                    "v102_swa_state_machine_scaffold_only": True,
+                    "v102_swa_state_machine_reason": "diagnostic_action_probe_hold_all_history_is_reference",
+                    "v102_swa_state_machine_hold_prev_frames": hold_prev_frames,
+                    "v102_swa_state_machine_hold_history_frames": history_frames,
+                    "v102_swa_state_machine_hold_reference_tokens": kept_history_tokens,
+                    "v102_swa_state_machine_hold_d_low_tokens": hold_d_low_count,
+                    "v102_swa_state_machine_hold_semantic_static_tokens": hold_semantic_static_count,
+                    "v102_swa_state_machine_hold_k_stable_tokens": hold_k_stable_count,
+                    "v102_swa_state_machine_rejected_history_tokens": 0,
+                    "v102_swa_state_machine_kept_history_tokens": kept_history_tokens,
+                    "v102_swa_state_machine_source_keep_tokens": int(source_keep_mask.sum().item()),
+                    "v102_swa_state_machine_source_total_tokens": int(source_keep_mask.numel()),
+                    "v102_swa_state_machine_rejected_history_frac": 0.0,
+                })
+                return None, stats
+
+            attention_mass_stats: List[Dict[str, Any]] = []
+            if soft_hold_impl:
+                affected_mask = ~source_keep_mask
+                source_bias_values = torch.zeros_like(source_keep_mask, dtype=torch.float32)
+                source_bias_values = source_bias_values.masked_fill(
+                    affected_mask,
+                    math.log(float(hold_soft_min_keep)),
+                )
+                attn_mask = {
+                    "type": "source_soft",
+                    "affected_mask": affected_mask.detach(),
+                    "source_bias_values": source_bias_values.detach(),
+                    "stable_anchor_mask": source_keep_mask.detach(),
+                    "attention_mass_stats": attention_mass_stats,
+                    "attention_mass_max_queries": int(
+                        hmc_control.get("v102_state_machine_attention_mass_max_queries", 64) or 64
+                    ),
+                    "attention_mass_metric": "v102_source_soft_hold_prev_reference",
+                }
+                reason = "diagnostic_action_probe_source_soft_hold_prev_reference"
+            else:
+                attn_mask = {
+                    "type": "compact_kv",
+                    "source_keep_mask": source_keep_mask.detach(),
+                    "attention_mass_stats": attention_mass_stats,
+                    "attention_mass_max_queries": int(
+                        hmc_control.get("v102_state_machine_attention_mass_max_queries", 64) or 64
+                    ),
+                }
+                reason = "diagnostic_action_probe_compact_kv_hold_prev_reference"
+            stats.update({
+                "v102_swa_state_machine_trace_applied": True,
+                "v102_swa_state_machine_scaffold_only": False,
+                "v102_swa_state_machine_reason": reason,
+                "v102_swa_state_machine_runtime_action_allowed": False,
+                "v102_swa_state_machine_hold_prev_frames": hold_prev_frames,
+                "v102_swa_state_machine_hold_history_frames": history_frames,
+                "v102_swa_state_machine_hold_reference_tokens": kept_history_tokens,
+                "v102_swa_state_machine_hold_d_low_tokens": hold_d_low_count,
+                "v102_swa_state_machine_hold_semantic_static_tokens": hold_semantic_static_count,
+                "v102_swa_state_machine_hold_k_stable_tokens": hold_k_stable_count,
+                "v102_swa_state_machine_hold_soft_min_keep": hold_soft_min_keep if soft_hold_impl else 0.0,
+                "v102_swa_state_machine_min_history_keep_frac": min_keep_frac,
+                "v102_swa_state_machine_rejected_history_tokens": rejected_history_tokens,
+                "v102_swa_state_machine_kept_history_tokens": kept_history_tokens,
+                "v102_swa_state_machine_source_keep_tokens": int(source_keep_mask.sum().item()),
+                "v102_swa_state_machine_source_total_tokens": int(source_keep_mask.numel()),
+                "v102_swa_state_machine_rejected_history_frac": float(
+                    rejected_history_tokens / max(1, int(batch_size) * int(history_tokens))
+                ),
+            })
+            return attn_mask, stats
+
+        if supported_impl:
+            supported_mask = None
+            d_low_count = 0
+            semantic_static_count = 0
+            k_stable_count = 0
+            fallback_used = False
+            if d_prev is not None:
+                d_low = d_prev <= supported_d_max
+                d_low_count = int(d_low.sum().item())
+                supported_mask = d_low
+            semantic_static = None
+            if g_prev_labels is not None:
+                semantic_static = (
+                    (g_prev_labels == int(_CONTEXT_SEM_GROUP_STRUCTURE))
+                    | (g_prev_labels == int(_CONTEXT_SEM_GROUP_STATIC))
+                )
+            if l_prev_labels is not None:
+                fine_static = torch.zeros_like(l_prev_labels, dtype=torch.bool)
+                for label_id in set(_CONTEXT_GROUND_FINE_LABEL_IDS) | set(_CONTEXT_VERTICAL_STATIC_FINE_LABEL_IDS) | {15}:
+                    fine_static |= l_prev_labels == int(label_id)
+                semantic_static = fine_static if semantic_static is None else (semantic_static | fine_static)
+            if semantic_static is not None:
+                semantic_static_count = int(semantic_static.sum().item())
+                if require_static_semantic:
+                    supported_mask = semantic_static if supported_mask is None else (supported_mask & semantic_static)
+            if supported_k_min > 0.0 and k_stable is not None:
+                k_mask = k_stable >= supported_k_min
+                k_stable_count = int(k_mask.sum().item())
+                supported_mask = k_mask if supported_mask is None else (supported_mask & k_mask)
+            if supported_mask is None:
+                stats.update({
+                    "v102_swa_state_machine_scaffold_only": True,
+                    "v102_swa_state_machine_reason": "diagnostic_action_probe_missing_supported_sources",
+                    "v102_swa_state_machine_supported_d_low_tokens": 0,
+                    "v102_swa_state_machine_supported_semantic_static_tokens": 0,
+                    "v102_swa_state_machine_supported_k_stable_tokens": 0,
+                    "v102_swa_state_machine_rejected_history_tokens": 0,
+                    "v102_swa_state_machine_kept_history_tokens": int(history_tokens) * int(batch_size),
+                })
+                return None, stats
+            if not bool(supported_mask.any()) and d_prev is not None:
+                supported_mask = d_prev <= supported_d_max
+                fallback_used = True
+
+            history_keep = supported_mask.to(device=device, dtype=torch.bool)
+            min_keep = int(math.ceil(float(history_tokens) * min_keep_frac))
+            if min_keep > 0:
+                for b in range(int(batch_size)):
+                    if int(history_keep[b].sum().item()) >= min_keep:
+                        continue
+                    scores = torch.zeros(int(history_tokens), device=device, dtype=torch.float32)
+                    if d_prev is not None:
+                        scores = scores + d_prev[b].float()
+                    if g_prev is not None:
+                        scores = scores + g_prev[b].float()
+                    if k_stable is not None:
+                        scores = scores - k_stable[b].float()
+                    keep_idx = torch.argsort(scores, descending=False)[:min_keep]
+                    history_keep[b, keep_idx] = True
+
+            current_keep = torch.ones(int(batch_size), int(current_tokens), device=device, dtype=torch.bool)
+            source_keep_mask = torch.cat([history_keep, current_keep], dim=1)
+            rejected_history_tokens = int((~history_keep).sum().item())
+            kept_history_tokens = int(history_keep.sum().item())
+            if rejected_history_tokens <= 0:
+                stats.update({
+                    "v102_swa_state_machine_trace_applied": False,
+                    "v102_swa_state_machine_scaffold_only": True,
+                    "v102_swa_state_machine_reason": "diagnostic_action_probe_all_history_supported",
+                    "v102_swa_state_machine_supported_d_max": supported_d_max,
+                    "v102_swa_state_machine_supported_k_min": supported_k_min,
+                    "v102_swa_state_machine_supported_require_static_semantic": require_static_semantic,
+                    "v102_swa_state_machine_supported_fallback_used": fallback_used,
+                    "v102_swa_state_machine_supported_d_low_tokens": d_low_count,
+                    "v102_swa_state_machine_supported_semantic_static_tokens": semantic_static_count,
+                    "v102_swa_state_machine_supported_k_stable_tokens": k_stable_count,
+                    "v102_swa_state_machine_supported_history_tokens": kept_history_tokens,
+                    "v102_swa_state_machine_rejected_history_tokens": 0,
+                    "v102_swa_state_machine_kept_history_tokens": kept_history_tokens,
+                    "v102_swa_state_machine_source_keep_tokens": int(source_keep_mask.sum().item()),
+                    "v102_swa_state_machine_source_total_tokens": int(source_keep_mask.numel()),
+                    "v102_swa_state_machine_rejected_history_frac": 0.0,
+                })
+                return None, stats
+
+            attention_mass_stats: List[Dict[str, Any]] = []
+            if soft_supported_impl:
+                affected_mask = ~source_keep_mask
+                source_bias_values = torch.zeros_like(source_keep_mask, dtype=torch.float32)
+                source_bias_values = source_bias_values.masked_fill(
+                    affected_mask,
+                    math.log(float(soft_unsupported_min_keep)),
+                )
+                attn_mask = {
+                    "type": "source_soft",
+                    "affected_mask": affected_mask.detach(),
+                    "source_bias_values": source_bias_values.detach(),
+                    "stable_anchor_mask": source_keep_mask.detach(),
+                    "attention_mass_stats": attention_mass_stats,
+                    "attention_mass_max_queries": int(
+                        hmc_control.get("v102_state_machine_attention_mass_max_queries", 64) or 64
+                    ),
+                    "attention_mass_metric": "v102_source_soft_transmit_supported",
+                }
+                stats.update({
+                    "v102_swa_state_machine_trace_applied": True,
+                    "v102_swa_state_machine_scaffold_only": False,
+                    "v102_swa_state_machine_reason": "diagnostic_action_probe_source_soft_transmit_supported",
+                    "v102_swa_state_machine_runtime_action_allowed": False,
+                    "v102_swa_state_machine_supported_d_max": supported_d_max,
+                    "v102_swa_state_machine_supported_k_min": supported_k_min,
+                    "v102_swa_state_machine_supported_require_static_semantic": require_static_semantic,
+                    "v102_swa_state_machine_supported_fallback_used": fallback_used,
+                    "v102_swa_state_machine_supported_d_low_tokens": d_low_count,
+                    "v102_swa_state_machine_supported_semantic_static_tokens": semantic_static_count,
+                    "v102_swa_state_machine_supported_k_stable_tokens": k_stable_count,
+                    "v102_swa_state_machine_supported_history_tokens": kept_history_tokens,
+                    "v102_swa_state_machine_soft_unsupported_min_keep": soft_unsupported_min_keep,
+                    "v102_swa_state_machine_min_history_keep_frac": min_keep_frac,
+                    "v102_swa_state_machine_rejected_history_tokens": rejected_history_tokens,
+                    "v102_swa_state_machine_kept_history_tokens": kept_history_tokens,
+                    "v102_swa_state_machine_source_keep_tokens": int(source_keep_mask.sum().item()),
+                    "v102_swa_state_machine_source_total_tokens": int(source_keep_mask.numel()),
+                    "v102_swa_state_machine_rejected_history_frac": float(
+                        rejected_history_tokens / max(1, int(batch_size) * int(history_tokens))
+                    ),
+                })
+                return attn_mask, stats
+            attn_mask = {
+                "type": "compact_kv",
+                "source_keep_mask": source_keep_mask.detach(),
+                "attention_mass_stats": attention_mass_stats,
+                "attention_mass_max_queries": int(
+                    hmc_control.get("v102_state_machine_attention_mass_max_queries", 64) or 64
+                ),
+            }
+            stats.update({
+                "v102_swa_state_machine_trace_applied": True,
+                "v102_swa_state_machine_scaffold_only": False,
+                "v102_swa_state_machine_reason": "diagnostic_action_probe_compact_kv_transmit_supported",
+                "v102_swa_state_machine_runtime_action_allowed": False,
+                "v102_swa_state_machine_supported_d_max": supported_d_max,
+                "v102_swa_state_machine_supported_k_min": supported_k_min,
+                "v102_swa_state_machine_supported_require_static_semantic": require_static_semantic,
+                "v102_swa_state_machine_supported_fallback_used": fallback_used,
+                "v102_swa_state_machine_supported_d_low_tokens": d_low_count,
+                "v102_swa_state_machine_supported_semantic_static_tokens": semantic_static_count,
+                "v102_swa_state_machine_supported_k_stable_tokens": k_stable_count,
+                "v102_swa_state_machine_supported_history_tokens": kept_history_tokens,
+                "v102_swa_state_machine_min_history_keep_frac": min_keep_frac,
+                "v102_swa_state_machine_rejected_history_tokens": rejected_history_tokens,
+                "v102_swa_state_machine_kept_history_tokens": kept_history_tokens,
+                "v102_swa_state_machine_source_keep_tokens": int(source_keep_mask.sum().item()),
+                "v102_swa_state_machine_source_total_tokens": int(source_keep_mask.numel()),
+                "v102_swa_state_machine_rejected_history_frac": float(
+                    rejected_history_tokens / max(1, int(batch_size) * int(history_tokens))
+                ),
+            })
+            return attn_mask, stats
+
+        unreliable_mask = None
+        d_high_count = 0
+        g_high_count = 0
+        if d_prev is not None:
+            d_high = d_prev >= d_min
+            d_high_count = int(d_high.sum().item())
+            unreliable_mask = d_high
+        if g_prev is not None:
+            g_high = g_prev >= g_min
+            g_high_count = int(g_high.sum().item())
+            unreliable_mask = g_high if unreliable_mask is None else (unreliable_mask | g_high)
+        if unreliable_mask is None:
+            stats.update({
+                "v102_swa_state_machine_scaffold_only": True,
+                "v102_swa_state_machine_reason": "diagnostic_action_probe_missing_D_prev_and_G_prev",
+                "v102_swa_state_machine_unreliable_d_high_tokens": 0,
+                "v102_swa_state_machine_unreliable_g_high_tokens": 0,
+                "v102_swa_state_machine_rejected_history_tokens": 0,
+                "v102_swa_state_machine_kept_history_tokens": int(history_tokens) * int(batch_size),
+            })
+            return None, stats
+
+        history_keep = ~unreliable_mask.to(device=device, dtype=torch.bool)
+        min_keep = int(math.ceil(float(history_tokens) * min_keep_frac))
+        if min_keep > 0:
+            for b in range(int(batch_size)):
+                if int(history_keep[b].sum().item()) >= min_keep:
+                    continue
+                scores = torch.zeros(int(history_tokens), device=device, dtype=torch.float32)
+                if d_prev is not None:
+                    scores = scores + d_prev[b].float()
+                if g_prev is not None:
+                    scores = scores + g_prev[b].float()
+                keep_idx = torch.argsort(scores, descending=False)[:min_keep]
+                history_keep[b, keep_idx] = True
+
+        current_keep = torch.ones(int(batch_size), int(current_tokens), device=device, dtype=torch.bool)
+        source_keep_mask = torch.cat([history_keep, current_keep], dim=1)
+        rejected_history_tokens = int((~history_keep).sum().item())
+        kept_history_tokens = int(history_keep.sum().item())
+        if rejected_history_tokens <= 0:
+            stats.update({
+                "v102_swa_state_machine_trace_applied": False,
+                "v102_swa_state_machine_scaffold_only": True,
+                "v102_swa_state_machine_reason": "diagnostic_action_probe_no_unreliable_source_tokens",
+                "v102_swa_state_machine_unreliable_d_high_tokens": d_high_count,
+                "v102_swa_state_machine_unreliable_g_high_tokens": g_high_count,
+                "v102_swa_state_machine_rejected_history_tokens": 0,
+                "v102_swa_state_machine_kept_history_tokens": kept_history_tokens,
+                "v102_swa_state_machine_source_keep_tokens": int(source_keep_mask.sum().item()),
+                "v102_swa_state_machine_source_total_tokens": int(source_keep_mask.numel()),
+            })
+            return None, stats
+
+        attention_mass_stats: List[Dict[str, Any]] = []
+        attn_mask = {
+            "type": "compact_kv",
+            "source_keep_mask": source_keep_mask.detach(),
+            "attention_mass_stats": attention_mass_stats,
+            "attention_mass_max_queries": int(
+                hmc_control.get("v102_state_machine_attention_mass_max_queries", 64) or 64
+            ),
+        }
+        stats.update({
+            "v102_swa_state_machine_trace_applied": True,
+            "v102_swa_state_machine_scaffold_only": False,
+            "v102_swa_state_machine_reason": "diagnostic_action_probe_compact_kv_reject_unreliable",
+            "v102_swa_state_machine_runtime_action_allowed": False,
+            "v102_swa_state_machine_unreliable_d_min": d_min,
+            "v102_swa_state_machine_unreliable_g_min": g_min,
+            "v102_swa_state_machine_min_history_keep_frac": min_keep_frac,
+            "v102_swa_state_machine_unreliable_d_high_tokens": d_high_count,
+            "v102_swa_state_machine_unreliable_g_high_tokens": g_high_count,
+            "v102_swa_state_machine_rejected_history_tokens": rejected_history_tokens,
+            "v102_swa_state_machine_kept_history_tokens": kept_history_tokens,
+            "v102_swa_state_machine_source_keep_tokens": int(source_keep_mask.sum().item()),
+            "v102_swa_state_machine_source_total_tokens": int(source_keep_mask.numel()),
+            "v102_swa_state_machine_rejected_history_frac": float(
+                rejected_history_tokens / max(1, int(batch_size) * int(history_tokens))
+            ),
+        })
+        return attn_mask, stats
 
     @staticmethod
     def _swa_overlap_source_semantic_modes() -> set:
@@ -3124,6 +5129,2447 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             }
         except Exception as exc:  # pragma: no cover - audit-only best effort.
             return {"swa_overlap_feature_dump_error": f"{type(exc).__name__}: {exc}"}
+
+    @staticmethod
+    def _swa_raw_transport_trace_layer_enabled(
+        hmc_control: Optional[Dict[str, Any]],
+        *,
+        layer_idx: int,
+        n_layers: int,
+    ) -> bool:
+        if not hmc_control or hmc_control.get("identity_hooks", False):
+            return False
+        if not str(hmc_control.get("swa_raw_transport_trace_dir", "") or "").strip():
+            return False
+        mode = str(hmc_control.get("swa_raw_transport_trace_layer_mode", "all") or "all")
+        single = int(hmc_control.get("swa_raw_transport_trace_single_layer", -1) or -1)
+        if mode == "first":
+            return int(layer_idx) == 0
+        if mode == "last":
+            return int(layer_idx) == max(int(n_layers) - 1, 0)
+        if mode == "single":
+            return int(layer_idx) == int(single)
+        return True
+
+    @staticmethod
+    def _swa_trace_source_values(
+        hmc_control: Optional[Dict[str, Any]],
+        key: str,
+        *,
+        batch_size: int,
+        history_tokens: int,
+        tokens_per_frame: int = 0,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        value = (hmc_control or {}).get(key)
+        if value is None or not hasattr(value, "detach"):
+            return None
+        flat = value.detach().to(device=device).reshape(-1)
+
+        def _interleave_patch_tokens(x: torch.Tensor, samples: int) -> Optional[torch.Tensor]:
+            if int(tokens_per_frame) <= 0 or int(history_tokens) % int(tokens_per_frame) != 0:
+                return None
+            frames = int(history_tokens) // int(tokens_per_frame)
+            if frames <= 0:
+                return None
+            if int(x.numel()) % int(samples) != 0:
+                return None
+            per_sample = int(x.numel()) // int(samples)
+            if per_sample <= 0 or per_sample >= int(history_tokens):
+                return None
+            if per_sample % frames != 0:
+                return None
+            patch_tokens_per_frame = per_sample // frames
+            patch_start = int(tokens_per_frame) - int(patch_tokens_per_frame)
+            if patch_start < 0:
+                return None
+            shaped = x.reshape(int(samples), frames, patch_tokens_per_frame)
+            out = torch.zeros(int(samples), frames, int(tokens_per_frame), device=device, dtype=x.dtype)
+            out[:, :, patch_start : patch_start + patch_tokens_per_frame] = shaped
+            return out.reshape(int(samples), int(history_tokens))
+
+        if int(flat.numel()) == int(history_tokens):
+            flat = flat.reshape(1, int(history_tokens)).repeat(int(batch_size), 1)
+        elif int(flat.numel()) < int(history_tokens) and int(batch_size) == 1:
+            interleaved = _interleave_patch_tokens(flat, 1)
+            if interleaved is not None:
+                flat = interleaved
+            else:
+                pad = int(history_tokens) - int(flat.numel())
+                flat = torch.cat([torch.zeros(pad, device=device, dtype=flat.dtype), flat], dim=0)
+                flat = flat.reshape(1, int(history_tokens))
+        elif int(flat.numel()) == int(batch_size) * int(history_tokens):
+            flat = flat.reshape(int(batch_size), int(history_tokens))
+        elif int(batch_size) > 1 and int(flat.numel()) < int(batch_size) * int(history_tokens):
+            per_sample = int(flat.numel()) // int(batch_size)
+            if per_sample > 0 and per_sample * int(batch_size) == int(flat.numel()) and per_sample < int(history_tokens):
+                interleaved = _interleave_patch_tokens(flat, int(batch_size))
+                if interleaved is not None:
+                    flat = interleaved
+                else:
+                    pad = int(history_tokens) - int(per_sample)
+                    flat = flat.reshape(int(batch_size), per_sample)
+                    flat = torch.cat(
+                        [torch.zeros(int(batch_size), pad, device=device, dtype=flat.dtype), flat],
+                        dim=1,
+                    )
+            else:
+                return None
+        else:
+            return None
+        return flat.to(dtype=dtype)
+
+    @staticmethod
+    def _swa_trace_source_matrix(
+        hmc_control: Optional[Dict[str, Any]],
+        key: str,
+        *,
+        batch_size: int,
+        history_tokens: int,
+        tokens_per_frame: int = 0,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        value = (hmc_control or {}).get(key)
+        if value is None or not hasattr(value, "detach"):
+            return None
+        raw = value.detach().to(device=device)
+        if raw.ndim <= 1:
+            mat = raw.reshape(-1, 1)
+        else:
+            mat = raw.reshape(-1, int(raw.shape[-1]))
+        feature_dim = int(mat.shape[-1])
+        if feature_dim <= 0:
+            return None
+
+        def _interleave_patch_tokens(x: torch.Tensor, samples: int) -> Optional[torch.Tensor]:
+            if int(tokens_per_frame) <= 0 or int(history_tokens) % int(tokens_per_frame) != 0:
+                return None
+            frames = int(history_tokens) // int(tokens_per_frame)
+            if frames <= 0:
+                return None
+            if int(x.shape[0]) % int(samples) != 0:
+                return None
+            per_sample = int(x.shape[0]) // int(samples)
+            if per_sample <= 0 or per_sample >= int(history_tokens):
+                return None
+            if per_sample % frames != 0:
+                return None
+            patch_tokens_per_frame = per_sample // frames
+            patch_start = int(tokens_per_frame) - int(patch_tokens_per_frame)
+            if patch_start < 0:
+                return None
+            shaped = x.reshape(int(samples), frames, patch_tokens_per_frame, feature_dim)
+            out = torch.zeros(
+                int(samples),
+                frames,
+                int(tokens_per_frame),
+                feature_dim,
+                device=device,
+                dtype=x.dtype,
+            )
+            out[:, :, patch_start : patch_start + patch_tokens_per_frame, :] = shaped
+            return out.reshape(int(samples), int(history_tokens), feature_dim)
+
+        if int(mat.shape[0]) == int(history_tokens):
+            mat = mat.reshape(1, int(history_tokens), feature_dim).repeat(int(batch_size), 1, 1)
+        elif int(mat.shape[0]) < int(history_tokens) and int(batch_size) == 1:
+            interleaved = _interleave_patch_tokens(mat, 1)
+            if interleaved is not None:
+                mat = interleaved
+            else:
+                pad = int(history_tokens) - int(mat.shape[0])
+                mat = torch.cat(
+                    [torch.zeros(pad, feature_dim, device=device, dtype=mat.dtype), mat],
+                    dim=0,
+                ).reshape(1, int(history_tokens), feature_dim)
+        elif int(mat.shape[0]) == int(batch_size) * int(history_tokens):
+            mat = mat.reshape(int(batch_size), int(history_tokens), feature_dim)
+        elif int(batch_size) > 1 and int(mat.shape[0]) < int(batch_size) * int(history_tokens):
+            per_sample = int(mat.shape[0]) // int(batch_size)
+            if per_sample > 0 and per_sample * int(batch_size) == int(mat.shape[0]) and per_sample < int(history_tokens):
+                interleaved = _interleave_patch_tokens(mat, int(batch_size))
+                if interleaved is not None:
+                    mat = interleaved
+                else:
+                    pad = int(history_tokens) - int(per_sample)
+                    mat = mat.reshape(int(batch_size), per_sample, feature_dim)
+                    mat = torch.cat(
+                        [torch.zeros(int(batch_size), pad, feature_dim, device=device, dtype=mat.dtype), mat],
+                        dim=1,
+                    )
+            else:
+                return None
+        else:
+            return None
+        return mat.to(dtype=dtype)
+
+    @staticmethod
+    def _swa_trace_same_count_control(mask: torch.Tensor, *, salt: float) -> torch.Tensor:
+        mask_bool = mask.detach().bool()
+        out = torch.zeros_like(mask_bool)
+        token_idx = torch.arange(int(mask_bool.shape[1]), device=mask_bool.device, dtype=torch.float32)
+        base_scores = torch.frac(torch.sin((token_idx + 1.0 + float(salt)) * 12.9898) * 43758.5453)
+        for b in range(int(mask_bool.shape[0])):
+            count = int(mask_bool[b].sum().item())
+            if count <= 0:
+                continue
+            selected = torch.topk(base_scores + float(b) * 1e-6, k=min(count, int(mask_bool.shape[1]))).indices
+            out[b, selected] = True
+        return out
+
+    @staticmethod
+    def _dump_swa_raw_transport_trace(
+        hmc_control: Optional[Dict[str, Any]],
+        *,
+        layer: int,
+        swa_layer_idx: int,
+        batch_size: int,
+        frame_num: int,
+        tokens_per_frame: int,
+        q_current: torch.Tensor,
+        k_current: torch.Tensor,
+        v_current: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        hidden_current: Optional[torch.Tensor] = None,
+        hidden_cache: Optional[torch.Tensor] = None,
+        extra_trace_fields: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        dump_dir_text = str((hmc_control or {}).get("swa_raw_transport_trace_dir", "") or "").strip()
+        if not dump_dir_text:
+            return {}
+        try:
+            max_queries = int((hmc_control or {}).get("swa_raw_transport_trace_max_queries", 128) or 128)
+            max_queries = max(1, max_queries)
+            history_tokens = int(k_cache.shape[2])
+            current_tokens = int(q_current.shape[2])
+            head_count = int(q_current.shape[1])
+            head_dim = int(q_current.shape[-1])
+            q_idx = torch.linspace(
+                0,
+                max(current_tokens - 1, 0),
+                steps=min(max_queries, current_tokens),
+                device=q_current.device,
+            ).round().long().unique(sorted=True)
+            if int(q_idx.numel()) == 0:
+                q_idx = torch.arange(min(1, current_tokens), device=q_current.device, dtype=torch.long)
+
+            with torch.no_grad():
+                direct_match_only = bool((hmc_control or {}).get("swa_raw_transport_trace_direct_match_only", False))
+                q_sample = q_current.index_select(2, q_idx).detach().float()
+                k_hist = k_cache.detach().float()
+                if direct_match_only:
+                    topk_count = int((hmc_control or {}).get("swa_raw_transport_trace_topk", 8) or 8)
+                    topk_count = max(1, min(int(topk_count), int(history_tokens)))
+                    query_block_size = int(
+                        (hmc_control or {}).get("swa_raw_transport_trace_query_block_size", 128) or 128
+                    )
+                    query_block_size = max(1, int(query_block_size))
+                    topk_scores_parts: List[torch.Tensor] = []
+                    topk_indices_parts: List[torch.Tensor] = []
+                    scale = max(float(head_dim) ** 0.5, 1.0)
+                    for q_start in range(0, int(q_sample.shape[2]), int(query_block_size)):
+                        q_end = min(q_start + int(query_block_size), int(q_sample.shape[2]))
+                        q_block = q_sample[:, :, q_start:q_end, :]
+                        scores_block = torch.matmul(q_block, k_hist.transpose(-2, -1)) / scale
+                        block_scores, block_indices = torch.topk(scores_block, k=topk_count, dim=-1)
+                        topk_scores_parts.append(block_scores.detach().cpu().to(torch.float16))
+                        topk_indices_parts.append(block_indices.detach().cpu().to(torch.int32))
+                        del scores_block, block_scores, block_indices, q_block
+                    topk_scores_cpu = torch.cat(topk_scores_parts, dim=2) if topk_scores_parts else torch.empty(0)
+                    topk_indices_cpu = torch.cat(topk_indices_parts, dim=2) if topk_indices_parts else torch.empty(0)
+
+                    def _current_trace_values_direct(key: str, dtype: torch.dtype) -> Optional[torch.Tensor]:
+                        raw = (hmc_control or {}).get(key)
+                        if not torch.is_tensor(raw) or int(current_tokens) <= 0:
+                            return None
+                        vals = raw.detach().cpu().to(dtype=dtype)
+                        needed = int(batch_size) * int(current_tokens)
+                        if int(vals.numel()) < needed:
+                            return None
+                        return vals.reshape(int(batch_size), -1)[:, : int(current_tokens)]
+
+                    def _source_values_direct(key: str, dtype: torch.dtype) -> Optional[torch.Tensor]:
+                        vals = Pi3._swa_trace_source_values(
+                            hmc_control,
+                            key,
+                            batch_size=batch_size,
+                            history_tokens=history_tokens,
+                            tokens_per_frame=tokens_per_frame,
+                            device=q_current.device,
+                            dtype=dtype,
+                        )
+                        if vals is None:
+                            return None
+                        return vals.detach().cpu().to(dtype=dtype)
+
+                    def _topk_source_values_direct(
+                        values: Optional[torch.Tensor],
+                        dtype: torch.dtype,
+                    ) -> Optional[torch.Tensor]:
+                        if values is None or int(topk_indices_cpu.numel()) == 0:
+                            return None
+                        vals = values.detach().cpu().to(dtype=dtype)
+                        if int(vals.numel()) < int(batch_size) * int(history_tokens):
+                            return None
+                        vals = vals.reshape(int(batch_size), -1)[:, : int(history_tokens)]
+                        idx = topk_indices_cpu.long()
+                        expanded = vals[:, None, None, :].expand(
+                            int(batch_size),
+                            int(head_count),
+                            int(idx.shape[2]),
+                            int(history_tokens),
+                        )
+                        return torch.gather(expanded, -1, idx)
+
+                    def _bool_mean_direct(x: Optional[torch.Tensor]) -> Optional[float]:
+                        if x is None:
+                            return None
+                        return float(x.detach().float().mean().item())
+
+                    def _current_unique_hist(
+                        values: Optional[torch.Tensor],
+                    ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], int, int]:
+                        if values is None:
+                            return None, None, 0, 0
+                        flat = values.detach().long().reshape(-1)
+                        nonnegative = flat[flat >= 0]
+                        if int(nonnegative.numel()) == 0:
+                            return None, None, 0, 0
+                        unique, counts = torch.unique(nonnegative, sorted=True, return_counts=True)
+                        return (
+                            unique.detach().cpu().to(torch.int32),
+                            counts.detach().cpu().to(torch.int32),
+                            int(nonnegative.numel()),
+                            int(unique.numel()),
+                        )
+
+                    l_current = _current_trace_values_direct("L_sem_tok", torch.int64)
+                    g_current = _current_trace_values_direct("G_sem_tok", torch.int64)
+                    stage_c_seed_current = _current_trace_values_direct(
+                        "stage_c_seed_global_track_idx_tok",
+                        torch.int64,
+                    )
+                    stage_c_masklet_instance_current = _current_trace_values_direct(
+                        "stage_c_masklet_instance_idx_tok",
+                        torch.int64,
+                    )
+                    q_idx_cpu = q_idx.detach().cpu().long()
+                    sampled_query_fine_labels = (
+                        l_current.index_select(1, q_idx_cpu) if l_current is not None and int(q_idx_cpu.numel()) else None
+                    )
+                    sampled_query_group_labels = (
+                        g_current.index_select(1, q_idx_cpu) if g_current is not None and int(q_idx_cpu.numel()) else None
+                    )
+                    sampled_query_stage_c_seed_global_track_idx = (
+                        stage_c_seed_current.index_select(1, q_idx_cpu)
+                        if stage_c_seed_current is not None and int(q_idx_cpu.numel()) else None
+                    )
+                    sampled_query_stage_c_masklet_instance_idx = (
+                        stage_c_masklet_instance_current.index_select(1, q_idx_cpu)
+                        if stage_c_masklet_instance_current is not None and int(q_idx_cpu.numel()) else None
+                    )
+                    (
+                        current_stage_c_seed_unique_ids,
+                        current_stage_c_seed_unique_counts,
+                        current_stage_c_seed_nonnegative_count,
+                        current_stage_c_seed_unique_count,
+                    ) = _current_unique_hist(stage_c_seed_current)
+                    (
+                        current_stage_c_masklet_instance_unique_ids,
+                        current_stage_c_masklet_instance_unique_counts,
+                        current_stage_c_masklet_instance_nonnegative_count,
+                        current_stage_c_masklet_instance_unique_count,
+                    ) = _current_unique_hist(stage_c_masklet_instance_current)
+
+                    l_prev = _source_values_direct("L_prev_patch", torch.float32)
+                    g_prev = _source_values_direct("G_prev_patch", torch.float32)
+                    stage_c_seed_prev = _source_values_direct("stage_c_seed_global_track_idx_prev_patch", torch.int64)
+                    stage_c_masklet_instance_prev = _source_values_direct(
+                        "stage_c_masklet_instance_idx_prev_patch",
+                        torch.int64,
+                    )
+                    ttt_prev_tracked_instance = _source_values_direct(
+                        "prev_ttt_tracked_instance_anchor_mask_patch",
+                        torch.float32,
+                    )
+                    ttt_prev_tracked_instance_anchor_ids = _source_values_direct(
+                        "prev_ttt_tracked_instance_anchor_id_patch",
+                        torch.int64,
+                    )
+                    ttt_prev_tracked_instance_anchor_seeds = _source_values_direct(
+                        "prev_ttt_tracked_instance_anchor_seed_patch",
+                        torch.int64,
+                    )
+                    topk_cache_fine_labels = _topk_source_values_direct(l_prev, torch.int64)
+                    topk_cache_group_labels = _topk_source_values_direct(g_prev, torch.int64)
+                    topk_cache_stage_c_seed_global_track_idx = _topk_source_values_direct(
+                        stage_c_seed_prev,
+                        torch.int64,
+                    )
+                    topk_cache_stage_c_masklet_instance_idx = _topk_source_values_direct(
+                        stage_c_masklet_instance_prev,
+                        torch.int64,
+                    )
+                    topk_tracked_instance_anchor_mask_values = _topk_source_values_direct(
+                        ttt_prev_tracked_instance,
+                        torch.float32,
+                    )
+                    topk_tracked_instance_anchor_hit_mask = (
+                        topk_tracked_instance_anchor_mask_values >= 0.5
+                        if topk_tracked_instance_anchor_mask_values is not None
+                        else None
+                    )
+                    topk_tracked_instance_anchor_ids = _topk_source_values_direct(
+                        ttt_prev_tracked_instance_anchor_ids,
+                        torch.int64,
+                    )
+                    if topk_tracked_instance_anchor_hit_mask is not None and topk_tracked_instance_anchor_ids is not None:
+                        topk_tracked_instance_anchor_ids = torch.where(
+                            topk_tracked_instance_anchor_hit_mask,
+                            topk_tracked_instance_anchor_ids,
+                            torch.full_like(topk_tracked_instance_anchor_ids, -1),
+                        )
+                    topk_tracked_instance_anchor_seeds = _topk_source_values_direct(
+                        ttt_prev_tracked_instance_anchor_seeds,
+                        torch.int64,
+                    )
+                    if topk_tracked_instance_anchor_hit_mask is not None and topk_tracked_instance_anchor_seeds is not None:
+                        topk_tracked_instance_anchor_seeds = torch.where(
+                            topk_tracked_instance_anchor_hit_mask,
+                            topk_tracked_instance_anchor_seeds,
+                            torch.full_like(topk_tracked_instance_anchor_seeds, -1),
+                        )
+                    topk_same_fine_labels: Optional[torch.Tensor] = None
+                    topk_same_group_labels: Optional[torch.Tensor] = None
+                    topk_same_stage_c_seed_global_track_idx: Optional[torch.Tensor] = None
+                    topk_same_stage_c_masklet_instance_idx: Optional[torch.Tensor] = None
+                    if sampled_query_fine_labels is not None and topk_cache_fine_labels is not None:
+                        q_fine = sampled_query_fine_labels[:, None, :, None].expand_as(topk_cache_fine_labels)
+                        topk_same_fine_labels = (topk_cache_fine_labels == q_fine) & (topk_cache_fine_labels > 0)
+                    if sampled_query_group_labels is not None and topk_cache_group_labels is not None:
+                        q_group = sampled_query_group_labels[:, None, :, None].expand_as(topk_cache_group_labels)
+                        topk_same_group_labels = (topk_cache_group_labels == q_group) & (topk_cache_group_labels > 0)
+                    if (
+                        sampled_query_stage_c_seed_global_track_idx is not None
+                        and topk_cache_stage_c_seed_global_track_idx is not None
+                    ):
+                        q_seed = sampled_query_stage_c_seed_global_track_idx[:, None, :, None].expand_as(
+                            topk_cache_stage_c_seed_global_track_idx
+                        )
+                        topk_same_stage_c_seed_global_track_idx = (
+                            topk_cache_stage_c_seed_global_track_idx == q_seed
+                        ) & (topk_cache_stage_c_seed_global_track_idx >= 0)
+                    if (
+                        sampled_query_stage_c_masklet_instance_idx is not None
+                        and topk_cache_stage_c_masklet_instance_idx is not None
+                    ):
+                        q_inst = sampled_query_stage_c_masklet_instance_idx[:, None, :, None].expand_as(
+                            topk_cache_stage_c_masklet_instance_idx
+                        )
+                        topk_same_stage_c_masklet_instance_idx = (
+                            topk_cache_stage_c_masklet_instance_idx == q_inst
+                        ) & (topk_cache_stage_c_masklet_instance_idx >= 0)
+                    topk_tracked_instance_same_seed_hits = (
+                        topk_tracked_instance_anchor_hit_mask & topk_same_stage_c_seed_global_track_idx
+                        if topk_tracked_instance_anchor_hit_mask is not None
+                        and topk_same_stage_c_seed_global_track_idx is not None
+                        else None
+                    )
+                    topk_tracked_instance_same_masklet_hits = (
+                        topk_tracked_instance_anchor_hit_mask & topk_same_stage_c_masklet_instance_idx
+                        if topk_tracked_instance_anchor_hit_mask is not None
+                        and topk_same_stage_c_masklet_instance_idx is not None
+                        else None
+                    )
+
+                    def _tracked_instance_anchor_lifecycle_rows_direct() -> List[Dict[str, Any]]:
+                        if (
+                            ttt_prev_tracked_instance is None
+                            or ttt_prev_tracked_instance_anchor_ids is None
+                            or ttt_prev_tracked_instance_anchor_seeds is None
+                            or topk_tracked_instance_anchor_ids is None
+                            or topk_tracked_instance_anchor_hit_mask is None
+                        ):
+                            return []
+                        valid_topk = topk_tracked_instance_anchor_ids[topk_tracked_instance_anchor_ids >= 0]
+                        if int(valid_topk.numel()) == 0:
+                            return []
+                        unique_ids, counts = torch.unique(valid_topk, return_counts=True)
+                        order = torch.argsort(counts, descending=True)
+                        max_rows = int(
+                            (hmc_control or {}).get(
+                                "swa_raw_transport_trace_tracked_instance_lifecycle_max_ids",
+                                (hmc_control or {}).get("swa_raw_transport_trace_anchor_lifecycle_max_ids", 128),
+                            )
+                            or 128
+                        )
+                        max_rows = max(1, min(max_rows, int(unique_ids.numel())))
+                        denom_qh = max(int(batch_size) * int(head_count) * int(topk_indices_cpu.shape[2]), 1)
+                        rows_out: List[Dict[str, Any]] = []
+                        tracked_bool = ttt_prev_tracked_instance.to(dtype=torch.bool)
+                        ids_hist = ttt_prev_tracked_instance_anchor_ids.to(dtype=torch.int64)
+                        seed_hist = ttt_prev_tracked_instance_anchor_seeds.to(dtype=torch.int64)
+                        topk_score_float = topk_scores_cpu.to(dtype=torch.float32)
+                        for idx in order[:max_rows]:
+                            anchor_id = int(unique_ids[idx].item())
+                            hist_mask = tracked_bool & (ids_hist == int(anchor_id))
+                            hit_pos = topk_tracked_instance_anchor_ids == int(anchor_id)
+                            qh_hit = hit_pos.any(dim=-1)
+                            score_sum_for_anchor = torch.where(
+                                hit_pos,
+                                topk_score_float,
+                                torch.zeros_like(topk_score_float),
+                            ).sum(dim=-1)
+                            source_seed_mode: Optional[int] = None
+                            source_seed_mode_frac: Optional[float] = None
+                            if bool(hist_mask.any()):
+                                seed_vals = seed_hist[hist_mask]
+                                seed_vals = seed_vals[seed_vals >= 0]
+                                if int(seed_vals.numel()) > 0:
+                                    seed_ids, seed_counts = torch.unique(seed_vals, return_counts=True)
+                                    seed_best = torch.argmax(seed_counts)
+                                    source_seed_mode = int(seed_ids[seed_best].item())
+                                    source_seed_mode_frac = float(
+                                        seed_counts[seed_best].float().div(seed_counts.sum().clamp_min(1)).item()
+                                    )
+                            same_seed_count = 0
+                            if topk_tracked_instance_same_seed_hits is not None:
+                                same_seed_count = int((hit_pos & topk_tracked_instance_same_seed_hits).sum().item())
+                            same_masklet_count = 0
+                            if topk_tracked_instance_same_masklet_hits is not None:
+                                same_masklet_count = int((hit_pos & topk_tracked_instance_same_masklet_hits).sum().item())
+                            qh_by_head = (
+                                qh_hit.float().mean(dim=(0, 2))
+                                if qh_hit.ndim == 3
+                                else torch.empty(0, device=topk_scores_cpu.device)
+                            )
+                            rows_out.append(
+                                {
+                                    "anchor_id": int(anchor_id),
+                                    "source_type": "thing_tracked",
+                                    "source_token_count": int(hist_mask.sum().item()),
+                                    "topk_hit_position_count": int(hit_pos.sum().item()),
+                                    "topk_same_seed_position_count": same_seed_count,
+                                    "topk_same_masklet_position_count": same_masklet_count,
+                                    "query_head_hit_frac": float(qh_hit.float().sum().item() / float(denom_qh)),
+                                    "query_head_hit_max": float(qh_by_head.max().item())
+                                    if int(qh_by_head.numel()) else None,
+                                    "query_head_ge50_frac": float((qh_by_head >= 0.50).float().mean().item())
+                                    if int(qh_by_head.numel()) else None,
+                                    "query_head_ge75_frac": float((qh_by_head >= 0.75).float().mean().item())
+                                    if int(qh_by_head.numel()) else None,
+                                    "direct_match_topk_score_sum_mean": float(
+                                        score_sum_for_anchor.float().mean().item()
+                                    ),
+                                    "direct_match_topk_score_sum_max": float(
+                                        score_sum_for_anchor.float().max().item()
+                                    ),
+                                    "topk_route_mass_mean": None,
+                                    "topk_route_mass_max": None,
+                                    "source_stage_c_seed_global_track_idx_mode": source_seed_mode,
+                                    "source_stage_c_seed_global_track_idx_mode_frac": source_seed_mode_frac,
+                                    "source_chunk_idx": int(
+                                        (hmc_control or {}).get(
+                                            "prev_ttt_tracked_instance_anchor_source_chunk_idx",
+                                            -1,
+                                        )
+                                        or -1
+                                    ),
+                                    "current_chunk_idx": int(
+                                        (hmc_control or {}).get("semantic_action_chunk_idx", -1) or -1
+                                    ),
+                                    "runtime_action_allowed": False,
+                                    "claim_level": "diagnostic_tracked_instance_anchor_lifecycle_no_runtime",
+                                }
+                            )
+                        return rows_out
+
+                    ttt_prev_tracked_instance_lifecycle_rows_direct = (
+                        _tracked_instance_anchor_lifecycle_rows_direct()
+                    )
+
+                    topk_frames: Optional[torch.Tensor] = None
+                    topk_identity_frame_missing_reason = ""
+                    if int(tokens_per_frame) > 0 and int(history_tokens) % int(tokens_per_frame) == 0:
+                        topk_frames = torch.div(topk_indices_cpu.long(), int(tokens_per_frame), rounding_mode="floor")
+                    else:
+                        topk_identity_frame_missing_reason = (
+                            "tokens_per_frame<=0 or history_tokens not divisible by tokens_per_frame"
+                        )
+                    hidden_trace_debug: Dict[str, Any] = {
+                        "hidden_current_input_shape": list(hidden_current.shape)
+                        if torch.is_tensor(hidden_current) else None,
+                        "hidden_cache_input_shape": list(hidden_cache.shape)
+                        if torch.is_tensor(hidden_cache) else None,
+                        "hidden_current_accepted": False,
+                        "hidden_cache_accepted": False,
+                        "hidden_trace_reason": "direct_match_only_skips_hidden_trace",
+                    }
+                    dump_dir = Path(dump_dir_text)
+                    dump_dir.mkdir(parents=True, exist_ok=True)
+                    chunk_idx = int((hmc_control or {}).get("semantic_action_chunk_idx", -1))
+                    out_path = dump_dir / f"chunk_{chunk_idx:03d}_swa_raw_transport_layer_{int(swa_layer_idx):02d}.pt"
+                    payload = {
+                        "schema": "acl2_v103_swa_raw_transport_direct_match_trace_v2",
+                        "artifact": "SAVE_V103_SWA_RAW_TRANSPORT_DIRECT_MATCH_TOPK_IDENTITY",
+                        "diagnostic_only": True,
+                        "direct_match_only": True,
+                        "direct_match_query_block_size": int(query_block_size),
+                        "chunk_idx": int(chunk_idx),
+                        "layer": int(layer),
+                        "swa_layer_idx": int(swa_layer_idx),
+                        "batch_size": int(batch_size),
+                        "frame_num": int(frame_num),
+                        "tokens_per_frame": int(tokens_per_frame),
+                        "head_count": int(head_count),
+                        "current_tokens": int(current_tokens),
+                        "history_tokens": int(history_tokens),
+                        "current_semantic_fine_trace_available": bool(sampled_query_fine_labels is not None),
+                        "current_semantic_group_trace_available": bool(sampled_query_group_labels is not None),
+                        "current_stage_c_seed_global_track_idx_trace_available": bool(
+                            sampled_query_stage_c_seed_global_track_idx is not None
+                        ),
+                        "cache_stage_c_seed_global_track_idx_trace_available": bool(
+                            topk_cache_stage_c_seed_global_track_idx is not None
+                        ),
+                        "current_stage_c_masklet_instance_idx_trace_available": bool(
+                            sampled_query_stage_c_masklet_instance_idx is not None
+                        ),
+                        "cache_stage_c_masklet_instance_idx_trace_available": bool(
+                            topk_cache_stage_c_masklet_instance_idx is not None
+                        ),
+                        "ttt_prev_tracked_instance_anchor_identity_available": bool(
+                            topk_tracked_instance_anchor_hit_mask is not None
+                            and bool(topk_tracked_instance_anchor_hit_mask.any())
+                        ),
+                        "ttt_prev_tracked_instance_anchor_source_token_count": int(
+                            (hmc_control or {}).get("prev_ttt_tracked_instance_anchor_token_count", 0) or 0
+                        ),
+                        "ttt_prev_tracked_instance_anchor_source_chunk_idx": int(
+                            (hmc_control or {}).get("prev_ttt_tracked_instance_anchor_source_chunk_idx", -1) or -1
+                        ),
+                        "ttt_prev_tracked_instance_anchor_lifecycle_schema": (
+                            "acl2_v103_tracked_instance_anchor_lifecycle_rows_v1"
+                        ),
+                        "ttt_prev_tracked_instance_anchor_lifecycle_rows": (
+                            ttt_prev_tracked_instance_lifecycle_rows_direct
+                        ),
+                        "ttt_prev_tracked_instance_anchor_lifecycle_row_count": int(
+                            len(ttt_prev_tracked_instance_lifecycle_rows_direct)
+                        ),
+                        "sampled_query_count": int(q_idx.numel()),
+                        "sampled_query_indices": q_idx.detach().cpu(),
+                        "sampled_query_fine_label_ids": (
+                            sampled_query_fine_labels.detach().cpu().to(torch.int16)
+                            if sampled_query_fine_labels is not None else None
+                        ),
+                        "sampled_query_group_ids": (
+                            sampled_query_group_labels.detach().cpu().to(torch.int16)
+                            if sampled_query_group_labels is not None else None
+                        ),
+                        "sampled_query_stage_c_seed_global_track_idx": (
+                            sampled_query_stage_c_seed_global_track_idx.detach().cpu().to(torch.int32)
+                            if sampled_query_stage_c_seed_global_track_idx is not None else None
+                        ),
+                        "sampled_query_stage_c_masklet_instance_idx": (
+                            sampled_query_stage_c_masklet_instance_idx.detach().cpu().to(torch.int32)
+                            if sampled_query_stage_c_masklet_instance_idx is not None else None
+                        ),
+                        "current_stage_c_seed_global_track_idx_unique_ids": current_stage_c_seed_unique_ids,
+                        "current_stage_c_seed_global_track_idx_unique_counts": current_stage_c_seed_unique_counts,
+                        "current_stage_c_seed_global_track_idx_nonnegative_count": int(
+                            current_stage_c_seed_nonnegative_count
+                        ),
+                        "current_stage_c_seed_global_track_idx_unique_count": int(current_stage_c_seed_unique_count),
+                        "current_stage_c_masklet_instance_idx_unique_ids": current_stage_c_masklet_instance_unique_ids,
+                        "current_stage_c_masklet_instance_idx_unique_counts": (
+                            current_stage_c_masklet_instance_unique_counts
+                        ),
+                        "current_stage_c_masklet_instance_idx_nonnegative_count": int(
+                            current_stage_c_masklet_instance_nonnegative_count
+                        ),
+                        "current_stage_c_masklet_instance_idx_unique_count": int(
+                            current_stage_c_masklet_instance_unique_count
+                        ),
+                        "topk_identity_available": True,
+                        "topk_identity_topk": int(topk_count),
+                        "topk_identity_missing_reason": "",
+                        "topk_identity_frame_missing_reason": topk_identity_frame_missing_reason,
+                        "q_current_shape": list(q_current.shape),
+                        "k_current_shape": list(k_current.shape),
+                        "v_current_shape": list(v_current.shape),
+                        "k_cache_shape": list(k_cache.shape),
+                        "v_cache_shape": list(v_cache.shape),
+                        **hidden_trace_debug,
+                        "current_Q_to_cache_K_topk_cache_indices": topk_indices_cpu.to(torch.int32),
+                        "current_Q_to_cache_K_topk_cache_fine_label_ids": (
+                            topk_cache_fine_labels.detach().cpu().to(torch.int16)
+                            if topk_cache_fine_labels is not None else None
+                        ),
+                        "current_Q_to_cache_K_topk_cache_group_ids": (
+                            topk_cache_group_labels.detach().cpu().to(torch.int16)
+                            if topk_cache_group_labels is not None else None
+                        ),
+                        "current_Q_to_cache_K_topk_cache_stage_c_seed_global_track_idx": (
+                            topk_cache_stage_c_seed_global_track_idx.detach().cpu().to(torch.int32)
+                            if topk_cache_stage_c_seed_global_track_idx is not None else None
+                        ),
+                        "current_Q_to_cache_K_topk_cache_stage_c_masklet_instance_idx": (
+                            topk_cache_stage_c_masklet_instance_idx.detach().cpu().to(torch.int32)
+                            if topk_cache_stage_c_masklet_instance_idx is not None else None
+                        ),
+                        "current_Q_to_cache_K_topk_same_fine_label": (
+                            topk_same_fine_labels.detach().cpu()
+                            if topk_same_fine_labels is not None else None
+                        ),
+                        "current_Q_to_cache_K_topk_same_group": (
+                            topk_same_group_labels.detach().cpu()
+                            if topk_same_group_labels is not None else None
+                        ),
+                        "current_Q_to_cache_K_topk_same_stage_c_seed_global_track_idx": (
+                            topk_same_stage_c_seed_global_track_idx.detach().cpu()
+                            if topk_same_stage_c_seed_global_track_idx is not None else None
+                        ),
+                        "current_Q_to_cache_K_topk_same_stage_c_masklet_instance_idx": (
+                            topk_same_stage_c_masklet_instance_idx.detach().cpu()
+                            if topk_same_stage_c_masklet_instance_idx is not None else None
+                        ),
+                        "current_Q_to_cache_K_topk_ttt_prev_tracked_instance_anchor_hit_mask": (
+                            topk_tracked_instance_anchor_hit_mask.detach().cpu()
+                            if topk_tracked_instance_anchor_hit_mask is not None else None
+                        ),
+                        "current_Q_to_cache_K_topk_ttt_prev_tracked_instance_anchor_ids": (
+                            topk_tracked_instance_anchor_ids.detach().cpu().to(torch.int64)
+                            if topk_tracked_instance_anchor_ids is not None else None
+                        ),
+                        "current_Q_to_cache_K_topk_ttt_prev_tracked_instance_anchor_seeds": (
+                            topk_tracked_instance_anchor_seeds.detach().cpu().to(torch.int64)
+                            if topk_tracked_instance_anchor_seeds is not None else None
+                        ),
+                        "current_Q_to_cache_K_topk_ttt_prev_tracked_instance_anchor_same_seed": (
+                            topk_tracked_instance_same_seed_hits.detach().cpu()
+                            if topk_tracked_instance_same_seed_hits is not None else None
+                        ),
+                        "current_Q_to_cache_K_topk_ttt_prev_tracked_instance_anchor_same_masklet": (
+                            topk_tracked_instance_same_masklet_hits.detach().cpu()
+                            if topk_tracked_instance_same_masklet_hits is not None else None
+                        ),
+                        "ttt_prev_tracked_instance_anchor_topk_hit_frac_mean": _bool_mean_direct(
+                            topk_tracked_instance_anchor_hit_mask
+                        ),
+                        "ttt_prev_tracked_instance_anchor_topk_same_seed_frac_mean": _bool_mean_direct(
+                            topk_tracked_instance_same_seed_hits
+                        ),
+                        "ttt_prev_tracked_instance_anchor_topk_same_masklet_frac_mean": _bool_mean_direct(
+                            topk_tracked_instance_same_masklet_hits
+                        ),
+                        "current_Q_to_cache_K_topk_cache_frames": (
+                            topk_frames.detach().cpu().to(torch.int16) if topk_frames is not None else None
+                        ),
+                        "current_Q_to_cache_K_topk_scores": topk_scores_cpu.to(torch.float16),
+                    }
+                    torch.save(payload, out_path)
+                    return {
+                        "swa_raw_transport_trace_available": True,
+                        "swa_raw_transport_trace_path": str(out_path),
+                        "swa_raw_transport_trace_schema": payload["schema"],
+                        "swa_raw_transport_trace_sampled_query_count": int(q_idx.numel()),
+                        "swa_raw_transport_trace_head_count": int(head_count),
+                        "swa_raw_transport_trace_direct_match_only": True,
+                        "swa_raw_transport_trace_query_block_size": int(query_block_size),
+                        "swa_raw_transport_topk_identity_available": True,
+                        "swa_raw_transport_topk_identity_topk": int(topk_count),
+                        "swa_raw_transport_current_tokens": int(current_tokens),
+                        "swa_raw_transport_history_tokens": int(history_tokens),
+                    }
+
+                k_sample = k_current.index_select(2, q_idx).detach().float()
+                v_sample = v_current.index_select(2, q_idx).detach().float()
+                v_hist = v_cache.detach().float()
+                hidden_sample: Optional[torch.Tensor] = None
+                hidden_hist: Optional[torch.Tensor] = None
+                hidden_trace_debug: Dict[str, Any] = {
+                    "hidden_current_input_shape": list(hidden_current.shape)
+                    if torch.is_tensor(hidden_current) else None,
+                    "hidden_cache_input_shape": list(hidden_cache.shape)
+                    if torch.is_tensor(hidden_cache) else None,
+                    "hidden_current_accepted": False,
+                    "hidden_cache_accepted": False,
+                    "hidden_trace_reason": "",
+                }
+                if (
+                    torch.is_tensor(hidden_current)
+                    and hidden_current.ndim == 3
+                    and int(hidden_current.shape[0]) == int(batch_size)
+                    and int(hidden_current.shape[1]) >= int(current_tokens)
+                ):
+                    hidden_sample = hidden_current.index_select(1, q_idx).detach().float()
+                    hidden_trace_debug["hidden_current_accepted"] = True
+                if (
+                    torch.is_tensor(hidden_cache)
+                    and hidden_cache.ndim == 3
+                    and int(hidden_cache.shape[0]) == int(batch_size)
+                    and int(hidden_cache.shape[1]) >= int(history_tokens)
+                ):
+                    hidden_hist = hidden_cache[:, : int(history_tokens), :].detach().float()
+                    hidden_trace_debug["hidden_cache_accepted"] = True
+                if hidden_sample is None or hidden_hist is None:
+                    missing = []
+                    if hidden_sample is None:
+                        missing.append("hidden_current")
+                    if hidden_hist is None:
+                        missing.append("hidden_cache")
+                    hidden_trace_debug["hidden_trace_reason"] = "missing_or_shape_mismatch:" + ",".join(missing)
+                q_norm = F.normalize(q_sample, dim=-1)
+                k_norm = F.normalize(k_hist, dim=-1)
+                cosine = torch.matmul(q_norm, k_norm.transpose(-2, -1))
+                scores = torch.matmul(q_sample, k_hist.transpose(-2, -1)) / max(float(head_dim) ** 0.5, 1.0)
+                route = torch.softmax(scores, dim=-1)
+                entropy = -(route.clamp_min(1e-12) * route.clamp_min(1e-12).log()).sum(dim=-1)
+                entropy = entropy / torch.log(
+                    torch.tensor(float(max(history_tokens, 2)), device=route.device, dtype=entropy.dtype)
+                ).clamp_min(1e-12)
+                transported_v = torch.matmul(route, v_hist)
+                residual = (transported_v - v_sample).norm(dim=-1) / max(float(head_dim) ** 0.5, 1.0)
+
+                topk_count = int((hmc_control or {}).get("swa_raw_transport_trace_topk", 8) or 8)
+                topk_count = max(1, min(int(topk_count), int(history_tokens)))
+                topk_scores, topk_indices = torch.topk(scores, k=topk_count, dim=-1)
+                top1_indices = topk_indices[..., 0]
+
+                def _unique_frac_by_head(index_tensor: torch.Tensor) -> torch.Tensor:
+                    vals = index_tensor.detach().reshape(int(batch_size), int(head_count), -1)
+                    out_vals: List[float] = []
+                    for head_idx in range(int(head_count)):
+                        head_vals = vals[:, head_idx, :].reshape(-1)
+                        denom = max(int(head_vals.numel()), 1)
+                        out_vals.append(float(torch.unique(head_vals).numel()) / float(denom))
+                    return torch.tensor(out_vals, device=index_tensor.device, dtype=torch.float32)
+
+                def _switch_rate_by_head(index_tensor: torch.Tensor) -> torch.Tensor:
+                    vals = index_tensor.detach().reshape(int(batch_size), int(head_count), -1)
+                    if int(vals.shape[-1]) < 2:
+                        return torch.zeros(int(head_count), device=index_tensor.device, dtype=torch.float32)
+                    switches = (vals[..., 1:] != vals[..., :-1]).float()
+                    return switches.mean(dim=(0, 2)).float()
+
+                top1_index_unique_frac = _unique_frac_by_head(top1_indices)
+                top1_index_switch_rate = _switch_rate_by_head(top1_indices)
+                topk_frames: Optional[torch.Tensor] = None
+                top1_frame_unique_frac: Optional[torch.Tensor] = None
+                top1_frame_switch_rate: Optional[torch.Tensor] = None
+                top1_same_frame_frac: Optional[torch.Tensor] = None
+                topk_query_frame_hit_frac: Optional[torch.Tensor] = None
+                topk_same_frame_frac: Optional[torch.Tensor] = None
+                top1_abs_frame_delta_mean: Optional[torch.Tensor] = None
+                topk_identity_frame_missing_reason = ""
+                if int(tokens_per_frame) > 0 and int(history_tokens) % int(tokens_per_frame) == 0:
+                    topk_frames = torch.div(topk_indices, int(tokens_per_frame), rounding_mode="floor")
+                    q_frames = torch.div(q_idx, int(tokens_per_frame), rounding_mode="floor").view(1, 1, -1)
+                    q_frames = q_frames.to(device=topk_frames.device, dtype=topk_frames.dtype)
+                    top1_frames = topk_frames[..., 0]
+                    top1_frame_unique_frac = _unique_frac_by_head(top1_frames)
+                    top1_frame_switch_rate = _switch_rate_by_head(top1_frames)
+                    same_top1 = (top1_frames == q_frames).float()
+                    same_topk = (topk_frames == q_frames.unsqueeze(-1)).float()
+                    top1_same_frame_frac = same_top1.mean(dim=(0, 2)).float()
+                    topk_query_frame_hit_frac = (same_topk.sum(dim=-1) > 0).float().mean(dim=(0, 2)).float()
+                    topk_same_frame_frac = same_topk.mean(dim=(0, 2, 3)).float()
+                    top1_abs_frame_delta_mean = (top1_frames.float() - q_frames.float()).abs().mean(dim=(0, 2)).float()
+                else:
+                    topk_identity_frame_missing_reason = (
+                        "tokens_per_frame<=0 or history_tokens not divisible by tokens_per_frame"
+                    )
+
+                def _mean_by_head(x: torch.Tensor) -> List[float]:
+                    vals = x.float()
+                    while vals.ndim > 2:
+                        vals = vals.mean(dim=-1)
+                    if vals.ndim == 2:
+                        vals = vals.mean(dim=0)
+                    return [float(v) for v in vals.detach().cpu().reshape(-1).tolist()]
+
+                def _scalar_mean(x: Optional[torch.Tensor]) -> Optional[float]:
+                    if x is None:
+                        return None
+                    return float(x.detach().float().mean().item())
+
+                def _route_mass(mask: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+                    if mask is None:
+                        return None
+                    mask_bool = mask.to(device=route.device, dtype=torch.bool)
+                    if not bool(mask_bool.any()):
+                        return None
+                    return (route * mask_bool[:, None, None, :].float()).sum(dim=-1)
+
+                def _topk_mask_hits(
+                    mask: Optional[torch.Tensor],
+                ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+                    if mask is None:
+                        return None, None, None
+                    mask_bool = mask.to(device=topk_indices.device, dtype=torch.bool)
+                    if not bool(mask_bool.any()):
+                        return None, None, None
+                    expanded = mask_bool[:, None, None, :].expand(
+                        int(batch_size),
+                        int(head_count),
+                        int(topk_indices.shape[2]),
+                        int(history_tokens),
+                    )
+                    hits = torch.gather(expanded, -1, topk_indices.long())
+                    return hits, hits.any(dim=-1).float(), hits[..., 0].float()
+
+                def _topk_anchor_ids(
+                    ids: Optional[torch.Tensor],
+                    hit_mask: Optional[torch.Tensor],
+                ) -> Optional[torch.Tensor]:
+                    if ids is None or hit_mask is None:
+                        return None
+                    ids_long = ids.to(device=topk_indices.device, dtype=torch.int64)
+                    expanded = ids_long[:, None, None, :].expand(
+                        int(batch_size),
+                        int(head_count),
+                        int(topk_indices.shape[2]),
+                        int(history_tokens),
+                    )
+                    gathered = torch.gather(expanded, -1, topk_indices.long())
+                    return torch.where(hit_mask.to(dtype=torch.bool), gathered, torch.full_like(gathered, -1))
+
+                def _current_trace_values(key: str, dtype: torch.dtype) -> Optional[torch.Tensor]:
+                    raw = (hmc_control or {}).get(key)
+                    if not torch.is_tensor(raw) or int(current_tokens) <= 0:
+                        return None
+                    vals = raw.to(device=route.device, dtype=dtype)
+                    needed = int(batch_size) * int(current_tokens)
+                    if int(vals.numel()) < needed:
+                        return None
+                    vals = vals.reshape(int(batch_size), -1)[:, : int(current_tokens)]
+                    return vals
+
+                def _topk_source_values(
+                    values: Optional[torch.Tensor],
+                    dtype: torch.dtype,
+                    missing_value: int = -1,
+                ) -> Optional[torch.Tensor]:
+                    if values is None:
+                        return None
+                    vals = values.to(device=topk_indices.device, dtype=dtype)
+                    if int(vals.numel()) < int(batch_size) * int(history_tokens):
+                        return None
+                    vals = vals.reshape(int(batch_size), -1)[:, : int(history_tokens)]
+                    expanded = vals[:, None, None, :].expand(
+                        int(batch_size),
+                        int(head_count),
+                        int(topk_indices.shape[2]),
+                        int(history_tokens),
+                    )
+                    gathered = torch.gather(expanded, -1, topk_indices.long())
+                    if missing_value is None:
+                        return gathered
+                    return torch.where(
+                        torch.ones_like(gathered, dtype=torch.bool),
+                        gathered,
+                        torch.full_like(gathered, int(missing_value)),
+                    )
+
+                def _adjacent_frame_stability(x: torch.Tensor) -> Optional[torch.Tensor]:
+                    if int(tokens_per_frame) <= 0 or history_tokens % int(tokens_per_frame) != 0:
+                        return None
+                    hist_frames = history_tokens // int(tokens_per_frame)
+                    if hist_frames < 2:
+                        return None
+                    shaped = F.normalize(
+                        x.detach().float().reshape(
+                            int(batch_size),
+                            int(x.shape[1]),
+                            int(hist_frames),
+                            int(tokens_per_frame),
+                            int(x.shape[-1]),
+                        ),
+                        dim=-1,
+                    )
+                    cos = (shaped[:, :, 1:] * shaped[:, :, :-1]).sum(dim=-1)
+                    return cos.mean(dim=(0, 2, 3))
+
+                d_prev = Pi3._swa_trace_source_values(
+                    hmc_control,
+                    "D_prev_patch",
+                    batch_size=batch_size,
+                    history_tokens=history_tokens,
+                    tokens_per_frame=tokens_per_frame,
+                    device=route.device,
+                    dtype=torch.float32,
+                )
+                g_prev = Pi3._swa_trace_source_values(
+                    hmc_control,
+                    "G_prev_patch",
+                    batch_size=batch_size,
+                    history_tokens=history_tokens,
+                    tokens_per_frame=tokens_per_frame,
+                    device=route.device,
+                    dtype=torch.float32,
+                )
+                l_prev = Pi3._swa_trace_source_values(
+                    hmc_control,
+                    "L_prev_patch",
+                    batch_size=batch_size,
+                    history_tokens=history_tokens,
+                    tokens_per_frame=tokens_per_frame,
+                    device=route.device,
+                    dtype=torch.float32,
+                )
+                l_current = _current_trace_values("L_sem_tok", torch.int64)
+                g_current = _current_trace_values("G_sem_tok", torch.int64)
+                stage_c_seed_current = _current_trace_values("stage_c_seed_global_track_idx_tok", torch.int64)
+                stage_c_masklet_instance_current = _current_trace_values(
+                    "stage_c_masklet_instance_idx_tok",
+                    torch.int64,
+                )
+                sampled_query_fine_labels = (
+                    l_current.index_select(1, q_idx.to(device=l_current.device, dtype=torch.long))
+                    if l_current is not None and int(q_idx.numel()) > 0
+                    else None
+                )
+                sampled_query_group_labels = (
+                    g_current.index_select(1, q_idx.to(device=g_current.device, dtype=torch.long))
+                    if g_current is not None and int(q_idx.numel()) > 0
+                    else None
+                )
+                sampled_query_stage_c_seed_global_track_idx = (
+                    stage_c_seed_current.index_select(
+                        1,
+                        q_idx.to(device=stage_c_seed_current.device, dtype=torch.long),
+                    )
+                    if stage_c_seed_current is not None and int(q_idx.numel()) > 0
+                    else None
+                )
+                sampled_query_stage_c_masklet_instance_idx = (
+                    stage_c_masklet_instance_current.index_select(
+                        1,
+                        q_idx.to(device=stage_c_masklet_instance_current.device, dtype=torch.long),
+                    )
+                    if stage_c_masklet_instance_current is not None and int(q_idx.numel()) > 0
+                    else None
+                )
+
+                def _current_unique_hist(
+                    values: Optional[torch.Tensor],
+                ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], int, int]:
+                    if values is None:
+                        return None, None, 0, 0
+                    flat = values.detach().long().reshape(-1)
+                    nonnegative = flat[flat >= 0]
+                    if int(nonnegative.numel()) == 0:
+                        return None, None, 0, 0
+                    unique, counts = torch.unique(nonnegative, sorted=True, return_counts=True)
+                    return (
+                        unique.detach().cpu().to(torch.int32),
+                        counts.detach().cpu().to(torch.int32),
+                        int(nonnegative.numel()),
+                        int(unique.numel()),
+                    )
+
+                (
+                    current_stage_c_seed_unique_ids,
+                    current_stage_c_seed_unique_counts,
+                    current_stage_c_seed_nonnegative_count,
+                    current_stage_c_seed_unique_count,
+                ) = _current_unique_hist(stage_c_seed_current)
+                (
+                    current_stage_c_masklet_instance_unique_ids,
+                    current_stage_c_masklet_instance_unique_counts,
+                    current_stage_c_masklet_instance_nonnegative_count,
+                    current_stage_c_masklet_instance_unique_count,
+                ) = _current_unique_hist(stage_c_masklet_instance_current)
+                topk_cache_fine_labels = _topk_source_values(l_prev, torch.int64)
+                topk_cache_group_labels = _topk_source_values(g_prev, torch.int64)
+                stage_c_seed_prev = Pi3._swa_trace_source_values(
+                    hmc_control,
+                    "stage_c_seed_global_track_idx_prev_patch",
+                    batch_size=batch_size,
+                    history_tokens=history_tokens,
+                    tokens_per_frame=tokens_per_frame,
+                    device=route.device,
+                    dtype=torch.int64,
+                )
+                topk_cache_stage_c_seed_global_track_idx = _topk_source_values(stage_c_seed_prev, torch.int64)
+                stage_c_masklet_instance_prev = Pi3._swa_trace_source_values(
+                    hmc_control,
+                    "stage_c_masklet_instance_idx_prev_patch",
+                    batch_size=batch_size,
+                    history_tokens=history_tokens,
+                    tokens_per_frame=tokens_per_frame,
+                    device=route.device,
+                    dtype=torch.int64,
+                )
+                topk_cache_stage_c_masklet_instance_idx = _topk_source_values(
+                    stage_c_masklet_instance_prev,
+                    torch.int64,
+                )
+                topk_same_fine_labels: Optional[torch.Tensor] = None
+                topk_same_group_labels: Optional[torch.Tensor] = None
+                topk_same_stage_c_seed_global_track_idx: Optional[torch.Tensor] = None
+                topk_same_stage_c_masklet_instance_idx: Optional[torch.Tensor] = None
+                if sampled_query_fine_labels is not None and topk_cache_fine_labels is not None:
+                    q_fine = sampled_query_fine_labels[:, None, :, None].expand_as(topk_cache_fine_labels)
+                    topk_same_fine_labels = (topk_cache_fine_labels == q_fine) & (topk_cache_fine_labels > 0)
+                if sampled_query_group_labels is not None and topk_cache_group_labels is not None:
+                    q_group = sampled_query_group_labels[:, None, :, None].expand_as(topk_cache_group_labels)
+                    topk_same_group_labels = (topk_cache_group_labels == q_group) & (topk_cache_group_labels > 0)
+                if (
+                    sampled_query_stage_c_seed_global_track_idx is not None
+                    and topk_cache_stage_c_seed_global_track_idx is not None
+                ):
+                    q_seed = sampled_query_stage_c_seed_global_track_idx[:, None, :, None].expand_as(
+                        topk_cache_stage_c_seed_global_track_idx
+                    )
+                    topk_same_stage_c_seed_global_track_idx = (
+                        topk_cache_stage_c_seed_global_track_idx == q_seed
+                    ) & (topk_cache_stage_c_seed_global_track_idx >= 0)
+                if (
+                    sampled_query_stage_c_masklet_instance_idx is not None
+                    and topk_cache_stage_c_masklet_instance_idx is not None
+                ):
+                    q_inst = sampled_query_stage_c_masklet_instance_idx[:, None, :, None].expand_as(
+                        topk_cache_stage_c_masklet_instance_idx
+                    )
+                    topk_same_stage_c_masklet_instance_idx = (
+                        topk_cache_stage_c_masklet_instance_idx == q_inst
+                    ) & (topk_cache_stage_c_masklet_instance_idx >= 0)
+                k_stable = Pi3._swa_trace_source_values(
+                    hmc_control,
+                    "K_stable_tok",
+                    batch_size=batch_size,
+                    history_tokens=history_tokens,
+                    tokens_per_frame=tokens_per_frame,
+                    device=route.device,
+                    dtype=torch.float32,
+                )
+                ttt_prev_stable = Pi3._swa_trace_source_values(
+                    hmc_control,
+                    "prev_ttt_stable_anchor_mask_patch",
+                    batch_size=batch_size,
+                    history_tokens=history_tokens,
+                    tokens_per_frame=tokens_per_frame,
+                    device=route.device,
+                    dtype=torch.float32,
+                )
+                ttt_prev_anchor_ids = Pi3._swa_trace_source_values(
+                    hmc_control,
+                    "prev_ttt_stable_anchor_id_patch",
+                    batch_size=batch_size,
+                    history_tokens=history_tokens,
+                    tokens_per_frame=tokens_per_frame,
+                    device=route.device,
+                    dtype=torch.int64,
+                )
+                ttt_prev_retention = Pi3._swa_trace_source_values(
+                    hmc_control,
+                    "prev_ttt_stable_anchor_retention_patch",
+                    batch_size=batch_size,
+                    history_tokens=history_tokens,
+                    tokens_per_frame=tokens_per_frame,
+                    device=route.device,
+                    dtype=torch.float32,
+                )
+                ttt_prev_residual = Pi3._swa_trace_source_values(
+                    hmc_control,
+                    "prev_ttt_stable_anchor_residual_patch",
+                    batch_size=batch_size,
+                    history_tokens=history_tokens,
+                    tokens_per_frame=tokens_per_frame,
+                    device=route.device,
+                    dtype=torch.float32,
+                )
+                ttt_prev_z_write_key_norm = Pi3._swa_trace_source_values(
+                    hmc_control,
+                    "prev_ttt_stable_anchor_z_write_key_norm_patch",
+                    batch_size=batch_size,
+                    history_tokens=history_tokens,
+                    tokens_per_frame=tokens_per_frame,
+                    device=route.device,
+                    dtype=torch.float32,
+                )
+                ttt_prev_z_write_key_sketch = Pi3._swa_trace_source_matrix(
+                    hmc_control,
+                    "prev_ttt_stable_anchor_z_write_key_sketch_patch",
+                    batch_size=batch_size,
+                    history_tokens=history_tokens,
+                    tokens_per_frame=tokens_per_frame,
+                    device=route.device,
+                    dtype=torch.float32,
+                )
+                ttt_prev_z_write_key_vec = Pi3._swa_trace_source_matrix(
+                    hmc_control,
+                    "prev_ttt_stable_anchor_z_write_key_vec_patch",
+                    batch_size=batch_size,
+                    history_tokens=history_tokens,
+                    tokens_per_frame=tokens_per_frame,
+                    device=route.device,
+                    dtype=torch.float32,
+                )
+                ttt_prev_z_write_hidden_vec = Pi3._swa_trace_source_matrix(
+                    hmc_control,
+                    "prev_ttt_stable_anchor_z_write_hidden_vec_patch",
+                    batch_size=batch_size,
+                    history_tokens=history_tokens,
+                    tokens_per_frame=tokens_per_frame,
+                    device=route.device,
+                    dtype=torch.float32,
+                )
+                ttt_prev_tracked_instance = Pi3._swa_trace_source_values(
+                    hmc_control,
+                    "prev_ttt_tracked_instance_anchor_mask_patch",
+                    batch_size=batch_size,
+                    history_tokens=history_tokens,
+                    tokens_per_frame=tokens_per_frame,
+                    device=route.device,
+                    dtype=torch.float32,
+                )
+                ttt_prev_tracked_instance_anchor_ids = Pi3._swa_trace_source_values(
+                    hmc_control,
+                    "prev_ttt_tracked_instance_anchor_id_patch",
+                    batch_size=batch_size,
+                    history_tokens=history_tokens,
+                    tokens_per_frame=tokens_per_frame,
+                    device=route.device,
+                    dtype=torch.int64,
+                )
+                ttt_prev_tracked_instance_anchor_seeds = Pi3._swa_trace_source_values(
+                    hmc_control,
+                    "prev_ttt_tracked_instance_anchor_seed_patch",
+                    batch_size=batch_size,
+                    history_tokens=history_tokens,
+                    tokens_per_frame=tokens_per_frame,
+                    device=route.device,
+                    dtype=torch.int64,
+                )
+
+                stable_d_max = float((hmc_control or {}).get("swa_raw_transport_trace_stable_d_max", 0.25) or 0.25)
+                unreliable_d_min = float((hmc_control or {}).get("swa_raw_transport_trace_unreliable_d_min", 0.50) or 0.50)
+                d_low_mask = None
+                d_high_mask = None
+                g_high_mask = None
+                k_stable_mask = None
+                label_static_mask = None
+                stable_mask = None
+                unreliable_mask = None
+                stable_reason = "missing_prev_dynamic_and_label_proxy"
+                unreliable_reason = "missing_prev_dynamic_proxy"
+                if d_prev is not None:
+                    d_low_mask = d_prev <= stable_d_max
+                    d_high_mask = d_prev >= unreliable_d_min
+                    stable_mask = d_low_mask
+                    unreliable_mask = d_high_mask
+                    stable_reason = "D_prev_low"
+                    unreliable_reason = "D_prev_high"
+                if k_stable is not None:
+                    k_stable_mask = k_stable >= 0.5
+                    stable_mask = k_stable_mask if stable_mask is None else (stable_mask & k_stable_mask)
+                    stable_reason += "+K_stable_tok"
+                if l_prev is not None:
+                    stable_labels = (
+                        set(_CONTEXT_GROUND_FINE_LABEL_IDS)
+                        | set(_CONTEXT_VERTICAL_STATIC_FINE_LABEL_IDS)
+                        | {15}
+                    )
+                    label_static_mask = torch.zeros_like(l_prev, dtype=torch.bool)
+                    l_long = l_prev.long()
+                    for label_id in stable_labels:
+                        label_static_mask |= l_long == int(label_id)
+                    stable_mask = label_static_mask if stable_mask is None else (stable_mask & label_static_mask)
+                    stable_reason += "+L_prev_static_structure"
+                if g_prev is not None:
+                    g_high_mask = g_prev >= unreliable_d_min
+                    unreliable_mask = g_high_mask if unreliable_mask is None else (unreliable_mask | g_high_mask)
+                    unreliable_reason += "+G_prev_high"
+
+                strict_stable_mask = stable_mask
+                semantic_lowd_mask = None
+                lowd_nonunreliable_mask = None
+                stable_fallback_used = False
+                stable_fallback_reason = ""
+                if d_low_mask is not None and label_static_mask is not None:
+                    semantic_lowd_mask = d_low_mask & label_static_mask
+                if d_low_mask is not None:
+                    if unreliable_mask is None:
+                        lowd_nonunreliable_mask = d_low_mask
+                    else:
+                        lowd_nonunreliable_mask = d_low_mask & (~unreliable_mask)
+                if stable_mask is not None and not bool(stable_mask.any()):
+                    if semantic_lowd_mask is not None and bool(semantic_lowd_mask.any()):
+                        stable_mask = semantic_lowd_mask
+                        stable_fallback_used = True
+                        stable_fallback_reason = "strict_empty_use_D_prev_low+L_prev_static_structure"
+                    elif lowd_nonunreliable_mask is not None and bool(lowd_nonunreliable_mask.any()):
+                        stable_mask = lowd_nonunreliable_mask
+                        stable_fallback_used = True
+                        stable_fallback_reason = "strict_empty_use_D_prev_low+not_unreliable"
+                    if stable_fallback_used:
+                        stable_reason += f"+fallback:{stable_fallback_reason}"
+
+                def _mask_count(mask: Optional[torch.Tensor]) -> int:
+                    if mask is None:
+                        return 0
+                    return int(mask.sum().item())
+
+                stable_mass = _route_mass(stable_mask)
+                unreliable_mass = _route_mass(unreliable_mask)
+                ttt_prev_stable_mask = ttt_prev_stable >= 0.5 if ttt_prev_stable is not None else None
+                ttt_prev_stable_mass = _route_mass(ttt_prev_stable_mask)
+                ttt_prev_topk_hits, ttt_prev_query_hits, ttt_prev_top1_hits = _topk_mask_hits(
+                    ttt_prev_stable_mask
+                )
+                ttt_prev_topk_anchor_ids = _topk_anchor_ids(ttt_prev_anchor_ids, ttt_prev_topk_hits)
+                ttt_prev_tracked_instance_mask = (
+                    ttt_prev_tracked_instance >= 0.5
+                    if ttt_prev_tracked_instance is not None
+                    else None
+                )
+                ttt_prev_tracked_instance_mass = _route_mass(ttt_prev_tracked_instance_mask)
+                (
+                    ttt_prev_tracked_instance_topk_hits,
+                    ttt_prev_tracked_instance_query_hits,
+                    ttt_prev_tracked_instance_top1_hits,
+                ) = _topk_mask_hits(ttt_prev_tracked_instance_mask)
+                ttt_prev_tracked_instance_topk_anchor_ids = _topk_anchor_ids(
+                    ttt_prev_tracked_instance_anchor_ids,
+                    ttt_prev_tracked_instance_topk_hits,
+                )
+                ttt_prev_tracked_instance_topk_anchor_seeds = _topk_anchor_ids(
+                    ttt_prev_tracked_instance_anchor_seeds,
+                    ttt_prev_tracked_instance_topk_hits,
+                )
+                ttt_prev_same_fine_topk_hits = (
+                    ttt_prev_topk_hits.to(dtype=torch.bool) & topk_same_fine_labels
+                    if ttt_prev_topk_hits is not None and topk_same_fine_labels is not None
+                    else None
+                )
+                ttt_prev_same_group_topk_hits = (
+                    ttt_prev_topk_hits.to(dtype=torch.bool) & topk_same_group_labels
+                    if ttt_prev_topk_hits is not None and topk_same_group_labels is not None
+                    else None
+                )
+                ttt_prev_same_stage_c_seed_topk_hits = (
+                    ttt_prev_topk_hits.to(dtype=torch.bool) & topk_same_stage_c_seed_global_track_idx
+                    if ttt_prev_topk_hits is not None and topk_same_stage_c_seed_global_track_idx is not None
+                    else None
+                )
+                ttt_prev_tracked_instance_same_seed_topk_hits = (
+                    ttt_prev_tracked_instance_topk_hits.to(dtype=torch.bool)
+                    & topk_same_stage_c_seed_global_track_idx
+                    if ttt_prev_tracked_instance_topk_hits is not None
+                    and topk_same_stage_c_seed_global_track_idx is not None
+                    else None
+                )
+                ttt_prev_tracked_instance_same_masklet_topk_hits = (
+                    ttt_prev_tracked_instance_topk_hits.to(dtype=torch.bool)
+                    & topk_same_stage_c_masklet_instance_idx
+                    if ttt_prev_tracked_instance_topk_hits is not None
+                    and topk_same_stage_c_masklet_instance_idx is not None
+                    else None
+                )
+
+                def _anchor_lifecycle_rows() -> List[Dict[str, Any]]:
+                    if (
+                        ttt_prev_anchor_ids is None
+                        or ttt_prev_stable_mask is None
+                        or ttt_prev_topk_anchor_ids is None
+                        or ttt_prev_topk_hits is None
+                    ):
+                        return []
+                    ids_hist = ttt_prev_anchor_ids.to(device=topk_indices.device, dtype=torch.int64)
+                    stable_bool = ttt_prev_stable_mask.to(device=topk_indices.device, dtype=torch.bool)
+                    valid_topk = ttt_prev_topk_anchor_ids.to(device=topk_indices.device, dtype=torch.int64)
+                    valid_topk = valid_topk[valid_topk >= 0]
+                    if int(valid_topk.numel()) == 0:
+                        return []
+                    unique_ids, counts = torch.unique(valid_topk, return_counts=True)
+                    order = torch.argsort(counts, descending=True)
+                    max_rows = int((hmc_control or {}).get("swa_raw_transport_trace_anchor_lifecycle_max_ids", 128) or 128)
+                    max_rows = max(1, min(max_rows, int(unique_ids.numel())))
+                    topk_route = torch.gather(route, -1, topk_indices.long())
+                    topk_cosine = torch.gather(cosine, -1, topk_indices.long()).float()
+                    topk_norm_l2 = torch.sqrt(torch.clamp(2.0 - 2.0 * topk_cosine, min=0.0))
+                    v_norm = F.normalize(v_sample, dim=-1)
+                    v_hist_norm = F.normalize(v_hist, dim=-1)
+                    v_cosine = torch.matmul(v_norm, v_hist_norm.transpose(-2, -1))
+                    topk_v_cosine = torch.gather(v_cosine, -1, topk_indices.long()).float()
+                    topk_v_norm_l2 = torch.sqrt(torch.clamp(2.0 - 2.0 * topk_v_cosine, min=0.0))
+                    gather_index = topk_indices.long().unsqueeze(-1).expand(
+                        int(batch_size),
+                        int(head_count),
+                        int(topk_indices.shape[2]),
+                        int(topk_indices.shape[3]),
+                        int(head_dim),
+                    )
+                    value_dim = int(v_hist.shape[-1])
+                    v_gather_index = topk_indices.long().unsqueeze(-1).expand(
+                        int(batch_size),
+                        int(head_count),
+                        int(topk_indices.shape[2]),
+                        int(topk_indices.shape[3]),
+                        int(value_dim),
+                    )
+                    k_topk_norm = torch.gather(
+                        k_norm[:, :, None, :, :].expand(
+                            int(batch_size),
+                            int(head_count),
+                            int(topk_indices.shape[2]),
+                            int(history_tokens),
+                            int(value_dim),
+                        ),
+                        3,
+                        v_gather_index,
+                    )
+                    v_topk_norm = torch.gather(
+                        v_hist_norm[:, :, None, :, :].expand(
+                            int(batch_size),
+                            int(head_count),
+                            int(topk_indices.shape[2]),
+                            int(history_tokens),
+                            int(head_dim),
+                        ),
+                        3,
+                        gather_index,
+                    )
+                    q_topk_norm = q_norm.unsqueeze(-2).expand_as(k_topk_norm)
+                    k_sample_norm = F.normalize(k_sample, dim=-1)
+                    k_current_topk_norm = k_sample_norm.unsqueeze(-2).expand_as(k_topk_norm)
+                    v_current_topk_norm = v_norm.unsqueeze(-2).expand_as(v_topk_norm)
+                    hidden_hist_norm: Optional[torch.Tensor] = None
+                    hidden_sample_norm: Optional[torch.Tensor] = None
+                    hidden_topk_norm: Optional[torch.Tensor] = None
+                    hidden_current_topk_norm: Optional[torch.Tensor] = None
+                    if hidden_hist is not None and hidden_sample is not None:
+                        hidden_hist_norm = F.normalize(hidden_hist, dim=-1)
+                        hidden_sample_norm = F.normalize(hidden_sample, dim=-1)
+                        hidden_dim = int(hidden_hist_norm.shape[-1])
+                        hidden_gather_index = topk_indices.long().unsqueeze(-1).expand(
+                            int(batch_size),
+                            int(head_count),
+                            int(topk_indices.shape[2]),
+                            int(topk_indices.shape[3]),
+                            hidden_dim,
+                        )
+                        hidden_topk_norm = torch.gather(
+                            hidden_hist_norm[:, None, None, :, :].expand(
+                                int(batch_size),
+                                int(head_count),
+                                int(topk_indices.shape[2]),
+                                int(history_tokens),
+                                hidden_dim,
+                            ),
+                            3,
+                            hidden_gather_index,
+                        )
+                        hidden_current_topk_norm = hidden_sample_norm[:, None, :, None, :].expand_as(
+                            hidden_topk_norm
+                        )
+                    z_sketch_dim = int((hmc_control or {}).get("swa_raw_transport_trace_z_sketch_dim", 16) or 16)
+                    z_sketch_dim = max(1, min(int(z_sketch_dim), 32))
+
+                    def _chunk_sketch(vec: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+                        if vec is None or int(vec.numel()) == 0:
+                            return None
+                        flat_vec = vec.detach().float().reshape(-1)
+                        dim = min(int(z_sketch_dim), int(flat_vec.numel()))
+                        if dim <= 0:
+                            return None
+                        return torch.stack([part.mean() for part in torch.chunk(flat_vec, chunks=dim, dim=0)], dim=0)
+
+                    def _project_vec(vec: Optional[torch.Tensor], target_dim: int) -> Optional[torch.Tensor]:
+                        if vec is None or int(vec.numel()) == 0 or int(target_dim) <= 0:
+                            return None
+                        flat_vec = vec.detach().float().reshape(-1)
+                        if int(flat_vec.numel()) == int(target_dim):
+                            return flat_vec
+                        chunks = torch.chunk(flat_vec, chunks=min(int(target_dim), int(flat_vec.numel())), dim=0)
+                        projected = torch.stack([part.mean() for part in chunks], dim=0)
+                        if int(projected.numel()) != int(target_dim):
+                            return None
+                        return projected
+
+                    def _weighted_feature_mean(
+                        values: torch.Tensor,
+                        weights: torch.Tensor,
+                    ) -> Optional[torch.Tensor]:
+                        if int(values.numel()) == 0 or int(weights.numel()) == 0:
+                            return None
+                        vals = values.detach().float().reshape(-1, int(values.shape[-1]))
+                        w = weights.detach().float().reshape(-1, 1)
+                        denom = w.sum().clamp_min(1.0e-12)
+                        return (vals * w).sum(dim=0) / denom
+
+                    def _vec_list(vec: Optional[torch.Tensor]) -> Optional[List[float]]:
+                        if vec is None:
+                            return None
+                        return [float(v) for v in vec.detach().float().cpu().reshape(-1).tolist()]
+
+                    def _cosine_residual(
+                        lhs: Optional[torch.Tensor],
+                        rhs: Optional[torch.Tensor],
+                    ) -> Optional[float]:
+                        if lhs is None or rhs is None or int(lhs.numel()) != int(rhs.numel()):
+                            return None
+                        lhs_f = lhs.detach().float().reshape(-1)
+                        rhs_f = rhs.detach().float().reshape(-1)
+                        denom = lhs_f.norm().mul(rhs_f.norm()).clamp_min(1.0e-12)
+                        cos_val = torch.dot(lhs_f, rhs_f).div(denom).clamp(-1.0, 1.0)
+                        return float((1.0 - cos_val).item())
+                    rows_out: List[Dict[str, Any]] = []
+                    denom_qh = max(int(batch_size) * int(head_count) * int(topk_indices.shape[2]), 1)
+                    for idx in order[:max_rows]:
+                        anchor_id = int(unique_ids[idx].item())
+                        hist_mask = stable_bool & (ids_hist == int(anchor_id))
+                        hit_pos = ttt_prev_topk_anchor_ids.to(device=topk_indices.device, dtype=torch.int64) == int(anchor_id)
+                        qh_hit = hit_pos.any(dim=-1)
+                        route_mass_for_anchor = torch.where(
+                            hit_pos,
+                            topk_route,
+                            torch.zeros_like(topk_route),
+                        ).sum(dim=-1)
+                        retention_mean: Optional[float] = None
+                        if ttt_prev_retention is not None and bool(hist_mask.any()):
+                            retention_mean = float(
+                                ttt_prev_retention.to(device=hist_mask.device, dtype=torch.float32)[hist_mask]
+                                .detach()
+                                .float()
+                                .mean()
+                                .item()
+                            )
+                        source_residual_mean: Optional[float] = None
+                        if ttt_prev_residual is not None and bool(hist_mask.any()):
+                            source_residual_mean = float(
+                                ttt_prev_residual.to(device=hist_mask.device, dtype=torch.float32)[hist_mask]
+                                .detach()
+                                .float()
+                                .mean()
+                                .item()
+                            )
+                        source_label_mode: Optional[int] = None
+                        source_label_mode_frac: Optional[float] = None
+                        if l_prev is not None and bool(hist_mask.any()):
+                            label_vals = l_prev.to(device=hist_mask.device, dtype=torch.int64)[hist_mask]
+                            if int(label_vals.numel()) > 0:
+                                label_ids, label_counts = torch.unique(label_vals, return_counts=True)
+                                label_best = torch.argmax(label_counts)
+                                source_label_mode = int(label_ids[label_best].item())
+                                source_label_mode_frac = float(
+                                    label_counts[label_best].float().div(label_counts.sum().clamp_min(1)).item()
+                                )
+                        source_stage_c_seed_global_track_idx_mode: Optional[int] = None
+                        source_stage_c_seed_global_track_idx_mode_frac: Optional[float] = None
+                        if stage_c_seed_prev is not None and bool(hist_mask.any()):
+                            seed_vals = stage_c_seed_prev.to(device=hist_mask.device, dtype=torch.int64)[hist_mask]
+                            seed_vals = seed_vals[seed_vals >= 0]
+                            if int(seed_vals.numel()) > 0:
+                                seed_ids, seed_counts = torch.unique(seed_vals, return_counts=True)
+                                seed_best = torch.argmax(seed_counts)
+                                source_stage_c_seed_global_track_idx_mode = int(seed_ids[seed_best].item())
+                                source_stage_c_seed_global_track_idx_mode_frac = float(
+                                    seed_counts[seed_best].float().div(seed_counts.sum().clamp_min(1)).item()
+                                )
+                        current_residual_mean: Optional[float] = None
+                        if bool(qh_hit.any()):
+                            current_residual_mean = float(residual[qh_hit].detach().float().mean().item())
+                        z_write_key_norm_mean: Optional[float] = None
+                        z_write_key_sketch_norm_mean: Optional[float] = None
+                        z_write_key_sketch_abs_mean: Optional[float] = None
+                        z_write_key_sketch_mean: Optional[List[float]] = None
+                        z_write_hidden_vec_mean: Optional[List[float]] = None
+                        z_write_key_sketch_dim = 0
+                        z_write_key_vec_mean: Optional[List[float]] = None
+                        z_write_key_vec_projected_mean: Optional[List[float]] = None
+                        z_write_key_vec_dim = 0
+                        z_write_key_vec_projected_dim = 0
+                        z_write_key_vec: Optional[torch.Tensor] = None
+                        z_write_key_vec_projected: Optional[torch.Tensor] = None
+                        z_write_hidden_vec: Optional[torch.Tensor] = None
+                        if ttt_prev_z_write_key_norm is not None and bool(hist_mask.any()):
+                            z_write_key_norm_mean = float(
+                                ttt_prev_z_write_key_norm.to(device=hist_mask.device, dtype=torch.float32)[hist_mask]
+                                .detach()
+                                .float()
+                                .mean()
+                                .item()
+                            )
+                        if ttt_prev_z_write_key_sketch is not None and bool(hist_mask.any()):
+                            sketch_vals = ttt_prev_z_write_key_sketch.to(device=hist_mask.device, dtype=torch.float32)[hist_mask]
+                            if int(sketch_vals.numel()) > 0 and sketch_vals.ndim == 2:
+                                z_write_key_sketch_dim = int(sketch_vals.shape[-1])
+                                z_write_key_sketch_vec = sketch_vals.detach().float().mean(dim=0)
+                                z_write_key_sketch_mean = _vec_list(z_write_key_sketch_vec)
+                                z_write_key_sketch_norm_mean = float(
+                                    sketch_vals.detach().float().norm(dim=-1).mean().item()
+                                )
+                                z_write_key_sketch_abs_mean = float(
+                                    sketch_vals.detach().float().abs().mean().item()
+                                )
+                        if ttt_prev_z_write_key_vec is not None and bool(hist_mask.any()):
+                            vec_vals = ttt_prev_z_write_key_vec.to(device=hist_mask.device, dtype=torch.float32)[hist_mask]
+                            if int(vec_vals.numel()) > 0 and vec_vals.ndim == 2:
+                                z_write_key_vec_dim = int(vec_vals.shape[-1])
+                                z_write_key_vec = F.normalize(vec_vals.detach().float().mean(dim=0), dim=0)
+                                z_write_key_vec_mean = _vec_list(z_write_key_vec)
+                        if ttt_prev_z_write_hidden_vec is not None and bool(hist_mask.any()):
+                            hidden_vals = ttt_prev_z_write_hidden_vec.to(
+                                device=hist_mask.device,
+                                dtype=torch.float32,
+                            )[hist_mask]
+                            if int(hidden_vals.numel()) > 0 and hidden_vals.ndim == 2:
+                                z_write_hidden_vec = F.normalize(
+                                    hidden_vals.detach().float().mean(dim=0),
+                                    dim=0,
+                                )
+                                z_write_hidden_vec_mean = _vec_list(z_write_hidden_vec)
+                        z_cache_current_cos_mean: Optional[float] = None
+                        z_cache_current_cos_route_weighted_mean: Optional[float] = None
+                        z_cache_current_l2_mean: Optional[float] = None
+                        z_cache_current_l2_route_weighted_mean: Optional[float] = None
+                        z_cache_current_v_cos_mean: Optional[float] = None
+                        z_cache_current_v_cos_route_weighted_mean: Optional[float] = None
+                        z_cache_current_v_l2_mean: Optional[float] = None
+                        z_cache_current_v_l2_route_weighted_mean: Optional[float] = None
+                        z_current_q_sketch_mean: Optional[List[float]] = None
+                        z_cache_k_sketch_mean: Optional[List[float]] = None
+                        z_current_v_sketch_mean: Optional[List[float]] = None
+                        z_cache_v_sketch_mean: Optional[List[float]] = None
+                        z_current_q_vec_mean: Optional[List[float]] = None
+                        z_current_k_vec_mean: Optional[List[float]] = None
+                        z_cache_k_vec_mean: Optional[List[float]] = None
+                        z_ref_cache_k_vec_mean: Optional[List[float]] = None
+                        z_current_v_vec_mean: Optional[List[float]] = None
+                        z_cache_v_vec_mean: Optional[List[float]] = None
+                        z_ref_cache_v_vec_mean: Optional[List[float]] = None
+                        z_ref_hidden_vec_mean: Optional[List[float]] = None
+                        z_cache_hidden_vec_mean: Optional[List[float]] = None
+                        z_current_hidden_vec_mean: Optional[List[float]] = None
+                        z_cache_current_k_sketch_residual: Optional[float] = None
+                        z_cache_current_v_sketch_residual: Optional[float] = None
+                        z_write_current_q_sketch_residual: Optional[float] = None
+                        z_write_cache_k_sketch_residual: Optional[float] = None
+                        z_cache_current_k_vec_residual: Optional[float] = None
+                        z_cache_current_k_native_vec_residual: Optional[float] = None
+                        z_ref_current_k_native_vec_residual: Optional[float] = None
+                        z_ref_cache_k_vec_residual: Optional[float] = None
+                        z_cache_current_v_vec_residual: Optional[float] = None
+                        z_ref_current_v_vec_residual: Optional[float] = None
+                        z_ref_cache_v_vec_residual: Optional[float] = None
+                        z_write_cache_hidden_vec_residual: Optional[float] = None
+                        z_write_current_hidden_vec_residual: Optional[float] = None
+                        z_ref_current_hidden_vec_residual: Optional[float] = None
+                        z_ref_cache_hidden_vec_residual: Optional[float] = None
+                        z_write_current_q_vec_residual: Optional[float] = None
+                        z_write_current_k_vec_residual: Optional[float] = None
+                        z_write_cache_k_vec_residual: Optional[float] = None
+                        z_write_current_q_vec_projected_residual: Optional[float] = None
+                        z_write_current_k_vec_projected_residual: Optional[float] = None
+                        z_write_cache_k_vec_projected_residual: Optional[float] = None
+                        z_write_ref_cache_k_vec_projected_residual: Optional[float] = None
+                        k_ref_vec: Optional[torch.Tensor] = None
+                        v_ref_vec: Optional[torch.Tensor] = None
+                        hidden_ref_vec: Optional[torch.Tensor] = None
+                        if bool(hist_mask.any()):
+                            hist_head_mask = hist_mask[:, None, :].expand(
+                                int(batch_size),
+                                int(head_count),
+                                int(history_tokens),
+                            )
+                            if bool(hist_head_mask.any()):
+                                k_ref_values = k_norm[hist_head_mask]
+                                v_ref_values = v_hist_norm[hist_head_mask]
+                                ref_weights = torch.ones(
+                                    int(k_ref_values.reshape(-1, int(k_ref_values.shape[-1])).shape[0]),
+                                    device=k_ref_values.device,
+                                    dtype=torch.float32,
+                                )
+                                k_ref_vec = _weighted_feature_mean(k_ref_values, ref_weights)
+                                v_ref_vec = _weighted_feature_mean(v_ref_values, ref_weights)
+                                z_ref_cache_k_vec_mean = _vec_list(k_ref_vec)
+                                z_ref_cache_v_vec_mean = _vec_list(v_ref_vec)
+                            if hidden_hist_norm is not None:
+                                hidden_ref_values = hidden_hist_norm[hist_mask]
+                                hidden_ref_weights = torch.ones(
+                                    int(hidden_ref_values.reshape(-1, int(hidden_ref_values.shape[-1])).shape[0]),
+                                    device=hidden_ref_values.device,
+                                    dtype=torch.float32,
+                                )
+                                hidden_ref_vec = _weighted_feature_mean(hidden_ref_values, hidden_ref_weights)
+                                z_ref_hidden_vec_mean = _vec_list(hidden_ref_vec)
+                        if bool(hit_pos.any()):
+                            cos_hits = topk_cosine[hit_pos].detach().float()
+                            l2_hits = topk_norm_l2[hit_pos].detach().float()
+                            v_cos_hits = topk_v_cosine[hit_pos].detach().float()
+                            v_l2_hits = topk_v_norm_l2[hit_pos].detach().float()
+                            route_hits = topk_route[hit_pos].detach().float()
+                            z_cache_current_cos_mean = float(cos_hits.mean().item())
+                            z_cache_current_l2_mean = float(l2_hits.mean().item())
+                            z_cache_current_v_cos_mean = float(v_cos_hits.mean().item())
+                            z_cache_current_v_l2_mean = float(v_l2_hits.mean().item())
+                            route_denom = route_hits.sum().clamp_min(1.0e-12)
+                            z_cache_current_cos_route_weighted_mean = float((cos_hits * route_hits).sum().div(route_denom).item())
+                            z_cache_current_l2_route_weighted_mean = float((l2_hits * route_hits).sum().div(route_denom).item())
+                            z_cache_current_v_cos_route_weighted_mean = float((v_cos_hits * route_hits).sum().div(route_denom).item())
+                            z_cache_current_v_l2_route_weighted_mean = float((v_l2_hits * route_hits).sum().div(route_denom).item())
+                            q_vec = _weighted_feature_mean(q_topk_norm[hit_pos], route_hits)
+                            k_current_vec = _weighted_feature_mean(k_current_topk_norm[hit_pos], route_hits)
+                            k_vec = _weighted_feature_mean(k_topk_norm[hit_pos], route_hits)
+                            v_current_vec = _weighted_feature_mean(v_current_topk_norm[hit_pos], route_hits)
+                            v_cache_vec = _weighted_feature_mean(v_topk_norm[hit_pos], route_hits)
+                            hidden_current_vec: Optional[torch.Tensor] = None
+                            hidden_cache_vec: Optional[torch.Tensor] = None
+                            if hidden_topk_norm is not None and hidden_current_topk_norm is not None:
+                                hidden_cache_vec = _weighted_feature_mean(hidden_topk_norm[hit_pos], route_hits)
+                                hidden_current_vec = _weighted_feature_mean(
+                                    hidden_current_topk_norm[hit_pos],
+                                    route_hits,
+                                )
+                            z_current_q_vec_mean = _vec_list(q_vec)
+                            z_current_k_vec_mean = _vec_list(k_current_vec)
+                            z_cache_k_vec_mean = _vec_list(k_vec)
+                            z_current_v_vec_mean = _vec_list(v_current_vec)
+                            z_cache_v_vec_mean = _vec_list(v_cache_vec)
+                            z_cache_hidden_vec_mean = _vec_list(hidden_cache_vec)
+                            z_current_hidden_vec_mean = _vec_list(hidden_current_vec)
+                            z_cache_current_k_vec_residual = _cosine_residual(k_vec, q_vec)
+                            z_cache_current_k_native_vec_residual = _cosine_residual(k_vec, k_current_vec)
+                            z_ref_current_k_native_vec_residual = _cosine_residual(k_ref_vec, k_current_vec)
+                            z_ref_cache_k_vec_residual = _cosine_residual(k_ref_vec, k_vec)
+                            z_cache_current_v_vec_residual = _cosine_residual(v_cache_vec, v_current_vec)
+                            z_ref_current_v_vec_residual = _cosine_residual(v_ref_vec, v_current_vec)
+                            z_ref_cache_v_vec_residual = _cosine_residual(v_ref_vec, v_cache_vec)
+                            z_write_cache_hidden_vec_residual = _cosine_residual(z_write_hidden_vec, hidden_cache_vec)
+                            z_write_current_hidden_vec_residual = _cosine_residual(
+                                z_write_hidden_vec,
+                                hidden_current_vec,
+                            )
+                            z_ref_current_hidden_vec_residual = _cosine_residual(hidden_ref_vec, hidden_current_vec)
+                            z_ref_cache_hidden_vec_residual = _cosine_residual(hidden_ref_vec, hidden_cache_vec)
+                            if q_vec is not None and z_write_key_vec is not None:
+                                z_write_key_vec_projected = _project_vec(z_write_key_vec, int(q_vec.numel()))
+                                if z_write_key_vec_projected is not None:
+                                    z_write_key_vec_projected_dim = int(z_write_key_vec_projected.numel())
+                                    z_write_key_vec_projected_mean = _vec_list(z_write_key_vec_projected)
+                            q_sketch = _chunk_sketch(q_vec)
+                            k_sketch = _chunk_sketch(k_vec)
+                            v_current_sketch = _chunk_sketch(v_current_vec)
+                            v_cache_sketch = _chunk_sketch(v_cache_vec)
+                            z_current_q_sketch_mean = _vec_list(q_sketch)
+                            z_cache_k_sketch_mean = _vec_list(k_sketch)
+                            z_current_v_sketch_mean = _vec_list(v_current_sketch)
+                            z_cache_v_sketch_mean = _vec_list(v_cache_sketch)
+                            z_cache_current_k_sketch_residual = _cosine_residual(k_sketch, q_sketch)
+                            z_cache_current_v_sketch_residual = _cosine_residual(v_cache_sketch, v_current_sketch)
+                            if z_write_key_sketch_mean is not None:
+                                z_write_sketch_tensor = torch.tensor(
+                                    z_write_key_sketch_mean,
+                                    device=route.device,
+                                    dtype=torch.float32,
+                                )
+                                z_write_current_q_sketch_residual = _cosine_residual(
+                                    z_write_sketch_tensor,
+                                    q_sketch,
+                                )
+                                z_write_cache_k_sketch_residual = _cosine_residual(
+                                    z_write_sketch_tensor,
+                                    k_sketch,
+                                )
+                            if z_write_key_vec is not None:
+                                z_write_current_q_vec_residual = _cosine_residual(z_write_key_vec, q_vec)
+                                z_write_current_k_vec_residual = _cosine_residual(z_write_key_vec, k_current_vec)
+                                z_write_cache_k_vec_residual = _cosine_residual(z_write_key_vec, k_vec)
+                            if z_write_key_vec_projected is not None:
+                                z_write_current_q_vec_projected_residual = _cosine_residual(
+                                    z_write_key_vec_projected,
+                                    q_vec,
+                                )
+                                z_write_current_k_vec_projected_residual = _cosine_residual(
+                                    z_write_key_vec_projected,
+                                    k_current_vec,
+                                )
+                                z_write_cache_k_vec_projected_residual = _cosine_residual(
+                                    z_write_key_vec_projected,
+                                    k_vec,
+                                )
+                                z_write_ref_cache_k_vec_projected_residual = _cosine_residual(
+                                    z_write_key_vec_projected,
+                                    k_ref_vec,
+                                )
+                        qh_by_head = qh_hit.float().mean(dim=(0, 2)) if qh_hit.ndim == 3 else torch.empty(0, device=route.device)
+                        rows_out.append(
+                            {
+                                "anchor_id": int(anchor_id),
+                                "source_token_count": int(hist_mask.sum().item()),
+                                "topk_hit_position_count": int(hit_pos.sum().item()),
+                                "query_head_hit_frac": float(qh_hit.float().sum().item() / float(denom_qh)),
+                                "query_head_hit_max": float(qh_by_head.max().item()) if int(qh_by_head.numel()) else None,
+                                "query_head_ge50_frac": (
+                                    float((qh_by_head >= 0.50).float().mean().item())
+                                    if int(qh_by_head.numel()) else None
+                                ),
+                                "query_head_ge75_frac": (
+                                    float((qh_by_head >= 0.75).float().mean().item())
+                                    if int(qh_by_head.numel()) else None
+                                ),
+                                "topk_route_mass_mean": float(route_mass_for_anchor.detach().float().mean().item()),
+                                "topk_route_mass_max": float(route_mass_for_anchor.detach().float().max().item()),
+                                "source_retention_mean": retention_mean,
+                                "source_residual_mean": source_residual_mean,
+                                "source_label_mode": source_label_mode,
+                                "source_label_mode_frac": source_label_mode_frac,
+                                "source_stage_c_seed_global_track_idx_mode": (
+                                    source_stage_c_seed_global_track_idx_mode
+                                ),
+                                "source_stage_c_seed_global_track_idx_mode_frac": (
+                                    source_stage_c_seed_global_track_idx_mode_frac
+                                ),
+                                "current_feature_residual_mean": current_residual_mean,
+                                "z_write_key_norm_mean": z_write_key_norm_mean,
+                                "z_write_key_sketch_norm_mean": z_write_key_sketch_norm_mean,
+                                "z_write_key_sketch_abs_mean": z_write_key_sketch_abs_mean,
+                                "z_write_key_sketch_dim": int(z_write_key_sketch_dim),
+                                "z_write_key_sketch_mean": z_write_key_sketch_mean,
+                                "z_write_key_sketch_source": "ttt_pre_zp_replay_key_mean_normalized_chunk_mean",
+                                "z_write_hidden_vec_mean": z_write_hidden_vec_mean,
+                                "z_write_hidden_vec_source": "ttt_write_tokens_out_hidden_mean_normalized",
+                                "z_write_key_vec_dim": int(z_write_key_vec_dim),
+                                "z_write_key_vec_mean": z_write_key_vec_mean,
+                                "z_write_key_vec_source": "ttt_pre_zp_replay_key_mean_normalized_full",
+                                "z_write_key_vec_projected_dim": int(z_write_key_vec_projected_dim),
+                                "z_write_key_vec_projected_mean": z_write_key_vec_projected_mean,
+                                "z_write_key_vec_projected_source": "chunk_mean_projection_to_swa_head_dim",
+                                "z_sketch_dim": int(z_sketch_dim),
+                                "z_current_q_sketch_mean": z_current_q_sketch_mean,
+                                "z_cache_k_sketch_mean": z_cache_k_sketch_mean,
+                                "z_current_v_sketch_mean": z_current_v_sketch_mean,
+                                "z_cache_v_sketch_mean": z_cache_v_sketch_mean,
+                                "z_current_q_vec_mean": z_current_q_vec_mean,
+                                "z_current_k_vec_mean": z_current_k_vec_mean,
+                                "z_cache_k_vec_mean": z_cache_k_vec_mean,
+                                "z_ref_cache_k_vec_mean": z_ref_cache_k_vec_mean,
+                                "z_current_v_vec_mean": z_current_v_vec_mean,
+                                "z_cache_v_vec_mean": z_cache_v_vec_mean,
+                                "z_ref_cache_v_vec_mean": z_ref_cache_v_vec_mean,
+                                "z_ref_hidden_vec_mean": z_ref_hidden_vec_mean,
+                                "z_cache_hidden_vec_mean": z_cache_hidden_vec_mean,
+                                "z_current_hidden_vec_mean": z_current_hidden_vec_mean,
+                                "z_cache_current_k_sketch_residual": z_cache_current_k_sketch_residual,
+                                "z_cache_current_v_sketch_residual": z_cache_current_v_sketch_residual,
+                                "z_write_current_q_sketch_residual": z_write_current_q_sketch_residual,
+                                "z_write_cache_k_sketch_residual": z_write_cache_k_sketch_residual,
+                                "z_cache_current_k_vec_residual": z_cache_current_k_vec_residual,
+                                "z_cache_current_k_native_vec_residual": z_cache_current_k_native_vec_residual,
+                                "z_ref_current_k_native_vec_residual": z_ref_current_k_native_vec_residual,
+                                "z_ref_cache_k_vec_residual": z_ref_cache_k_vec_residual,
+                                "z_cache_current_v_vec_residual": z_cache_current_v_vec_residual,
+                                "z_ref_current_v_vec_residual": z_ref_current_v_vec_residual,
+                                "z_ref_cache_v_vec_residual": z_ref_cache_v_vec_residual,
+                                "z_write_cache_hidden_vec_residual": z_write_cache_hidden_vec_residual,
+                                "z_write_current_hidden_vec_residual": z_write_current_hidden_vec_residual,
+                                "z_ref_current_hidden_vec_residual": z_ref_current_hidden_vec_residual,
+                                "z_ref_cache_hidden_vec_residual": z_ref_cache_hidden_vec_residual,
+                                "z_write_current_q_vec_residual": z_write_current_q_vec_residual,
+                                "z_write_current_k_vec_residual": z_write_current_k_vec_residual,
+                                "z_write_cache_k_vec_residual": z_write_cache_k_vec_residual,
+                                "z_write_current_q_vec_projected_residual": z_write_current_q_vec_projected_residual,
+                                "z_write_current_k_vec_projected_residual": z_write_current_k_vec_projected_residual,
+                                "z_write_cache_k_vec_projected_residual": z_write_cache_k_vec_projected_residual,
+                                "z_write_ref_cache_k_vec_projected_residual": z_write_ref_cache_k_vec_projected_residual,
+                                "z_cache_current_pair_count": int(hit_pos.sum().item()),
+                                "z_cache_current_cos_mean": z_cache_current_cos_mean,
+                                "z_cache_current_cos_route_weighted_mean": z_cache_current_cos_route_weighted_mean,
+                                "z_cache_current_l2_mean": z_cache_current_l2_mean,
+                                "z_cache_current_l2_route_weighted_mean": z_cache_current_l2_route_weighted_mean,
+                                "z_cache_current_v_cos_mean": z_cache_current_v_cos_mean,
+                                "z_cache_current_v_cos_route_weighted_mean": z_cache_current_v_cos_route_weighted_mean,
+                                "z_cache_current_v_l2_mean": z_cache_current_v_l2_mean,
+                                "z_cache_current_v_l2_route_weighted_mean": z_cache_current_v_l2_route_weighted_mean,
+                                "source_chunk_idx": int((hmc_control or {}).get("prev_ttt_stable_anchor_source_chunk_idx", -1) or -1),
+                                "current_chunk_idx": int((hmc_control or {}).get("semantic_action_chunk_idx", -1) or -1),
+                            }
+                        )
+                    return rows_out
+
+                def _tracked_instance_anchor_lifecycle_rows() -> List[Dict[str, Any]]:
+                    if (
+                        ttt_prev_tracked_instance_anchor_ids is None
+                        or ttt_prev_tracked_instance_anchor_seeds is None
+                        or ttt_prev_tracked_instance_mask is None
+                        or ttt_prev_tracked_instance_topk_anchor_ids is None
+                        or ttt_prev_tracked_instance_topk_hits is None
+                    ):
+                        return []
+                    ids_hist = ttt_prev_tracked_instance_anchor_ids.to(
+                        device=topk_indices.device,
+                        dtype=torch.int64,
+                    )
+                    seed_hist = ttt_prev_tracked_instance_anchor_seeds.to(
+                        device=topk_indices.device,
+                        dtype=torch.int64,
+                    )
+                    tracked_bool = ttt_prev_tracked_instance_mask.to(
+                        device=topk_indices.device,
+                        dtype=torch.bool,
+                    )
+                    topk_ids = ttt_prev_tracked_instance_topk_anchor_ids.to(
+                        device=topk_indices.device,
+                        dtype=torch.int64,
+                    )
+                    valid_topk = topk_ids[topk_ids >= 0]
+                    if int(valid_topk.numel()) == 0:
+                        return []
+                    unique_ids, counts = torch.unique(valid_topk, return_counts=True)
+                    order = torch.argsort(counts, descending=True)
+                    max_rows = int(
+                        (hmc_control or {}).get(
+                            "swa_raw_transport_trace_tracked_instance_lifecycle_max_ids",
+                            (hmc_control or {}).get("swa_raw_transport_trace_anchor_lifecycle_max_ids", 128),
+                        )
+                        or 128
+                    )
+                    max_rows = max(1, min(max_rows, int(unique_ids.numel())))
+                    topk_route = torch.gather(route, -1, topk_indices.long())
+                    denom_qh = max(int(batch_size) * int(head_count) * int(topk_indices.shape[2]), 1)
+                    rows_out: List[Dict[str, Any]] = []
+                    for idx in order[:max_rows]:
+                        anchor_id = int(unique_ids[idx].item())
+                        hist_mask = tracked_bool & (ids_hist == int(anchor_id))
+                        hit_pos = topk_ids == int(anchor_id)
+                        qh_hit = hit_pos.any(dim=-1)
+                        route_mass_for_anchor = torch.where(
+                            hit_pos,
+                            topk_route,
+                            torch.zeros_like(topk_route),
+                        ).sum(dim=-1)
+                        source_seed_mode: Optional[int] = None
+                        source_seed_mode_frac: Optional[float] = None
+                        if bool(hist_mask.any()):
+                            seed_vals = seed_hist[hist_mask]
+                            seed_vals = seed_vals[seed_vals >= 0]
+                            if int(seed_vals.numel()) > 0:
+                                seed_ids, seed_counts = torch.unique(seed_vals, return_counts=True)
+                                seed_best = torch.argmax(seed_counts)
+                                source_seed_mode = int(seed_ids[seed_best].item())
+                                source_seed_mode_frac = float(
+                                    seed_counts[seed_best].float().div(seed_counts.sum().clamp_min(1)).item()
+                                )
+                        same_seed_count = 0
+                        if ttt_prev_tracked_instance_same_seed_topk_hits is not None:
+                            same_seed_count = int(
+                                (
+                                    hit_pos
+                                    & ttt_prev_tracked_instance_same_seed_topk_hits.to(
+                                        device=hit_pos.device,
+                                        dtype=torch.bool,
+                                    )
+                                ).sum().item()
+                            )
+                        same_masklet_count = 0
+                        if ttt_prev_tracked_instance_same_masklet_topk_hits is not None:
+                            same_masklet_count = int(
+                                (
+                                    hit_pos
+                                    & ttt_prev_tracked_instance_same_masklet_topk_hits.to(
+                                        device=hit_pos.device,
+                                        dtype=torch.bool,
+                                    )
+                                ).sum().item()
+                            )
+                        qh_by_head = (
+                            qh_hit.float().mean(dim=(0, 2))
+                            if qh_hit.ndim == 3
+                            else torch.empty(0, device=route.device)
+                        )
+                        rows_out.append(
+                            {
+                                "anchor_id": int(anchor_id),
+                                "source_type": "thing_tracked",
+                                "source_token_count": int(hist_mask.sum().item()),
+                                "topk_hit_position_count": int(hit_pos.sum().item()),
+                                "topk_same_seed_position_count": same_seed_count,
+                                "topk_same_masklet_position_count": same_masklet_count,
+                                "query_head_hit_frac": float(qh_hit.float().sum().item() / float(denom_qh)),
+                                "query_head_hit_max": float(qh_by_head.max().item()) if int(qh_by_head.numel()) else None,
+                                "query_head_ge50_frac": (
+                                    float((qh_by_head >= 0.50).float().mean().item())
+                                    if int(qh_by_head.numel()) else None
+                                ),
+                                "query_head_ge75_frac": (
+                                    float((qh_by_head >= 0.75).float().mean().item())
+                                    if int(qh_by_head.numel()) else None
+                                ),
+                                "topk_route_mass_mean": float(route_mass_for_anchor.detach().float().mean().item()),
+                                "topk_route_mass_max": float(route_mass_for_anchor.detach().float().max().item()),
+                                "source_stage_c_seed_global_track_idx_mode": source_seed_mode,
+                                "source_stage_c_seed_global_track_idx_mode_frac": source_seed_mode_frac,
+                                "source_chunk_idx": int(
+                                    (hmc_control or {}).get(
+                                        "prev_ttt_tracked_instance_anchor_source_chunk_idx",
+                                        -1,
+                                    )
+                                    or -1
+                                ),
+                                "current_chunk_idx": int(
+                                    (hmc_control or {}).get("semantic_action_chunk_idx", -1) or -1
+                                ),
+                                "runtime_action_allowed": False,
+                                "claim_level": "diagnostic_tracked_instance_anchor_lifecycle_no_runtime",
+                            }
+                        )
+                    return rows_out
+
+                ttt_prev_anchor_lifecycle_rows = _anchor_lifecycle_rows()
+                ttt_prev_tracked_instance_lifecycle_rows = _tracked_instance_anchor_lifecycle_rows()
+                stable_random_mass = None
+                unreliable_random_mass = None
+                if stable_mask is not None and bool(stable_mask.any()):
+                    stable_random_mass = _route_mass(
+                        Pi3._swa_trace_same_count_control(stable_mask, salt=17031.0 + float(swa_layer_idx))
+                    )
+                if unreliable_mask is not None and bool(unreliable_mask.any()):
+                    unreliable_random_mass = _route_mass(
+                        Pi3._swa_trace_same_count_control(unreliable_mask, salt=27031.0 + float(swa_layer_idx))
+                    )
+
+                route_mass_by_prev_label: Dict[str, float] = {}
+                if l_prev is not None:
+                    l_long = l_prev.long()
+                    for label_id in sorted(int(v) for v in torch.unique(l_long.detach()).cpu().tolist()):
+                        label_mask = l_long == int(label_id)
+                        label_mass = _route_mass(label_mask)
+                        if label_mass is not None:
+                            route_mass_by_prev_label[str(label_id)] = float(label_mass.mean().item())
+
+                cache_k_stability = _adjacent_frame_stability(k_hist)
+                cache_v_stability = _adjacent_frame_stability(v_hist)
+
+                stable_delta = None
+                if stable_mass is not None and stable_random_mass is not None:
+                    stable_delta = stable_mass - stable_random_mass
+                unreliable_delta = None
+                if unreliable_mass is not None and unreliable_random_mass is not None:
+                    unreliable_delta = unreliable_mass - unreliable_random_mass
+
+                dump_dir = Path(dump_dir_text)
+                dump_dir.mkdir(parents=True, exist_ok=True)
+                chunk_idx = int((hmc_control or {}).get("semantic_action_chunk_idx", -1))
+                out_path = dump_dir / f"chunk_{chunk_idx:03d}_swa_raw_transport_layer_{int(swa_layer_idx):02d}.pt"
+                payload = {
+                    "schema": "acl2_v97_swa_raw_transport_trace_v2",
+                    "artifact": "SAVE_V97_SWA_RAW_TRANSPORT_TRACE_TOPK_IDENTITY",
+                    "diagnostic_only": True,
+                    "chunk_idx": int(chunk_idx),
+                    "layer": int(layer),
+                    "swa_layer_idx": int(swa_layer_idx),
+                    "batch_size": int(batch_size),
+                    "frame_num": int(frame_num),
+                    "tokens_per_frame": int(tokens_per_frame),
+                    "head_count": int(head_count),
+                    "current_tokens": int(current_tokens),
+                    "history_tokens": int(history_tokens),
+                    "d_prev_patch_tokens": int(d_prev.shape[-1]) if d_prev is not None else 0,
+                    "label_prev_patch_tokens": int(l_prev.shape[-1]) if l_prev is not None else 0,
+                    "current_semantic_fine_trace_available": bool(sampled_query_fine_labels is not None),
+                    "current_semantic_group_trace_available": bool(sampled_query_group_labels is not None),
+                    "current_stage_c_seed_global_track_idx_trace_available": bool(
+                        sampled_query_stage_c_seed_global_track_idx is not None
+                    ),
+                    "cache_stage_c_seed_global_track_idx_trace_available": bool(
+                        topk_cache_stage_c_seed_global_track_idx is not None
+                    ),
+                    "current_stage_c_masklet_instance_idx_trace_available": bool(
+                        sampled_query_stage_c_masklet_instance_idx is not None
+                    ),
+                    "cache_stage_c_masklet_instance_idx_trace_available": bool(
+                        topk_cache_stage_c_masklet_instance_idx is not None
+                    ),
+                    "sampled_query_count": int(q_idx.numel()),
+                    "sampled_query_indices": q_idx.detach().cpu(),
+                    "sampled_query_fine_label_ids": (
+                        sampled_query_fine_labels.detach().cpu().to(torch.int16)
+                        if sampled_query_fine_labels is not None else None
+                    ),
+                    "sampled_query_group_ids": (
+                        sampled_query_group_labels.detach().cpu().to(torch.int16)
+                        if sampled_query_group_labels is not None else None
+                    ),
+                    "sampled_query_stage_c_seed_global_track_idx": (
+                        sampled_query_stage_c_seed_global_track_idx.detach().cpu().to(torch.int32)
+                        if sampled_query_stage_c_seed_global_track_idx is not None else None
+                    ),
+                    "sampled_query_stage_c_masklet_instance_idx": (
+                        sampled_query_stage_c_masklet_instance_idx.detach().cpu().to(torch.int32)
+                        if sampled_query_stage_c_masklet_instance_idx is not None else None
+                    ),
+                    "current_stage_c_seed_global_track_idx_unique_ids": current_stage_c_seed_unique_ids,
+                    "current_stage_c_seed_global_track_idx_unique_counts": current_stage_c_seed_unique_counts,
+                    "current_stage_c_seed_global_track_idx_nonnegative_count": int(
+                        current_stage_c_seed_nonnegative_count
+                    ),
+                    "current_stage_c_seed_global_track_idx_unique_count": int(current_stage_c_seed_unique_count),
+                    "current_stage_c_masklet_instance_idx_unique_ids": current_stage_c_masklet_instance_unique_ids,
+                    "current_stage_c_masklet_instance_idx_unique_counts": (
+                        current_stage_c_masklet_instance_unique_counts
+                    ),
+                    "current_stage_c_masklet_instance_idx_nonnegative_count": int(
+                        current_stage_c_masklet_instance_nonnegative_count
+                    ),
+                    "current_stage_c_masklet_instance_idx_unique_count": int(
+                        current_stage_c_masklet_instance_unique_count
+                    ),
+                    "topk_identity_available": True,
+                    "topk_identity_topk": int(topk_count),
+                    "topk_identity_missing_reason": "",
+                    "topk_identity_frame_missing_reason": topk_identity_frame_missing_reason,
+                    "q_current_shape": list(q_current.shape),
+                    "k_current_shape": list(k_current.shape),
+                    "v_current_shape": list(v_current.shape),
+                    "k_cache_shape": list(k_cache.shape),
+                    "v_cache_shape": list(v_cache.shape),
+                    **hidden_trace_debug,
+                    "current_Q_to_cache_K_topk_cache_indices": topk_indices.detach().cpu().to(torch.int32),
+                    "current_Q_to_cache_K_topk_cache_fine_label_ids": (
+                        topk_cache_fine_labels.detach().cpu().to(torch.int16)
+                        if topk_cache_fine_labels is not None else None
+                    ),
+                    "current_Q_to_cache_K_topk_cache_group_ids": (
+                        topk_cache_group_labels.detach().cpu().to(torch.int16)
+                        if topk_cache_group_labels is not None else None
+                    ),
+                    "current_Q_to_cache_K_topk_cache_stage_c_seed_global_track_idx": (
+                        topk_cache_stage_c_seed_global_track_idx.detach().cpu().to(torch.int32)
+                        if topk_cache_stage_c_seed_global_track_idx is not None else None
+                    ),
+                    "current_Q_to_cache_K_topk_cache_stage_c_masklet_instance_idx": (
+                        topk_cache_stage_c_masklet_instance_idx.detach().cpu().to(torch.int32)
+                        if topk_cache_stage_c_masklet_instance_idx is not None else None
+                    ),
+                    "current_Q_to_cache_K_topk_same_fine_label": (
+                        topk_same_fine_labels.detach().cpu()
+                        if topk_same_fine_labels is not None else None
+                    ),
+                    "current_Q_to_cache_K_topk_same_group": (
+                        topk_same_group_labels.detach().cpu()
+                        if topk_same_group_labels is not None else None
+                    ),
+                    "current_Q_to_cache_K_topk_same_stage_c_seed_global_track_idx": (
+                        topk_same_stage_c_seed_global_track_idx.detach().cpu()
+                        if topk_same_stage_c_seed_global_track_idx is not None else None
+                    ),
+                    "current_Q_to_cache_K_topk_same_stage_c_masklet_instance_idx": (
+                        topk_same_stage_c_masklet_instance_idx.detach().cpu()
+                        if topk_same_stage_c_masklet_instance_idx is not None else None
+                    ),
+                    "current_Q_to_cache_K_topk_same_fine_label_frac_mean": _scalar_mean(
+                        topk_same_fine_labels.float() if topk_same_fine_labels is not None else None
+                    ),
+                    "current_Q_to_cache_K_topk_same_group_frac_mean": _scalar_mean(
+                        topk_same_group_labels.float() if topk_same_group_labels is not None else None
+                    ),
+                    "current_Q_to_cache_K_topk_same_stage_c_seed_global_track_idx_frac_mean": _scalar_mean(
+                        topk_same_stage_c_seed_global_track_idx.float()
+                        if topk_same_stage_c_seed_global_track_idx is not None else None
+                    ),
+                    "current_Q_to_cache_K_topk_same_stage_c_masklet_instance_idx_frac_mean": _scalar_mean(
+                        topk_same_stage_c_masklet_instance_idx.float()
+                        if topk_same_stage_c_masklet_instance_idx is not None else None
+                    ),
+                    "current_Q_to_cache_K_topk_cache_frames": (
+                        topk_frames.detach().cpu().to(torch.int16) if topk_frames is not None else None
+                    ),
+                    "current_Q_to_cache_K_topk_scores": topk_scores.detach().cpu().to(torch.float16),
+                    "current_Q_to_cache_K_similarity_mean_by_head": torch.tensor(_mean_by_head(cosine), dtype=torch.float32),
+                    "current_Q_to_cache_K_similarity_max_by_head": torch.tensor(_mean_by_head(cosine.max(dim=-1).values), dtype=torch.float32),
+                    "current_Q_to_cache_K_top1_cache_index_unique_frac_by_head": (
+                        top1_index_unique_frac.detach().cpu().float()
+                    ),
+                    "current_Q_to_cache_K_top1_cache_frame_unique_frac_by_head": (
+                        top1_frame_unique_frac.detach().cpu().float()
+                        if top1_frame_unique_frac is not None else None
+                    ),
+                    "current_Q_to_cache_K_top1_cache_index_switch_rate_by_head": (
+                        top1_index_switch_rate.detach().cpu().float()
+                    ),
+                    "current_Q_to_cache_K_top1_cache_frame_switch_rate_by_head": (
+                        top1_frame_switch_rate.detach().cpu().float()
+                        if top1_frame_switch_rate is not None else None
+                    ),
+                    "current_Q_to_cache_K_top1_same_frame_frac_by_head": (
+                        top1_same_frame_frac.detach().cpu().float()
+                        if top1_same_frame_frac is not None else None
+                    ),
+                    "current_Q_to_cache_K_topk_query_frame_hit_frac_by_head": (
+                        topk_query_frame_hit_frac.detach().cpu().float()
+                        if topk_query_frame_hit_frac is not None else None
+                    ),
+                    "current_Q_to_cache_K_topk_same_frame_frac_by_head": (
+                        topk_same_frame_frac.detach().cpu().float()
+                        if topk_same_frame_frac is not None else None
+                    ),
+                    "current_Q_to_cache_K_top1_abs_frame_delta_mean_by_head": (
+                        top1_abs_frame_delta_mean.detach().cpu().float()
+                        if top1_abs_frame_delta_mean is not None else None
+                    ),
+                    "route_entropy_mean_by_head": torch.tensor(_mean_by_head(entropy), dtype=torch.float32),
+                    "feature_transport_residual_by_head": torch.tensor(_mean_by_head(residual), dtype=torch.float32),
+                    "cache_K_stability_by_head": (
+                        cache_k_stability.detach().cpu().float() if cache_k_stability is not None else None
+                    ),
+                    "cache_V_stability_by_head": (
+                        cache_v_stability.detach().cpu().float() if cache_v_stability is not None else None
+                    ),
+                    "stable_structure_pair_mass_by_head": (
+                        torch.tensor(_mean_by_head(stable_mass), dtype=torch.float32) if stable_mass is not None else None
+                    ),
+                    "unreliable_dynamic_boundary_pair_mass_by_head": (
+                        torch.tensor(_mean_by_head(unreliable_mass), dtype=torch.float32)
+                        if unreliable_mass is not None else None
+                    ),
+                    "stable_route_actual_minus_random_by_head": (
+                        torch.tensor(_mean_by_head(stable_delta), dtype=torch.float32) if stable_delta is not None else None
+                    ),
+                    "unreliable_route_actual_minus_random_by_head": (
+                        torch.tensor(_mean_by_head(unreliable_delta), dtype=torch.float32)
+                        if unreliable_delta is not None else None
+                    ),
+                    "route_mass_by_prev_fine_label": route_mass_by_prev_label,
+                    "stable_pair_reason": stable_reason,
+                    "unreliable_pair_reason": unreliable_reason,
+                    "stable_pair_fallback_used": bool(stable_fallback_used),
+                    "stable_pair_fallback_reason": stable_fallback_reason,
+                    "d_prev_low_pair_tokens": _mask_count(d_low_mask),
+                    "d_prev_high_pair_tokens": _mask_count(d_high_mask),
+                    "g_prev_high_pair_tokens": _mask_count(g_high_mask),
+                    "k_stable_pair_tokens": _mask_count(k_stable_mask),
+                    "label_static_structure_pair_tokens": _mask_count(label_static_mask),
+                    "stable_pair_strict_tokens": _mask_count(strict_stable_mask),
+                    "stable_pair_semantic_lowd_tokens": _mask_count(semantic_lowd_mask),
+                    "stable_pair_lowd_nonunreliable_tokens": _mask_count(lowd_nonunreliable_mask),
+                    "stable_pair_tokens": int(stable_mask.sum().item()) if stable_mask is not None else 0,
+                    "unreliable_pair_tokens": int(unreliable_mask.sum().item()) if unreliable_mask is not None else 0,
+                    "ttt_prev_stable_anchor_identity_available": bool(
+                        ttt_prev_stable_mask is not None and bool(ttt_prev_stable_mask.any())
+                    ),
+                    "ttt_prev_stable_anchor_lifecycle_schema": "acl2_v99_anchor_lifecycle_rows_v1",
+                    "ttt_prev_stable_anchor_lifecycle_rows": ttt_prev_anchor_lifecycle_rows,
+                    "ttt_prev_stable_anchor_lifecycle_row_count": int(len(ttt_prev_anchor_lifecycle_rows)),
+                    "ttt_prev_tracked_instance_anchor_lifecycle_schema": (
+                        "acl2_v103_tracked_instance_anchor_lifecycle_rows_v1"
+                    ),
+                    "ttt_prev_tracked_instance_anchor_lifecycle_rows": (
+                        ttt_prev_tracked_instance_lifecycle_rows
+                    ),
+                    "ttt_prev_tracked_instance_anchor_lifecycle_row_count": int(
+                        len(ttt_prev_tracked_instance_lifecycle_rows)
+                    ),
+                    "ttt_prev_stable_anchor_source_chunk_idx": int(
+                        (hmc_control or {}).get("prev_ttt_stable_anchor_source_chunk_idx", -1) or -1
+                    ),
+                    "ttt_prev_stable_anchor_source_token_count": int(
+                        (hmc_control or {}).get("prev_ttt_stable_anchor_token_count", 0) or 0
+                    ),
+                    "ttt_prev_stable_anchor_full_token_count": _mask_count(ttt_prev_stable_mask),
+                    "ttt_prev_stable_anchor_route_mass_mean": _scalar_mean(ttt_prev_stable_mass),
+                    "ttt_prev_stable_anchor_topk_hit_frac_mean": _scalar_mean(
+                        ttt_prev_topk_hits.float() if ttt_prev_topk_hits is not None else None
+                    ),
+                    "ttt_prev_stable_anchor_topk_query_hit_frac_mean": _scalar_mean(ttt_prev_query_hits),
+                    "ttt_prev_stable_anchor_top1_hit_frac_mean": _scalar_mean(ttt_prev_top1_hits),
+                    "ttt_prev_tracked_instance_anchor_identity_available": bool(
+                        ttt_prev_tracked_instance_mask is not None
+                        and bool(ttt_prev_tracked_instance_mask.any())
+                    ),
+                    "ttt_prev_tracked_instance_anchor_source_chunk_idx": int(
+                        (hmc_control or {}).get("prev_ttt_tracked_instance_anchor_source_chunk_idx", -1) or -1
+                    ),
+                    "ttt_prev_tracked_instance_anchor_source_token_count": int(
+                        (hmc_control or {}).get("prev_ttt_tracked_instance_anchor_token_count", 0) or 0
+                    ),
+                    "ttt_prev_tracked_instance_anchor_full_token_count": _mask_count(
+                        ttt_prev_tracked_instance_mask
+                    ),
+                    "ttt_prev_tracked_instance_anchor_route_mass_mean": _scalar_mean(
+                        ttt_prev_tracked_instance_mass
+                    ),
+                    "ttt_prev_tracked_instance_anchor_topk_hit_frac_mean": _scalar_mean(
+                        ttt_prev_tracked_instance_topk_hits.float()
+                        if ttt_prev_tracked_instance_topk_hits is not None else None
+                    ),
+                    "ttt_prev_tracked_instance_anchor_topk_query_hit_frac_mean": _scalar_mean(
+                        ttt_prev_tracked_instance_query_hits
+                    ),
+                    "ttt_prev_tracked_instance_anchor_top1_hit_frac_mean": _scalar_mean(
+                        ttt_prev_tracked_instance_top1_hits
+                    ),
+                    "ttt_prev_tracked_instance_anchor_topk_same_seed_frac_mean": _scalar_mean(
+                        ttt_prev_tracked_instance_same_seed_topk_hits.float()
+                        if ttt_prev_tracked_instance_same_seed_topk_hits is not None else None
+                    ),
+                    "ttt_prev_tracked_instance_anchor_topk_same_masklet_frac_mean": _scalar_mean(
+                        ttt_prev_tracked_instance_same_masklet_topk_hits.float()
+                        if ttt_prev_tracked_instance_same_masklet_topk_hits is not None else None
+                    ),
+                    "ttt_prev_stable_anchor_topk_same_query_fine_label_frac_mean": _scalar_mean(
+                        ttt_prev_same_fine_topk_hits.float()
+                        if ttt_prev_same_fine_topk_hits is not None else None
+                    ),
+                    "ttt_prev_stable_anchor_topk_same_query_group_frac_mean": _scalar_mean(
+                        ttt_prev_same_group_topk_hits.float()
+                        if ttt_prev_same_group_topk_hits is not None else None
+                    ),
+                    "ttt_prev_stable_anchor_retention_mean": _scalar_mean(
+                        ttt_prev_retention[ttt_prev_stable_mask]
+                        if ttt_prev_retention is not None
+                        and ttt_prev_stable_mask is not None
+                        and bool(ttt_prev_stable_mask.any())
+                        else None
+                    ),
+                    "ttt_prev_stable_anchor_residual_mean": _scalar_mean(
+                        ttt_prev_residual[ttt_prev_stable_mask]
+                        if ttt_prev_residual is not None
+                        and ttt_prev_stable_mask is not None
+                        and bool(ttt_prev_stable_mask.any())
+                        else None
+                    ),
+                    "current_Q_to_cache_K_topk_ttt_prev_stable_anchor_hit_mask": (
+                        ttt_prev_topk_hits.detach().cpu() if ttt_prev_topk_hits is not None else None
+                    ),
+                    "current_Q_to_cache_K_topk_ttt_prev_stable_anchor_ids": (
+                        ttt_prev_topk_anchor_ids.detach().cpu().to(torch.int64)
+                        if ttt_prev_topk_anchor_ids is not None else None
+                    ),
+                    "current_Q_to_cache_K_topk_ttt_prev_stable_anchor_same_query_fine_label": (
+                        ttt_prev_same_fine_topk_hits.detach().cpu()
+                        if ttt_prev_same_fine_topk_hits is not None else None
+                    ),
+                    "current_Q_to_cache_K_topk_ttt_prev_stable_anchor_same_query_group": (
+                        ttt_prev_same_group_topk_hits.detach().cpu()
+                        if ttt_prev_same_group_topk_hits is not None else None
+                    ),
+                    "current_Q_to_cache_K_topk_ttt_prev_tracked_instance_anchor_hit_mask": (
+                        ttt_prev_tracked_instance_topk_hits.detach().cpu()
+                        if ttt_prev_tracked_instance_topk_hits is not None else None
+                    ),
+                    "current_Q_to_cache_K_topk_ttt_prev_tracked_instance_anchor_ids": (
+                        ttt_prev_tracked_instance_topk_anchor_ids.detach().cpu().to(torch.int64)
+                        if ttt_prev_tracked_instance_topk_anchor_ids is not None else None
+                    ),
+                    "current_Q_to_cache_K_topk_ttt_prev_tracked_instance_anchor_seeds": (
+                        ttt_prev_tracked_instance_topk_anchor_seeds.detach().cpu().to(torch.int64)
+                        if ttt_prev_tracked_instance_topk_anchor_seeds is not None else None
+                    ),
+                    "current_Q_to_cache_K_topk_ttt_prev_tracked_instance_anchor_same_seed": (
+                        ttt_prev_tracked_instance_same_seed_topk_hits.detach().cpu()
+                        if ttt_prev_tracked_instance_same_seed_topk_hits is not None else None
+                    ),
+                    "current_Q_to_cache_K_topk_ttt_prev_tracked_instance_anchor_same_masklet": (
+                        ttt_prev_tracked_instance_same_masklet_topk_hits.detach().cpu()
+                        if ttt_prev_tracked_instance_same_masklet_topk_hits is not None else None
+                    ),
+                    "stable_pair_groups_nonempty": bool(stable_mask is not None and bool(stable_mask.any())),
+                    "unreliable_pair_groups_nonempty": bool(unreliable_mask is not None and bool(unreliable_mask.any())),
+                    "qk_similarity_mean": _scalar_mean(cosine),
+                    "qk_similarity_max_mean": _scalar_mean(cosine.max(dim=-1).values),
+                    "route_entropy_mean": _scalar_mean(entropy),
+                    "feature_transport_residual_mean": _scalar_mean(residual),
+                    "cache_k_stability_mean": _scalar_mean(cache_k_stability),
+                    "cache_v_stability_mean": _scalar_mean(cache_v_stability),
+                    "top1_cache_index_unique_frac_mean": _scalar_mean(top1_index_unique_frac),
+                    "top1_cache_frame_unique_frac_mean": _scalar_mean(top1_frame_unique_frac),
+                    "top1_cache_index_switch_rate_mean": _scalar_mean(top1_index_switch_rate),
+                    "top1_cache_frame_switch_rate_mean": _scalar_mean(top1_frame_switch_rate),
+                    "top1_same_frame_frac_mean": _scalar_mean(top1_same_frame_frac),
+                    "topk_query_frame_hit_frac_mean": _scalar_mean(topk_query_frame_hit_frac),
+                    "topk_same_frame_frac_mean": _scalar_mean(topk_same_frame_frac),
+                    "top1_abs_frame_delta_mean": _scalar_mean(top1_abs_frame_delta_mean),
+                    "stable_pair_mass_mean": _scalar_mean(stable_mass),
+                    "unreliable_pair_mass_mean": _scalar_mean(unreliable_mass),
+                    "stable_actual_minus_random_mean": _scalar_mean(stable_delta),
+                    "unreliable_actual_minus_random_mean": _scalar_mean(unreliable_delta),
+                }
+                if isinstance(extra_trace_fields, dict):
+                    for key, value in extra_trace_fields.items():
+                        key_text = str(key)
+                        if not key_text.startswith("v102_swa_state_machine_"):
+                            continue
+                        if torch.is_tensor(value):
+                            if int(value.numel()) != 1:
+                                continue
+                            value = value.detach().cpu().item()
+                        elif isinstance(value, tuple):
+                            value = list(value)
+                        if isinstance(value, (str, bool, int, float)) or value is None:
+                            payload[key_text] = value
+                        elif isinstance(value, list) and all(
+                            isinstance(item, (str, bool, int, float)) or item is None
+                            for item in value
+                        ):
+                            payload[key_text] = value
+                torch.save(payload, out_path)
+
+                return {
+                    "swa_raw_transport_trace_available": True,
+                    "swa_raw_transport_trace_path": str(out_path),
+                    "swa_raw_transport_trace_schema": payload["schema"],
+                    "swa_raw_transport_trace_sampled_query_count": int(q_idx.numel()),
+                    "swa_raw_transport_trace_head_count": int(head_count),
+                    "swa_raw_transport_topk_identity_available": True,
+                    "swa_raw_transport_topk_identity_topk": int(topk_count),
+                    "swa_raw_transport_current_tokens": int(current_tokens),
+                    "swa_raw_transport_history_tokens": int(history_tokens),
+                    "swa_raw_transport_d_prev_low_pair_tokens": int(payload["d_prev_low_pair_tokens"]),
+                    "swa_raw_transport_d_prev_high_pair_tokens": int(payload["d_prev_high_pair_tokens"]),
+                    "swa_raw_transport_g_prev_high_pair_tokens": int(payload["g_prev_high_pair_tokens"]),
+                    "swa_raw_transport_k_stable_pair_tokens": int(payload["k_stable_pair_tokens"]),
+                    "swa_raw_transport_label_static_structure_pair_tokens": int(payload["label_static_structure_pair_tokens"]),
+                    "swa_raw_transport_stable_pair_strict_tokens": int(payload["stable_pair_strict_tokens"]),
+                    "swa_raw_transport_stable_pair_semantic_lowd_tokens": int(payload["stable_pair_semantic_lowd_tokens"]),
+                    "swa_raw_transport_stable_pair_lowd_nonunreliable_tokens": int(payload["stable_pair_lowd_nonunreliable_tokens"]),
+                    "swa_raw_transport_stable_pair_tokens": int(payload["stable_pair_tokens"]),
+                    "swa_raw_transport_unreliable_pair_tokens": int(payload["unreliable_pair_tokens"]),
+                    "swa_raw_transport_ttt_prev_stable_anchor_identity_available": bool(
+                        payload["ttt_prev_stable_anchor_identity_available"]
+                    ),
+                    "swa_raw_transport_ttt_prev_stable_anchor_full_token_count": int(
+                        payload["ttt_prev_stable_anchor_full_token_count"]
+                    ),
+                    "swa_raw_transport_ttt_prev_stable_anchor_topk_hit_frac_mean": payload[
+                        "ttt_prev_stable_anchor_topk_hit_frac_mean"
+                    ],
+                    "swa_raw_transport_ttt_prev_stable_anchor_topk_query_hit_frac_mean": payload[
+                        "ttt_prev_stable_anchor_topk_query_hit_frac_mean"
+                    ],
+                    "swa_raw_transport_stable_fallback_used": bool(stable_fallback_used),
+                    "swa_raw_transport_stable_groups_nonempty": bool(payload["stable_pair_groups_nonempty"]),
+                    "swa_raw_transport_unreliable_groups_nonempty": bool(payload["unreliable_pair_groups_nonempty"]),
+                    "swa_raw_transport_qk_similarity_mean": _scalar_mean(cosine),
+                    "swa_raw_transport_qk_similarity_max_mean": _scalar_mean(cosine.max(dim=-1).values),
+                    "swa_raw_transport_route_entropy_mean": _scalar_mean(entropy),
+                    "swa_raw_transport_feature_residual_mean": _scalar_mean(residual),
+                    "swa_raw_transport_cache_k_stability_mean": _scalar_mean(cache_k_stability),
+                    "swa_raw_transport_cache_v_stability_mean": _scalar_mean(cache_v_stability),
+                    "swa_raw_transport_top1_cache_index_unique_frac_mean": _scalar_mean(top1_index_unique_frac),
+                    "swa_raw_transport_top1_cache_frame_unique_frac_mean": _scalar_mean(top1_frame_unique_frac),
+                    "swa_raw_transport_top1_cache_index_switch_rate_mean": _scalar_mean(top1_index_switch_rate),
+                    "swa_raw_transport_top1_cache_frame_switch_rate_mean": _scalar_mean(top1_frame_switch_rate),
+                    "swa_raw_transport_top1_same_frame_frac_mean": _scalar_mean(top1_same_frame_frac),
+                    "swa_raw_transport_topk_query_frame_hit_frac_mean": _scalar_mean(topk_query_frame_hit_frac),
+                    "swa_raw_transport_topk_same_frame_frac_mean": _scalar_mean(topk_same_frame_frac),
+                    "swa_raw_transport_top1_abs_frame_delta_mean": _scalar_mean(top1_abs_frame_delta_mean),
+                    "swa_raw_transport_stable_pair_mass_mean": _scalar_mean(stable_mass),
+                    "swa_raw_transport_unreliable_pair_mass_mean": _scalar_mean(unreliable_mass),
+                    "swa_raw_transport_stable_actual_minus_random_mean": _scalar_mean(stable_delta),
+                    "swa_raw_transport_unreliable_actual_minus_random_mean": _scalar_mean(unreliable_delta),
+                }
+        except Exception as exc:  # pragma: no cover - diagnostic-only best effort.
+            return {
+                "swa_raw_transport_trace_available": False,
+                "swa_raw_transport_trace_error": f"{type(exc).__name__}: {exc}",
+            }
 
     def _make_swa_overlap_source_gate(
         self,
@@ -3716,6 +8162,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                         batch_size=B,
                         frame_num=N,
                         tokens_per_frame=hw,
+                        num_heads=int(getattr(getattr(blk, "attn", None), "num_heads", 0) or 0),
                         device=hidden_for_block.device,
                         dtype=hidden_for_block.dtype,
                     )
@@ -3776,10 +8223,19 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
             if self._hmc_hook_requested(hmc_control, hook_key):
                 mean_abs_bias = 0.0
                 max_abs_bias = 0.0
+                frame_bias_attention_mass_stats: Dict[str, Any] = {}
                 if attn_mask is not None and torch.is_tensor(attn_mask):
                     bias_abs = attn_mask.detach().float().abs()
                     mean_abs_bias = float(bias_abs.mean().item()) if bias_abs.numel() else 0.0
                     max_abs_bias = float(bias_abs.max().item()) if bias_abs.numel() else 0.0
+                    if hmc_attn_path == "frame_attention" and bool(hmc_control.get("frame_attention_record_bias_mass", False)):
+                        frame_bias_attention_mass_stats = self._sample_frame_bias_attention_mass_stats(
+                            blk,
+                            hidden_for_block,
+                            pos_for_block,
+                            attn_mask,
+                            max_queries=int(hmc_control.get("frame_attention_bias_mass_max_queries", 64) or 64),
+                        )
                 elif isinstance(attn_mask, dict) and attn_mask.get("type") == "compact_kv":
                     mean_abs_bias = 0.0
                     max_abs_bias = 0.0
@@ -3814,6 +8270,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                     "max_abs_query_gate_delta": max_abs_query_gate_delta,
                     "hook_site": "decoder_block_attn",
                     **context_skip_stats,
+                    **frame_bias_attention_mass_stats,
                 }
                 self._append_hmc_trace(hmc_trace, hmc_attn_path, trace_record)
             else:
@@ -3971,6 +8428,7 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                         "w2_old": output["w2_old"].detach().cpu(),
                         "apply_output_raw": output["apply_output_raw"].detach().cpu()
                         if output.get("apply_output_raw") is not None else None,
+                        "write_hidden": tokens_out.reshape(B, N * hw, -1).detach().cpu(),
                         "momentum": output["momentum"].detach().cpu() if output.get("momentum") is not None else None,
                         "muon_update_steps": output.get("muon_update_steps", 0),
                         "ttt_update_steps": output.get("ttt_update_steps", 1),
@@ -4076,6 +8534,93 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                     v_cache_controlled = v_cache
                     if swa_source_gate is not None:
                         v_cache_controlled = v_cache * swa_source_gate
+                    swa_prev_ttt_anchor_gate = None
+                    swa_prev_ttt_anchor_gate_stats: Dict[str, Any] = {
+                        "swa_prev_ttt_stable_anchor_gate_applied": False,
+                        "swa_prev_ttt_stable_anchor_gate_tokens": 0,
+                        "swa_prev_ttt_stable_anchor_gate_available": False,
+                    }
+                    if self._swa_prev_ttt_stable_anchor_layer_enabled(
+                        hmc_control,
+                        layer_idx=layer_idx,
+                        n_layers=len(insert_after_list),
+                    ):
+                        swa_prev_ttt_anchor_gate, swa_prev_ttt_anchor_gate_stats = (
+                            self._make_swa_prev_ttt_stable_anchor_gate(
+                                hmc_control,
+                                batch_size=B,
+                                tokens_per_frame=hw,
+                                history_tokens=history_tokens,
+                                device=v_cache.device,
+                                dtype=v_cache.dtype,
+                            )
+                        )
+                        if swa_prev_ttt_anchor_gate is not None:
+                            target = str(hmc_control.get("swa_prev_ttt_stable_anchor_gate_target", "v"))
+                            if target in {"v", "value", "kv", "both"}:
+                                v_cache_controlled = v_cache_controlled * swa_prev_ttt_anchor_gate
+                            if target in {"k", "key", "kv", "both"}:
+                                k_cache_controlled = k_cache_controlled * swa_prev_ttt_anchor_gate.to(
+                                    device=k_cache.device,
+                                    dtype=k_cache.dtype,
+                                )
+                    swa_prev_ttt_anchor_query_soft_stats: Dict[str, Any] = {
+                        "swa_prev_ttt_anchor_query_soft_available": False,
+                        "swa_prev_ttt_anchor_query_soft_applied": False,
+                        "swa_prev_ttt_anchor_query_soft_source_tokens": 0,
+                    }
+                    if self._swa_prev_ttt_anchor_query_soft_layer_enabled(
+                        hmc_control,
+                        layer_idx=layer_idx,
+                        n_layers=len(insert_after_list),
+                    ):
+                        swa_prev_ttt_anchor_query_soft, swa_prev_ttt_anchor_query_soft_stats = (
+                            self._make_swa_prev_ttt_anchor_query_soft_control(
+                                hmc_control,
+                                batch_size=B,
+                                tokens_per_frame=hw,
+                                history_tokens=history_tokens,
+                                device=x_curr_flat.device,
+                            )
+                        )
+                        if swa_prev_ttt_anchor_query_soft is not None:
+                            if swa_attn_mask is None:
+                                swa_attn_mask = swa_prev_ttt_anchor_query_soft
+                            else:
+                                swa_prev_ttt_anchor_query_soft_stats[
+                                    "swa_prev_ttt_anchor_query_soft_reason"
+                                ] = "incompatible_existing_swa_attn_mask"
+                    swa_prev_ttt_tracked_instance_query_soft_stats: Dict[str, Any] = {
+                        "swa_prev_ttt_tracked_instance_query_soft_available": False,
+                        "swa_prev_ttt_tracked_instance_query_soft_applied": False,
+                        "swa_prev_ttt_tracked_instance_query_soft_trace_only": True,
+                        "swa_prev_ttt_tracked_instance_query_soft_action_requested": False,
+                        "swa_prev_ttt_tracked_instance_query_soft_runtime_action_allowed": False,
+                        "swa_prev_ttt_tracked_instance_query_soft_source_tokens": 0,
+                    }
+                    if self._swa_prev_ttt_tracked_instance_query_soft_layer_enabled(
+                        hmc_control,
+                        layer_idx=layer_idx,
+                        n_layers=len(insert_after_list),
+                    ):
+                        (
+                            swa_prev_ttt_tracked_instance_query_soft,
+                            swa_prev_ttt_tracked_instance_query_soft_stats,
+                        ) = self._make_swa_prev_ttt_tracked_instance_query_soft_trace_control(
+                            hmc_control,
+                            batch_size=B,
+                            tokens_per_frame=hw,
+                            history_tokens=history_tokens,
+                            current_tokens=int(x_curr_flat.shape[1]),
+                            device=x_curr_flat.device,
+                        )
+                        if swa_prev_ttt_tracked_instance_query_soft is not None:
+                            if swa_attn_mask is None:
+                                swa_attn_mask = swa_prev_ttt_tracked_instance_query_soft
+                            else:
+                                swa_prev_ttt_tracked_instance_query_soft_stats[
+                                    "swa_prev_ttt_tracked_instance_query_soft_reason"
+                                ] = "incompatible_existing_swa_attn_mask"
                     swa_overlap_source_gate = None
                     swa_overlap_source_gate_stats: Dict[str, Any] = {
                         "swa_overlap_source_gate_applied": False,
@@ -4091,12 +8636,12 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                             batch_size=B,
                             frame_num=N,
                             tokens_per_frame=hw,
-	                            history_tokens=history_tokens,
-	                            current_tokens=int(N * hw),
-	                            device=v_cache.device,
-	                            dtype=v_cache.dtype,
-	                            swa_layer_idx=layer_idx,
-	                        )
+                            history_tokens=history_tokens,
+                            current_tokens=int(N * hw),
+                            device=v_cache.device,
+                            dtype=v_cache.dtype,
+                            swa_layer_idx=layer_idx,
+                        )
                         if swa_overlap_source_gate is not None:
                             target = str(hmc_control.get("swa_overlap_source_gate_target", "v"))
                             if target in {"v", "value", "kv", "both"}:
@@ -4120,12 +8665,12 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                             batch_size=B,
                             frame_num=N,
                             tokens_per_frame=hw,
-	                            history_tokens=history_tokens,
-	                            current_tokens=int(N * hw),
-	                            device=v_cache.device,
-	                            dtype=v_cache.dtype,
-	                            swa_layer_idx=layer_idx,
-	                        )
+                            history_tokens=history_tokens,
+                            current_tokens=int(N * hw),
+                            device=v_cache.device,
+                            dtype=v_cache.dtype,
+                            swa_layer_idx=layer_idx,
+                        )
                         if source_replace is not None:
                             source_start = int(source_replace["source_start"])
                             source_end = int(source_replace["source_end"])
@@ -4157,12 +8702,77 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                                 v_cache_controlled = _blend_source(v_cache_controlled, v_cur_cache)
                             if target in {"k", "key", "kv", "both"}:
                                 k_cache_controlled = _blend_source(k_cache_controlled, k_cur_cache)
+                    v102_state_machine_stats: Dict[str, Any] = {
+                        "v102_swa_state_machine_trace_available": False,
+                        "v102_swa_state_machine_trace_applied": False,
+                    }
+                    if self._v102_state_machine_trace_layer_enabled(
+                        hmc_control,
+                        layer_idx=layer_idx,
+                        n_layers=len(insert_after_list),
+                    ):
+                        v102_attn_mask, v102_state_machine_stats = self._make_v102_state_machine_action_probe(
+                            hmc_control,
+                            batch_size=B,
+                            tokens_per_frame=hw,
+                            history_tokens=history_tokens,
+                            current_tokens=int(N * hw),
+                            device=x_curr_flat.device,
+                            swa_layer_idx=layer_idx,
+                        )
+                        if v102_attn_mask is not None:
+                            if swa_attn_mask is None:
+                                swa_attn_mask = v102_attn_mask
+                            else:
+                                v102_state_machine_stats.update({
+                                    "v102_swa_state_machine_trace_applied": False,
+                                    "v102_swa_state_machine_scaffold_only": True,
+                                    "v102_swa_state_machine_reason": "incompatible_existing_swa_attn_mask",
+                                })
+                    swa_raw_transport_stats: Dict[str, Any] = {}
+                    if self._swa_raw_transport_trace_layer_enabled(
+                        hmc_control,
+                        layer_idx=layer_idx,
+                        n_layers=len(insert_after_list),
+                    ):
+                        q_cur_trace, k_cur_trace, v_cur_trace = self.swa_layers[layer_idx].compute_qkv_cache(
+                            x_curr_flat,
+                            xpos=pos_current,
+                        )
+                        swa_raw_transport_stats = self._dump_swa_raw_transport_trace(
+                            hmc_control,
+                            layer=int(i),
+                            swa_layer_idx=layer_idx,
+                            batch_size=B,
+                            frame_num=N,
+                            tokens_per_frame=hw,
+                            q_current=q_cur_trace,
+                            k_current=k_cur_trace,
+                            v_current=v_cur_trace,
+                            k_cache=k_cache,
+                            v_cache=v_cache,
+                            hidden_current=x_curr_flat,
+                            hidden_cache=history.get("hidden_pre") if isinstance(history, dict) else None,
+                            extra_trace_fields=v102_state_machine_stats,
+                        )
                     swa_trace_record: Optional[Dict[str, Any]] = None
                     if (
                         self._hmc_hook_requested(hmc_control, "enable_swa_read_control")
                         or self._hmc_hook_requested(hmc_control, "enable_swa_overlap_bias")
+                        or self._hmc_hook_requested(hmc_control, "enable_swa_prev_ttt_stable_anchor_gate")
+                        or self._hmc_hook_requested(hmc_control, "enable_swa_prev_ttt_anchor_query_soft")
+                        or self._hmc_hook_requested(
+                            hmc_control,
+                            "enable_swa_prev_ttt_tracked_instance_query_soft_trace",
+                        )
+                        or self._hmc_hook_requested(
+                            hmc_control,
+                            "enable_swa_prev_ttt_tracked_instance_query_soft_action",
+                        )
                         or self._hmc_hook_requested(hmc_control, "enable_swa_overlap_source_gate")
                         or self._hmc_hook_requested(hmc_control, "enable_swa_overlap_source_replace")
+                        or self._hmc_hook_requested(hmc_control, "enable_v102_state_machine_trace")
+                        or bool(swa_raw_transport_stats)
                     ):
                         gate_stats = {}
                         if swa_source_gate is not None:
@@ -4203,9 +8813,14 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                             "attn_mask_applied": swa_attn_mask is not None,
                             "hook_site": "swa_kv_cache_read",
                             **gate_stats,
+                            **swa_prev_ttt_anchor_gate_stats,
+                            **swa_prev_ttt_anchor_query_soft_stats,
+                            **swa_prev_ttt_tracked_instance_query_soft_stats,
                             **swa_overlap_bias_stats,
                             **swa_overlap_source_gate_stats,
                             **swa_overlap_source_replace_stats,
+                            **v102_state_machine_stats,
+                            **swa_raw_transport_stats,
                         }
                     swa_output_flat = self.swa_layers[layer_idx].forward_with_kv_cache(
                         x_curr_flat, k_cache_controlled, v_cache_controlled,
@@ -4334,6 +8949,10 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                         pca_swa_cache_v_parts.append((i, pca_swa_cache_v))
 
                 history_entry = {"k": k_new, "v": v_new}
+                if cache_ttt_primitives or (
+                    hmc_control and str(hmc_control.get("swa_raw_transport_trace_dir", "") or "").strip()
+                ):
+                    history_entry["hidden_pre"] = x_for_cache_flat.detach()
                 if hmc_control and hmc_control.get("swa_write_cache_store_post", False):
                     x_post_cache_flat = x_out_patch.reshape(B, N * hw, -1)
                     k_post, v_post = self.swa_layers[layer_idx].compute_kv_cache(
@@ -4652,10 +9271,15 @@ class Pi3(nn.Module, PyTorchModelHubMixin):
                 if entry is None:
                     moved.append(None)
                 else:
-                    moved.append({
+                    moved_entry = {
                         "k": entry["k"].to(device),
                         "v": entry["v"].to(device),
-                    })
+                    }
+                    for key in ("k_post", "v_post", "hidden_pre"):
+                        value = entry.get(key)
+                        if value is not None:
+                            moved_entry[key] = value.to(device)
+                    moved.append(moved_entry)
             return moved
 
         all_predictions = []

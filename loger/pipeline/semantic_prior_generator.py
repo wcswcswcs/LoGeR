@@ -159,6 +159,10 @@ class PriorOutput:
     R_global_tok: Optional[torch.Tensor] = None
     R_swa_tok: Optional[torch.Tensor] = None
     R_ttt_tok: Optional[torch.Tensor] = None
+    stage_c_seed_global_track_idx_patch_flat: Optional[torch.Tensor] = None
+    stage_c_seed_global_track_idx_tok: Optional[torch.Tensor] = None
+    stage_c_masklet_instance_idx_patch_flat: Optional[torch.Tensor] = None
+    stage_c_masklet_instance_idx_tok: Optional[torch.Tensor] = None
 
     B_chunk_geo: float = 0.0
     A_special: float = 1.0
@@ -194,6 +198,8 @@ def project_masklet_semantic_groups(
     )
     quality_patch = torch.zeros((T, H_tok, W_tok), dtype=torch.float32)
     label_patch = torch.full((T, H_tok, W_tok), -1, dtype=torch.long)
+    seed_patch = torch.full((T, H_tok, W_tok), -1, dtype=torch.long)
+    masklet_instance_patch = torch.full((T, H_tok, W_tok), -1, dtype=torch.long)
     best_score = torch.zeros((T, H_tok, W_tok), dtype=torch.float32)
 
     J = int(mo.num_masklets)
@@ -202,10 +208,15 @@ def project_masklet_semantic_groups(
         H_mask, W_mask = int(mo.frame_height), int(mo.frame_width)
         groups = mo.G_sem.detach().cpu().long().reshape(-1)
         label_ids = semantic_fine_label_ids_from_masklets(mo)
+        seed_ids = list(getattr(mo, "seed_global_track_idx", []) or [])
         trust = (mo.V_mask.detach().cpu().float() * mo.Q_mask.detach().cpu().float()).clamp(0.0, 1.0)
         for j in range(J):
             group_id = int(groups[j].item()) if j < int(groups.numel()) else int(SEMANTIC_GROUP_UNCERTAIN_REGION)
             label_id = int(label_ids[j].item()) if j < int(label_ids.numel()) else int(SEMANTIC_FINE_LABEL_UNKNOWN)
+            try:
+                seed_id = int(seed_ids[j]) if j < len(seed_ids) and seed_ids[j] is not None else -1
+            except (TypeError, ValueError):
+                seed_id = -1
             for t in range(T_use):
                 if not bool(mo.V_mask[j, t]):
                     continue
@@ -232,10 +243,18 @@ def project_masklet_semantic_groups(
                 group_patch[t] = torch.where(update, torch.full_like(group_patch[t], group_id), group_patch[t])
                 quality_patch[t] = torch.where(update, torch.full_like(quality_patch[t], q), quality_patch[t])
                 label_patch[t] = torch.where(update, torch.full_like(label_patch[t], label_id), label_patch[t])
+                seed_patch[t] = torch.where(update, torch.full_like(seed_patch[t], seed_id), seed_patch[t])
+                masklet_instance_patch[t] = torch.where(
+                    update,
+                    torch.full_like(masklet_instance_patch[t], int(j)),
+                    masklet_instance_patch[t],
+                )
 
     G_patch_flat = group_patch.reshape(-1).long()
     Q_patch_flat = quality_patch.reshape(-1).float().clamp(0.0, 1.0)
     L_patch_flat = label_patch.reshape(-1).long()
+    seed_patch_flat = seed_patch.reshape(-1).long()
+    masklet_instance_patch_flat = masklet_instance_patch.reshape(-1).long()
     R_patch_flat = semantic_roles_from_groups(G_patch_flat, Q_patch_flat)
     path_roles = semantic_path_role_priors_from_fine_labels(L_patch_flat, G_patch_flat, Q_patch_flat)
 
@@ -244,6 +263,8 @@ def project_masklet_semantic_groups(
     G_tok = torch.full((L_tok,), int(SEMANTIC_GROUP_UNCERTAIN_REGION), dtype=torch.long)
     Q_tok = torch.zeros((L_tok,), dtype=torch.float32)
     L_label_tok = torch.full((L_tok,), -1, dtype=torch.long)
+    seed_tok = torch.full((L_tok,), -1, dtype=torch.long)
+    masklet_instance_tok = torch.full((L_tok,), -1, dtype=torch.long)
     R_tok = torch.full((L_tok,), int(SEMANTIC_ROLE_FALLBACK), dtype=torch.long)
     R_frame_tok = torch.full((L_tok,), int(SEMANTIC_ROLE_FALLBACK), dtype=torch.long)
     R_global_tok = torch.full((L_tok,), int(SEMANTIC_ROLE_FALLBACK), dtype=torch.long)
@@ -256,6 +277,8 @@ def project_masklet_semantic_groups(
                 G_tok[i] = G_patch_flat[patch_idx]
                 Q_tok[i] = Q_patch_flat[patch_idx]
                 L_label_tok[i] = L_patch_flat[patch_idx]
+                seed_tok[i] = seed_patch_flat[patch_idx]
+                masklet_instance_tok[i] = masklet_instance_patch_flat[patch_idx]
                 R_tok[i] = R_patch_flat[patch_idx]
                 R_frame_tok[i] = path_roles["R_frame_patch_flat"][patch_idx]
                 R_global_tok[i] = path_roles["R_global_patch_flat"][patch_idx]
@@ -275,6 +298,10 @@ def project_masklet_semantic_groups(
         "G_sem_tok": G_tok,
         "Q_sem_tok": Q_tok,
         "L_sem_tok": L_label_tok,
+        "stage_c_seed_global_track_idx_patch_flat": seed_patch_flat,
+        "stage_c_seed_global_track_idx_tok": seed_tok,
+        "stage_c_masklet_instance_idx_patch_flat": masklet_instance_patch_flat,
+        "stage_c_masklet_instance_idx_tok": masklet_instance_tok,
         "R_sem_tok": R_tok,
         "R_frame_tok": R_frame_tok,
         "R_global_tok": R_global_tok,
@@ -561,6 +588,10 @@ def project_dense_semantic_label_maps(
     G_tok = torch.full((L_tok,), int(SEMANTIC_GROUP_UNCERTAIN_REGION), dtype=torch.long)
     Q_tok = torch.zeros((L_tok,), dtype=torch.float32)
     L_label_tok = torch.full((L_tok,), int(SEMANTIC_FINE_LABEL_UNKNOWN), dtype=torch.long)
+    seed_tok = torch.full((L_tok,), -1, dtype=torch.long)
+    seed_patch_flat = torch.full_like(L_patch_flat, -1, dtype=torch.long)
+    masklet_instance_tok = torch.full((L_tok,), -1, dtype=torch.long)
+    masklet_instance_patch_flat = torch.full_like(L_patch_flat, -1, dtype=torch.long)
     R_tok = torch.full((L_tok,), int(SEMANTIC_ROLE_FALLBACK), dtype=torch.long)
     R_frame_tok = torch.full((L_tok,), int(SEMANTIC_ROLE_FALLBACK), dtype=torch.long)
     R_global_tok = torch.full((L_tok,), int(SEMANTIC_ROLE_FALLBACK), dtype=torch.long)
@@ -601,6 +632,10 @@ def project_dense_semantic_label_maps(
         "G_sem_tok": G_tok,
         "Q_sem_tok": Q_tok,
         "L_sem_tok": L_label_tok,
+        "stage_c_seed_global_track_idx_patch_flat": seed_patch_flat,
+        "stage_c_seed_global_track_idx_tok": seed_tok,
+        "stage_c_masklet_instance_idx_patch_flat": masklet_instance_patch_flat,
+        "stage_c_masklet_instance_idx_tok": masklet_instance_tok,
         "R_sem_tok": R_tok,
         "R_frame_tok": R_frame_tok,
         "R_global_tok": R_global_tok,
@@ -848,6 +883,36 @@ class SemanticPriorGenerator:
             semantic_projection_source = str(
                 group_projection.get("debug", {}).get("semantic_source") or semantic_projection_source
             )
+            sparse_seed_projection = project_masklet_semantic_groups(
+                masklet,
+                geo,
+                num_frames=T,
+                pixel_resolution=(H_p, W_p),
+                patch_grid=(H_tok, W_tok),
+            )
+            group_projection["stage_c_seed_global_track_idx_patch_flat"] = sparse_seed_projection[
+                "stage_c_seed_global_track_idx_patch_flat"
+            ]
+            group_projection["stage_c_seed_global_track_idx_tok"] = sparse_seed_projection[
+                "stage_c_seed_global_track_idx_tok"
+            ]
+            group_projection["stage_c_masklet_instance_idx_patch_flat"] = sparse_seed_projection[
+                "stage_c_masklet_instance_idx_patch_flat"
+            ]
+            group_projection["stage_c_masklet_instance_idx_tok"] = sparse_seed_projection[
+                "stage_c_masklet_instance_idx_tok"
+            ]
+            group_projection.setdefault("debug", {})["stage_c_seed_projection_source"] = (
+                "masklet_sparse_projection_merged_with_dense_semantic_labels"
+            )
+            seed_tok = sparse_seed_projection["stage_c_seed_global_track_idx_tok"]
+            masklet_instance_tok = sparse_seed_projection["stage_c_masklet_instance_idx_tok"]
+            group_projection["debug"]["stage_c_seed_token_nonnegative_count"] = int(
+                (seed_tok.detach().cpu().long().reshape(-1) >= 0).sum().item()
+            )
+            group_projection["debug"]["stage_c_masklet_instance_token_nonnegative_count"] = int(
+                (masklet_instance_tok.detach().cpu().long().reshape(-1) >= 0).sum().item()
+            )
         V_sem_tok = torch.full((int(geo.token_type.numel()),), 1.0, dtype=torch.float32)
         token_type = geo.token_type.detach().cpu().long()
         patch_mask = token_type == TOKEN_TYPE_PATCH
@@ -885,6 +950,10 @@ class SemanticPriorGenerator:
             R_global_tok=group_projection["R_global_tok"],
             R_swa_tok=group_projection["R_swa_tok"],
             R_ttt_tok=group_projection["R_ttt_tok"],
+            stage_c_seed_global_track_idx_patch_flat=group_projection.get("stage_c_seed_global_track_idx_patch_flat"),
+            stage_c_seed_global_track_idx_tok=group_projection.get("stage_c_seed_global_track_idx_tok"),
+            stage_c_masklet_instance_idx_patch_flat=group_projection.get("stage_c_masklet_instance_idx_patch_flat"),
+            stage_c_masklet_instance_idx_tok=group_projection.get("stage_c_masklet_instance_idx_tok"),
             B_chunk_geo=B_chunk_geo,
             A_special=A_special,
             debug={
@@ -910,6 +979,9 @@ class SemanticPriorGenerator:
                 "dense_semantic_token_projection_nonempty": group_projection.get("debug", {}).get("dense_semantic_token_projection_nonempty"),
                 "dense_semantic_projection_mode": group_projection.get("debug", {}).get("dense_semantic_projection_mode"),
                 "dense_semantic_patch_purity": group_projection.get("debug", {}).get("dense_semantic_patch_purity"),
+                "stage_c_seed_projection_source": group_projection.get("debug", {}).get("stage_c_seed_projection_source"),
+                "stage_c_seed_token_nonnegative_count": group_projection.get("debug", {}).get("stage_c_seed_token_nonnegative_count"),
+                "stage_c_masklet_instance_token_nonnegative_count": group_projection.get("debug", {}).get("stage_c_masklet_instance_token_nonnegative_count"),
                 "dense_semantic_patch_confidence_mean": group_projection.get("debug", {}).get("dense_semantic_patch_confidence_mean"),
                 "semantic_trust_mean": group_projection.get("debug", {}).get("semantic_trust_mean"),
                 "dense_semantic_label_names": group_projection.get("debug", {}).get("dense_semantic_label_names"),

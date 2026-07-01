@@ -24,6 +24,11 @@ def main() -> None:
     parser.add_argument("--repeated-support-max-components", type=int, default=128)
     parser.add_argument("--repeated-support-max-groups-per-scene", type=int, default=80)
     parser.add_argument(
+        "--allow-duplicate-component-sets",
+        action="store_true",
+        help="Keep multiple representative masks even if they share the same scene/component set. Default keeps legacy deduplication.",
+    )
+    parser.add_argument(
         "--max-candidate-conflict-rate",
         type=float,
         default=-1.0,
@@ -50,6 +55,7 @@ def main() -> None:
         repeated_support_min_w_visible=args.repeated_support_min_w_visible,
         repeated_support_max_components=args.repeated_support_max_components,
         repeated_support_max_groups_per_scene=args.repeated_support_max_groups_per_scene,
+        deduplicate_component_sets=not bool(args.allow_duplicate_component_sets),
     )
     write_reprojection_ledger(args.output_root, payload, visualization_root=args.visualization_root)
     print(

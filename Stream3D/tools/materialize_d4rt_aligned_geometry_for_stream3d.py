@@ -40,6 +40,16 @@ def _read_seq_list(path: Path) -> list[str]:
 
 
 def _frame_ids_for_carrier_file(carrier_path: Path, num_frames: int) -> list[int]:
+    manifest_path = carrier_path.with_name(f"{carrier_path.stem}_manifest.json")
+    if manifest_path.exists():
+        try:
+            payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+            for key in ("raw_frame_ids", "frame_indices", "frame_ids"):
+                frame_ids = [int(value) for value in payload.get(key, [])]
+                if len(frame_ids) == num_frames:
+                    return frame_ids
+        except Exception:
+            pass
     summary_path = carrier_path.with_name(carrier_path.name.replace("carriers_", "").replace(".npz", "_summary.json"))
     if summary_path.exists():
         try:
@@ -49,6 +59,22 @@ def _frame_ids_for_carrier_file(carrier_path: Path, num_frames: int) -> list[int
                 return frame_ids
         except Exception:
             pass
+    try:
+        with np.load(carrier_path) as data:
+            src_frame = np.asarray(data.get("src_frame"), dtype=np.int64)
+            src_global = np.asarray(data.get("src_frame_global"), dtype=np.int64)
+        if src_frame.shape == src_global.shape and src_frame.size:
+            out: list[int] = []
+            for local_idx in range(num_frames):
+                vals = src_global[src_frame == local_idx]
+                if vals.size:
+                    uniq, counts = np.unique(vals, return_counts=True)
+                    out.append(int(uniq[np.argmax(counts)]))
+                else:
+                    out.append(int(local_idx))
+            return out
+    except Exception:
+        pass
     return list(range(num_frames))
 
 

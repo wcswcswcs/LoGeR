@@ -14,8 +14,9 @@ from .v47_common import (
     color_feature,
     dominant_gt,
     load_gt_label,
-    load_mask_label,
+    load_mask_label_from_root,
     read_json,
+    resolve_mask_dir,
     safe_mean,
     safe_quantile,
     utc_now,
@@ -63,6 +64,7 @@ def build_observation_tables(
     *,
     carrier_cache_root: Path,
     scenes: list[str],
+    mask_root: str | Path | None = None,
     visibility_threshold: float = 0.5,
     confidence_threshold: float = 0.5,
     min_mask_area: int = 64,
@@ -75,9 +77,14 @@ def build_observation_tables(
     source_manifests: list[dict[str, Any]] = []
     window_rows: list[dict[str, Any]] = []
     missing_scene_dirs: list[str] = []
+    resolved_mask_dirs: dict[str, str] = {}
     mask_node_serial = 0
 
     for scene in scenes:
+        resolved_mask_dir = resolve_mask_dir(mask_root, scene)
+        resolved_mask_dirs[scene] = str(
+            resolved_mask_dir.relative_to(ROOT) if resolved_mask_dir.is_relative_to(ROOT) else resolved_mask_dir
+        )
         scene_dir = carrier_cache_root / scene
         if not scene_dir.exists():
             missing_scene_dirs.append(scene)
@@ -99,7 +106,7 @@ def build_observation_tables(
             valid_uv_count = 0
             inside_count = 0
             for local_index, frame_id in enumerate(frame_ids[: uv_pred.shape[0]]):
-                label = load_mask_label(scene, int(frame_id))
+                label = load_mask_label_from_root(scene, int(frame_id), mask_root)
                 allowed_labels: set[int] = set()
                 mask_areas: dict[int, int] = {}
                 if label is not None:
@@ -266,6 +273,8 @@ def build_observation_tables(
         "carrier_cache_root": str(carrier_cache_root.relative_to(ROOT) if carrier_cache_root.is_relative_to(ROOT) else carrier_cache_root),
         "scenes": scenes,
         "missing_scene_dirs": missing_scene_dirs,
+        "mask_root_arg": str(mask_root or ""),
+        "resolved_mask_dirs": resolved_mask_dirs,
         "visibility_threshold": float(visibility_threshold),
         "confidence_threshold": float(confidence_threshold),
         "min_mask_area": int(min_mask_area),

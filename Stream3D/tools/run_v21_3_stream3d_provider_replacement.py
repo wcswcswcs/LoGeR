@@ -67,7 +67,14 @@ def _debug_frame_ids(debug_root: str | Path, scene: str) -> list[int]:
     return sorted(out)
 
 
-def _base_args(config_name: str, base_config: dict[str, Any], seq_name: str, backbone: str, debug: bool) -> SimpleNamespace:
+def _base_args(
+    config_name: str,
+    base_config: dict[str, Any],
+    seq_name: str,
+    backbone: str,
+    debug: bool,
+    frame_stride: int,
+) -> SimpleNamespace:
     payload = {
         "seq_name": seq_name,
         "seq_name_list": seq_name,
@@ -75,6 +82,7 @@ def _base_args(config_name: str, base_config: dict[str, Any], seq_name: str, bac
         "backbone": backbone,
         "debug": debug,
         "para": 1,
+        "frame_stride": int(frame_stride),
     }
     payload.update(base_config)
     return SimpleNamespace(**payload)
@@ -93,6 +101,11 @@ def _metric_from_file(path: Path) -> dict[str, float | None]:
         return {"ap": float(parts[0]), "ap50": float(parts[1]), "ap25": float(parts[2])}
     except ValueError:
         return {"ap": None, "ap50": None, "ap25": None}
+
+
+def _existing_segmentation_frame_ids(root: Path, scene: str, backbone: str) -> list[int]:
+    mask_dir = root / "data" / "scannet" / "processed" / scene / f"output_{backbone}" / "mask"
+    return sorted(int(path.stem) for path in mask_dir.glob("*.png") if path.stem.isdigit())
 
 
 def _prediction_stats(root: Path, config: str, scenes: list[str]) -> dict[str, Any]:
@@ -128,6 +141,7 @@ def _make_provider(spec: dict[str, Any], args: argparse.Namespace):
         debug_root=args.debug_root,
         mode=spec["mode"],
         nn_radius=args.nn_radius,
+        nn_k=args.nn_k,
         min_visibility=args.min_visibility,
         min_confidence=args.min_confidence,
         max_anchors=args.max_anchors,
@@ -136,6 +150,11 @@ def _make_provider(spec: dict[str, Any], args: argparse.Namespace):
         local_outlier_filter=bool(spec.get("local_outlier_filter", False)),
         min_mask_interior_px=float(spec.get("min_mask_interior_px", args.min_mask_interior_px)),
         overlap_policy=str(spec.get("overlap_policy", args.overlap_policy)),
+        stitch_uv_radius=float(spec.get("stitch_uv_radius", args.stitch_uv_radius)),
+        stitch_max_matches_per_frame=int(
+            spec.get("stitch_max_matches_per_frame", args.stitch_max_matches_per_frame)
+        ),
+        stitch_fit_trim_percentile=float(spec.get("stitch_fit_trim_percentile", args.stitch_fit_trim_percentile)),
     )
 
 
@@ -202,6 +221,30 @@ VARIANTS: dict[str, dict[str, Any]] = {
         "mode": "self_stitched_scale_normalized_density",
         "geometry_source": "d4rt_self_stitched_scale_normalized_density_carrier_provider",
         "overlap_policy": "best_confidence",
+    },
+    "G11": {
+        "label": "G11 D4RT scale-normalized self-stitch then eval-Sim3",
+        "provider": "d4rt",
+        "mode": "self_stitched_scale_normalized_eval_sim3",
+        "geometry_source": "d4rt_scale_normalized_self_stitched_then_eval_sim3_carrier_provider",
+        "overlap_policy": "best_confidence",
+    },
+    "G12": {
+        "label": "G12 D4RT scale-normalized self-stitch then eval-Sim3 density",
+        "provider": "d4rt",
+        "mode": "self_stitched_scale_normalized_eval_sim3_density",
+        "geometry_source": "d4rt_scale_normalized_self_stitched_then_eval_sim3_density_carrier_provider",
+        "overlap_policy": "best_confidence",
+    },
+    "G13": {
+        "label": "G13 D4RT direct-style self-stitch then eval-Sim3",
+        "provider": "d4rt",
+        "mode": "self_stitched_eval_sim3",
+        "geometry_source": "d4rt_direct_style_self_stitched_then_eval_sim3_carrier_provider",
+        "overlap_policy": "best_confidence",
+        "stitch_uv_radius": 0.002,
+        "stitch_max_matches_per_frame": 4096,
+        "stitch_fit_trim_percentile": 90.0,
     },
 }
 
@@ -292,13 +335,23 @@ def main() -> None:
     parser.add_argument("--base-config", default="configs/scannet.json")
     parser.add_argument("--backbone", default="Cropformer")
     parser.add_argument("--variants", default="G0,G1,G2,G3,G4,G5,G6")
+    parser.add_argument("--frame-stride", type=int, default=10)
+    parser.add_argument(
+        "--filter-existing-segmentation",
+        action="store_true",
+        help="Intersect the requested/debug frame support with available 2D segmentation files.",
+    )
     parser.add_argument("--min-visibility", type=float, default=0.5)
     parser.add_argument("--min-confidence", type=float, default=0.5)
     parser.add_argument("--max-anchors", type=int, default=8000)
     parser.add_argument("--robust-trim-percentile", type=float, default=90.0)
     parser.add_argument("--nn-radius", type=float, default=0.05)
+    parser.add_argument("--nn-k", type=int, default=1)
     parser.add_argument("--density-alpha", type=float, default=2.0)
     parser.add_argument("--min-mask-interior-px", type=float, default=0.0)
+    parser.add_argument("--stitch-uv-radius", type=float, default=0.01)
+    parser.add_argument("--stitch-max-matches-per-frame", type=int, default=512)
+    parser.add_argument("--stitch-fit-trim-percentile", type=float, default=0.0)
     parser.add_argument(
         "--overlap-policy",
         choices=["all", "all_window_union", "best_confidence", "lowest_residual", "newest_window"],
@@ -329,14 +382,36 @@ def main() -> None:
             "error": "",
             "geometry_source": spec["geometry_source"],
             "runtime_seconds": None,
+            "frame_stride": int(args.frame_stride),
+            "filter_existing_segmentation": bool(args.filter_existing_segmentation),
+            "min_visibility": float(args.min_visibility),
+            "min_confidence": float(args.min_confidence),
+            "stitch_uv_radius": float(spec.get("stitch_uv_radius", args.stitch_uv_radius)),
+            "stitch_max_matches_per_frame": int(
+                spec.get("stitch_max_matches_per_frame", args.stitch_max_matches_per_frame)
+            ),
+            "stitch_fit_trim_percentile": float(
+                spec.get("stitch_fit_trim_percentile", args.stitch_fit_trim_percentile)
+            ),
+            "nn_radius": float(args.nn_radius),
+            "nn_k": int(args.nn_k),
         }
         started = time.time()
         scene_errors = []
         for scene in scenes:
-            run_args = _base_args(output_config, base_config, scene, args.backbone, args.debug)
+            run_args = _base_args(output_config, base_config, scene, args.backbone, args.debug, int(args.frame_stride))
             run_args.geometry_provider = provider
             if args.limit_to_debug_frames:
                 run_args.frame_id_allowlist = _debug_frame_ids(args.debug_root, scene)
+            if args.filter_existing_segmentation:
+                available = set(_existing_segmentation_frame_ids(root, scene, args.backbone))
+                if hasattr(run_args, "frame_id_allowlist"):
+                    run_args.frame_id_allowlist = sorted(int(v) for v in run_args.frame_id_allowlist if int(v) in available)
+                else:
+                    run_args.frame_id_allowlist = sorted(available)
+                if not run_args.frame_id_allowlist:
+                    scene_errors.append(f"{scene}: no existing segmentation frames after filter")
+                    continue
             try:
                 stream3d_main(run_args, para=1)
             except Exception as exc:
@@ -376,6 +451,19 @@ def main() -> None:
                 "support_source": "own",
                 "geometry_source": spec["geometry_source"],
                 "eval_policy": "v21_3_provider_replacement_diagnostic",
+                "frame_stride": int(args.frame_stride),
+                "filter_existing_segmentation": bool(args.filter_existing_segmentation),
+                "min_visibility": float(args.min_visibility),
+                "min_confidence": float(args.min_confidence),
+                "nn_radius": float(args.nn_radius),
+                "nn_k": int(args.nn_k),
+                "stitch_uv_radius": float(spec.get("stitch_uv_radius", args.stitch_uv_radius)),
+                "stitch_max_matches_per_frame": int(
+                    spec.get("stitch_max_matches_per_frame", args.stitch_max_matches_per_frame)
+                ),
+                "stitch_fit_trim_percentile": float(
+                    spec.get("stitch_fit_trim_percentile", args.stitch_fit_trim_percentile)
+                ),
                 "uses_rgbd_for_prediction": uses_rgbd,
                 "uses_pose_for_prediction": uses_rgbd,
                 "uses_scannet_mesh_for_prediction": True,

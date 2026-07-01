@@ -123,6 +123,7 @@ class TTTLayerCache:
     ttt_update_steps: int
     ttt_op_order: list
     apply_output_raw: Optional[torch.Tensor] = None
+    write_hidden: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -383,10 +384,15 @@ class LoGeRGeometryBackbone:
             if entry is None:
                 copied.append(None)
             else:
-                copied.append({
+                copied_entry = {
                     "k": entry["k"].clone(),
                     "v": entry["v"].clone(),
-                })
+                }
+                for key in ("k_post", "v_post", "hidden_pre"):
+                    value = entry.get(key)
+                    if value is not None:
+                        copied_entry[key] = value.clone()
+                copied.append(copied_entry)
         return copied
 
     def _move_ttt_state_to_device(
@@ -408,10 +414,15 @@ class LoGeRGeometryBackbone:
                 if entry is None:
                     moved_history.append(None)
                 else:
-                    moved_history.append({
+                    moved_entry = {
                         "k": entry["k"].to(self.device),
                         "v": entry["v"].to(self.device),
-                    })
+                    }
+                    for key in ("k_post", "v_post", "hidden_pre"):
+                        value = entry.get(key)
+                        if value is not None:
+                            moved_entry[key] = value.to(self.device)
+                    moved_history.append(moved_entry)
             moved["history"] = moved_history
         return moved
 
@@ -439,10 +450,15 @@ class LoGeRGeometryBackbone:
                 if entry is None:
                     history_cpu.append(None)
                 else:
-                    history_cpu.append({
+                    history_entry = {
                         "k": entry["k"].detach().cpu(),
                         "v": entry["v"].detach().cpu(),
-                    })
+                    }
+                    for key in ("k_post", "v_post", "hidden_pre"):
+                        value = entry.get(key)
+                        if value is not None:
+                            history_entry[key] = value.detach().cpu()
+                    history_cpu.append(history_entry)
             state["history"] = history_cpu
         return state
 
@@ -563,6 +579,8 @@ class LoGeRGeometryBackbone:
                     ttt_op_order=wc["ttt_op_order"],
                     apply_output_raw=wc.get("apply_output_raw", None).cpu()
                     if wc.get("apply_output_raw", None) is not None else None,
+                    write_hidden=wc.get("write_hidden", None).cpu()
+                    if wc.get("write_hidden", None) is not None else None,
                 ))
 
             for li in range(n_layers):
@@ -594,6 +612,8 @@ class LoGeRGeometryBackbone:
                             copied["k_post"] = entry["k_post"].detach().cpu()
                         if "v_post" in entry and entry["v_post"] is not None:
                             copied["v_post"] = entry["v_post"].detach().cpu()
+                        if "hidden_pre" in entry and entry["hidden_pre"] is not None:
+                            copied["hidden_pre"] = entry["hidden_pre"].detach().cpu()
                         history_prov.append(copied)
 
         return WriteCacheOutput(

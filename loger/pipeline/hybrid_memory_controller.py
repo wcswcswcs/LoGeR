@@ -306,6 +306,10 @@ class HybridMemoryControlPrior:
     R_global_tok: Optional[torch.Tensor] = None
     R_swa_tok: Optional[torch.Tensor] = None
     R_ttt_tok: Optional[torch.Tensor] = None
+    stage_c_seed_global_track_idx_tok: Optional[torch.Tensor] = None
+    stage_c_masklet_instance_idx_tok: Optional[torch.Tensor] = None
+    K_stable_tok: Optional[torch.Tensor] = None
+    swa_redirection_source_mask_tok: Optional[torch.Tensor] = None
     C_ttt_conflict_tok: Optional[torch.Tensor] = None
     S_scale_risk_tok: Optional[torch.Tensor] = None
     A_anchor_tok: Optional[torch.Tensor] = None
@@ -909,6 +913,14 @@ def _parse_v67_semantic_cue(read_cue_source: str) -> Optional[Dict[str, Any]]:
 def _strip_v68_control_suffix(body: str) -> Tuple[str, str]:
     control = "none"
     suffixes = (
+        ("confidence_neutral_anchor_comp_same_attention_mass_random", "confidence_neutral_anchor_comp_same_attention_mass_random"),
+        ("confidence_neutral_anchor_comp_group_stratified_random", "confidence_neutral_anchor_comp_group_stratified_random"),
+        ("confidence_neutral_anchor_comp_label_shuffled", "confidence_neutral_anchor_comp_label_shuffled"),
+        ("confidence_neutral_anchor_comp", "confidence_neutral_anchor_comp"),
+        ("confidence_neutral_same_attention_mass_random", "confidence_neutral_same_attention_mass_random"),
+        ("confidence_neutral_group_stratified_random", "confidence_neutral_group_stratified_random"),
+        ("confidence_neutral_label_shuffled", "confidence_neutral_label_shuffled"),
+        ("confidence_neutral", "confidence_neutral"),
         ("same_composition_and_dg_random", "same_composition_and_dg_random"),
         ("same_composition_dg_random", "same_composition_and_dg_random"),
         ("random_same_composition_and_dg", "same_composition_and_dg_random"),
@@ -1085,12 +1097,41 @@ def _apply_v68_read_output_control(
 ) -> Tuple[torch.Tensor, Dict[str, Any]]:
     vals = values.detach().cpu().float().reshape(-1)
     control_l = str(control or "none").strip().lower()
+    post_control_l = control_l
+    if control_l == "confidence_neutral_same_attention_mass_random":
+        post_control_l = "same_attention_mass_random"
+    elif control_l == "confidence_neutral_group_stratified_random":
+        post_control_l = "group_stratified_random"
+    elif control_l == "confidence_neutral_anchor_comp_same_attention_mass_random":
+        post_control_l = "same_attention_mass_random"
+    elif control_l == "confidence_neutral_anchor_comp_group_stratified_random":
+        post_control_l = "group_stratified_random"
+    elif control_l in {"confidence_neutral", "confidence_neutral_label_shuffled"}:
+        post_control_l = "none"
+    elif control_l in {"confidence_neutral_anchor_comp", "confidence_neutral_anchor_comp_label_shuffled"}:
+        post_control_l = "none"
     seed = 6817000.0 + max(int(chunk_idx), 0) * 101.0
     debug: Dict[str, Any] = {
         "v68_read_control_applied": False,
         "v68_read_control_effective": control_l,
+        "v68_read_control_post_effective": post_control_l,
     }
-    if control_l not in {
+    if post_control_l == "geometry_only":
+        mot = torch.nan_to_num(motion.detach().cpu().float().reshape(-1), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+        if int(mot.numel()) != int(vals.numel()):
+            debug.update({
+                "v68_read_control_shuffle_reason": "geometry_motion_size_mismatch",
+                "v68_read_control_motion_tokens": int(mot.numel()),
+                "v68_read_control_value_tokens": int(vals.numel()),
+            })
+            return vals, debug
+        debug.update({
+            "v68_read_control_applied": True,
+            "v68_read_control_shuffle_mode": "geometry_only_motion_replace",
+            "v68_read_control_eligible_tokens": int(vals.numel()),
+        })
+        return mot, debug
+    if post_control_l not in {
         "same_cue_distribution_random",
         "same_attention_mass_random",
         "group_stratified_random",
@@ -1105,7 +1146,7 @@ def _apply_v68_read_output_control(
     lowstuff = meta.get("lowstuff")
     high_d = meta.get("high_d")
     mot = meta.get("motion")
-    if control_l == "same_cue_distribution_random":
+    if post_control_l == "same_cue_distribution_random":
         perm = _deterministic_permutation(torch.arange(int(vals.numel())), seed=seed)
         out = vals[perm]
         debug.update({
@@ -1114,7 +1155,7 @@ def _apply_v68_read_output_control(
             "v68_read_control_eligible_tokens": int(vals.numel()),
         })
         return out, debug
-    if control_l == "same_attention_mass_random":
+    if post_control_l == "same_attention_mass_random":
         n = int(vals.numel())
         T = max(int(num_frames), 1)
         if n > 1 and n % T == 0:
@@ -1135,26 +1176,26 @@ def _apply_v68_read_output_control(
         debug.update(sub_debug)
         debug["v68_read_control_applied"] = True
         return out, debug
-    if control_l == "group_stratified_random":
+    if post_control_l == "group_stratified_random":
         out, sub_debug = _shuffle_values_within_strata(vals, groups, seed=seed)
         debug.update(sub_debug)
         debug["v68_read_control_applied"] = True
         return out, debug
-    if control_l == "lowstuff_within_group_random":
+    if post_control_l == "lowstuff_within_group_random":
         eligible = lowstuff if lowstuff is not None else torch.zeros_like(vals, dtype=torch.bool)
         out, sub_debug = _shuffle_values_in_eligible_strata(vals, eligible, groups, seed=seed)
         debug.update(sub_debug)
         debug["v68_read_control_applied"] = True
         debug["v68_read_control_lowstuff_tokens"] = int(eligible.sum().item()) if eligible is not None else 0
         return out, debug
-    if control_l == "high_d_within_group_random":
+    if post_control_l == "high_d_within_group_random":
         eligible = high_d if high_d is not None else torch.zeros_like(vals, dtype=torch.bool)
         out, sub_debug = _shuffle_values_in_eligible_strata(vals, eligible, groups, seed=seed)
         debug.update(sub_debug)
         debug["v68_read_control_applied"] = True
         debug["v68_read_control_high_d_tokens"] = int(eligible.sum().item()) if eligible is not None else 0
         return out, debug
-    if control_l == "same_composition_and_dg_random":
+    if post_control_l == "same_composition_and_dg_random":
         n = int(vals.numel())
         if mot is not None and int(mot.numel()) == n:
             q1 = torch.quantile(mot, 0.25)
@@ -1272,6 +1313,88 @@ def _parse_v78_l07_l13_read_cue(read_cue_source: str) -> Optional[Dict[str, Any]
     }
 
 
+_V95_TRACKH_GATED_L07_SOURCES = {
+    "gate.fa_key_all_mean_ge_q60.then_v78_l07",
+    "gate.fa_key_middle_mean_ge_q60.then_v78_l07",
+    "gate.gg_qk_shallow_mean_le_q40.then_v78_l07",
+    "gate.gg_qk_shallow_mean_le_q40.chunk_ge_6.then_v78_l07",
+    "gate.gg_qk_shallow_mean_le_q40.chunk_ge_6.rtok_ge_0p005.then_v78_l07",
+    "gate.gg_qk_shallow_mean_le_q40.chunk_ge_33.rtok_ge_0p005.then_v78_l07",
+    "gate.gg_qk_shallow_mean_le_q40.chunk_eq_33.rtok_ge_0p005.then_v78_l07",
+    "gate.gg_qk_shallow_mean_le_q40.chunk_eq_36.rtok_ge_0p005.then_v78_l07",
+}
+
+_V95_TRACKH_GATED_L07_CONTROL_SUFFIX_TO_CUE = {
+    ".geometry_only": "v78.l07_l13.l07_action_only.geometry_only",
+    ".label_shuffled": "v78.l07_l13.l07_action_only.label_shuffled",
+    ".confidence_shuffled": "v78.l07_l13.l07_action_only.confidence_shuffled",
+    ".same_attention_mass_random": "v78.l07_l13.l07_action_only.same_attention_mass_random",
+    ".group_stratified_random": "v78.l07_l13.l07_action_only.group_stratified_random",
+    ".confidence_neutral": "v78.l07_l13.l07_action_only.confidence_neutral",
+    ".confidence_neutral_label_shuffled": "v78.l07_l13.l07_action_only.confidence_neutral_label_shuffled",
+    ".confidence_neutral_same_attention_mass_random": "v78.l07_l13.l07_action_only.confidence_neutral_same_attention_mass_random",
+    ".confidence_neutral_group_stratified_random": "v78.l07_l13.l07_action_only.confidence_neutral_group_stratified_random",
+    ".confidence_neutral_anchor_comp": "v78.l07_l13.l07_action_only.confidence_neutral_anchor_comp",
+    ".confidence_neutral_anchor_comp_label_shuffled": "v78.l07_l13.l07_action_only.confidence_neutral_anchor_comp_label_shuffled",
+    ".confidence_neutral_anchor_comp_same_attention_mass_random": "v78.l07_l13.l07_action_only.confidence_neutral_anchor_comp_same_attention_mass_random",
+    ".confidence_neutral_anchor_comp_group_stratified_random": "v78.l07_l13.l07_action_only.confidence_neutral_anchor_comp_group_stratified_random",
+}
+
+_V95_TRACKH_GATED_L07_SOURCES = _V95_TRACKH_GATED_L07_SOURCES | {
+    f"gate.gg_qk_shallow_mean_le_q40.chunk_ge_{min_chunk}.rtok_ge_0p005.then_v78_l07{suffix}"
+    for min_chunk in (6, 33)
+    for suffix in _V95_TRACKH_GATED_L07_CONTROL_SUFFIX_TO_CUE
+} | {
+    f"gate.gg_qk_shallow_mean_le_q40.chunk_eq_{chunk_idx}.rtok_ge_0p005.then_v78_l07{suffix}"
+    for chunk_idx in (33, 36)
+    for suffix in _V95_TRACKH_GATED_L07_CONTROL_SUFFIX_TO_CUE
+}
+
+
+def _is_v95_trackh_gated_l07_source(read_cue_source: str) -> bool:
+    return str(read_cue_source or "").strip() in _V95_TRACKH_GATED_L07_SOURCES
+
+
+def _v95_trackh_gated_l07_gate_key(read_cue_source: str) -> str:
+    src = str(read_cue_source or "").strip()
+    for suffix in _V95_TRACKH_GATED_L07_CONTROL_SUFFIX_TO_CUE:
+        if src.endswith(suffix):
+            return src[: -len(suffix)]
+    return src
+
+
+def _v95_trackh_gated_l07_active_read_cue(read_cue_source: str) -> str:
+    src = str(read_cue_source or "").strip()
+    for suffix, cue in _V95_TRACKH_GATED_L07_CONTROL_SUFFIX_TO_CUE.items():
+        if src.endswith(suffix):
+            return cue
+    return "v78.l07_l13.l07_action_only"
+
+
+def _read_cue_requires_semantic_prior(read_cue_source: str) -> bool:
+    src = str(read_cue_source or "").strip()
+    lowered = src.lower()
+    if lowered.startswith("v68.read."):
+        return not any(token in lowered for token in (".geometry_only", "_geometry_only", ".geo_only", "_geo_only"))
+    if lowered.startswith("v78.l07_l13."):
+        return True
+    if _is_v95_trackh_gated_l07_source(lowered):
+        return True
+    if lowered.startswith("v67.semgeo_"):
+        return True
+    if lowered.startswith("v67.semcue_"):
+        return True
+    if lowered.startswith("v67.semz_") and lowered.endswith(".c23past"):
+        return True
+    if lowered in {"v31.sem_z_fine.c23past", "v31.sem_z_coarse.c23past"}:
+        return True
+    if lowered.startswith(("v31.sem_resid_fine_l", "v31.sem_resid_coarse_l")) and lowered.endswith(".c23past"):
+        return True
+    if lowered.startswith("semantic_anchor_rescue."):
+        return True
+    return False
+
+
 def _strip_v70_radio_control_suffix(body: str) -> Tuple[str, str]:
     control = "none"
     suffixes = (
@@ -1331,6 +1454,19 @@ def _v70_radio_sidecar_path(sidecar_dir: str, chunk_idx: int) -> Optional[Path]:
     if not root.is_dir():
         return None
     hits = sorted(root.glob(f"chunk_{int(chunk_idx):03d}_*/radio_sidecar.pt"))
+    return hits[0] if hits else None
+
+
+def _semantic_overlap_support_path(support_dir: str, chunk_idx: int, kind: str) -> Optional[Path]:
+    root = Path(str(support_dir or "")).expanduser()
+    if not root.is_dir():
+        return None
+    hits = sorted(root.glob(f"**/chunk_{int(chunk_idx):03d}_swa_overlap_*_layer_*.pt"))
+    preferred_kind = str(kind or "").strip()
+    if preferred_kind:
+        preferred = [p for p in hits if f"_swa_overlap_{preferred_kind}_" in p.name]
+        if preferred:
+            hits = preferred
     return hits[0] if hits else None
 
 
@@ -1493,22 +1629,39 @@ def _v68_patch_semantic_support_risk(
         debug["v68_read_semantic_reason"] = "missing_trust"
         return zeros, torch.ones((n_patch,), dtype=torch.float32), zeros, debug
 
+    control_l = str(control).strip().lower()
     trust = Q_patch.detach().cpu().float().reshape(-1).clamp(0.0, 1.0)
     labels = L_patch.detach().cpu().long().reshape(-1) if L_patch is not None and int(L_patch.numel()) == n_patch else None
     groups = G_patch.detach().cpu().long().reshape(-1) if G_patch is not None and int(G_patch.numel()) == n_patch else None
 
     seed = 6809000 + max(int(chunk_idx), 0) * 101.0
-    if control in {"label_shuffled", "joint_label_confidence_shuffled"}:
+    if control_l in {
+        "label_shuffled",
+        "joint_label_confidence_shuffled",
+        "confidence_neutral_label_shuffled",
+        "confidence_neutral_anchor_comp_label_shuffled",
+    }:
         noise = _deterministic_patch_noise(n_patch, seed=seed + 11.0)
         perm = torch.argsort(noise, stable=True)
         if labels is not None:
             labels = labels[perm]
         if groups is not None:
             groups = groups[perm]
-    if control in {"confidence_shuffled", "joint_label_confidence_shuffled"}:
+    if control_l in {"confidence_shuffled", "joint_label_confidence_shuffled"}:
         noise = _deterministic_patch_noise(n_patch, seed=seed + 23.0)
         perm = torch.argsort(noise, stable=True)
         trust = trust[perm]
+    if control_l in {
+        "confidence_neutral",
+        "confidence_neutral_label_shuffled",
+        "confidence_neutral_same_attention_mass_random",
+        "confidence_neutral_group_stratified_random",
+        "confidence_neutral_anchor_comp",
+        "confidence_neutral_anchor_comp_label_shuffled",
+        "confidence_neutral_anchor_comp_same_attention_mass_random",
+        "confidence_neutral_anchor_comp_group_stratified_random",
+    }:
+        trust = torch.ones_like(trust)
 
     vertical = torch.zeros((n_patch,), dtype=torch.bool)
     road = torch.zeros((n_patch,), dtype=torch.bool)
@@ -1552,6 +1705,7 @@ def _v68_patch_semantic_support_risk(
     debug.update({
         "v68_read_semantic_available": True,
         "v68_read_semantic_reason": "ok",
+        "v68_read_semantic_confidence_neutralized": control_l.startswith("confidence_neutral"),
         "v68_read_semantic_trust_mean": float(trust.mean().item()) if trust.numel() else 0.0,
         "v68_read_semantic_support_mean": float(support.mean().item()) if support.numel() else 0.0,
         "v68_read_semantic_support_q90": float(torch.quantile(support, 0.90).item()) if support.numel() else 0.0,
@@ -1824,6 +1978,11 @@ def _v78_l07_l13_read_cue_patch(
         out = _robust_quantile01((l13_neg * contrast).clamp(0.0, 1.0), num_frames=max(int(num_frames), 1))
     else:
         out = (l13_neg * l07_layout).clamp(0.0, 1.0)
+    anchor_comp_requested = "anchor_comp" in control.lower()
+    anchor_comp_applied = False
+    anchor_comp_strength = 0.0
+    anchor_comp_gate = (support * l07_layout).clamp(0.0, 1.0)
+    anchor_comp_before = out.clone()
     out_before_control = out.clone()
     out, control_debug = _apply_v68_read_output_control(
         out,
@@ -1845,6 +2004,18 @@ def _v78_l07_l13_read_cue_patch(
         "v78_l07_l13_l07_layout_gt050_mass": float((l07_layout > 0.50).float().mean().item()) if l07_layout.numel() else 0.0,
         "v78_l07_l13_l13_neg_mean": float(l13_neg.mean().item()) if l13_neg.numel() else 0.0,
         "v78_l07_l13_l13_neg_q90": float(torch.quantile(l13_neg, 0.90).item()) if l13_neg.numel() else 0.0,
+        "v78_l07_l13_anchor_comp_requested": bool(anchor_comp_requested),
+        "v78_l07_l13_anchor_comp_applied": bool(anchor_comp_applied),
+        "v78_l07_l13_anchor_comp_strength": float(anchor_comp_strength) if anchor_comp_applied else 0.0,
+        "v78_l07_l13_anchor_comp_gate_mean": float(anchor_comp_gate.mean().item()) if anchor_comp_gate.numel() else 0.0,
+        "v78_l07_l13_anchor_comp_gate_q90": float(torch.quantile(anchor_comp_gate, 0.90).item()) if anchor_comp_gate.numel() else 0.0,
+        "v78_l07_l13_anchor_comp_output_mean_before": float(anchor_comp_before.mean().item()) if anchor_comp_before.numel() else 0.0,
+        "v78_l07_l13_anchor_comp_output_mean_after": float(out_before_control.mean().item()) if out_before_control.numel() else 0.0,
+        "v78_l07_l13_anchor_comp_removed_mean": (
+            float((anchor_comp_before - out_before_control).mean().item())
+            if anchor_comp_before.numel() and out_before_control.numel()
+            else 0.0
+        ),
         "v78_l07_l13_output_mean_before_control": float(out_before_control.mean().item()) if out_before_control.numel() else 0.0,
         "v78_l07_l13_output_q90_before_control": float(torch.quantile(out_before_control, 0.90).item()) if out_before_control.numel() else 0.0,
         "v78_l07_l13_output_gt050_mass_before_control": float((out_before_control > 0.50).float().mean().item()) if out_before_control.numel() else 0.0,
@@ -2423,6 +2594,7 @@ def _frame_bias_energy(
     *,
     num_frames: int,
     mode: str,
+    K_stable_tok: Optional[torch.Tensor] = None,
 ) -> float:
     D = D_tok.detach().cpu().float().reshape(-1)
     ref = P_ref.detach().cpu().float().reshape(-1) if P_ref is not None else torch.zeros_like(D)
@@ -2436,6 +2608,30 @@ def _frame_bias_energy(
         keep = (1.0 - Dk).expand(-1, tokens_per_frame, -1)
     elif mode == "query":
         return 0.0
+    elif mode in {
+        "qk_pair_stable_harm",
+        "qk_pair_random_same_mass",
+        "read_qk_pair_bias",
+        "qk_pair_key_stability",
+        "qk_pair_key_stability_random_same_mass",
+    }:
+        q_risk = Dq.clamp(0.0, 1.0)
+        if mode in {"qk_pair_key_stability", "qk_pair_key_stability_random_same_mass"} and K_stable_tok is not None:
+            K = K_stable_tok.detach().cpu().float().reshape(-1)
+            if K.numel() == D_tok.detach().cpu().reshape(-1).numel():
+                K = K.reshape(num_frames, tokens_per_frame)
+                if P_ref is not None:
+                    K = K * (1.0 - ref.clamp(0.0, 1.0).reshape(num_frames, tokens_per_frame))
+                k_stable = K.clamp(0.0, 1.0)[:, None, :]
+                k_harm = (1.0 - k_stable).clamp(0.0, 1.0)
+            else:
+                k_harm = Dk.clamp(0.0, 1.0)
+                k_stable = (1.0 - k_harm).clamp(0.0, 1.0)
+        else:
+            k_harm = Dk.clamp(0.0, 1.0)
+            k_stable = (1.0 - k_harm).clamp(0.0, 1.0)
+        pair_score = q_risk * (k_stable - k_harm)
+        return float(pair_score.abs().mean().item()) if pair_score.numel() else 0.0
     else:
         keep = 1.0 - (1.0 - Dq) * Dk
     bias = torch.log(keep.clamp_min(1e-4))
@@ -2502,6 +2698,92 @@ def _flatten_layer_group_map(
     else:
         reduced = selected.mean(dim=1)
     return _flatten_or_default(reduced, default)
+
+
+def _valid_patch_signal(values: torch.Tensor) -> bool:
+    vals = torch.nan_to_num(values.detach().cpu().float().reshape(-1), nan=0.0, posinf=0.0, neginf=0.0)
+    return bool(vals.numel() > 0 and float(vals.max().item()) > 1e-6)
+
+
+def _patch_signal_debug(prefix: str, values: torch.Tensor) -> Dict[str, Any]:
+    vals = torch.nan_to_num(values.detach().cpu().float().reshape(-1), nan=0.0, posinf=0.0, neginf=0.0)
+    if int(vals.numel()) <= 0:
+        return {
+            f"{prefix}_mean": None,
+            f"{prefix}_q90": None,
+            f"{prefix}_max": None,
+            f"{prefix}_gt050_mass": 0.0,
+        }
+    return {
+        f"{prefix}_mean": float(vals.mean().item()),
+        f"{prefix}_q90": float(torch.quantile(vals, 0.90).item()),
+        f"{prefix}_max": float(vals.max().item()),
+        f"{prefix}_gt050_mass": float((vals > 0.50).float().mean().item()),
+    }
+
+
+def _select_frame_key_stability_patch(
+    geo: GeometryOutput,
+    default: torch.Tensor,
+    *,
+    num_frames: int,
+) -> Tuple[torch.Tensor, Dict[str, Any]]:
+    """Select a non-GT key-stability source without silently zeroing missing avg maps."""
+    zero = torch.zeros_like(default.detach().cpu().float().reshape(-1))
+    candidates: List[Tuple[str, torch.Tensor]] = []
+
+    avg_raw = _flatten_optional_patch_map(geo.frame_attn_key_cosine_avg)
+    if avg_raw is not None and int(avg_raw.numel()) > 0:
+        candidates.append((
+            "frame_attn_key_cosine_avg",
+            _normalize01(_flatten_or_default(geo.frame_attn_key_cosine_avg, default)),
+        ))
+
+    if geo.frame_attn_cosine_key_layers is not None:
+        candidates.append((
+            "frame_attn_cosine_key_layers_all_robustq",
+            _robust_quantile01(
+                _flatten_layer_group_map(
+                    geo.frame_attn_cosine_key_layers,
+                    geo.frame_attn_cosine_layer_ids,
+                    default,
+                    group="all",
+                ),
+                num_frames=num_frames,
+            ),
+        ))
+
+    endpoint_parts: List[torch.Tensor] = []
+    for field_name in ("frame_attn_key_cosine_l0", "frame_attn_key_cosine_l4"):
+        vals = _flatten_optional_patch_map(getattr(geo, field_name, None))
+        if vals is None or int(vals.numel()) <= 0:
+            continue
+        endpoint_parts.append(_flatten_or_default(getattr(geo, field_name), default))
+    if endpoint_parts:
+        endpoint_raw = torch.stack(endpoint_parts, dim=0).mean(dim=0)
+        candidates.append((
+            "frame_attn_key_cosine_l0_l4_mean_robustq",
+            _robust_quantile01(endpoint_raw, num_frames=num_frames),
+        ))
+
+    selected_name = "missing_zero"
+    selected = zero
+    for name, patch in candidates:
+        if _valid_patch_signal(patch):
+            selected_name = name
+            selected = patch.detach().cpu().float().reshape(-1).clamp(0.0, 1.0)
+            break
+
+    debug: Dict[str, Any] = {
+        "key_stability_source": selected_name,
+        "key_stability_source_fallback_used": selected_name not in {
+            "frame_attn_key_cosine_avg",
+            "missing_zero",
+        },
+        "key_stability_source_candidate_count": int(len(candidates)),
+    }
+    debug.update(_patch_signal_debug("key_stability_base_patch", selected))
+    return selected, debug
 
 
 def _flatten_or_default(map_tensor: Optional[torch.Tensor], default: torch.Tensor) -> torch.Tensor:
@@ -3031,6 +3313,9 @@ class HybridMemoryController:
         swa_overlap_bias_head_indices: str = "",
         swa_overlap_bias_record_attention_mass: bool = False,
         swa_overlap_bias_attention_mass_max_queries: int = 64,
+        swa_overlap_external_mask_csv: str = "",
+        swa_overlap_external_mask_variant: str = "current_role_anchor",
+        swa_overlap_external_mask_seq: str = "",
         enable_swa_overlap_source_gate: bool = False,
         swa_overlap_source_gate_rho: float = 0.0,
         swa_overlap_source_gate_min: float = 0.85,
@@ -3038,30 +3323,90 @@ class HybridMemoryController:
         swa_overlap_source_gate_target: str = "v",
         swa_overlap_source_gate_layer_mode: str = "last",
         swa_overlap_source_gate_single_layer: int = -1,
+        enable_swa_prev_ttt_stable_anchor_gate: bool = False,
+        swa_prev_ttt_stable_anchor_gate_rho: float = 0.0,
+        swa_prev_ttt_stable_anchor_gate_min: float = 0.85,
+        swa_prev_ttt_stable_anchor_gate_target: str = "v",
+        swa_prev_ttt_stable_anchor_gate_layer_mode: str = "last",
+        swa_prev_ttt_stable_anchor_gate_single_layer: int = -1,
+        enable_swa_prev_ttt_anchor_query_soft: bool = False,
+        swa_prev_ttt_anchor_query_soft_rho: float = 0.0,
+        swa_prev_ttt_anchor_query_soft_min_keep: float = 0.5,
+        swa_prev_ttt_anchor_query_soft_query_head_frac_threshold: float = 0.75,
+        swa_prev_ttt_anchor_query_soft_topk: int = 8,
+        swa_prev_ttt_anchor_query_soft_query_block_size: int = 64,
+        swa_prev_ttt_anchor_query_soft_layer_mode: str = "last",
+        swa_prev_ttt_anchor_query_soft_single_layer: int = -1,
+        swa_prev_ttt_anchor_query_soft_attention_mass_max_queries: int = 64,
+        enable_swa_prev_ttt_tracked_instance_query_soft_trace: bool = False,
+        swa_prev_ttt_tracked_instance_query_soft_rho: float = 0.0,
+        swa_prev_ttt_tracked_instance_query_soft_min_keep: float = 0.5,
+        swa_prev_ttt_tracked_instance_query_soft_query_head_frac_threshold: float = 0.75,
+        swa_prev_ttt_tracked_instance_query_soft_topk: int = 4,
+        swa_prev_ttt_tracked_instance_query_soft_query_block_size: int = 64,
+        swa_prev_ttt_tracked_instance_query_soft_layer_mode: str = "last",
+        swa_prev_ttt_tracked_instance_query_soft_single_layer: int = -1,
+        swa_prev_ttt_tracked_instance_query_soft_attention_mass_max_queries: int = 64,
+        swa_prev_ttt_tracked_instance_query_soft_min_direct_witness_seeds: int = 4,
+        swa_prev_ttt_tracked_instance_query_soft_direct_match_mode: str = "any",
+        enable_swa_prev_ttt_tracked_instance_query_soft_action: bool = False,
+        swa_prev_ttt_tracked_instance_query_soft_action_runtime_authorized: bool = False,
         enable_swa_overlap_source_replace: bool = False,
         swa_overlap_source_replace_alpha: float = 0.0,
         swa_overlap_source_replace_mode: str = "union",
         swa_overlap_source_replace_target: str = "kv",
         swa_overlap_source_replace_layer_mode: str = "last",
         swa_overlap_source_replace_single_layer: int = -1,
+        enable_v102_state_machine_trace: bool = False,
+        v102_state_machine_action: str = "TRANSMIT_SUPPORTED_ANCHORS",
+        v102_state_machine_layer_mode: str = "last",
+        v102_state_machine_single_layer: int = -1,
+        v102_state_machine_strict_gate_pass: bool = False,
+        v102_state_machine_true_l3_gate_pass: bool = False,
+        enable_v102_state_machine_action_probe: bool = False,
+        v102_state_machine_probe_impl: str = "compact_kv_reject_unreliable",
+        v102_state_machine_unreliable_d_min: float = 0.50,
+        v102_state_machine_unreliable_g_min: float = 0.50,
+        v102_state_machine_supported_d_max: float = 0.25,
+        v102_state_machine_supported_k_min: float = 0.0,
+        v102_state_machine_supported_require_static_semantic: bool = True,
+        v102_state_machine_soft_unsupported_min_keep: float = 0.50,
+        v102_state_machine_hold_prev_frames: int = 1,
+        v102_state_machine_hold_soft_min_keep: float = 0.50,
+        v102_state_machine_delay_current_soft_min_keep: float = 0.50,
+        v102_state_machine_context_soft_min_keep: float = 0.50,
+        v102_state_machine_min_history_keep_frac: float = 0.05,
+        v102_state_machine_attention_mass_max_queries: int = 64,
         swa_overlap_feature_dump_dir: str = "",
         swa_overlap_feature_dump_dtype: str = "float16",
+        swa_raw_transport_trace_dir: str = "",
+        swa_raw_transport_trace_layer_mode: str = "all",
+        swa_raw_transport_trace_single_layer: int = -1,
+        swa_raw_transport_trace_max_queries: int = 128,
+        swa_raw_transport_trace_topk: int = 8,
+        swa_raw_transport_trace_direct_match_only: bool = False,
+        swa_raw_transport_trace_query_block_size: int = 128,
         enable_context_source_skip: bool = False,
         context_source_skip_impl: str = "bias",
         context_source_skip_scope: str = "frame",
         context_source_skip_mode: str = "hard",
         context_source_skip_mask: str = "dg_q90",
         context_source_skip_frame_region: str = "all",
+        context_source_skip_query_region: str = "all",
         context_source_skip_layer_mode: str = "early",
         context_source_skip_single_layer: int = -1,
+        context_source_skip_head_indices: str = "",
         context_source_skip_soft_rho: float = 0.5,
         context_source_skip_soft_min_keep: float = 0.5,
+        context_source_skip_source_attention_top_quantile: float = -1.0,
+        context_source_skip_source_attention_top_random_same_mass: bool = False,
         context_source_skip_record_attention_mass: bool = False,
         context_source_skip_attention_mass_max_queries: int = 512,
         context_source_skip_attention_map_dump_dir: str = "",
         context_source_skip_attention_map_dump_max_queries: int = 64,
         context_source_skip_attention_map_dump_dtype: str = "float16",
         context_source_skip_attention_map_dump_full_query_marginal: bool = False,
+        context_source_skip_attention_map_dump_head_marginal: bool = False,
         context_source_skip_attention_map_dump_query_block: int = 32,
         semantic_role_policy: str = "none",
         semantic_memory_paths: str = "",
@@ -3070,10 +3415,21 @@ class HybridMemoryController:
         semantic_role_positive_scale: float = 1.05,
         semantic_role_neutral_scale: float = 0.85,
         semantic_role_negative_scale: float = 0.65,
+        semantic_role_ttt_read_harm_veto_mode: str = "none",
+        semantic_role_ttt_read_harm_veto_scale: float = 0.0,
+        semantic_role_ttt_read_harm_veto_min_harm: int = 1,
+        semantic_role_ttt_read_harm_veto_max_stable_positive: int = 0,
         semantic_role_swa_negative_scale: float = 1.0,
         semantic_role_swa_protect_scale: float = 1.0,
         semantic_role_control_mode: str = "none",
         semantic_role_control_seed: int = 12345,
+        semantic_swa_redirection_phase3_root: str = "",
+        semantic_swa_redirection_stable_case: str = "P9_40_SOURCE_REPLACE_STABLE_AGREEMENT_TOPQ80_V_LAST",
+        semantic_swa_redirection_random_stable_case: str = "P9_41_SOURCE_REPLACE_STABLE_AGREEMENT_TOPQ80_RANDOM_SAME_MASS_V_LAST",
+        semantic_swa_redirection_layer: int = 3,
+        semantic_swa_redirection_top_quantile: float = 0.75,
+        semantic_swa_redirection_overlap_frames: int = 3,
+        semantic_swa_redirection_random_control: bool = False,
         semantic_anchor_mode: str = "semantic",
         semantic_anchor_target_ratio: float = 0.12,
         semantic_anchor_min_ratio: float = 0.03,
@@ -3100,8 +3456,18 @@ class HybridMemoryController:
         v70_radio_ttt_max_activity_risk: float = 0.85,
         v70_radio_ttt_boundary_threshold: float = 0.85,
         v70_radio_ttt_renorm_mean: bool = True,
+        semantic_ttt_overlap_support_dir: str = "",
+        semantic_ttt_overlap_support_kind: str = "source_gate",
+        semantic_ttt_overlap_support_score_key: str = "score_overlap",
+        semantic_ttt_overlap_support_scope: str = "head_overlap",
+        semantic_ttt_overlap_support_floor: float = 0.0,
+        semantic_ttt_overlap_support_renorm_mean: bool = False,
         read_topk_frac: float = 0.0,
         frame_bias_mode: str = "pair",
+        frame_bias_query_region: str = "all",
+        frame_bias_head_indices: str = "",
+        frame_attention_record_bias_mass: bool = False,
+        frame_attention_bias_mass_max_queries: int = 64,
         chunk_bias_mode: str = "key",
         swa_bias_mode: str = "prev_key",
         flow_model: str = "none",
@@ -3161,6 +3527,8 @@ class HybridMemoryController:
         v32_semantic_cue_trigger_min_mass: float = 0.05,
         v32_semantic_cue_trigger_warmup: int = 3,
         v32_semantic_cue_trigger_ema_alpha: float = 0.25,
+        read_cue_patch_dump_dir: str = "",
+        read_cue_patch_dump_dtype: str = "float16",
         fast_cue_eval: bool = False,
     ):
         self.device = device
@@ -3181,6 +3549,9 @@ class HybridMemoryController:
         self.swa_overlap_bias_head_indices = str(swa_overlap_bias_head_indices or "")
         self.swa_overlap_bias_record_attention_mass = bool(swa_overlap_bias_record_attention_mass)
         self.swa_overlap_bias_attention_mass_max_queries = int(swa_overlap_bias_attention_mass_max_queries)
+        self.swa_overlap_external_mask_csv = str(swa_overlap_external_mask_csv or "")
+        self.swa_overlap_external_mask_variant = str(swa_overlap_external_mask_variant or "current_role_anchor")
+        self.swa_overlap_external_mask_seq = str(swa_overlap_external_mask_seq or "")
         self.enable_swa_overlap_source_gate = bool(enable_swa_overlap_source_gate)
         self.swa_overlap_source_gate_rho = float(swa_overlap_source_gate_rho)
         self.swa_overlap_source_gate_min = float(swa_overlap_source_gate_min)
@@ -3188,24 +3559,117 @@ class HybridMemoryController:
         self.swa_overlap_source_gate_target = str(swa_overlap_source_gate_target)
         self.swa_overlap_source_gate_layer_mode = str(swa_overlap_source_gate_layer_mode)
         self.swa_overlap_source_gate_single_layer = int(swa_overlap_source_gate_single_layer)
+        self.enable_swa_prev_ttt_stable_anchor_gate = bool(enable_swa_prev_ttt_stable_anchor_gate)
+        self.swa_prev_ttt_stable_anchor_gate_rho = float(swa_prev_ttt_stable_anchor_gate_rho)
+        self.swa_prev_ttt_stable_anchor_gate_min = float(swa_prev_ttt_stable_anchor_gate_min)
+        self.swa_prev_ttt_stable_anchor_gate_target = str(swa_prev_ttt_stable_anchor_gate_target)
+        self.swa_prev_ttt_stable_anchor_gate_layer_mode = str(swa_prev_ttt_stable_anchor_gate_layer_mode)
+        self.swa_prev_ttt_stable_anchor_gate_single_layer = int(swa_prev_ttt_stable_anchor_gate_single_layer)
+        self.enable_swa_prev_ttt_anchor_query_soft = bool(enable_swa_prev_ttt_anchor_query_soft)
+        self.swa_prev_ttt_anchor_query_soft_rho = float(swa_prev_ttt_anchor_query_soft_rho)
+        self.swa_prev_ttt_anchor_query_soft_min_keep = float(swa_prev_ttt_anchor_query_soft_min_keep)
+        self.swa_prev_ttt_anchor_query_soft_query_head_frac_threshold = float(
+            swa_prev_ttt_anchor_query_soft_query_head_frac_threshold
+        )
+        self.swa_prev_ttt_anchor_query_soft_topk = int(swa_prev_ttt_anchor_query_soft_topk)
+        self.swa_prev_ttt_anchor_query_soft_query_block_size = int(swa_prev_ttt_anchor_query_soft_query_block_size)
+        self.swa_prev_ttt_anchor_query_soft_layer_mode = str(swa_prev_ttt_anchor_query_soft_layer_mode)
+        self.swa_prev_ttt_anchor_query_soft_single_layer = int(swa_prev_ttt_anchor_query_soft_single_layer)
+        self.swa_prev_ttt_anchor_query_soft_attention_mass_max_queries = int(
+            swa_prev_ttt_anchor_query_soft_attention_mass_max_queries
+        )
+        self.enable_swa_prev_ttt_tracked_instance_query_soft_trace = bool(
+            enable_swa_prev_ttt_tracked_instance_query_soft_trace
+        )
+        self.swa_prev_ttt_tracked_instance_query_soft_rho = float(
+            swa_prev_ttt_tracked_instance_query_soft_rho
+        )
+        self.swa_prev_ttt_tracked_instance_query_soft_min_keep = float(
+            swa_prev_ttt_tracked_instance_query_soft_min_keep
+        )
+        self.swa_prev_ttt_tracked_instance_query_soft_query_head_frac_threshold = float(
+            swa_prev_ttt_tracked_instance_query_soft_query_head_frac_threshold
+        )
+        self.swa_prev_ttt_tracked_instance_query_soft_topk = int(
+            swa_prev_ttt_tracked_instance_query_soft_topk
+        )
+        self.swa_prev_ttt_tracked_instance_query_soft_query_block_size = int(
+            swa_prev_ttt_tracked_instance_query_soft_query_block_size
+        )
+        self.swa_prev_ttt_tracked_instance_query_soft_layer_mode = str(
+            swa_prev_ttt_tracked_instance_query_soft_layer_mode
+        )
+        self.swa_prev_ttt_tracked_instance_query_soft_single_layer = int(
+            swa_prev_ttt_tracked_instance_query_soft_single_layer
+        )
+        self.swa_prev_ttt_tracked_instance_query_soft_attention_mass_max_queries = int(
+            swa_prev_ttt_tracked_instance_query_soft_attention_mass_max_queries
+        )
+        self.swa_prev_ttt_tracked_instance_query_soft_min_direct_witness_seeds = int(
+            swa_prev_ttt_tracked_instance_query_soft_min_direct_witness_seeds
+        )
+        self.swa_prev_ttt_tracked_instance_query_soft_direct_match_mode = str(
+            swa_prev_ttt_tracked_instance_query_soft_direct_match_mode or "any"
+        )
+        self.enable_swa_prev_ttt_tracked_instance_query_soft_action = bool(
+            enable_swa_prev_ttt_tracked_instance_query_soft_action
+        )
+        self.swa_prev_ttt_tracked_instance_query_soft_action_runtime_authorized = bool(
+            swa_prev_ttt_tracked_instance_query_soft_action_runtime_authorized
+        )
         self.enable_swa_overlap_source_replace = bool(enable_swa_overlap_source_replace)
         self.swa_overlap_source_replace_alpha = float(swa_overlap_source_replace_alpha)
         self.swa_overlap_source_replace_mode = str(swa_overlap_source_replace_mode)
         self.swa_overlap_source_replace_target = str(swa_overlap_source_replace_target)
         self.swa_overlap_source_replace_layer_mode = str(swa_overlap_source_replace_layer_mode)
         self.swa_overlap_source_replace_single_layer = int(swa_overlap_source_replace_single_layer)
+        self.enable_v102_state_machine_trace = bool(enable_v102_state_machine_trace)
+        self.v102_state_machine_action = str(v102_state_machine_action or "TRANSMIT_SUPPORTED_ANCHORS")
+        self.v102_state_machine_layer_mode = str(v102_state_machine_layer_mode or "last")
+        self.v102_state_machine_single_layer = int(v102_state_machine_single_layer)
+        self.v102_state_machine_strict_gate_pass = bool(v102_state_machine_strict_gate_pass)
+        self.v102_state_machine_true_l3_gate_pass = bool(v102_state_machine_true_l3_gate_pass)
+        self.enable_v102_state_machine_action_probe = bool(enable_v102_state_machine_action_probe)
+        self.v102_state_machine_probe_impl = str(v102_state_machine_probe_impl or "compact_kv_reject_unreliable")
+        self.v102_state_machine_unreliable_d_min = float(v102_state_machine_unreliable_d_min)
+        self.v102_state_machine_unreliable_g_min = float(v102_state_machine_unreliable_g_min)
+        self.v102_state_machine_supported_d_max = float(v102_state_machine_supported_d_max)
+        self.v102_state_machine_supported_k_min = float(v102_state_machine_supported_k_min)
+        self.v102_state_machine_supported_require_static_semantic = bool(
+            v102_state_machine_supported_require_static_semantic
+        )
+        self.v102_state_machine_soft_unsupported_min_keep = float(v102_state_machine_soft_unsupported_min_keep)
+        self.v102_state_machine_hold_prev_frames = int(v102_state_machine_hold_prev_frames)
+        self.v102_state_machine_hold_soft_min_keep = float(v102_state_machine_hold_soft_min_keep)
+        self.v102_state_machine_delay_current_soft_min_keep = float(v102_state_machine_delay_current_soft_min_keep)
+        self.v102_state_machine_context_soft_min_keep = float(v102_state_machine_context_soft_min_keep)
+        self.v102_state_machine_min_history_keep_frac = float(v102_state_machine_min_history_keep_frac)
+        self.v102_state_machine_attention_mass_max_queries = int(v102_state_machine_attention_mass_max_queries)
         self.swa_overlap_feature_dump_dir = str(swa_overlap_feature_dump_dir)
         self.swa_overlap_feature_dump_dtype = str(swa_overlap_feature_dump_dtype)
+        self.swa_raw_transport_trace_dir = str(swa_raw_transport_trace_dir or "")
+        self.swa_raw_transport_trace_layer_mode = str(swa_raw_transport_trace_layer_mode or "all")
+        self.swa_raw_transport_trace_single_layer = int(swa_raw_transport_trace_single_layer)
+        self.swa_raw_transport_trace_max_queries = int(swa_raw_transport_trace_max_queries)
+        self.swa_raw_transport_trace_topk = int(swa_raw_transport_trace_topk)
+        self.swa_raw_transport_trace_direct_match_only = bool(swa_raw_transport_trace_direct_match_only)
+        self.swa_raw_transport_trace_query_block_size = int(swa_raw_transport_trace_query_block_size)
         self.enable_context_source_skip = bool(enable_context_source_skip)
         self.context_source_skip_impl = str(context_source_skip_impl)
         self.context_source_skip_scope = str(context_source_skip_scope)
         self.context_source_skip_mode = str(context_source_skip_mode)
         self.context_source_skip_mask = str(context_source_skip_mask)
         self.context_source_skip_frame_region = str(context_source_skip_frame_region)
+        self.context_source_skip_query_region = str(context_source_skip_query_region)
         self.context_source_skip_layer_mode = str(context_source_skip_layer_mode)
         self.context_source_skip_single_layer = int(context_source_skip_single_layer)
+        self.context_source_skip_head_indices = str(context_source_skip_head_indices)
         self.context_source_skip_soft_rho = float(context_source_skip_soft_rho)
         self.context_source_skip_soft_min_keep = float(context_source_skip_soft_min_keep)
+        self.context_source_skip_source_attention_top_quantile = float(context_source_skip_source_attention_top_quantile)
+        self.context_source_skip_source_attention_top_random_same_mass = bool(
+            context_source_skip_source_attention_top_random_same_mass
+        )
         self.context_source_skip_record_attention_mass = bool(context_source_skip_record_attention_mass)
         self.context_source_skip_attention_mass_max_queries = int(context_source_skip_attention_mass_max_queries)
         self.context_source_skip_attention_map_dump_dir = str(context_source_skip_attention_map_dump_dir)
@@ -3213,6 +3677,9 @@ class HybridMemoryController:
         self.context_source_skip_attention_map_dump_dtype = str(context_source_skip_attention_map_dump_dtype)
         self.context_source_skip_attention_map_dump_full_query_marginal = bool(
             context_source_skip_attention_map_dump_full_query_marginal
+        )
+        self.context_source_skip_attention_map_dump_head_marginal = bool(
+            context_source_skip_attention_map_dump_head_marginal
         )
         self.context_source_skip_attention_map_dump_query_block = int(
             context_source_skip_attention_map_dump_query_block
@@ -3224,10 +3691,32 @@ class HybridMemoryController:
         self.semantic_role_positive_scale = float(semantic_role_positive_scale)
         self.semantic_role_neutral_scale = float(semantic_role_neutral_scale)
         self.semantic_role_negative_scale = float(semantic_role_negative_scale)
+        self.semantic_role_ttt_read_harm_veto_mode = str(
+            semantic_role_ttt_read_harm_veto_mode or "none"
+        ).strip().lower()
+        self.semantic_role_ttt_read_harm_veto_scale = max(
+            0.0,
+            min(1.5, float(semantic_role_ttt_read_harm_veto_scale)),
+        )
+        self.semantic_role_ttt_read_harm_veto_min_harm = max(
+            0,
+            int(semantic_role_ttt_read_harm_veto_min_harm),
+        )
+        self.semantic_role_ttt_read_harm_veto_max_stable_positive = max(
+            0,
+            int(semantic_role_ttt_read_harm_veto_max_stable_positive),
+        )
         self.semantic_role_swa_negative_scale = float(semantic_role_swa_negative_scale)
         self.semantic_role_swa_protect_scale = float(semantic_role_swa_protect_scale)
         self.semantic_role_control_mode = str(semantic_role_control_mode or "none").strip().lower()
         self.semantic_role_control_seed = int(semantic_role_control_seed)
+        self.semantic_swa_redirection_phase3_root = str(semantic_swa_redirection_phase3_root or "")
+        self.semantic_swa_redirection_stable_case = str(semantic_swa_redirection_stable_case or "")
+        self.semantic_swa_redirection_random_stable_case = str(semantic_swa_redirection_random_stable_case or "")
+        self.semantic_swa_redirection_layer = int(semantic_swa_redirection_layer)
+        self.semantic_swa_redirection_top_quantile = float(semantic_swa_redirection_top_quantile)
+        self.semantic_swa_redirection_overlap_frames = max(int(semantic_swa_redirection_overlap_frames), 0)
+        self.semantic_swa_redirection_random_control = bool(semantic_swa_redirection_random_control)
         self.semantic_anchor_mode = str(semantic_anchor_mode or "semantic").strip().lower()
         self.semantic_anchor_target_ratio = float(semantic_anchor_target_ratio)
         self.semantic_anchor_min_ratio = float(semantic_anchor_min_ratio)
@@ -3266,8 +3755,18 @@ class HybridMemoryController:
         self.v70_radio_ttt_max_activity_risk = float(v70_radio_ttt_max_activity_risk)
         self.v70_radio_ttt_boundary_threshold = float(v70_radio_ttt_boundary_threshold)
         self.v70_radio_ttt_renorm_mean = bool(v70_radio_ttt_renorm_mean)
+        self.semantic_ttt_overlap_support_dir = str(semantic_ttt_overlap_support_dir or "")
+        self.semantic_ttt_overlap_support_kind = str(semantic_ttt_overlap_support_kind or "source_gate")
+        self.semantic_ttt_overlap_support_score_key = str(semantic_ttt_overlap_support_score_key or "score_overlap")
+        self.semantic_ttt_overlap_support_scope = str(semantic_ttt_overlap_support_scope or "head_overlap")
+        self.semantic_ttt_overlap_support_floor = float(semantic_ttt_overlap_support_floor)
+        self.semantic_ttt_overlap_support_renorm_mean = bool(semantic_ttt_overlap_support_renorm_mean)
         self.read_topk_frac = float(read_topk_frac)
         self.frame_bias_mode = str(frame_bias_mode)
+        self.frame_bias_query_region = str(frame_bias_query_region or "all")
+        self.frame_bias_head_indices = str(frame_bias_head_indices or "")
+        self.frame_attention_record_bias_mass = bool(frame_attention_record_bias_mass)
+        self.frame_attention_bias_mass_max_queries = int(frame_attention_bias_mass_max_queries)
         self.chunk_bias_mode = str(chunk_bias_mode)
         self.swa_bias_mode = str(swa_bias_mode)
         self.flow_model = str(flow_model)
@@ -3330,6 +3829,8 @@ class HybridMemoryController:
         self._v32_semantic_cue_ema: Optional[float] = None
         self._v32_semantic_cue_mad: Optional[float] = None
         self._v32_semantic_cue_count = 0
+        self.read_cue_patch_dump_dir = str(read_cue_patch_dump_dir or "")
+        self.read_cue_patch_dump_dtype = str(read_cue_patch_dump_dtype or "float16")
         self.fast_cue_eval = bool(fast_cue_eval)
         self.ttt_update_controller = TTTWriteController(
             lambda_min=lambda_min,
@@ -3561,6 +4062,143 @@ class HybridMemoryController:
             accum[:n] += per_tok[:n]
             count[:n] += 1.0
         return torch.where(count > 0, accum / count.clamp_min(1.0), torch.zeros_like(accum))
+
+    def _read_cue_dump_dtype(self) -> torch.dtype:
+        name = str(self.read_cue_patch_dump_dtype or "float16").strip().lower()
+        if name in {"fp32", "float32"}:
+            return torch.float32
+        if name in {"bf16", "bfloat16"}:
+            return torch.bfloat16
+        return torch.float16
+
+    @staticmethod
+    def _patch_vector_to_grid_or_flat(
+        values: Optional[torch.Tensor],
+        *,
+        num_frames: int,
+        patch_grid: Tuple[int, int],
+        dtype: torch.dtype,
+    ) -> Optional[torch.Tensor]:
+        if values is None:
+            return None
+        x = values.detach().cpu().float().reshape(-1)
+        t = max(int(num_frames), 1)
+        h = max(int(patch_grid[0]), 1)
+        w = max(int(patch_grid[1]), 1)
+        if int(x.numel()) == t * h * w:
+            x = x.reshape(t, h, w)
+        return x.to(dtype=dtype)
+
+    @staticmethod
+    def _read_active_q90_mask(read_patch: torch.Tensor, *, num_frames: int, patch_grid: Tuple[int, int]) -> torch.Tensor:
+        x = read_patch.detach().cpu().float().reshape(-1)
+        t = max(int(num_frames), 1)
+        h = max(int(patch_grid[0]), 1)
+        w = max(int(patch_grid[1]), 1)
+        if int(x.numel()) != t * h * w:
+            if x.numel() <= 0:
+                return torch.zeros((0,), dtype=torch.bool)
+            k = max(1, int(math.ceil(0.10 * int(x.numel()))))
+            idx = torch.topk(x, k=min(k, int(x.numel())), largest=True).indices
+            mask = torch.zeros_like(x, dtype=torch.bool)
+            mask[idx] = True
+            return mask
+        grid = x.reshape(t, h * w)
+        k = max(1, int(math.ceil(0.10 * h * w)))
+        idx = torch.topk(grid, k=min(k, h * w), dim=1, largest=True).indices
+        mask = torch.zeros_like(grid, dtype=torch.bool)
+        mask.scatter_(1, idx, True)
+        return mask.reshape(t, h, w)
+
+    @staticmethod
+    def _dump_stats(values: torch.Tensor) -> Dict[str, Any]:
+        x = values.detach().cpu().float().reshape(-1)
+        x = x[torch.isfinite(x)]
+        if int(x.numel()) <= 0:
+            return {"mean": None, "q90": None, "max": None, "finite_count": 0}
+        return {
+            "mean": float(x.mean().item()),
+            "q90": float(torch.quantile(x, 0.90).item()),
+            "max": float(x.max().item()),
+            "finite_count": int(x.numel()),
+        }
+
+    def _dump_read_cue_patch(
+        self,
+        *,
+        read_patch: torch.Tensor,
+        num_frames: int,
+        patch_grid: Tuple[int, int],
+        chunk_idx: int,
+        cue_source_effective: str,
+        patch_debug: Dict[str, Any],
+        extra_patches: Dict[str, Optional[torch.Tensor]],
+    ) -> Dict[str, Any]:
+        dump_dir = str(self.read_cue_patch_dump_dir or "")
+        if not dump_dir:
+            return {"read_cue_patch_dump_status": "disabled"}
+        try:
+            dtype = self._read_cue_dump_dtype()
+            out_dir = Path(dump_dir)
+            out_dir.mkdir(parents=True, exist_ok=True)
+            read_grid = self._patch_vector_to_grid_or_flat(
+                read_patch,
+                num_frames=num_frames,
+                patch_grid=patch_grid,
+                dtype=dtype,
+            )
+            if read_grid is None:
+                return {"read_cue_patch_dump_status": "skipped_no_read_patch"}
+            q90_mask = self._read_active_q90_mask(read_patch, num_frames=num_frames, patch_grid=patch_grid)
+            gt050_mask = (read_grid.float() > 0.50)
+            tensors: Dict[str, Any] = {
+                "read_patch_final": read_grid,
+                "read_active_gt050_patch": gt050_mask.cpu(),
+                "read_active_q90_patch": q90_mask.cpu(),
+            }
+            for key, value in sorted(extra_patches.items()):
+                tensor = self._patch_vector_to_grid_or_flat(
+                    value,
+                    num_frames=num_frames,
+                    patch_grid=patch_grid,
+                    dtype=dtype,
+                )
+                if tensor is not None:
+                    tensors[key] = tensor
+            payload = {
+                "schema": "acl2_v79_read_cue_patch_dump_v1",
+                "chunk_idx": int(chunk_idx),
+                "num_frames": int(num_frames),
+                "patch_grid": [int(patch_grid[0]), int(patch_grid[1])],
+                "read_cue_source": str(self.read_cue_source),
+                "cue_source_effective": str(cue_source_effective),
+                "read_calib_mode": str(self.read_calib_mode),
+                "read_target_mass": float(self.read_target_mass),
+                "read_calib_tau": float(self.read_calib_tau),
+                "read_blend_lambda": float(self.read_blend_lambda),
+                "read_topk_frac": float(self.read_topk_frac),
+                "dtype": str(dtype).replace("torch.", ""),
+                "debug": dict(patch_debug),
+                "stats": {
+                    "read_patch_final": self._dump_stats(read_grid.float()),
+                    "read_active_gt050_mass": float(gt050_mask.float().mean().item()) if gt050_mask.numel() else 0.0,
+                    "read_active_q90_mass": float(q90_mask.float().mean().item()) if q90_mask.numel() else 0.0,
+                },
+                "tensors": tensors,
+            }
+            out_path = out_dir / f"chunk_{int(chunk_idx):03d}_read_cue_patch.pt"
+            torch.save(payload, out_path)
+            return {
+                "read_cue_patch_dump_status": "saved",
+                "read_cue_patch_dump_path": str(out_path),
+                "read_cue_patch_dump_read_mean": payload["stats"]["read_patch_final"]["mean"],
+                "read_cue_patch_dump_q90_mass": payload["stats"]["read_active_q90_mass"],
+            }
+        except Exception as exc:
+            return {
+                "read_cue_patch_dump_status": "failed",
+                "read_cue_patch_dump_error": f"{type(exc).__name__}:{exc}",
+            }
 
     def _build_semantic_anchor_bank(
         self,
@@ -3980,6 +4618,178 @@ class HybridMemoryController:
             "v70_radio_ttt_prior_abs_change_ratio": float((P_new_patch - P_patch).abs().mean().item() / max(float(P_patch.mean().item()), 1e-12)) if P_patch.numel() else 0.0,
         })
         return P_new.to(device=P_ttt_write.device, dtype=P_ttt_write.dtype), debug
+
+    def _apply_semantic_ttt_overlap_support_prior(
+        self,
+        *,
+        token_type: torch.Tensor,
+        P_ttt_write: Optional[torch.Tensor],
+        num_frames: int,
+        patch_grid: Tuple[int, int],
+        chunk_idx: int,
+    ) -> Tuple[Optional[torch.Tensor], Dict[str, Any]]:
+        debug: Dict[str, Any] = {
+            "semantic_ttt_overlap_support_enabled": bool(str(self.semantic_ttt_overlap_support_dir or "").strip()),
+            "semantic_ttt_overlap_support_applied": False,
+            "semantic_ttt_overlap_support_dir": str(self.semantic_ttt_overlap_support_dir or ""),
+            "semantic_ttt_overlap_support_kind": str(self.semantic_ttt_overlap_support_kind or ""),
+            "semantic_ttt_overlap_support_score_key": str(self.semantic_ttt_overlap_support_score_key or ""),
+            "semantic_ttt_overlap_support_scope": str(self.semantic_ttt_overlap_support_scope or ""),
+            "semantic_ttt_overlap_support_floor": float(self.semantic_ttt_overlap_support_floor),
+        }
+        if not bool(debug["semantic_ttt_overlap_support_enabled"]):
+            debug["semantic_ttt_overlap_support_reason"] = "dir_not_configured"
+            return P_ttt_write, debug
+        if P_ttt_write is None:
+            debug["semantic_ttt_overlap_support_reason"] = "missing_ttt_write_prior"
+            return P_ttt_write, debug
+
+        path = _semantic_overlap_support_path(
+            self.semantic_ttt_overlap_support_dir,
+            int(chunk_idx),
+            self.semantic_ttt_overlap_support_kind,
+        )
+        if path is None:
+            debug["semantic_ttt_overlap_support_reason"] = "map_missing"
+            return P_ttt_write, debug
+        try:
+            payload = torch.load(path, map_location="cpu", weights_only=False)
+        except TypeError:
+            payload = torch.load(path, map_location="cpu")
+        except Exception as exc:
+            debug["semantic_ttt_overlap_support_reason"] = f"load_error:{type(exc).__name__}:{exc}"
+            debug["semantic_ttt_overlap_support_path"] = str(path)
+            return P_ttt_write, debug
+        if not isinstance(payload, dict):
+            debug["semantic_ttt_overlap_support_reason"] = "payload_not_dict"
+            debug["semantic_ttt_overlap_support_path"] = str(path)
+            return P_ttt_write, debug
+
+        key = str(self.semantic_ttt_overlap_support_score_key or "score_overlap").strip()
+        score = payload.get(key)
+        if not torch.is_tensor(score):
+            debug["semantic_ttt_overlap_support_reason"] = f"missing_score_key:{key}"
+            debug["semantic_ttt_overlap_support_path"] = str(path)
+            return P_ttt_write, debug
+        score = torch.nan_to_num(score.detach().cpu().float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+        if score.ndim == 3:
+            score = score[0]
+        if score.ndim == 1:
+            score = score.unsqueeze(0)
+        if score.ndim != 2:
+            debug["semantic_ttt_overlap_support_reason"] = f"unsupported_score_shape:{tuple(score.shape)}"
+            debug["semantic_ttt_overlap_support_path"] = str(path)
+            return P_ttt_write, debug
+
+        token_type_cpu = token_type.detach().cpu().long().reshape(-1)
+        patch_mask = token_type_cpu == TOKEN_TYPE_PATCH
+        n_patch = int(patch_mask.sum().item())
+        T = max(int(num_frames), 1)
+        if n_patch <= 0 or n_patch % T != 0:
+            debug["semantic_ttt_overlap_support_reason"] = "invalid_patch_frame_layout"
+            debug["semantic_ttt_overlap_support_patch_tokens"] = int(n_patch)
+            debug["semantic_ttt_overlap_support_num_frames"] = int(T)
+            return P_ttt_write, debug
+        patches_per_frame = n_patch // T
+        target_h, target_w = int(patch_grid[0]), int(patch_grid[1])
+        if target_h > 0 and target_w > 0 and target_h * target_w != patches_per_frame:
+            debug["semantic_ttt_overlap_support_reason"] = "patch_grid_mismatch"
+            debug["semantic_ttt_overlap_support_patch_tokens_per_frame"] = int(patches_per_frame)
+            debug["semantic_ttt_overlap_support_target_patch_grid"] = [target_h, target_w]
+            return P_ttt_write, debug
+
+        tokens_per_frame = int(payload.get("tokens_per_frame", int(score.shape[-1])) or int(score.shape[-1]))
+        token_count = min(int(tokens_per_frame), int(score.shape[-1]))
+        patch_start = max(0, token_count - patches_per_frame) if token_count >= patches_per_frame else 0
+        patch_count = min(patches_per_frame, int(score.shape[-1]) - patch_start)
+        if patch_count != patches_per_frame:
+            debug["semantic_ttt_overlap_support_reason"] = "support_patch_count_mismatch"
+            debug["semantic_ttt_overlap_support_tokens_per_frame"] = int(tokens_per_frame)
+            debug["semantic_ttt_overlap_support_patch_tokens_per_frame"] = int(patches_per_frame)
+            debug["semantic_ttt_overlap_support_path"] = str(path)
+            return P_ttt_write, debug
+
+        ov = min(int(score.shape[0]), T)
+        if ov <= 0:
+            debug["semantic_ttt_overlap_support_reason"] = "empty_overlap"
+            debug["semantic_ttt_overlap_support_path"] = str(path)
+            return P_ttt_write, debug
+        support_frames = score[:ov, patch_start : patch_start + patches_per_frame].reshape(ov, patches_per_frame)
+        support_slice = support_frames.reshape(-1)
+        full_support = torch.ones(n_patch, dtype=torch.float32)
+        scope = str(self.semantic_ttt_overlap_support_scope or "head_overlap").strip().lower()
+        frame_slots: List[Tuple[int, int]] = []
+        if scope in {"head", "head_overlap", "overlap_head"}:
+            frame_slots = [(i, i) for i in range(0, ov)]
+        elif scope in {"tail", "tail_overlap", "overlap_tail"}:
+            frame_slots = [(T - ov + i, i) for i in range(0, ov)]
+        elif scope in {"both", "both_overlap", "overlap_both"}:
+            frame_slots = [(i, i) for i in range(0, ov)] + [(T - ov + i, i) for i in range(0, ov)]
+        else:
+            debug["semantic_ttt_overlap_support_reason"] = f"unsupported_scope:{scope}"
+            debug["semantic_ttt_overlap_support_path"] = str(path)
+            return P_ttt_write, debug
+        for slot, source_i in frame_slots:
+            lo = int(slot) * patches_per_frame
+            hi = lo + patches_per_frame
+            full_support[lo:hi] = support_frames[int(source_i)]
+
+        floor = min(max(float(self.semantic_ttt_overlap_support_floor), 0.0), 1.0)
+        scale = (floor + (1.0 - floor) * full_support).clamp(0.0, 1.0)
+        P = P_ttt_write.detach().cpu().float().reshape(-1).clone()
+        patch_only_prior = False
+        if P.numel() == token_type_cpu.numel():
+            P_patch = P[patch_mask].clone()
+        elif P.numel() == n_patch:
+            patch_only_prior = True
+            P_patch = P.clone()
+        else:
+            debug["semantic_ttt_overlap_support_reason"] = "prior_token_type_length_mismatch"
+            debug["semantic_ttt_overlap_support_prior_tokens"] = int(P.numel())
+            debug["semantic_ttt_overlap_support_token_type_tokens"] = int(token_type_cpu.numel())
+            debug["semantic_ttt_overlap_support_patch_tokens"] = int(n_patch)
+            debug["semantic_ttt_overlap_support_path"] = str(path)
+            return P_ttt_write, debug
+        P_new_patch = (P_patch * scale).clamp(0.0, 2.0)
+        if self.semantic_ttt_overlap_support_renorm_mean and P_new_patch.numel():
+            old_mean = float(P_patch.mean().item())
+            new_mean = float(P_new_patch.mean().item())
+            if math.isfinite(old_mean) and math.isfinite(new_mean) and new_mean > 1e-12:
+                P_new_patch = (P_new_patch * (old_mean / new_mean)).clamp(0.0, 2.0)
+        if patch_only_prior:
+            P_out = P_new_patch
+        else:
+            P[patch_mask] = P_new_patch
+            P_out = P
+        changed = (P_new_patch - P_patch).abs() > 1e-8
+        active_mask = scale < 0.999999
+        debug.update({
+            "semantic_ttt_overlap_support_applied": bool(changed.any()),
+            "semantic_ttt_overlap_support_reason": "ok",
+            "semantic_ttt_overlap_support_path": str(path),
+            "semantic_ttt_overlap_support_artifact": str(payload.get("artifact", "")),
+            "semantic_ttt_overlap_support_payload_kind": str(payload.get("kind", "")),
+            "semantic_ttt_overlap_support_payload_mode": str(payload.get("mode", "")),
+            "semantic_ttt_overlap_support_payload_schema": str(payload.get("schema", "")),
+            "semantic_ttt_overlap_support_chunk_idx": int(chunk_idx),
+            "semantic_ttt_overlap_support_overlap_frames": int(ov),
+            "semantic_ttt_overlap_support_patch_tokens": int(n_patch),
+            "semantic_ttt_overlap_support_patch_only_prior": bool(patch_only_prior),
+            "semantic_ttt_overlap_support_patch_tokens_per_frame": int(patches_per_frame),
+            "semantic_ttt_overlap_support_tokens_per_frame": int(tokens_per_frame),
+            "semantic_ttt_overlap_support_patch_start": int(patch_start),
+            "semantic_ttt_overlap_support_target_patch_grid": [target_h, target_w],
+            "semantic_ttt_overlap_support_frame_slots": [int(x[0]) for x in frame_slots],
+            "semantic_ttt_overlap_support_changed_patch_frac": float(changed.float().mean().item()) if changed.numel() else 0.0,
+            "semantic_ttt_overlap_support_active_patch_frac": float(active_mask.float().mean().item()) if active_mask.numel() else 0.0,
+            "semantic_ttt_overlap_support_score_mean": float(support_slice.mean().item()) if support_slice.numel() else 1.0,
+            "semantic_ttt_overlap_support_score_q10": float(torch.quantile(support_slice, 0.10).item()) if support_slice.numel() else 1.0,
+            "semantic_ttt_overlap_support_score_q50": float(torch.quantile(support_slice, 0.50).item()) if support_slice.numel() else 1.0,
+            "semantic_ttt_overlap_support_score_q90": float(torch.quantile(support_slice, 0.90).item()) if support_slice.numel() else 1.0,
+            "semantic_ttt_overlap_support_prior_mean_before": float(P_patch.mean().item()) if P_patch.numel() else 1.0,
+            "semantic_ttt_overlap_support_prior_mean_after": float(P_new_patch.mean().item()) if P_new_patch.numel() else 1.0,
+        })
+        return P_out.to(device=P_ttt_write.device, dtype=P_ttt_write.dtype), debug
 
     def _phase_e_write_prior(
         self,
@@ -4522,6 +5332,138 @@ class HybridMemoryController:
         self.semantic_condition_scale_tok = _optional_1d_float_tensor(scale_tok)
         self.semantic_condition_scale_token_exact = bool(scale_token_exact and self.semantic_condition_scale_tok is not None)
 
+    def _swa_stable_redirection_token_mask(
+        self,
+        *,
+        token_type: torch.Tensor,
+        patch_mask: torch.Tensor,
+        num_frames: int,
+        patch_grid: Tuple[int, int],
+        chunk_idx: int,
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Load a Phase3 SWA stable overlap map as a token-aligned role mask."""
+
+        out = torch.zeros_like(patch_mask, dtype=torch.bool)
+        root = Path(str(getattr(self, "semantic_swa_redirection_phase3_root", "") or "")).expanduser()
+        use_random = bool(getattr(self, "semantic_swa_redirection_random_control", False))
+        case = (
+            str(getattr(self, "semantic_swa_redirection_random_stable_case", "") or "")
+            if use_random
+            else str(getattr(self, "semantic_swa_redirection_stable_case", "") or "")
+        )
+        layer = int(getattr(self, "semantic_swa_redirection_layer", 3))
+        q = min(max(float(getattr(self, "semantic_swa_redirection_top_quantile", 0.75)), 0.0), 1.0)
+        overlap_frames = max(int(getattr(self, "semantic_swa_redirection_overlap_frames", 3)), 0)
+        debug: Dict[str, Any] = {
+            "swa_redirection_available": False,
+            "swa_redirection_reason": "disabled",
+            "swa_redirection_phase3_root": str(root) if str(root) else "",
+            "swa_redirection_case": case,
+            "swa_redirection_random_control": bool(use_random),
+            "swa_redirection_layer": int(layer),
+            "swa_redirection_top_quantile": float(q),
+            "swa_redirection_overlap_frames_requested": int(overlap_frames),
+            "swa_redirection_chunk_idx": int(chunk_idx),
+            "swa_redirection_selected_tokens": 0,
+        }
+        if not str(root) or not case:
+            return out, debug
+        feature_dir = root / f"chunk{int(chunk_idx):02d}" / case / "swa_overlap_feature_maps"
+        feature_path = feature_dir / f"chunk_{int(chunk_idx):03d}_swa_overlap_source_replace_layer_{int(layer):02d}.pt"
+        if not feature_path.is_file():
+            candidates = sorted(feature_dir.glob(f"chunk_{int(chunk_idx):03d}_swa_overlap_source_replace_layer_*.pt"))
+            if candidates:
+                feature_path = candidates[-1]
+            else:
+                debug.update({
+                    "swa_redirection_reason": "missing_feature_map",
+                    "swa_redirection_feature_path": str(feature_path),
+                })
+                return out, debug
+        try:
+            payload = torch.load(feature_path, map_location="cpu", weights_only=False)
+        except Exception as exc:  # noqa: BLE001
+            debug.update({
+                "swa_redirection_reason": f"feature_load_error:{type(exc).__name__}:{exc}",
+                "swa_redirection_feature_path": str(feature_path),
+            })
+            return out, debug
+        score = payload.get("score_overlap") if isinstance(payload, dict) else None
+        if not torch.is_tensor(score):
+            debug.update({
+                "swa_redirection_reason": "missing_score_overlap",
+                "swa_redirection_feature_path": str(feature_path),
+            })
+            return out, debug
+        x = score.detach().cpu().float()
+        if x.ndim == 3:
+            x = x[0]
+        if x.ndim != 2:
+            debug.update({
+                "swa_redirection_reason": f"bad_score_shape:{tuple(score.shape)}",
+                "swa_redirection_feature_path": str(feature_path),
+            })
+            return out, debug
+        H, W = int(patch_grid[0]), int(patch_grid[1])
+        T = int(num_frames)
+        patch_per_frame = max(H * W, 0)
+        tokens_per_frame = int(payload.get("tokens_per_frame", int(x.shape[-1])) or int(x.shape[-1])) if isinstance(payload, dict) else int(x.shape[-1])
+        patch_start = max(0, int(tokens_per_frame) - patch_per_frame)
+        patch_end = patch_start + patch_per_frame
+        if patch_per_frame <= 0 or T <= 0 or int(x.shape[-1]) < patch_end:
+            debug.update({
+                "swa_redirection_reason": "patch_grid_mismatch",
+                "swa_redirection_feature_path": str(feature_path),
+                "swa_redirection_score_shape": list(int(v) for v in x.shape),
+                "swa_redirection_patch_grid": [H, W],
+            })
+            return out, debug
+        ov = min(int(overlap_frames or payload.get("overlap_frames_effective", 0) or x.shape[0]), int(x.shape[0]), T)
+        patch_score = x[:ov, patch_start:patch_end].reshape(ov, H, W).clamp_min(0.0)
+        positive = patch_score[patch_score > 0.0]
+        if int(positive.numel()) <= 0:
+            debug.update({
+                "swa_redirection_reason": "empty_positive_support",
+                "swa_redirection_feature_path": str(feature_path),
+                "swa_redirection_overlap_frames_effective": int(ov),
+            })
+            return out, debug
+        threshold = float(torch.quantile(positive, q).item())
+        selected_cube = (patch_score >= threshold) & (patch_score > 0.0)
+        patch_flat = torch.zeros((T, H, W), dtype=torch.bool)
+        patch_flat[:ov] = selected_cube
+        patch_values = patch_flat.reshape(-1)
+        patch_indices = torch.nonzero(patch_mask.detach().cpu().bool().reshape(-1), as_tuple=False).reshape(-1)
+        if int(patch_indices.numel()) != int(patch_values.numel()):
+            debug.update({
+                "swa_redirection_reason": "token_patch_count_mismatch",
+                "swa_redirection_feature_path": str(feature_path),
+                "swa_redirection_patch_token_count": int(patch_indices.numel()),
+                "swa_redirection_mask_patch_count": int(patch_values.numel()),
+            })
+            return out, debug
+        out = out.detach().cpu().bool().reshape(-1)
+        out[patch_indices] = patch_values
+        out = out.reshape_as(patch_mask)
+        frame_counts = [int(v) for v in selected_cube.reshape(ov, -1).sum(dim=1).tolist()]
+        debug.update({
+            "swa_redirection_available": True,
+            "swa_redirection_reason": "ok",
+            "swa_redirection_feature_path": str(feature_path),
+            "swa_redirection_schema": payload.get("schema") if isinstance(payload, dict) else None,
+            "swa_redirection_overlap_frames_effective": int(ov),
+            "swa_redirection_patch_grid": [H, W],
+            "swa_redirection_positive_support": int(positive.numel()),
+            "swa_redirection_threshold": float(threshold),
+            "swa_redirection_selected_tokens": int(out.sum().item()),
+            "swa_redirection_selected_patch_mass": float(selected_cube.float().mean().item()) if selected_cube.numel() else 0.0,
+            "swa_redirection_frame_counts": frame_counts,
+            "swa_redirection_score_positive_mean": float(positive.mean().item()),
+            "swa_redirection_score_positive_q75": float(torch.quantile(positive, 0.75).item()),
+            "swa_redirection_score_positive_q90": float(torch.quantile(positive, 0.90).item()),
+        })
+        return out, debug
+
     def _fine_path_roles(
         self,
         *,
@@ -4533,6 +5475,10 @@ class HybridMemoryController:
         high_d: torch.Tensor,
         low_d: torch.Tensor,
         high_trust: torch.Tensor,
+        read_patch_tok: Optional[torch.Tensor] = None,
+        key_stability_tok: Optional[torch.Tensor] = None,
+        num_frames: int = 0,
+        patch_grid: Tuple[int, int] = (0, 0),
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
         """Build path-specific fine-label roles with D/Q and v27 risk signals."""
 
@@ -4605,6 +5551,22 @@ class HybridMemoryController:
             risky_nonstructure = (vegetation | movable) & high_d & high_trust & (high_conflict | high_scale | high_d)
         weak_nonstructure = (vegetation | movable) & (~risky_nonstructure) & high_trust
 
+        read_active = torch.zeros_like(patch_mask, dtype=torch.bool)
+        if read_patch_tok is not None:
+            read_values = read_patch_tok.detach().cpu().float().reshape(-1)
+            if int(read_values.numel()) == int(D.numel()):
+                read_active = (read_values > 0.50) & patch_mask
+        key_stability_available = False
+        key_stability_thr: Optional[float] = None
+        key_stable = torch.zeros_like(patch_mask, dtype=torch.bool)
+        if key_stability_tok is not None:
+            key_stability = key_stability_tok.detach().cpu().float().reshape(-1).clamp(0.0, 1.0)
+            if int(key_stability.numel()) == int(D.numel()) and bool(patch_mask.any()):
+                key_stability_available = True
+                q = min(max(float(self.semantic_role_highd_quantile), 0.0), 1.0)
+                key_stability_thr = float(torch.quantile(key_stability[patch_mask], q).item())
+                key_stable = (key_stability >= float(key_stability_thr)) & patch_mask
+
         # Frame/global source roles: source protection for stable structure,
         # weak source for sky/vegetation, source skip only when semantic risk is
         # also high-D. Query tokens remain untouched in the model hook.
@@ -4642,6 +5604,64 @@ class HybridMemoryController:
         R_ttt[risky_nonstructure] = int(SEMANTIC_ROLE_NEGATIVE_SHORT)
         if policy in {"fine_ttt_lowstuff_highd_short", "causal_ttt_lowstuff_highd_conflict_shortneg", "causal_ttt_full_role_tree"}:
             R_ttt[lowstuff_highd] = int(SEMANTIC_ROLE_NEGATIVE_SHORT)
+        swa_redirection_policy = policy in {
+            "fine_ttt_swa_stable_top25_positive_context_neutral",
+            "fine_ttt_swa_stable_redirection_positive_context_neutral",
+            "fine_ttt_swa_stable_top25_source_boost_context_neutral",
+        }
+        swa_source_boost_policy = policy in {
+            "fine_ttt_swa_stable_top25_source_boost_context_neutral",
+        }
+        swa_redirection_mask = torch.zeros_like(patch_mask, dtype=torch.bool)
+        swa_redirection_debug: Dict[str, Any] = {
+            "swa_redirection_policy_applied": False,
+            "swa_redirection_policy": policy,
+        }
+        read_aligned_ttt_policy = policy in {
+            "fine_ttt_read_active_all_positive",
+            "fine_ttt_read_active_key_stable_positive_context_neutral",
+            "fine_ttt_read_active_key_stable_lowd_positive_context_neutral",
+            "fine_ttt_read_active_regime_guarded_pos_neutral",
+            "fine_ttt_read_active_structure_positive_highd_short",
+            "fine_ttt_read_active_structure_positive_context_neutral",
+            "fine_ttt_read_aligned_structure_positive",
+        }
+        read_active_key_stable_lowd = torch.zeros_like(patch_mask, dtype=torch.bool)
+        if read_aligned_ttt_policy:
+            read_active_structure = read_active & structure & high_trust
+            if policy in {
+                "fine_ttt_read_active_key_stable_positive_context_neutral",
+                "fine_ttt_read_active_key_stable_lowd_positive_context_neutral",
+            }:
+                read_active_key_stable = read_active & key_stable & high_trust
+                if policy == "fine_ttt_read_active_key_stable_lowd_positive_context_neutral":
+                    read_active_key_stable_lowd = read_active_key_stable & low_d
+                    read_active_key_positive = read_active_key_stable_lowd
+                else:
+                    read_active_key_positive = read_active_key_stable
+                read_active_key_context = read_active & high_trust & (~read_active_key_positive)
+                R_ttt[read_active_key_positive] = int(SEMANTIC_ROLE_POSITIVE_LONG)
+                R_ttt[read_active_key_context] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+            elif policy == "fine_ttt_read_active_regime_guarded_pos_neutral":
+                read_active_stable_structure = read_active & structure & low_d & high_trust
+                read_active_guarded_context = read_active & high_trust & (~read_active_stable_structure)
+                R_ttt[read_active_stable_structure] = int(SEMANTIC_ROLE_POSITIVE_LONG)
+                R_ttt[read_active_guarded_context] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+            elif policy == "fine_ttt_read_active_all_positive":
+                R_ttt[read_active & high_trust] = int(SEMANTIC_ROLE_POSITIVE_LONG)
+            else:
+                R_ttt[read_active_structure] = int(SEMANTIC_ROLE_POSITIVE_LONG)
+            if policy == "fine_ttt_read_active_structure_positive_context_neutral":
+                read_active_context = read_active & high_trust & (~read_active_structure)
+                R_ttt[read_active_context] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+            elif policy not in {
+                "fine_ttt_read_active_all_positive",
+                "fine_ttt_read_active_key_stable_positive_context_neutral",
+                "fine_ttt_read_active_key_stable_lowd_positive_context_neutral",
+                "fine_ttt_read_active_regime_guarded_pos_neutral",
+            }:
+                read_active_highd_context = read_active & high_d & high_trust & (sky | vegetation | movable)
+                R_ttt[read_active_highd_context] = int(SEMANTIC_ROLE_NEGATIVE_SHORT)
         if causal_policy:
             high_risk = high_conflict | high_scale
             R_ttt[structure & high_trust & high_risk] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
@@ -4706,6 +5726,146 @@ class HybridMemoryController:
         for R in (R_frame, R_global, R_swa, R_ttt):
             R[(unknown & ~v57_group_level_source) | (~high_trust & patch_mask)] = int(SEMANTIC_ROLE_FALLBACK)
 
+        if swa_redirection_policy:
+            swa_redirection_mask, swa_redirection_debug = self._swa_stable_redirection_token_mask(
+                token_type=G,
+                patch_mask=patch_mask,
+                num_frames=max(int(num_frames), 1),
+                patch_grid=(int(patch_grid[0]), int(patch_grid[1])),
+                chunk_idx=int(getattr(self, "current_chunk_idx", -1)),
+            )
+            swa_redirection_mask = swa_redirection_mask & patch_mask
+            if bool(swa_redirection_debug.get("swa_redirection_available", False)) and bool(swa_redirection_mask.any()):
+                base_positive_outside = (R_ttt == int(SEMANTIC_ROLE_POSITIVE_LONG)) & patch_mask & (~swa_redirection_mask)
+                read_context_outside = read_active & high_trust & (~swa_redirection_mask)
+                frame_positive_outside = (R_frame == int(SEMANTIC_ROLE_POSITIVE_LONG)) & patch_mask & (~swa_redirection_mask)
+                global_positive_outside = (R_global == int(SEMANTIC_ROLE_POSITIVE_LONG)) & patch_mask & (~swa_redirection_mask)
+                R_ttt[base_positive_outside | read_context_outside] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+                if swa_source_boost_policy:
+                    R_frame[frame_positive_outside] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+                    R_global[global_positive_outside] = int(SEMANTIC_ROLE_NEUTRAL_KEEP)
+                R_ttt[swa_redirection_mask] = int(SEMANTIC_ROLE_POSITIVE_LONG)
+                R_frame[swa_redirection_mask] = int(SEMANTIC_ROLE_POSITIVE_LONG)
+                R_global[swa_redirection_mask] = int(SEMANTIC_ROLE_POSITIVE_LONG)
+                R_swa[swa_redirection_mask] = int(SEMANTIC_ROLE_PROTECT_NEUTRAL)
+                swa_redirection_debug.update({
+                    "swa_redirection_policy_applied": True,
+                    "swa_redirection_source_boost_policy": bool(swa_source_boost_policy),
+                    "swa_redirection_positive_count": int((swa_redirection_mask & (R_ttt == int(SEMANTIC_ROLE_POSITIVE_LONG))).sum().item()),
+                    "swa_redirection_neutralized_base_positive_count": int(base_positive_outside.sum().item()),
+                    "swa_redirection_neutralized_read_context_count": int(read_context_outside.sum().item()),
+                    "swa_redirection_neutralized_frame_positive_count": int(frame_positive_outside.sum().item()) if swa_source_boost_policy else 0,
+                    "swa_redirection_neutralized_global_positive_count": int(global_positive_outside.sum().item()) if swa_source_boost_policy else 0,
+                })
+
+        read_active_mask = read_active & patch_mask
+        if swa_redirection_policy:
+            read_stable_proxy = swa_redirection_mask & patch_mask
+        elif policy == "fine_ttt_read_active_key_stable_positive_context_neutral":
+            read_stable_proxy = read_active_mask & key_stable & high_trust
+        elif policy == "fine_ttt_read_active_key_stable_lowd_positive_context_neutral":
+            read_stable_proxy = read_active_mask & key_stable & low_d & high_trust
+        else:
+            read_stable_proxy = read_active_mask & structure & low_d & high_trust
+        read_harm_proxy = read_active_mask & high_d & high_trust
+        read_active_positive = read_active_mask & (R_ttt == int(SEMANTIC_ROLE_POSITIVE_LONG))
+        read_active_neutral = read_active_mask & (
+            (R_ttt == int(SEMANTIC_ROLE_NEUTRAL_KEEP))
+            | (R_ttt == int(SEMANTIC_ROLE_PROTECT_NEUTRAL))
+        )
+        read_active_negative = read_active_mask & (R_ttt == int(SEMANTIC_ROLE_NEGATIVE_SHORT))
+        read_stable_positive = read_stable_proxy & (R_ttt == int(SEMANTIC_ROLE_POSITIVE_LONG))
+        read_harm_negative = read_harm_proxy & (R_ttt == int(SEMANTIC_ROLE_NEGATIVE_SHORT))
+        read_harm_no_persistent = read_harm_proxy & (
+            (R_ttt == int(SEMANTIC_ROLE_NEGATIVE_SHORT))
+            | (R_ttt == int(SEMANTIC_ROLE_NEUTRAL_KEEP))
+            | (R_ttt == int(SEMANTIC_ROLE_PROTECT_NEUTRAL))
+        )
+        read_active_regime_guard_neutral = (
+            read_active_mask & high_trust & (R_ttt == int(SEMANTIC_ROLE_NEUTRAL_KEEP))
+            if policy == "fine_ttt_read_active_regime_guarded_pos_neutral"
+            else torch.zeros_like(patch_mask, dtype=torch.bool)
+        )
+        read_active_key_context_neutral = (
+            read_active_mask & high_trust & (R_ttt == int(SEMANTIC_ROLE_NEUTRAL_KEEP))
+            if policy in {
+                "fine_ttt_read_active_key_stable_positive_context_neutral",
+                "fine_ttt_read_active_key_stable_lowd_positive_context_neutral",
+            }
+            else torch.zeros_like(patch_mask, dtype=torch.bool)
+        )
+        if policy == "fine_ttt_read_active_structure_positive_context_neutral":
+            read_active_context_neutral = read_active_mask & high_trust & (~(read_active & structure & high_trust))
+        elif swa_redirection_policy:
+            read_active_context_neutral = (
+                read_active_mask
+                & high_trust
+                & (~swa_redirection_mask)
+                & (R_ttt == int(SEMANTIC_ROLE_NEUTRAL_KEEP))
+            )
+        elif policy in {
+            "fine_ttt_read_active_key_stable_positive_context_neutral",
+            "fine_ttt_read_active_key_stable_lowd_positive_context_neutral",
+        }:
+            read_active_context_neutral = read_active_key_context_neutral
+        else:
+            read_active_context_neutral = read_active_regime_guard_neutral
+
+        def _count(mask: torch.Tensor) -> int:
+            return int(mask.sum().item())
+
+        def _rate(num: torch.Tensor, den: torch.Tensor) -> Optional[float]:
+            den_count = _count(den)
+            if den_count <= 0:
+                return None
+            return float(_count(num) / max(den_count, 1))
+
+        read_ttt_alignment_terms = [
+            value
+            for value in (
+                _rate(read_stable_positive, read_stable_proxy),
+                _rate(read_harm_no_persistent, read_harm_proxy),
+            )
+            if value is not None
+        ]
+        read_ttt_alignment_score = (
+            float(sum(read_ttt_alignment_terms) / len(read_ttt_alignment_terms))
+            if read_ttt_alignment_terms
+            else None
+        )
+        read_ttt_role_alignment = {
+            "schema": "acl2_v79_read_ttt_role_alignment_log_v1",
+            "source": "in_controller_runtime_role_intersection",
+            "note": (
+                (
+                    "SWA-redirection policy uses external Phase3 SWA stable-positive top-quantile support "
+                    "as the stable proxy; harm remains READ active high-D high-trust."
+                )
+                if swa_redirection_policy
+                else (
+                    "READ stable/harm are runtime proxies: stable=READ active structure low-D high-trust; "
+                    "harm=READ active high-D high-trust."
+                )
+            ),
+            "policy": policy,
+            "read_active_count": _count(read_active_mask),
+            "read_stable_proxy_count": _count(read_stable_proxy),
+            "read_harm_proxy_count": _count(read_harm_proxy),
+            "read_active_positive_count": _count(read_active_positive),
+            "read_active_neutral_count": _count(read_active_neutral),
+            "read_active_negative_count": _count(read_active_negative),
+            "read_active_positive_rate": _rate(read_active_positive, read_active_mask),
+            "read_active_neutral_rate": _rate(read_active_neutral, read_active_mask),
+            "read_active_negative_rate": _rate(read_active_negative, read_active_mask),
+            "read_stable_positive_count": _count(read_stable_positive),
+            "read_harm_negative_count": _count(read_harm_negative),
+            "read_harm_no_persistent_count": _count(read_harm_no_persistent),
+            "read_stable_positive_rate": _rate(read_stable_positive, read_stable_proxy),
+            "read_harm_negative_rate": _rate(read_harm_negative, read_harm_proxy),
+            "read_harm_no_persistent_rate": _rate(read_harm_no_persistent, read_harm_proxy),
+            "alignment_score": read_ttt_alignment_score,
+        }
+
         debug = {
             "runtime_fine_role_policy_available": True,
             "fine_label_token_count": int(known.sum().item()),
@@ -4737,6 +5897,75 @@ class HybridMemoryController:
                 "broadcast/proxy signals are not counted as stronger evidence."
             ),
             "fine_role_policy_variant": policy,
+            "read_aligned_ttt_policy_applied": bool(read_aligned_ttt_policy),
+            "read_aligned_ttt_read_active_count": int((read_active & patch_mask).sum().item()),
+            "read_aligned_ttt_read_active_structure_positive_count": int(
+                (
+                    read_active_positive
+                    if read_aligned_ttt_policy
+                    else (
+                        (read_active & high_trust)
+                        if policy == "fine_ttt_read_active_all_positive"
+                        else (read_active & structure & high_trust)
+                    )
+                ).sum().item()
+            ),
+            "read_aligned_ttt_read_active_stable_structure_positive_count": int(
+                (read_stable_proxy & (R_ttt == int(SEMANTIC_ROLE_POSITIVE_LONG))).sum().item()
+            ),
+            "read_aligned_ttt_read_active_regime_guard_neutral_count": int(
+                read_active_regime_guard_neutral.sum().item()
+            ),
+            "read_aligned_ttt_read_active_regime_highd_count": int(
+                (read_active_mask & high_d & high_trust).sum().item()
+            ),
+            "read_aligned_ttt_key_stability_available": bool(key_stability_available),
+            "read_aligned_ttt_key_stability_threshold": key_stability_thr,
+            "read_aligned_ttt_read_active_key_stable_count": int(
+                (read_active_mask & key_stable & high_trust).sum().item()
+            ),
+            "read_aligned_ttt_read_active_key_stable_positive_count": int(
+                (read_active_mask & key_stable & high_trust & (R_ttt == int(SEMANTIC_ROLE_POSITIVE_LONG))).sum().item()
+            ),
+            "read_aligned_ttt_read_active_key_stable_lowd_count": int(
+                (read_active_mask & key_stable & low_d & high_trust).sum().item()
+            ),
+            "read_aligned_ttt_read_active_key_stable_lowd_positive_count": int(
+                (
+                    read_active_mask
+                    & key_stable
+                    & low_d
+                    & high_trust
+                    & (R_ttt == int(SEMANTIC_ROLE_POSITIVE_LONG))
+                ).sum().item()
+            ),
+            "read_aligned_ttt_read_active_key_context_neutral_count": int(
+                read_active_key_context_neutral.sum().item()
+            ),
+            "READ_TTT_ROLE_ALIGNMENT_LOG": read_ttt_role_alignment,
+            "read_ttt_role_alignment": read_ttt_role_alignment,
+            "read_ttt_alignment_score": read_ttt_alignment_score,
+            "prior_read_ttt_role_alignment": read_ttt_role_alignment,
+            "prior_read_ttt_alignment_score": read_ttt_alignment_score,
+            "read_aligned_ttt_read_active_structure_positive_count_legacy": int(
+                (
+                    (read_active & high_trust)
+                    if policy == "fine_ttt_read_active_all_positive"
+                    else (read_active & structure & high_trust)
+                ).sum().item()
+            ),
+            "read_aligned_ttt_read_active_context_neutral_count": int(
+                read_active_context_neutral.sum().item()
+            ),
+            "read_aligned_ttt_read_active_highd_context_negative_count": int(
+                (read_active & high_d & high_trust & (sky | vegetation | movable)).sum().item()
+                if policy
+                not in {
+                    "fine_ttt_read_active_structure_positive_context_neutral",
+                    "fine_ttt_read_active_all_positive",
+                }
+                else 0
+            ),
             "R_frame_role_counts": self._role_counts(R_frame[patch_mask]),
             "R_global_role_counts": self._role_counts(R_global[patch_mask]),
             "R_swa_role_counts": self._role_counts(R_swa[patch_mask]),
@@ -4756,7 +5985,54 @@ class HybridMemoryController:
                 "ttt": self._label_role_counts(L, R_ttt, patch_mask),
             },
         }
+        debug.update(swa_redirection_debug)
         return R_frame, R_global, R_swa, R_ttt, debug
+
+    @staticmethod
+    def _swa_redirection_source_mask_from_roles(
+        R_frame_tok: Optional[torch.Tensor],
+        R_global_tok: Optional[torch.Tensor],
+        role_debug: Dict[str, Any],
+    ) -> Optional[torch.Tensor]:
+        if not (
+            bool(role_debug.get("swa_redirection_policy_applied", False))
+            and bool(role_debug.get("swa_redirection_source_boost_policy", False))
+        ):
+            return None
+        if R_frame_tok is None:
+            role_debug["swa_redirection_source_mask_reason"] = "missing_R_frame_tok"
+            return None
+        frame_pos = (
+            R_frame_tok.detach().cpu().long().reshape(-1)
+            == int(SEMANTIC_ROLE_POSITIVE_LONG)
+        )
+        if R_global_tok is not None:
+            global_pos = (
+                R_global_tok.detach().cpu().long().reshape(-1)
+                == int(SEMANTIC_ROLE_POSITIVE_LONG)
+            )
+            if int(global_pos.numel()) == int(frame_pos.numel()):
+                source_mask = frame_pos & global_pos
+                role_debug["swa_redirection_source_mask_global_positive_count"] = int(global_pos.sum().item())
+                role_debug["swa_redirection_source_mask_frame_global_match"] = bool(torch.equal(frame_pos, global_pos))
+            else:
+                source_mask = frame_pos
+                role_debug["swa_redirection_source_mask_frame_global_match"] = False
+                role_debug["swa_redirection_source_mask_reason"] = "R_global_tok_shape_mismatch"
+        else:
+            source_mask = frame_pos
+            role_debug["swa_redirection_source_mask_frame_global_match"] = None
+        count = int(source_mask.sum().item())
+        expected = role_debug.get("swa_redirection_selected_tokens")
+        expected_int = int(expected) if expected is not None else None
+        role_debug.update({
+            "swa_redirection_source_mask_available": True,
+            "swa_redirection_source_mask_token_count": count,
+            "swa_redirection_source_mask_matches_selected": (
+                bool(expected_int == count) if expected_int is not None else None
+            ),
+        })
+        return source_mask
 
     def _apply_semantic_role_policy(
         self,
@@ -4775,6 +6051,10 @@ class HybridMemoryController:
         R_ttt_tok: Optional[torch.Tensor],
         P_ttt_write: Optional[torch.Tensor],
         D_swa_write_tok: Optional[torch.Tensor],
+        read_patch_tok: Optional[torch.Tensor] = None,
+        key_stability_tok: Optional[torch.Tensor] = None,
+        num_frames: int = 0,
+        patch_grid: Tuple[int, int] = (0, 0),
     ) -> Tuple[
         Optional[torch.Tensor],
         Optional[torch.Tensor],
@@ -4892,6 +6172,10 @@ class HybridMemoryController:
                 high_d=high_d,
                 low_d=low_d,
                 high_trust=high_trust,
+                read_patch_tok=read_patch_tok,
+                key_stability_tok=key_stability_tok,
+                num_frames=num_frames,
+                patch_grid=patch_grid,
             )
             # Shared role is retained for legacy summaries. Model hook sites
             # consume the path-specific roles where available.
@@ -4968,6 +6252,11 @@ class HybridMemoryController:
             "ttt_semantic_write_role_stats": {},
             "ttt_semantic_write_role_max_abs_rel_change": 0.0,
             "ttt_semantic_write_role_intended_change_ge20": False,
+            "semantic_role_ttt_read_harm_veto_mode": str(
+                getattr(self, "semantic_role_ttt_read_harm_veto_mode", "none") or "none"
+            ),
+            "semantic_role_ttt_read_harm_veto_applied": False,
+            "semantic_role_ttt_read_harm_veto_reason": "ttt_path_disabled_or_missing_write_prior",
         }
         P_out = P_ttt_write
         if (ttt_on or lifecycle_on) and P_ttt_write is not None:
@@ -4979,6 +6268,55 @@ class HybridMemoryController:
             P[pos] = (P[pos] * float(self.semantic_role_positive_scale)).clamp(0.0, 1.5)
             P[neu] = (P[neu] * float(self.semantic_role_neutral_scale)).clamp(0.0, 1.5)
             P[neg] = (P[neg] * float(self.semantic_role_negative_scale)).clamp(0.0, 1.5)
+            P_after_role = P.clone()
+            veto_mode = str(getattr(self, "semantic_role_ttt_read_harm_veto_mode", "none") or "none").strip().lower()
+            veto_scale = max(0.0, min(1.5, float(getattr(self, "semantic_role_ttt_read_harm_veto_scale", 0.0))))
+            veto_min_harm = max(0, int(getattr(self, "semantic_role_ttt_read_harm_veto_min_harm", 1)))
+            veto_max_stable_positive = max(
+                0,
+                int(getattr(self, "semantic_role_ttt_read_harm_veto_max_stable_positive", 0)),
+            )
+            read_active = torch.zeros_like(patch_mask, dtype=torch.bool)
+            if read_patch_tok is not None:
+                read_values = read_patch_tok.detach().cpu().float().reshape(-1)
+                if int(read_values.numel()) == int(D.numel()):
+                    read_active = (read_values > 0.50) & patch_mask
+            read_harm_proxy = read_active & high_d & high_trust
+            read_stable_positive = read_active & low_d & high_trust & pos
+            read_harm_no_persistent = read_harm_proxy & (neg | neu | (R_ttt == int(SEMANTIC_ROLE_PROTECT_NEUTRAL)))
+            veto_mask = read_harm_no_persistent
+            if veto_mode == "read_harm_negative_no_stable":
+                veto_mask = read_harm_proxy & neg
+            elif veto_mode in {"read_active_no_stable", "read_active_harm_no_stable"}:
+                veto_mask = read_active & high_trust
+            read_harm_count = int(read_harm_no_persistent.sum().item())
+            read_stable_positive_count = int(read_stable_positive.sum().item())
+            veto_candidate_count = int((veto_mask & patch_mask).sum().item())
+            veto_applied = False
+            veto_reason = "disabled"
+            veto_before_mean = None
+            veto_after_mean = None
+            if veto_mode not in {"", "none", "off", "noop"}:
+                if veto_mode not in {
+                    "read_harm_no_stable",
+                    "read_harm_negative_no_stable",
+                    "read_active_no_stable",
+                    "read_active_harm_no_stable",
+                }:
+                    veto_reason = f"unknown_mode:{veto_mode}"
+                elif read_harm_count < veto_min_harm:
+                    veto_reason = "below_min_read_harm"
+                elif read_stable_positive_count > veto_max_stable_positive:
+                    veto_reason = "stable_positive_available"
+                elif veto_candidate_count <= 0:
+                    veto_reason = "empty_veto_mask"
+                else:
+                    active_veto = veto_mask & patch_mask
+                    veto_before_mean = float(P_after_role[active_veto].mean().item())
+                    P[active_veto] = (P[active_veto] * veto_scale).clamp(0.0, 1.5)
+                    veto_after_mean = float(P[active_veto].mean().item())
+                    veto_applied = True
+                    veto_reason = "read_harm_without_stable_positive"
             P_out = P
             role_specs = (
                 ("positive", pos, float(self.semantic_role_positive_scale)),
@@ -5010,6 +6348,18 @@ class HybridMemoryController:
                 "ttt_semantic_write_role_stats": role_stats,
                 "ttt_semantic_write_role_max_abs_rel_change": float(max_abs_rel),
                 "ttt_semantic_write_role_intended_change_ge20": bool(max_abs_rel >= 0.20),
+                "semantic_role_ttt_read_harm_veto_mode": veto_mode or "none",
+                "semantic_role_ttt_read_harm_veto_scale": float(veto_scale),
+                "semantic_role_ttt_read_harm_veto_min_harm": int(veto_min_harm),
+                "semantic_role_ttt_read_harm_veto_max_stable_positive": int(veto_max_stable_positive),
+                "semantic_role_ttt_read_harm_veto_applied": bool(veto_applied),
+                "semantic_role_ttt_read_harm_veto_reason": veto_reason,
+                "semantic_role_ttt_read_harm_veto_read_active_count": int(read_active.sum().item()),
+                "semantic_role_ttt_read_harm_veto_read_harm_no_persistent_count": int(read_harm_count),
+                "semantic_role_ttt_read_harm_veto_read_stable_positive_count": int(read_stable_positive_count),
+                "semantic_role_ttt_read_harm_veto_candidate_count": int(veto_candidate_count),
+                "semantic_role_ttt_read_harm_veto_before_mean": veto_before_mean,
+                "semantic_role_ttt_read_harm_veto_after_mean": veto_after_mean,
             }
 
         D_swa_out = D_swa_write_tok
@@ -5292,6 +6642,11 @@ class HybridMemoryController:
                     new_item["v_post"] = item["v_post"].index_select(2, keep_idx.to(device=item["v_post"].device))
                 if torch.is_tensor(item.get("k_post")):
                     new_item["k_post"] = item["k_post"].index_select(2, keep_idx.to(device=item["k_post"].device))
+                if torch.is_tensor(item.get("hidden_pre")):
+                    new_item["hidden_pre"] = item["hidden_pre"].index_select(
+                        1,
+                        keep_idx.to(device=item["hidden_pre"].device),
+                    )
                 v = new_item["v"]
                 num_tokens = int(v.shape[2])
             gate = _aligned_gate(num_tokens, device=v.device, dtype=v.dtype)
@@ -5417,6 +6772,14 @@ class HybridMemoryController:
             and not gate_active
         )
         inactive_chunk = bool(self.semantic_action_active_chunks and not gate_active)
+        read_cue_semantic_prior_requested = _read_cue_requires_semantic_prior(self.read_cue_source)
+        keep_inactive_read_cue_prior = bool(
+            inactive_chunk
+            and not use_inactive_source
+            and read_cue_semantic_prior_requested
+            and prior_output is not None
+        )
+        prior_output_for_impl = prior_output if ((not inactive_chunk) or keep_inactive_read_cue_prior) else None
         if use_inactive_source:
             self.read_cue_source = inactive_source
         if inactive_chunk:
@@ -5429,16 +6792,23 @@ class HybridMemoryController:
             out = self._build_control_prior_impl(
                 probe=probe,
                 cue=cue,
-                prior_output=None if inactive_chunk else prior_output,
+                prior_output=prior_output_for_impl,
                 mode=mode,
             )
             out.debug["semantic_action_chunk_gate_mode"] = gate_mode
             out.debug["semantic_action_chunk_gate_active"] = bool(gate_active)
             out.debug["semantic_action_prior_gate_active"] = bool(not inactive_chunk)
-            out.debug["semantic_action_prior_consumed"] = bool((not inactive_chunk) and prior_output is not None)
-            out.debug["semantic_action_inactive_policy"] = (
-                "disable_semantic_prior_role_control_anchor" if inactive_chunk else "none"
-            )
+            out.debug["semantic_action_prior_consumed"] = bool(prior_output_for_impl is not None)
+            out.debug["semantic_action_prior_consumed_for_action"] = bool((not inactive_chunk) and prior_output is not None)
+            out.debug["semantic_action_read_cue_requires_semantic_prior"] = bool(read_cue_semantic_prior_requested)
+            out.debug["semantic_action_read_cue_prior_consumed"] = bool(keep_inactive_read_cue_prior)
+            if inactive_chunk and keep_inactive_read_cue_prior:
+                inactive_policy = "disable_semantic_action_keep_read_cue_prior"
+            elif inactive_chunk:
+                inactive_policy = "disable_semantic_prior_role_control_anchor"
+            else:
+                inactive_policy = "none"
+            out.debug["semantic_action_inactive_policy"] = inactive_policy
             out.debug["semantic_action_read_cue_gate_mode"] = gate_mode
             out.debug["semantic_action_read_cue_gate_active"] = bool(not use_inactive_source)
             out.debug["semantic_action_inactive_read_cue_source"] = inactive_source or None
@@ -5652,11 +7022,31 @@ class HybridMemoryController:
 
                 U_tok = torch.ones(L_tok, dtype=torch.float32)
                 P_ref = (token_type != TOKEN_TYPE_PATCH).float() if self.read_protect_ref else torch.zeros(L_tok, dtype=torch.float32)
+                key_stability_patch, key_stability_debug = _select_frame_key_stability_patch(
+                    geo,
+                    dyn_patch,
+                    num_frames=num_frames,
+                )
+                key_stability_tok = _token_from_patch_values(
+                    geo,
+                    key_stability_patch,
+                    special_value=0.0,
+                ).clamp(0.0, 1.0)
+                key_stability_debug.update({
+                    "key_stability_modulated_by_qk_var": False,
+                    "key_stability_tok_gt050_mass": (
+                        float((key_stability_tok > 0.50).float().mean().item())
+                        if key_stability_tok.numel()
+                        else 0.0
+                    ),
+                })
+                patch_debug.update(key_stability_debug)
                 raw_frame_bias_energy = _frame_bias_energy(
                     D_tok,
                     P_ref,
                     num_frames=num_frames,
                     mode=self.frame_bias_mode,
+                    K_stable_tok=key_stability_tok,
                 )
                 beta_frame_effective = self.beta_frame
                 beta_was_clipped = False
@@ -5702,6 +7092,24 @@ class HybridMemoryController:
                     R_ttt_tok = getattr(prior_output, "R_ttt_tok", None)
                     if R_ttt_tok is not None:
                         R_ttt_tok = R_ttt_tok.detach().cpu().long()
+                    stage_c_seed_global_track_idx_tok = getattr(
+                        prior_output,
+                        "stage_c_seed_global_track_idx_tok",
+                        None,
+                    )
+                    if stage_c_seed_global_track_idx_tok is not None:
+                        stage_c_seed_global_track_idx_tok = (
+                            stage_c_seed_global_track_idx_tok.detach().cpu().long()
+                        )
+                    stage_c_masklet_instance_idx_tok = getattr(
+                        prior_output,
+                        "stage_c_masklet_instance_idx_tok",
+                        None,
+                    )
+                    if stage_c_masklet_instance_idx_tok is not None:
+                        stage_c_masklet_instance_idx_tok = (
+                            stage_c_masklet_instance_idx_tok.detach().cpu().long()
+                        )
                     override_write, write_debug = self._phase_e_write_prior(
                         probe=probe,
                         token_type=token_type,
@@ -5729,6 +7137,8 @@ class HybridMemoryController:
                     R_global_tok = None
                     R_swa_tok = None
                     R_ttt_tok = None
+                    stage_c_seed_global_track_idx_tok = None
+                    stage_c_masklet_instance_idx_tok = None
                     override_write, write_debug = self._phase_e_write_prior(
                         probe=probe,
                         token_type=token_type,
@@ -5773,10 +7183,18 @@ class HybridMemoryController:
                     R_ttt_tok=R_ttt_tok,
                     P_ttt_write=P_ttt_write,
                     D_swa_write_tok=D_swa_write_tok,
+                    read_patch_tok=_token_from_patch_values(geo, read_patch, special_value=0.0),
+                    key_stability_tok=key_stability_tok,
+                    num_frames=num_frames,
+                    patch_grid=(int(geo.patch_grid[0]), int(geo.patch_grid[1])),
+                )
+                swa_redirection_source_mask_tok = self._swa_redirection_source_mask_from_roles(
+                    R_frame_tok,
+                    R_global_tok,
+                    role_debug,
                 )
                 patch_debug.update(role_debug)
 
-                key_avg_patch_anchor = _normalize01(_flatten_or_default(geo.frame_attn_key_cosine_avg, dyn_patch))
                 A_anchor_tok, A_anchor_mask_tok, anchor_debug = self._build_semantic_anchor_bank(
                     token_type=token_type,
                     D_tok=D_tok,
@@ -5787,7 +7205,7 @@ class HybridMemoryController:
                     S_tok=S_tok,
                     V_sem_tok=V_sem_tok,
                     conf_patch=conf_patch,
-                    key_avg_patch=key_avg_patch_anchor,
+                    key_avg_patch=key_stability_patch,
                     num_frames=num_frames,
                     patch_grid=(int(geo.patch_grid[0]), int(geo.patch_grid[1])),
                 )
@@ -5806,6 +7224,22 @@ class HybridMemoryController:
                     chunk_idx=int(getattr(self, "current_chunk_idx", -1)),
                 )
                 patch_debug.update(v70_ttt_debug)
+                P_ttt_write, semantic_ttt_support_debug = self._apply_semantic_ttt_overlap_support_prior(
+                    token_type=token_type,
+                    P_ttt_write=P_ttt_write,
+                    num_frames=num_frames,
+                    patch_grid=(int(geo.patch_grid[0]), int(geo.patch_grid[1])),
+                    chunk_idx=int(getattr(self, "current_chunk_idx", -1)),
+                )
+                patch_debug.update(semantic_ttt_support_debug)
+
+                frame_read_effective_enabled = bool(self.enable_frame_read_control)
+                if (
+                    _is_v95_trackh_gated_l07_source(self.read_cue_source)
+                    and patch_debug.get("v95_trackH_gate_active") is False
+                ):
+                    frame_read_effective_enabled = False
+                    patch_debug["v95_trackH_gate_strict_noop"] = True
 
                 return HybridMemoryControlPrior(
                     D_tok=D_tok,
@@ -5822,6 +7256,10 @@ class HybridMemoryController:
                     R_global_tok=R_global_tok,
                     R_swa_tok=R_swa_tok,
                     R_ttt_tok=R_ttt_tok,
+                    stage_c_seed_global_track_idx_tok=stage_c_seed_global_track_idx_tok,
+                    stage_c_masklet_instance_idx_tok=stage_c_masklet_instance_idx_tok,
+                    K_stable_tok=key_stability_tok,
+                    swa_redirection_source_mask_tok=swa_redirection_source_mask_tok,
                     A_anchor_tok=A_anchor_tok,
                     A_anchor_mask_tok=A_anchor_mask_tok,
                     C_ttt_conflict_tok=(
@@ -5839,10 +7277,12 @@ class HybridMemoryController:
                     P_swa_read_prev=None,
                     D_swa_write_tok=D_swa_write_tok,
                     frame_bias_spec={
-                        "enabled": self.enable_frame_read_control,
+                        "enabled": frame_read_effective_enabled,
                         "beta": self.beta_frame,
                         "beta_effective": beta_frame_effective,
                         "mode": self.frame_bias_mode,
+                        "query_region": self.frame_bias_query_region,
+                        "head_indices": self.frame_bias_head_indices,
                         "cue_source": self.read_cue_source,
                         "topk_frac": self.read_topk_frac,
                         "calib_mode": self.read_calib_mode,
@@ -5884,6 +7324,8 @@ class HybridMemoryController:
                         "beta_raw_frame_bias_energy": raw_frame_bias_energy,
                         "beta_was_clipped": bool(beta_was_clipped),
                         "frame_bias_mode": self.frame_bias_mode,
+                        "frame_bias_query_region": self.frame_bias_query_region,
+                        "frame_bias_head_indices": self.frame_bias_head_indices,
                         "chunk_bias_mode": self.chunk_bias_mode,
                         "swa_bias_mode": self.swa_bias_mode,
                         "read_protect_ref": self.read_protect_ref,
@@ -5986,6 +7428,18 @@ class HybridMemoryController:
             )
             fa_key_deep_low_patch = _robust_quantile01(1.0 - fa_key_deep_raw, num_frames=num_frames)
             fa_query_shallow_patch = _robust_quantile01(fa_query_shallow_raw, num_frames=num_frames)
+            key_stability_base_patch, key_stability_debug = _select_frame_key_stability_patch(
+                geo,
+                dyn_patch,
+                num_frames=num_frames,
+            )
+            key_stability_patch = (
+                key_stability_base_patch * (1.0 - qk_var_patch).clamp(0.0, 1.0)
+            ).clamp(0.0, 1.0)
+            key_stability_debug.update({
+                "key_stability_modulated_by_qk_var": True,
+                **_patch_signal_debug("key_stability_patch", key_stability_patch),
+            })
             gg_qk_middle_patch = _robust_quantile01(
                 _global_centroid_metric(
                     geo.global_q_raw_patchvec_layers,
@@ -6132,6 +7586,7 @@ class HybridMemoryController:
             fallback_rate = 0.0
             cue_source_effective = self.read_cue_source
             cue_extra_debug: Dict[str, Any] = {}
+            read_skip_calibration = False
             acl2_patch = _acl2_read_patch_from_source(
                 self.read_cue_source,
                 geo.global_q_raw_patchvec_layers,
@@ -6609,6 +8064,145 @@ class HybridMemoryController:
                 read_patch = fa_key_deep_patch
             elif self.read_cue_source == "fa.key.all.high.robustq":
                 read_patch = fa_key_all_patch
+            elif _is_v95_trackh_gated_l07_source(self.read_cue_source):
+                gate_specs = {
+                    "gate.fa_key_all_mean_ge_q60.then_v78_l07": {
+                        "patch": fa_key_all_patch,
+                        "direction": "ge",
+                        "threshold": 0.235332936049,
+                        "source": "fa_key_all_patch_mean",
+                    },
+                    "gate.fa_key_middle_mean_ge_q60.then_v78_l07": {
+                        "patch": fa_key_middle_patch,
+                        "direction": "ge",
+                        "threshold": 0.235332936049,
+                        "source": "fa_key_middle_patch_mean",
+                    },
+                    "gate.gg_qk_shallow_mean_le_q40.then_v78_l07": {
+                        "patch": gg_qk_shallow_patch,
+                        "direction": "le",
+                        "threshold": 0.225390625,
+                        "source": "gg_qk_shallow_patch_mean",
+                    },
+                    "gate.gg_qk_shallow_mean_le_q40.chunk_ge_6.then_v78_l07": {
+                        "patch": gg_qk_shallow_patch,
+                        "direction": "le",
+                        "threshold": 0.225390625,
+                        "source": "gg_qk_shallow_patch_mean",
+                        "min_chunk_idx": 6,
+                    },
+                    "gate.gg_qk_shallow_mean_le_q40.chunk_ge_6.rtok_ge_0p005.then_v78_l07": {
+                        "patch": gg_qk_shallow_patch,
+                        "direction": "le",
+                        "threshold": 0.225390625,
+                        "source": "gg_qk_shallow_patch_mean",
+                        "min_chunk_idx": 6,
+                        "min_mean_R_tok": 0.005,
+                    },
+                    "gate.gg_qk_shallow_mean_le_q40.chunk_ge_33.rtok_ge_0p005.then_v78_l07": {
+                        "patch": gg_qk_shallow_patch,
+                        "direction": "le",
+                        "threshold": 0.225390625,
+                        "source": "gg_qk_shallow_patch_mean",
+                        "min_chunk_idx": 33,
+                        "min_mean_R_tok": 0.005,
+                    },
+                    "gate.gg_qk_shallow_mean_le_q40.chunk_eq_33.rtok_ge_0p005.then_v78_l07": {
+                        "patch": gg_qk_shallow_patch,
+                        "direction": "le",
+                        "threshold": 0.225390625,
+                        "source": "gg_qk_shallow_patch_mean",
+                        "min_chunk_idx": 33,
+                        "max_chunk_idx": 33,
+                        "min_mean_R_tok": 0.005,
+                    },
+                    "gate.gg_qk_shallow_mean_le_q40.chunk_eq_36.rtok_ge_0p005.then_v78_l07": {
+                        "patch": gg_qk_shallow_patch,
+                        "direction": "le",
+                        "threshold": 0.225390625,
+                        "source": "gg_qk_shallow_patch_mean",
+                        "min_chunk_idx": 36,
+                        "max_chunk_idx": 36,
+                        "min_mean_R_tok": 0.005,
+                    },
+                }
+                gate_source = str(self.read_cue_source)
+                gate_key = _v95_trackh_gated_l07_gate_key(gate_source)
+                gate_spec = gate_specs[gate_key]
+                active_read_cue = _v95_trackh_gated_l07_active_read_cue(gate_source)
+                gate_patch = gate_spec["patch"]
+                gate_threshold = float(gate_spec["threshold"])
+                gate_direction = str(gate_spec["direction"])
+                gate_min_chunk_idx = int(gate_spec.get("min_chunk_idx", -1))
+                gate_max_chunk_idx = int(gate_spec.get("max_chunk_idx", -1))
+                gate_min_mean_R_tok = gate_spec.get("min_mean_R_tok")
+                gate_score = float(gate_patch.mean().item()) if gate_patch.numel() else 0.0
+                gate_R_tok = _token_from_patch_values(
+                    geo,
+                    ((1.0 - occ_patch) * (1.0 - unc_patch)).clamp(0.0, 1.0),
+                    special_value=1.0,
+                )
+                gate_mean_R_tok = float(gate_R_tok.float().mean().item()) if gate_R_tok.numel() else 1.0
+                if gate_direction == "le":
+                    gate_active = bool(gate_score <= gate_threshold)
+                else:
+                    gate_active = bool(gate_score >= gate_threshold)
+                current_chunk_idx = int(getattr(self, "current_chunk_idx", -1))
+                if gate_min_chunk_idx >= 0 and current_chunk_idx < gate_min_chunk_idx:
+                    gate_active = False
+                if gate_max_chunk_idx >= 0 and current_chunk_idx > gate_max_chunk_idx:
+                    gate_active = False
+                gate_mean_R_tok_pass = True
+                if gate_min_mean_R_tok is not None:
+                    gate_mean_R_tok_pass = bool(gate_mean_R_tok >= float(gate_min_mean_R_tok))
+                    if not gate_mean_R_tok_pass:
+                        gate_active = False
+                l07_patch = None
+                l07_debug: Dict[str, Any] = {}
+                if gate_active:
+                    l07_cfg = _parse_v78_l07_l13_read_cue(active_read_cue)
+                    if l07_cfg is not None:
+                        l07_patch, l07_debug = _v78_l07_l13_read_cue_patch(
+                            token_type=token_type,
+                            prior_output=prior_output,
+                            cfg=l07_cfg,
+                            q_layers=geo.global_q_raw_patchvec_layers,
+                            k_layers=geo.global_k_raw_patchvec_layers,
+                            v_layers=getattr(geo, "global_v_raw_patchvec_layers", None),
+                            default=dyn_patch,
+                            num_frames=num_frames,
+                            chunk_idx=current_chunk_idx,
+                        )
+                if gate_active and l07_patch is not None:
+                    read_patch = l07_patch
+                    cue_extra_debug.update(l07_debug)
+                    cue_gate = 1.0
+                    fallback_rate = 0.0
+                    cue_source_effective = f"{self.read_cue_source}:active"
+                else:
+                    read_patch = torch.zeros_like(dyn_patch)
+                    read_skip_calibration = True
+                    cue_gate = 0.0
+                    fallback_rate = 1.0
+                    cue_source_effective = f"{self.read_cue_source}:inactive"
+                cue_extra_debug.update(
+                    {
+                        "v95_trackH_gate_source": str(gate_spec["source"]),
+                        "v95_trackH_gate_direction": gate_direction,
+                        "v95_trackH_gate_min_chunk_idx": gate_min_chunk_idx if gate_min_chunk_idx >= 0 else None,
+                        "v95_trackH_gate_max_chunk_idx": gate_max_chunk_idx if gate_max_chunk_idx >= 0 else None,
+                        "v95_trackH_gate_threshold": float(gate_threshold),
+                        "v95_trackH_gate_score": float(gate_score),
+                        "v95_trackH_gate_min_mean_R_tok": (
+                            float(gate_min_mean_R_tok) if gate_min_mean_R_tok is not None else None
+                        ),
+                        "v95_trackH_gate_mean_R_tok": float(gate_mean_R_tok),
+                        "v95_trackH_gate_mean_R_tok_pass": bool(gate_mean_R_tok_pass),
+                        "v95_trackH_gate_active": bool(gate_active),
+                        "v95_trackH_gate_chunk_idx": int(current_chunk_idx),
+                        "v95_trackH_gate_active_read_cue": active_read_cue,
+                    }
+                )
             elif self.read_cue_source == "fa.key.shallow_deep.decay.robustq":
                 read_patch = fa_key_decay_patch
             elif self.read_cue_source == "fa.key.l0_deep.decay.robustq":
@@ -6650,7 +8244,7 @@ class HybridMemoryController:
             else:
                 read_patch = dyn_patch
 
-            if self.read_calib_mode == "per_frame_quantile":
+            if (not read_skip_calibration) and self.read_calib_mode == "per_frame_quantile":
                 calibrated = _adaptive_quantile_calibrate(
                     read_patch,
                     num_frames=num_frames,
@@ -6660,7 +8254,7 @@ class HybridMemoryController:
                 blend = min(max(float(self.read_blend_lambda), 0.0), 1.0)
                 read_patch = ((1.0 - blend) * read_patch + blend * calibrated).clamp(0.0, 1.0)
 
-            if self.read_topk_frac > 0.0:
+            if (not read_skip_calibration) and self.read_topk_frac > 0.0:
                 read_patch = _topk_per_frame(read_patch, num_frames=num_frames, frac=self.read_topk_frac)
 
             safe_patch = (anchor_patch >= self.read_static_anchor_thr) & (dyn_patch <= self.read_static_dyn_thr)
@@ -6669,7 +8263,7 @@ class HybridMemoryController:
                 num_patch=int(read_patch.numel()),
                 num_frames=num_frames,
                 safe_patch=safe_patch,
-                key_avg_patch=key_avg_patch,
+                key_avg_patch=key_stability_base_patch,
             )
             if self.read_protect_static:
                 phase_e_protect_patch = torch.maximum(phase_e_protect_patch, safe_patch.float())
@@ -6747,7 +8341,56 @@ class HybridMemoryController:
                 "gram_layer_groups": self.gram_layer_groups,
                 **protect_debug,
                 **cue_extra_debug,
+                **key_stability_debug,
             }
+            patch_debug.update(
+                self._dump_read_cue_patch(
+                    read_patch=read_patch,
+                    num_frames=num_frames,
+                    patch_grid=(int(geo.patch_grid[0]), int(geo.patch_grid[1])),
+                    chunk_idx=int(getattr(self, "current_chunk_idx", -1)),
+                    cue_source_effective=cue_source_effective,
+                    patch_debug=patch_debug,
+                    extra_patches={
+                        "dyn_patch": dyn_patch,
+                        "confidence_patch": conf_patch,
+                        "uncertainty_patch": unc_patch,
+                        "occlusion_patch": occ_patch,
+                        "anchor_patch": anchor_patch,
+                        "key_avg_patch": key_avg_patch,
+                        "key_stability_base_patch": key_stability_base_patch,
+                        "key_stability_patch": key_stability_patch,
+                        "qk_var_patch": qk_var_patch,
+                        "qq_patch": qq_patch,
+                        "kk_patch": kk_patch,
+                        "dyn4d_patch": dyn4d_patch,
+                        "query_avg_patch": query_avg_patch,
+                        "query_shallow_patch": query_shallow_patch,
+                        "query_deep_patch": query_deep_patch,
+                        "fa_query_shallow_patch": fa_query_shallow_patch,
+                        "fa_key_l0_patch": fa_key_l0_patch,
+                        "fa_key_l4_patch": fa_key_l4_patch,
+                        "fa_key_shallow_patch": fa_key_shallow_patch,
+                        "fa_key_middle_patch": fa_key_middle_patch,
+                        "fa_key_deep_patch": fa_key_deep_patch,
+                        "fa_key_all_patch": fa_key_all_patch,
+                        "fa_key_layer_var_patch": fa_key_layer_var_patch,
+                        "fa_key_decay_patch": fa_key_decay_patch,
+                        "fa_key_l0_deep_decay_patch": fa_key_l0_deep_decay_patch,
+                        "fa_key_l4_deep_decay_patch": fa_key_l4_deep_decay_patch,
+                        "fa_key_deep_low_patch": fa_key_deep_low_patch,
+                        "gg_qk_middle_patch": gg_qk_middle_patch,
+                        "gg_qk_shallow_patch": gg_qk_shallow_patch,
+                        "gg_qk_deep_patch": gg_qk_deep_patch,
+                        "gg_qq_middle_patch": gg_qq_middle_patch,
+                        "gg_kk_middle_patch": gg_kk_middle_patch,
+                        "gg_qq_shallow_patch": gg_qq_shallow_patch,
+                        "gg_deep_static_patch": gg_deep_static_patch,
+                        "gg_smd_a1b1g1_patch": gg_smd_a1b1g1_patch,
+                        "gg_smd_a0b1g1_patch": gg_smd_a0b1g1_patch,
+                    },
+                )
+            )
         else:
             D_tok = torch.zeros(L_tok, dtype=torch.float32)
             R_tok = torch.ones(L_tok, dtype=torch.float32)
@@ -6759,11 +8402,27 @@ class HybridMemoryController:
         if bool((P_safe > 0.0).any()):
             P_ref = torch.maximum(P_ref, P_safe)
         D_swa_write_tok = D_tok.detach().cpu().float().clone()
+        if cue is not None and cue.E_cue_patch is not None:
+            key_stability_tok = _token_from_patch_values(
+                geo,
+                key_stability_patch,
+                special_value=0.0,
+            ).clamp(0.0, 1.0)
+            patch_debug.update({
+                "key_stability_tok_gt050_mass": (
+                    float((key_stability_tok > 0.50).float().mean().item())
+                    if key_stability_tok.numel()
+                    else 0.0
+                ),
+            })
+        else:
+            key_stability_tok = torch.zeros_like(D_tok)
         raw_frame_bias_energy = _frame_bias_energy(
             D_tok,
             P_ref,
             num_frames=num_frames,
             mode=self.frame_bias_mode,
+            K_stable_tok=key_stability_tok,
         )
         beta_frame_effective = self.beta_frame
         beta_was_clipped = False
@@ -6808,6 +8467,20 @@ class HybridMemoryController:
             R_ttt_tok = getattr(prior_output, "R_ttt_tok", None)
             if R_ttt_tok is not None:
                 R_ttt_tok = R_ttt_tok.detach().cpu().long()
+            stage_c_seed_global_track_idx_tok = getattr(
+                prior_output,
+                "stage_c_seed_global_track_idx_tok",
+                None,
+            )
+            if stage_c_seed_global_track_idx_tok is not None:
+                stage_c_seed_global_track_idx_tok = stage_c_seed_global_track_idx_tok.detach().cpu().long()
+            stage_c_masklet_instance_idx_tok = getattr(
+                prior_output,
+                "stage_c_masklet_instance_idx_tok",
+                None,
+            )
+            if stage_c_masklet_instance_idx_tok is not None:
+                stage_c_masklet_instance_idx_tok = stage_c_masklet_instance_idx_tok.detach().cpu().long()
             override_write, write_debug = self._phase_e_write_prior(
                 probe=probe,
                 token_type=token_type,
@@ -6835,6 +8508,8 @@ class HybridMemoryController:
             R_global_tok = None
             R_swa_tok = None
             R_ttt_tok = None
+            stage_c_seed_global_track_idx_tok = None
+            stage_c_masklet_instance_idx_tok = None
             patch_debug.update({"hmc_write_score_source": self.hmc_write_score_source, "hmc_write_override": False})
 
         if mode in {"unity_replay", "native", "identity_hooks", "read_path_only", "probe_only"}:
@@ -6864,6 +8539,15 @@ class HybridMemoryController:
             R_ttt_tok=R_ttt_tok,
             P_ttt_write=P_ttt_write,
             D_swa_write_tok=D_swa_write_tok,
+            read_patch_tok=_token_from_patch_values(geo, read_patch, special_value=0.0),
+            key_stability_tok=key_stability_tok,
+            num_frames=num_frames,
+            patch_grid=(int(geo.patch_grid[0]), int(geo.patch_grid[1])),
+        )
+        swa_redirection_source_mask_tok = self._swa_redirection_source_mask_from_roles(
+            R_frame_tok,
+            R_global_tok,
+            role_debug,
         )
         patch_debug.update(role_debug)
 
@@ -6877,7 +8561,7 @@ class HybridMemoryController:
             S_tok=S_tok,
             V_sem_tok=V_sem_tok,
             conf_patch=conf_patch if cue is not None and cue.E_cue_patch is not None else None,
-            key_avg_patch=key_avg_patch if cue is not None and cue.E_cue_patch is not None else None,
+            key_avg_patch=key_stability_base_patch if cue is not None and cue.E_cue_patch is not None else None,
             num_frames=num_frames,
             patch_grid=(int(geo.patch_grid[0]), int(geo.patch_grid[1])),
         )
@@ -6896,6 +8580,24 @@ class HybridMemoryController:
             chunk_idx=int(getattr(self, "current_chunk_idx", -1)),
         )
         patch_debug.update(v70_ttt_debug)
+        P_ttt_write, semantic_ttt_support_debug = self._apply_semantic_ttt_overlap_support_prior(
+            token_type=token_type,
+            P_ttt_write=P_ttt_write,
+            num_frames=num_frames,
+            patch_grid=(int(geo.patch_grid[0]), int(geo.patch_grid[1])),
+            chunk_idx=int(getattr(self, "current_chunk_idx", -1)),
+        )
+        patch_debug.update(semantic_ttt_support_debug)
+
+        frame_read_effective_enabled = bool(self.enable_frame_read_control)
+        if (
+            _is_v95_trackh_gated_l07_source(self.read_cue_source)
+            and cue_extra_debug.get("v95_trackH_gate_active") is False
+        ):
+            frame_read_effective_enabled = False
+            cue_extra_debug["v95_trackH_gate_strict_noop"] = True
+        elif _is_v95_trackh_gated_l07_source(self.read_cue_source):
+            cue_extra_debug["v95_trackH_gate_strict_noop"] = False
 
         return HybridMemoryControlPrior(
             D_tok=D_tok,
@@ -6912,6 +8614,10 @@ class HybridMemoryController:
             R_global_tok=R_global_tok,
             R_swa_tok=R_swa_tok,
             R_ttt_tok=R_ttt_tok,
+            stage_c_seed_global_track_idx_tok=stage_c_seed_global_track_idx_tok,
+            stage_c_masklet_instance_idx_tok=stage_c_masklet_instance_idx_tok,
+            K_stable_tok=key_stability_tok,
+            swa_redirection_source_mask_tok=swa_redirection_source_mask_tok,
             A_anchor_tok=A_anchor_tok,
             A_anchor_mask_tok=A_anchor_mask_tok,
             C_ttt_conflict_tok=(
@@ -6929,7 +8635,7 @@ class HybridMemoryController:
             P_swa_read_prev=None,
             D_swa_write_tok=D_swa_write_tok,
             frame_bias_spec={
-                "enabled": self.enable_frame_read_control,
+                "enabled": frame_read_effective_enabled,
                 "beta": self.beta_frame,
                 "beta_effective": beta_frame_effective,
                 "mode": self.frame_bias_mode,
@@ -7020,6 +8726,44 @@ class HybridMemoryController:
             prev_L_patch = state_m.prev_control_summary.get("L_patch")
             if prev_L_patch is not None:
                 model_hmc_control["L_prev_patch"] = prev_L_patch
+            prev_stage_c_seed_patch = state_m.prev_control_summary.get("stage_c_seed_global_track_idx_patch")
+            if prev_stage_c_seed_patch is not None:
+                model_hmc_control["stage_c_seed_global_track_idx_prev_patch"] = prev_stage_c_seed_patch
+            prev_stage_c_masklet_instance_patch = state_m.prev_control_summary.get("stage_c_masklet_instance_idx_patch")
+            if prev_stage_c_masklet_instance_patch is not None:
+                model_hmc_control["stage_c_masklet_instance_idx_prev_patch"] = prev_stage_c_masklet_instance_patch
+            for prev_key in (
+                "ttt_stable_anchor_mask_patch",
+                "ttt_stable_anchor_id_patch",
+                "ttt_stable_anchor_retention_patch",
+                "ttt_stable_anchor_residual_patch",
+                "ttt_stable_anchor_z_write_key_norm_patch",
+                "ttt_stable_anchor_z_write_key_vec_patch",
+                "ttt_stable_anchor_z_write_key_sketch_patch",
+                "ttt_stable_anchor_z_write_hidden_vec_patch",
+                "ttt_tracked_instance_anchor_mask_patch",
+                "ttt_tracked_instance_anchor_id_patch",
+                "ttt_tracked_instance_anchor_seed_patch",
+            ):
+                prev_value = state_m.prev_control_summary.get(prev_key)
+                if prev_value is not None:
+                    model_hmc_control[f"prev_{prev_key}"] = prev_value
+            if "ttt_stable_anchor_source_chunk_idx" in state_m.prev_control_summary:
+                model_hmc_control["prev_ttt_stable_anchor_source_chunk_idx"] = int(
+                    state_m.prev_control_summary.get("ttt_stable_anchor_source_chunk_idx", -1)
+                )
+            if "ttt_stable_anchor_token_count" in state_m.prev_control_summary:
+                model_hmc_control["prev_ttt_stable_anchor_token_count"] = int(
+                    state_m.prev_control_summary.get("ttt_stable_anchor_token_count", 0) or 0
+                )
+            if "ttt_tracked_instance_anchor_source_chunk_idx" in state_m.prev_control_summary:
+                model_hmc_control["prev_ttt_tracked_instance_anchor_source_chunk_idx"] = int(
+                    state_m.prev_control_summary.get("ttt_tracked_instance_anchor_source_chunk_idx", -1)
+                )
+            if "ttt_tracked_instance_anchor_token_count" in state_m.prev_control_summary:
+                model_hmc_control["prev_ttt_tracked_instance_anchor_token_count"] = int(
+                    state_m.prev_control_summary.get("ttt_tracked_instance_anchor_token_count", 0) or 0
+                )
         geo, write_cache = backbone.run(
             images,
             ttt_state=state_m.to_ttt_input() if state_m is not None else None,
@@ -7059,6 +8803,10 @@ class HybridMemoryController:
                 old_mode = self.ttt_update_controller.write_mode
                 self.ttt_update_controller.write_mode = write_mode
                 self.ttt_update_controller.current_chunk_idx = int(getattr(self, "current_chunk_idx", -1))
+                scale_state_debug = self._configure_ttt_write_scale_state(
+                    geo,
+                    state_m.prev_control_summary if state_m is not None else None,
+                )
                 write_cache_for_commit, dual_lifetime_debug = _write_cache_with_long_old_weights_for_dual_lifetime(
                     write_cache,
                     state_m.ttt_state if state_m is not None else None,
@@ -7072,6 +8820,7 @@ class HybridMemoryController:
                     num_frames=int(geo.num_frames),
                     overlap_frames=int(self.read_overlap_frames),
                     risk_tok=control_prior.D_tok if control_prior is not None else None,
+                    role_tok=control_prior.R_ttt_tok if control_prior is not None else None,
                     prev_transient_delta=(
                         state_m.ttt_state.get("transient_delta")
                         if state_m is not None and isinstance(state_m.ttt_state, dict)
@@ -7080,6 +8829,7 @@ class HybridMemoryController:
                 )
                 self.ttt_update_controller.write_mode = old_mode
                 write_result.debug.update(dual_lifetime_debug)
+                write_result.debug["ttt_scale_state_diagnostic"] = scale_state_debug
                 gated_history, swa_write_debug = self._apply_swa_history_write_gate(
                     write_result.history,
                     control_prior,
@@ -7098,7 +8848,15 @@ class HybridMemoryController:
             ttt_state=ttt_next,
             swa_state=None,
             ref_state=None,
-            prev_control_summary=self._build_prev_control_summary(control_prior, geo),
+            prev_control_summary=self._build_prev_control_summary(
+                control_prior,
+                geo,
+                prev_control_summary=state_m.prev_control_summary if state_m is not None else None,
+                ttt_token_contribution_diagnostic=(
+                    write_result.token_contribution_diagnostic if write_result is not None else None
+                ),
+                chunk_idx=int(getattr(self, "current_chunk_idx", -1)),
+            ),
         )
         output_hash = hybrid_state_fingerprint(state_next)
         trace_dict = geo.hmc_trace or {}
@@ -7181,6 +8939,73 @@ class HybridMemoryController:
                 for rec in records
                 if isinstance(rec, dict) and rec.get("swa_overlap_source_replace_score_mean") is not None
             ]
+            prev_ttt_anchor_gate_mean_vals = [
+                float(rec.get("swa_prev_ttt_stable_anchor_gate_mean", 1.0))
+                for rec in records
+                if isinstance(rec, dict) and rec.get("swa_prev_ttt_stable_anchor_gate_mean") is not None
+            ]
+            prev_ttt_anchor_gate_delta_vals = [
+                float(rec.get("swa_prev_ttt_stable_anchor_gate_mean_abs_delta", 0.0))
+                for rec in records
+                if isinstance(rec, dict) and rec.get("swa_prev_ttt_stable_anchor_gate_mean_abs_delta") is not None
+            ]
+            prev_ttt_anchor_max_gate_delta_vals = [
+                float(rec.get("swa_prev_ttt_stable_anchor_gate_max_abs_delta", 0.0))
+                for rec in records
+                if isinstance(rec, dict) and rec.get("swa_prev_ttt_stable_anchor_gate_max_abs_delta") is not None
+            ]
+            prev_ttt_anchor_gate_token_vals = [
+                int(rec.get("swa_prev_ttt_stable_anchor_gate_tokens", 0) or 0)
+                for rec in records
+                if isinstance(rec, dict)
+            ]
+            prev_ttt_anchor_gate_frac_vals = [
+                float(rec.get("swa_prev_ttt_stable_anchor_gate_selected_frac", 0.0))
+                for rec in records
+                if isinstance(rec, dict) and rec.get("swa_prev_ttt_stable_anchor_gate_selected_frac") is not None
+            ]
+            prev_ttt_anchor_query_soft_source_token_vals = [
+                int(rec.get("prev_ttt_anchor_query_soft_source_tokens", 0) or 0)
+                for rec in records
+                if isinstance(rec, dict)
+            ]
+            prev_ttt_anchor_query_soft_selected_query_vals = [
+                int(rec.get("prev_ttt_anchor_query_soft_selected_query_count", 0) or 0)
+                for rec in records
+                if isinstance(rec, dict)
+            ]
+            prev_ttt_anchor_query_soft_selected_frac_vals = [
+                float(rec.get("prev_ttt_anchor_query_soft_query_selected_frac", 0.0))
+                for rec in records
+                if isinstance(rec, dict) and rec.get("prev_ttt_anchor_query_soft_query_selected_frac") is not None
+            ]
+            prev_ttt_tracked_instance_query_soft_source_token_vals = [
+                int(rec.get("prev_ttt_tracked_instance_query_soft_source_tokens", 0) or 0)
+                for rec in records
+                if isinstance(rec, dict)
+            ]
+            prev_ttt_tracked_instance_query_soft_selected_query_vals = [
+                int(rec.get("prev_ttt_tracked_instance_query_soft_selected_query_count", 0) or 0)
+                for rec in records
+                if isinstance(rec, dict)
+            ]
+            prev_ttt_tracked_instance_query_soft_selected_frac_vals = [
+                float(rec.get("prev_ttt_tracked_instance_query_soft_query_selected_frac", 0.0))
+                for rec in records
+                if isinstance(rec, dict)
+                and rec.get("prev_ttt_tracked_instance_query_soft_query_selected_frac") is not None
+            ]
+            prev_ttt_tracked_instance_query_soft_seed_count_vals = [
+                int(rec.get("prev_ttt_tracked_instance_query_soft_direct_witness_seed_count", 0) or 0)
+                for rec in records
+                if isinstance(rec, dict)
+            ]
+            prev_ttt_tracked_instance_query_soft_rule_pass_vals = [
+                bool(rec.get("prev_ttt_tracked_instance_query_soft_carrier_rule_pass", False))
+                for rec in records
+                if isinstance(rec, dict)
+                and rec.get("prev_ttt_tracked_instance_query_soft_carrier_rule_pass") is not None
+            ]
             source_keep_ratio_vals = [
                 float(rec.get("source_keep_ratio", 1.0))
                 for rec in records
@@ -7261,6 +9086,31 @@ class HybridMemoryController:
                 for rec in records
                 if isinstance(rec, dict) and rec.get("attention_mass_retained_tokens_mean") is not None
             ]
+            attention_mass_stable_anchor_before_vals = [
+                float(rec.get("attention_mass_stable_anchor_before"))
+                for rec in records
+                if isinstance(rec, dict) and rec.get("attention_mass_stable_anchor_before") is not None
+            ]
+            attention_mass_stable_anchor_after_vals = [
+                float(rec.get("attention_mass_stable_anchor_after"))
+                for rec in records
+                if isinstance(rec, dict) and rec.get("attention_mass_stable_anchor_after") is not None
+            ]
+            attention_mass_stable_anchor_actual_after_vals = [
+                float(rec.get("attention_mass_stable_anchor_actual_after"))
+                for rec in records
+                if isinstance(rec, dict) and rec.get("attention_mass_stable_anchor_actual_after") is not None
+            ]
+            attention_mass_stable_anchor_token_vals = [
+                float(rec.get("attention_mass_stable_anchor_tokens_mean"))
+                for rec in records
+                if isinstance(rec, dict) and rec.get("attention_mass_stable_anchor_tokens_mean") is not None
+            ]
+            attention_mass_stable_anchor_preservation_vals = [
+                float(rec.get("attention_mass_stable_anchor_preservation_ratio"))
+                for rec in records
+                if isinstance(rec, dict) and rec.get("attention_mass_stable_anchor_preservation_ratio") is not None
+            ]
             attention_mass_metrics = sorted({
                 str(rec.get("attention_mass_metric"))
                 for rec in records
@@ -7308,6 +9158,108 @@ class HybridMemoryController:
                 "source_control_score_max",
                 "source_weight_mean",
                 "source_weight_min",
+                "semantic_anchor_rescue_source_tokens",
+                "semantic_anchor_rescue_source_ratio",
+                "semantic_anchor_rescue_source_score_mean",
+                "semantic_anchor_rescue_source_score_max",
+                "frame_bias_positive_pair_mass_before",
+                "frame_bias_positive_pair_mass_after",
+                "frame_bias_positive_pair_mass_lift",
+                "frame_bias_negative_pair_mass_before",
+                "frame_bias_negative_pair_mass_after",
+                "frame_bias_negative_pair_mass_lift",
+                "frame_bias_positive_pair_count_mean",
+                "frame_bias_negative_pair_count_mean",
+                "frame_bias_positive_pair_fraction",
+                "frame_bias_negative_pair_fraction",
+                "frame_bias_positive_bias_mean",
+                "frame_bias_negative_bias_mean",
+                "frame_bias_attention_mass_query_count",
+                "swa_raw_transport_trace_sampled_query_count",
+                "swa_raw_transport_trace_head_count",
+                "swa_raw_transport_current_tokens",
+                "swa_raw_transport_history_tokens",
+                "swa_raw_transport_d_prev_low_pair_tokens",
+                "swa_raw_transport_d_prev_high_pair_tokens",
+                "swa_raw_transport_g_prev_high_pair_tokens",
+                "swa_raw_transport_k_stable_pair_tokens",
+                "swa_raw_transport_label_static_structure_pair_tokens",
+                "swa_raw_transport_stable_pair_strict_tokens",
+                "swa_raw_transport_stable_pair_semantic_lowd_tokens",
+                "swa_raw_transport_stable_pair_lowd_nonunreliable_tokens",
+                "swa_raw_transport_stable_pair_tokens",
+                "swa_raw_transport_unreliable_pair_tokens",
+                "swa_raw_transport_qk_similarity_mean",
+                "swa_raw_transport_qk_similarity_max_mean",
+                "swa_raw_transport_route_entropy_mean",
+                "swa_raw_transport_feature_residual_mean",
+                "swa_raw_transport_cache_k_stability_mean",
+                "swa_raw_transport_cache_v_stability_mean",
+                "swa_raw_transport_stable_pair_mass_mean",
+                "swa_raw_transport_unreliable_pair_mass_mean",
+                "swa_raw_transport_stable_actual_minus_random_mean",
+                "swa_raw_transport_unreliable_actual_minus_random_mean",
+                "swa_raw_transport_topk_identity_available",
+                "swa_raw_transport_topk_identity_topk",
+                "swa_raw_transport_top1_cache_index_unique_frac_mean",
+                "swa_raw_transport_top1_cache_frame_unique_frac_mean",
+                "swa_raw_transport_top1_cache_index_switch_rate_mean",
+                "swa_raw_transport_top1_cache_frame_switch_rate_mean",
+                "swa_raw_transport_top1_same_frame_frac_mean",
+                "swa_raw_transport_topk_query_frame_hit_frac_mean",
+                "swa_raw_transport_topk_same_frame_frac_mean",
+                "swa_raw_transport_top1_abs_frame_delta_mean",
+                "prev_ttt_tracked_instance_query_soft_source_tokens",
+                "prev_ttt_tracked_instance_query_soft_selected_query_count",
+                "prev_ttt_tracked_instance_query_soft_query_selected_frac",
+                "prev_ttt_tracked_instance_query_soft_topk",
+                "prev_ttt_tracked_instance_query_soft_head_frac_threshold",
+                "prev_ttt_tracked_instance_query_soft_query_block_size",
+                "prev_ttt_tracked_instance_query_soft_direct_witness_hit_count",
+                "prev_ttt_tracked_instance_query_soft_direct_witness_seed_count",
+                "prev_ttt_tracked_instance_query_soft_min_direct_witness_seeds",
+                "v102_swa_state_machine_history_tokens",
+                "v102_swa_state_machine_current_tokens",
+                "v102_swa_state_machine_swa_layer",
+                "v102_swa_state_machine_unreliable_d_min",
+                "v102_swa_state_machine_unreliable_g_min",
+                "v102_swa_state_machine_supported_d_max",
+                "v102_swa_state_machine_supported_k_min",
+                "v102_swa_state_machine_soft_unsupported_min_keep",
+                "v102_swa_state_machine_hold_prev_frames",
+                "v102_swa_state_machine_hold_history_frames",
+                "v102_swa_state_machine_hold_reference_tokens",
+                "v102_swa_state_machine_hold_d_low_tokens",
+                "v102_swa_state_machine_hold_semantic_static_tokens",
+                "v102_swa_state_machine_hold_k_stable_tokens",
+                "v102_swa_state_machine_hold_soft_min_keep",
+                "v102_swa_state_machine_delay_current_tokens",
+                "v102_swa_state_machine_delay_current_frac",
+                "v102_swa_state_machine_delay_current_soft_min_keep",
+                "v102_swa_state_machine_context_semantic_tokens",
+                "v102_swa_state_machine_context_scale_observable_tokens",
+                "v102_swa_state_machine_context_d_low_tokens",
+                "v102_swa_state_machine_context_demoted_tokens",
+                "v102_swa_state_machine_context_soft_min_keep",
+                "v102_swa_state_machine_min_history_keep_frac",
+                "v102_swa_state_machine_unreliable_d_high_tokens",
+                "v102_swa_state_machine_unreliable_g_high_tokens",
+                "v102_swa_state_machine_supported_d_low_tokens",
+                "v102_swa_state_machine_supported_semantic_static_tokens",
+                "v102_swa_state_machine_supported_k_stable_tokens",
+                "v102_swa_state_machine_supported_history_tokens",
+                "v102_swa_state_machine_rejected_history_tokens",
+                "v102_swa_state_machine_kept_history_tokens",
+                "v102_swa_state_machine_source_keep_tokens",
+                "v102_swa_state_machine_source_total_tokens",
+                "v102_swa_state_machine_rejected_history_frac",
+                "attention_mass_removed_before",
+                "attention_mass_removed_after",
+                "attention_mass_retained_before",
+                "attention_mass_retained_after",
+                "attention_mass_removed_tokens_mean",
+                "attention_mass_retained_tokens_mean",
+                "attention_mass_query_sample_tokens_mean",
             ):
                 vals = [
                     float(rec.get(extra_key))
@@ -7379,8 +9331,25 @@ class HybridMemoryController:
                 "v40_r3_source_attention_mass_available_before_action",
                 "v67_source_attention_random_same_mass",
                 "v67_source_attention_group_missing_semantic",
+                "semantic_anchor_rescue_source_available",
                 "swa_overlap_source_semantic_missing_labels",
                 "swa_overlap_source_semantic_random_same_mass",
+                "swa_raw_transport_trace_available",
+                "swa_raw_transport_stable_fallback_used",
+                "swa_raw_transport_stable_groups_nonempty",
+                "swa_raw_transport_unreliable_groups_nonempty",
+                "v102_swa_state_machine_trace_available",
+                "v102_swa_state_machine_trace_applied",
+                "v102_swa_state_machine_scaffold_only",
+                "v102_swa_state_machine_runtime_action_allowed",
+                "v102_swa_state_machine_strict_gate_pass",
+                "v102_swa_state_machine_true_l3_gate_pass",
+                "v102_swa_state_machine_action_probe_enabled",
+                "v102_swa_state_machine_supported_require_static_semantic",
+                "v102_swa_state_machine_supported_fallback_used",
+                "prev_ttt_tracked_instance_query_soft_trace_only",
+                "prev_ttt_tracked_instance_query_soft_carrier_rule_pass",
+                "prev_ttt_tracked_instance_query_soft_direct_match_available",
             ):
                 vals = [
                     bool(rec.get(extra_key))
@@ -7389,6 +9358,22 @@ class HybridMemoryController:
                 ]
                 if vals:
                     extra_bool_summary[f"frac_{extra_key}"] = float(torch.tensor(vals, dtype=torch.float32).mean().item())
+            extra_categorical_summary: Dict[str, Any] = {}
+            for extra_key in (
+                "v102_swa_state_machine_action",
+                "v102_swa_state_machine_reason",
+                "v102_swa_state_machine_required_terms",
+                "v102_swa_state_machine_probe_impl",
+                "prev_ttt_tracked_instance_query_soft_direct_match_mode",
+                "prev_ttt_tracked_instance_query_soft_direct_match_missing_reason",
+            ):
+                vals = sorted({
+                    str(rec.get(extra_key))
+                    for rec in records
+                    if isinstance(rec, dict) and rec.get(extra_key) not in (None, "")
+                })
+                if vals:
+                    extra_categorical_summary[f"values_{extra_key}"] = vals
             hook_effect_summary[path_name] = {
                 "num_calls": len(records),
                 "num_enabled_layers": sum(
@@ -7398,6 +9383,9 @@ class HybridMemoryController:
                         bool(rec.get("layer_enabled", True))
                         or bool(rec.get("swa_overlap_bias_applied", False))
                         or bool(rec.get("swa_overlap_source_gate_applied", False))
+                        or bool(rec.get("swa_prev_ttt_stable_anchor_gate_applied", False))
+                        or bool(rec.get("prev_ttt_anchor_query_soft_applied", False))
+                        or rec.get("prev_ttt_tracked_instance_query_soft_reason") is not None
                         or bool(rec.get("swa_overlap_source_replace_applied", False))
                     )
                 ),
@@ -7411,11 +9399,45 @@ class HybridMemoryController:
                     1 for rec in records
                     if isinstance(rec, dict) and bool(rec.get("swa_overlap_source_replace_applied", False))
                 ),
+                "num_swa_prev_ttt_stable_anchor_gate_applied": sum(
+                    1 for rec in records
+                    if isinstance(rec, dict) and bool(rec.get("swa_prev_ttt_stable_anchor_gate_applied", False))
+                ),
+                "num_swa_prev_ttt_anchor_query_soft_applied": sum(
+                    1 for rec in records
+                    if isinstance(rec, dict) and bool(rec.get("prev_ttt_anchor_query_soft_applied", False))
+                ),
+                "num_swa_prev_ttt_tracked_instance_query_soft_trace": sum(
+                    1 for rec in records
+                    if isinstance(rec, dict)
+                    and rec.get("prev_ttt_tracked_instance_query_soft_reason") is not None
+                ),
+                "num_swa_prev_ttt_tracked_instance_query_soft_carrier_rule_pass": sum(
+                    1 for rec in records
+                    if isinstance(rec, dict)
+                    and bool(rec.get("prev_ttt_tracked_instance_query_soft_carrier_rule_pass", False))
+                ),
                 "num_source_gate_applied": sum(
                     1 for rec in records if isinstance(rec, dict) and bool(rec.get("source_gate_applied", False))
                 ),
                 "num_context_source_skip_applied": sum(
                     1 for rec in records if isinstance(rec, dict) and bool(rec.get("context_source_skip_applied", False))
+                ),
+                "num_v102_swa_state_machine_trace_available": sum(
+                    1 for rec in records
+                    if isinstance(rec, dict) and bool(rec.get("v102_swa_state_machine_trace_available", False))
+                ),
+                "num_v102_swa_state_machine_trace_applied": sum(
+                    1 for rec in records
+                    if isinstance(rec, dict) and bool(rec.get("v102_swa_state_machine_trace_applied", False))
+                ),
+                "num_v102_swa_state_machine_runtime_action_allowed": sum(
+                    1 for rec in records
+                    if isinstance(rec, dict) and bool(rec.get("v102_swa_state_machine_runtime_action_allowed", False))
+                ),
+                "num_v102_swa_state_machine_scaffold_only": sum(
+                    1 for rec in records
+                    if isinstance(rec, dict) and bool(rec.get("v102_swa_state_machine_scaffold_only", False))
                 ),
                 "mean_abs_bias": float(torch.tensor(mean_vals).mean().item()) if mean_vals else 0.0,
                 "max_abs_bias": max(max_vals) if max_vals else 0.0,
@@ -7438,6 +9460,42 @@ class HybridMemoryController:
                 if overlap_source_replace_alpha_p90_vals else 0.0,
                 "mean_swa_overlap_source_replace_score": float(torch.tensor(overlap_source_replace_score_vals).mean().item())
                 if overlap_source_replace_score_vals else 0.0,
+                "mean_swa_prev_ttt_stable_anchor_gate": float(torch.tensor(prev_ttt_anchor_gate_mean_vals).mean().item())
+                if prev_ttt_anchor_gate_mean_vals else 1.0,
+                "mean_swa_prev_ttt_stable_anchor_gate_delta": float(torch.tensor(prev_ttt_anchor_gate_delta_vals).mean().item())
+                if prev_ttt_anchor_gate_delta_vals else 0.0,
+                "max_swa_prev_ttt_stable_anchor_gate_delta": max(prev_ttt_anchor_max_gate_delta_vals)
+                if prev_ttt_anchor_max_gate_delta_vals else 0.0,
+                "max_swa_prev_ttt_stable_anchor_gate_tokens": max(prev_ttt_anchor_gate_token_vals)
+                if prev_ttt_anchor_gate_token_vals else 0,
+                "mean_swa_prev_ttt_stable_anchor_gate_selected_frac": float(
+                    torch.tensor(prev_ttt_anchor_gate_frac_vals).mean().item()
+                ) if prev_ttt_anchor_gate_frac_vals else 0.0,
+                "max_swa_prev_ttt_anchor_query_soft_source_tokens": max(prev_ttt_anchor_query_soft_source_token_vals)
+                if prev_ttt_anchor_query_soft_source_token_vals else 0,
+                "max_swa_prev_ttt_anchor_query_soft_selected_queries": max(prev_ttt_anchor_query_soft_selected_query_vals)
+                if prev_ttt_anchor_query_soft_selected_query_vals else 0,
+                "mean_swa_prev_ttt_anchor_query_soft_selected_frac": float(
+                    torch.tensor(prev_ttt_anchor_query_soft_selected_frac_vals).mean().item()
+                ) if prev_ttt_anchor_query_soft_selected_frac_vals else 0.0,
+                "max_swa_prev_ttt_tracked_instance_query_soft_source_tokens": (
+                    max(prev_ttt_tracked_instance_query_soft_source_token_vals)
+                    if prev_ttt_tracked_instance_query_soft_source_token_vals else 0
+                ),
+                "max_swa_prev_ttt_tracked_instance_query_soft_selected_queries": (
+                    max(prev_ttt_tracked_instance_query_soft_selected_query_vals)
+                    if prev_ttt_tracked_instance_query_soft_selected_query_vals else 0
+                ),
+                "mean_swa_prev_ttt_tracked_instance_query_soft_selected_frac": float(
+                    torch.tensor(prev_ttt_tracked_instance_query_soft_selected_frac_vals).mean().item()
+                ) if prev_ttt_tracked_instance_query_soft_selected_frac_vals else 0.0,
+                "max_swa_prev_ttt_tracked_instance_query_soft_direct_witness_seed_count": (
+                    max(prev_ttt_tracked_instance_query_soft_seed_count_vals)
+                    if prev_ttt_tracked_instance_query_soft_seed_count_vals else 0
+                ),
+                "frac_swa_prev_ttt_tracked_instance_query_soft_carrier_rule_pass": float(
+                    torch.tensor(prev_ttt_tracked_instance_query_soft_rule_pass_vals, dtype=torch.float32).mean().item()
+                ) if prev_ttt_tracked_instance_query_soft_rule_pass_vals else 0.0,
                 "mean_context_source_keep_ratio": float(torch.tensor(source_keep_ratio_vals).mean().item())
                 if source_keep_ratio_vals else 1.0,
                 "max_context_source_skip_tokens": max(source_skip_token_vals) if source_skip_token_vals else 0,
@@ -7463,20 +9521,58 @@ class HybridMemoryController:
                 if attention_mass_removed_token_vals else None,
                 "mean_attention_mass_retained_tokens": float(torch.tensor(attention_mass_retained_token_vals).mean().item())
                 if attention_mass_retained_token_vals else None,
+                "mean_attention_mass_stable_anchor_before": float(torch.tensor(attention_mass_stable_anchor_before_vals).mean().item())
+                if attention_mass_stable_anchor_before_vals else None,
+                "mean_attention_mass_stable_anchor_after": float(torch.tensor(attention_mass_stable_anchor_after_vals).mean().item())
+                if attention_mass_stable_anchor_after_vals else None,
+                "mean_attention_mass_stable_anchor_actual_after": float(torch.tensor(attention_mass_stable_anchor_actual_after_vals).mean().item())
+                if attention_mass_stable_anchor_actual_after_vals else None,
+                "mean_attention_mass_stable_anchor_tokens": float(torch.tensor(attention_mass_stable_anchor_token_vals).mean().item())
+                if attention_mass_stable_anchor_token_vals else None,
+                "mean_attention_mass_stable_anchor_preservation_ratio": float(torch.tensor(attention_mass_stable_anchor_preservation_vals).mean().item())
+                if attention_mass_stable_anchor_preservation_vals else None,
                 "max_history_tokens": max(history_token_vals) if history_token_vals else 0,
                 "max_d_prev_tokens": max(d_prev_token_vals) if d_prev_token_vals else 0,
             }
             hook_effect_summary[path_name].update(extra_numeric_summary)
             hook_effect_summary[path_name].update(extra_array_summary)
             hook_effect_summary[path_name].update(extra_bool_summary)
+            hook_effect_summary[path_name].update(extra_categorical_summary)
+        frame_bias_spec = (control_prior.frame_bias_spec or {}) if control_prior is not None else {}
+        frame_read_effective_enabled = bool(self.enable_frame_read_control)
+        frame_read_effective_enabled = frame_read_effective_enabled and bool(
+            frame_bias_spec.get("enabled", frame_read_effective_enabled)
+        )
         implemented_paths: List[str] = []
         if mode == "identity_hooks":
             implemented_paths = ["frame_attention", "swa_read", "ttt_apply", "chunk_attention"]
         elif mode == "ttt_write_only":
             implemented_paths = ["ttt_update"]
+            if self.enable_swa_read_control:
+                implemented_paths.append("swa_read")
+            elif self.enable_swa_overlap_bias:
+                implemented_paths.append("swa_overlap_bias")
+            elif self.enable_swa_overlap_source_gate:
+                implemented_paths.append("swa_overlap_source_gate")
+            elif self.enable_swa_prev_ttt_stable_anchor_gate:
+                implemented_paths.append("swa_prev_ttt_stable_anchor_gate")
+            elif self.enable_swa_prev_ttt_anchor_query_soft:
+                implemented_paths.append("swa_prev_ttt_anchor_query_soft")
+            elif self.enable_swa_prev_ttt_tracked_instance_query_soft_action:
+                implemented_paths.append(
+                    "swa_prev_ttt_tracked_instance_query_soft_action"
+                    if self.swa_prev_ttt_tracked_instance_query_soft_action_runtime_authorized
+                    else "swa_prev_ttt_tracked_instance_query_soft_action_requested_trace_only"
+                )
+            elif self.enable_swa_prev_ttt_tracked_instance_query_soft_trace:
+                implemented_paths.append("swa_prev_ttt_tracked_instance_query_soft_trace")
+            elif self.enable_swa_overlap_source_replace:
+                implemented_paths.append("swa_overlap_source_replace")
+            if self.swa_raw_transport_trace_dir:
+                implemented_paths.append("swa_raw_transport_trace")
         elif mode == "hybrid":
             implemented_paths = ["ttt_update"]
-            if self.enable_frame_read_control:
+            if frame_read_effective_enabled:
                 implemented_paths.append("frame_attention")
             if self.enable_swa_read_control:
                 implemented_paths.append("swa_read")
@@ -7484,8 +9580,22 @@ class HybridMemoryController:
                 implemented_paths.append("swa_overlap_bias")
             elif self.enable_swa_overlap_source_gate:
                 implemented_paths.append("swa_overlap_source_gate")
+            elif self.enable_swa_prev_ttt_stable_anchor_gate:
+                implemented_paths.append("swa_prev_ttt_stable_anchor_gate")
+            elif self.enable_swa_prev_ttt_anchor_query_soft:
+                implemented_paths.append("swa_prev_ttt_anchor_query_soft")
+            elif self.enable_swa_prev_ttt_tracked_instance_query_soft_action:
+                implemented_paths.append(
+                    "swa_prev_ttt_tracked_instance_query_soft_action"
+                    if self.swa_prev_ttt_tracked_instance_query_soft_action_runtime_authorized
+                    else "swa_prev_ttt_tracked_instance_query_soft_action_requested_trace_only"
+                )
+            elif self.enable_swa_prev_ttt_tracked_instance_query_soft_trace:
+                implemented_paths.append("swa_prev_ttt_tracked_instance_query_soft_trace")
             elif self.enable_swa_overlap_source_replace:
                 implemented_paths.append("swa_overlap_source_replace")
+            if self.swa_raw_transport_trace_dir:
+                implemented_paths.append("swa_raw_transport_trace")
             if self.enable_context_source_skip:
                 implemented_paths.append("context_source_skip")
             if self.enable_ttt_apply_control:
@@ -7493,7 +9603,7 @@ class HybridMemoryController:
             if self.enable_chunk_read_control:
                 implemented_paths.append("chunk_attention")
         elif mode == "read_path_only":
-            if self.enable_frame_read_control:
+            if frame_read_effective_enabled:
                 implemented_paths.append("frame_attention")
             if self.enable_swa_read_control:
                 implemented_paths.append("swa_read")
@@ -7501,8 +9611,22 @@ class HybridMemoryController:
                 implemented_paths.append("swa_overlap_bias")
             elif self.enable_swa_overlap_source_gate:
                 implemented_paths.append("swa_overlap_source_gate")
+            elif self.enable_swa_prev_ttt_stable_anchor_gate:
+                implemented_paths.append("swa_prev_ttt_stable_anchor_gate")
+            elif self.enable_swa_prev_ttt_anchor_query_soft:
+                implemented_paths.append("swa_prev_ttt_anchor_query_soft")
+            elif self.enable_swa_prev_ttt_tracked_instance_query_soft_action:
+                implemented_paths.append(
+                    "swa_prev_ttt_tracked_instance_query_soft_action"
+                    if self.swa_prev_ttt_tracked_instance_query_soft_action_runtime_authorized
+                    else "swa_prev_ttt_tracked_instance_query_soft_action_requested_trace_only"
+                )
+            elif self.enable_swa_prev_ttt_tracked_instance_query_soft_trace:
+                implemented_paths.append("swa_prev_ttt_tracked_instance_query_soft_trace")
             elif self.enable_swa_overlap_source_replace:
                 implemented_paths.append("swa_overlap_source_replace")
+            if self.swa_raw_transport_trace_dir:
+                implemented_paths.append("swa_raw_transport_trace")
             if self.enable_context_source_skip:
                 implemented_paths.append("context_source_skip")
             if self.enable_ttt_apply_control:
@@ -7545,6 +9669,7 @@ class HybridMemoryController:
         *,
         token_type: Optional[torch.Tensor] = None,
         prev_ttt_state: Optional[Dict[str, Any]] = None,
+        prev_control_summary: Optional[Dict[str, Any]] = None,
     ) -> Tuple[HybridMemoryState, Optional[WriteResult]]:
         """Commit TTT writes from the native probe cache, not controlled tokens.
 
@@ -7566,6 +9691,10 @@ class HybridMemoryController:
         old_mode = self.ttt_update_controller.write_mode
         self.ttt_update_controller.write_mode = "semantic"
         self.ttt_update_controller.current_chunk_idx = int(getattr(self, "current_chunk_idx", -1))
+        scale_state_debug = self._configure_ttt_write_scale_state(
+            probe.geometry,
+            prev_control_summary,
+        )
         write_result = self.ttt_update_controller.run(
             write_cache,
             A_tok,
@@ -7575,6 +9704,7 @@ class HybridMemoryController:
             num_frames=int(probe.geometry.num_frames),
             overlap_frames=int(self.read_overlap_frames),
             risk_tok=control_prior.D_tok if control_prior is not None else None,
+            role_tok=control_prior.R_ttt_tok if control_prior is not None else None,
             prev_transient_delta=(
                 prev_ttt_state.get("transient_delta")
                 if isinstance(prev_ttt_state, dict)
@@ -7583,6 +9713,7 @@ class HybridMemoryController:
         )
         self.ttt_update_controller.write_mode = old_mode
         write_result.debug.update(dual_lifetime_debug)
+        write_result.debug["ttt_scale_state_diagnostic"] = scale_state_debug
         gated_history, swa_write_debug = self._apply_swa_history_write_gate(
             write_result.history,
             control_prior,
@@ -7599,7 +9730,13 @@ class HybridMemoryController:
             ttt_state=ttt_next,
             swa_state=None,
             ref_state=None,
-            prev_control_summary=self._build_prev_control_summary(control_prior, probe.geometry),
+            prev_control_summary=self._build_prev_control_summary(
+                control_prior,
+                probe.geometry,
+                prev_control_summary=prev_control_summary,
+                ttt_token_contribution_diagnostic=write_result.token_contribution_diagnostic,
+                chunk_idx=int(getattr(self, "current_chunk_idx", -1)),
+            ),
             debug={
                 "commit_source": "probe_ttt_write",
                 "write_debug": write_result.debug,
@@ -7629,7 +9766,18 @@ class HybridMemoryController:
         semantic_gate_mode = "fixed_chunks" if self.semantic_action_active_chunks else "ungated"
         semantic_paths = self.semantic_memory_paths if semantic_action_active else ""
         semantic_policy = self.semantic_role_policy if semantic_action_active else "none"
+        frame_bias_spec = (control_prior.frame_bias_spec or {}) if control_prior is not None else {}
         context_source_skip_enabled = bool(self.enable_context_source_skip and semantic_action_active)
+        if (
+            context_source_skip_enabled
+            and _is_v95_trackh_gated_l07_source(self.read_cue_source)
+            and "anchor_comp" in str(self.read_cue_source).lower()
+        ):
+            context_source_skip_enabled = bool(frame_bias_spec.get("enabled", False))
+        frame_read_effective_enabled = bool(self.enable_frame_read_control)
+        frame_read_effective_enabled = frame_read_effective_enabled and bool(
+            frame_bias_spec.get("enabled", frame_read_effective_enabled)
+        )
         return {
             "identity_hooks": is_identity,
             "collect_trace": True,
@@ -7639,12 +9787,22 @@ class HybridMemoryController:
             "G_sem_tok": control_prior.G_sem_tok if control_prior is not None else None,
             "Q_sem_tok": control_prior.Q_sem_tok if control_prior is not None else None,
             "L_sem_tok": control_prior.L_sem_tok if control_prior is not None else None,
+            "stage_c_seed_global_track_idx_tok": (
+                control_prior.stage_c_seed_global_track_idx_tok if control_prior is not None else None
+            ),
+            "stage_c_masklet_instance_idx_tok": (
+                control_prior.stage_c_masklet_instance_idx_tok if control_prior is not None else None
+            ),
             "V_sem_tok": control_prior.V_sem_tok if control_prior is not None else None,
             "R_sem_tok": control_prior.R_sem_tok if control_prior is not None else None,
             "R_frame_tok": control_prior.R_frame_tok if control_prior is not None else None,
             "R_global_tok": control_prior.R_global_tok if control_prior is not None else None,
             "R_swa_tok": control_prior.R_swa_tok if control_prior is not None else None,
             "R_ttt_tok": control_prior.R_ttt_tok if control_prior is not None else None,
+            "K_stable_tok": control_prior.K_stable_tok if control_prior is not None else None,
+            "swa_redirection_source_mask_tok": (
+                control_prior.swa_redirection_source_mask_tok if control_prior is not None else None
+            ),
             "A_anchor_tok": control_prior.A_anchor_tok if control_prior is not None else None,
             "A_anchor_mask_tok": control_prior.A_anchor_mask_tok if control_prior is not None else None,
             "semantic_anchor_mode": self.semantic_anchor_mode,
@@ -7654,11 +9812,11 @@ class HybridMemoryController:
             "semantic_action_chunk_idx": int(getattr(self, "current_chunk_idx", -1)),
             "semantic_role_policy": semantic_policy,
             "semantic_memory_paths": semantic_paths,
-            "enable_frame_read_control": False if is_identity else self.enable_frame_read_control,
+            "enable_frame_read_control": False if is_identity else frame_read_effective_enabled,
             "enable_swa_read_control": False if is_identity else self.enable_swa_read_control,
             "enable_ttt_apply_control": False if is_identity else self.enable_ttt_apply_control,
             "enable_chunk_read_control": False if is_identity else self.enable_chunk_read_control,
-            "beta_frame": 0.0 if is_identity else (
+            "beta_frame": 0.0 if (is_identity or not frame_read_effective_enabled) else (
                 float((control_prior.frame_bias_spec or {}).get("beta_effective", self.beta_frame))
                 if control_prior is not None else self.beta_frame
             ),
@@ -7674,6 +9832,9 @@ class HybridMemoryController:
             "swa_overlap_bias_head_indices": "" if is_identity else self.swa_overlap_bias_head_indices,
             "swa_overlap_bias_record_attention_mass": False if is_identity else self.swa_overlap_bias_record_attention_mass,
             "swa_overlap_bias_attention_mass_max_queries": self.swa_overlap_bias_attention_mass_max_queries,
+            "swa_overlap_external_mask_csv": "" if is_identity else self.swa_overlap_external_mask_csv,
+            "swa_overlap_external_mask_variant": self.swa_overlap_external_mask_variant,
+            "swa_overlap_external_mask_seq": self.swa_overlap_external_mask_seq,
             "enable_swa_overlap_source_gate": False if is_identity else self.enable_swa_overlap_source_gate,
             "swa_overlap_source_gate_rho": 0.0 if is_identity else self.swa_overlap_source_gate_rho,
             "swa_overlap_source_gate_min": self.swa_overlap_source_gate_min,
@@ -7681,24 +9842,135 @@ class HybridMemoryController:
             "swa_overlap_source_gate_target": self.swa_overlap_source_gate_target,
             "swa_overlap_source_gate_layer_mode": self.swa_overlap_source_gate_layer_mode,
             "swa_overlap_source_gate_single_layer": self.swa_overlap_source_gate_single_layer,
+            "enable_swa_prev_ttt_stable_anchor_gate": (
+                False if is_identity else self.enable_swa_prev_ttt_stable_anchor_gate
+            ),
+            "swa_prev_ttt_stable_anchor_gate_rho": (
+                0.0 if is_identity else self.swa_prev_ttt_stable_anchor_gate_rho
+            ),
+            "swa_prev_ttt_stable_anchor_gate_min": self.swa_prev_ttt_stable_anchor_gate_min,
+            "swa_prev_ttt_stable_anchor_gate_target": self.swa_prev_ttt_stable_anchor_gate_target,
+            "swa_prev_ttt_stable_anchor_gate_layer_mode": self.swa_prev_ttt_stable_anchor_gate_layer_mode,
+            "swa_prev_ttt_stable_anchor_gate_single_layer": self.swa_prev_ttt_stable_anchor_gate_single_layer,
+            "enable_swa_prev_ttt_anchor_query_soft": (
+                False if is_identity else self.enable_swa_prev_ttt_anchor_query_soft
+            ),
+            "swa_prev_ttt_anchor_query_soft_rho": (
+                0.0 if is_identity else self.swa_prev_ttt_anchor_query_soft_rho
+            ),
+            "swa_prev_ttt_anchor_query_soft_min_keep": self.swa_prev_ttt_anchor_query_soft_min_keep,
+            "swa_prev_ttt_anchor_query_soft_query_head_frac_threshold": (
+                self.swa_prev_ttt_anchor_query_soft_query_head_frac_threshold
+            ),
+            "swa_prev_ttt_anchor_query_soft_topk": self.swa_prev_ttt_anchor_query_soft_topk,
+            "swa_prev_ttt_anchor_query_soft_query_block_size": (
+                self.swa_prev_ttt_anchor_query_soft_query_block_size
+            ),
+            "swa_prev_ttt_anchor_query_soft_layer_mode": self.swa_prev_ttt_anchor_query_soft_layer_mode,
+            "swa_prev_ttt_anchor_query_soft_single_layer": self.swa_prev_ttt_anchor_query_soft_single_layer,
+            "swa_prev_ttt_anchor_query_soft_attention_mass_max_queries": (
+                self.swa_prev_ttt_anchor_query_soft_attention_mass_max_queries
+            ),
+            "enable_swa_prev_ttt_tracked_instance_query_soft_trace": (
+                False if is_identity else self.enable_swa_prev_ttt_tracked_instance_query_soft_trace
+            ),
+            "enable_swa_prev_ttt_tracked_instance_query_soft_action": (
+                False if is_identity else self.enable_swa_prev_ttt_tracked_instance_query_soft_action
+            ),
+            "swa_prev_ttt_tracked_instance_query_soft_action_runtime_authorized": (
+                False
+                if is_identity
+                else self.swa_prev_ttt_tracked_instance_query_soft_action_runtime_authorized
+            ),
+            "swa_prev_ttt_tracked_instance_query_soft_rho": (
+                0.0 if is_identity else self.swa_prev_ttt_tracked_instance_query_soft_rho
+            ),
+            "swa_prev_ttt_tracked_instance_query_soft_min_keep": (
+                self.swa_prev_ttt_tracked_instance_query_soft_min_keep
+            ),
+            "swa_prev_ttt_tracked_instance_query_soft_query_head_frac_threshold": (
+                self.swa_prev_ttt_tracked_instance_query_soft_query_head_frac_threshold
+            ),
+            "swa_prev_ttt_tracked_instance_query_soft_topk": self.swa_prev_ttt_tracked_instance_query_soft_topk,
+            "swa_prev_ttt_tracked_instance_query_soft_query_block_size": (
+                self.swa_prev_ttt_tracked_instance_query_soft_query_block_size
+            ),
+            "swa_prev_ttt_tracked_instance_query_soft_layer_mode": (
+                self.swa_prev_ttt_tracked_instance_query_soft_layer_mode
+            ),
+            "swa_prev_ttt_tracked_instance_query_soft_single_layer": (
+                self.swa_prev_ttt_tracked_instance_query_soft_single_layer
+            ),
+            "swa_prev_ttt_tracked_instance_query_soft_attention_mass_max_queries": (
+                self.swa_prev_ttt_tracked_instance_query_soft_attention_mass_max_queries
+            ),
+            "swa_prev_ttt_tracked_instance_query_soft_min_direct_witness_seeds": (
+                self.swa_prev_ttt_tracked_instance_query_soft_min_direct_witness_seeds
+            ),
+            "swa_prev_ttt_tracked_instance_query_soft_direct_match_mode": (
+                self.swa_prev_ttt_tracked_instance_query_soft_direct_match_mode
+            ),
             "enable_swa_overlap_source_replace": False if is_identity else self.enable_swa_overlap_source_replace,
             "swa_overlap_source_replace_alpha": 0.0 if is_identity else self.swa_overlap_source_replace_alpha,
             "swa_overlap_source_replace_mode": self.swa_overlap_source_replace_mode,
             "swa_overlap_source_replace_target": self.swa_overlap_source_replace_target,
             "swa_overlap_source_replace_layer_mode": self.swa_overlap_source_replace_layer_mode,
             "swa_overlap_source_replace_single_layer": self.swa_overlap_source_replace_single_layer,
+            "enable_v102_state_machine_trace": False if is_identity else self.enable_v102_state_machine_trace,
+            "v102_state_machine_action": self.v102_state_machine_action,
+            "v102_state_machine_layer_mode": self.v102_state_machine_layer_mode,
+            "v102_state_machine_single_layer": self.v102_state_machine_single_layer,
+            "v102_state_machine_strict_gate_pass": False if is_identity else self.v102_state_machine_strict_gate_pass,
+            "v102_state_machine_true_l3_gate_pass": (
+                False if is_identity else self.v102_state_machine_true_l3_gate_pass
+            ),
+            "enable_v102_state_machine_action_probe": (
+                False if is_identity else self.enable_v102_state_machine_action_probe
+            ),
+            "v102_state_machine_probe_impl": self.v102_state_machine_probe_impl,
+            "v102_state_machine_unreliable_d_min": self.v102_state_machine_unreliable_d_min,
+            "v102_state_machine_unreliable_g_min": self.v102_state_machine_unreliable_g_min,
+            "v102_state_machine_supported_d_max": self.v102_state_machine_supported_d_max,
+            "v102_state_machine_supported_k_min": self.v102_state_machine_supported_k_min,
+            "v102_state_machine_supported_require_static_semantic": (
+                False if is_identity else self.v102_state_machine_supported_require_static_semantic
+            ),
+            "v102_state_machine_soft_unsupported_min_keep": self.v102_state_machine_soft_unsupported_min_keep,
+            "v102_state_machine_hold_prev_frames": self.v102_state_machine_hold_prev_frames,
+            "v102_state_machine_hold_soft_min_keep": self.v102_state_machine_hold_soft_min_keep,
+            "v102_state_machine_delay_current_soft_min_keep": self.v102_state_machine_delay_current_soft_min_keep,
+            "v102_state_machine_context_soft_min_keep": self.v102_state_machine_context_soft_min_keep,
+            "v102_state_machine_min_history_keep_frac": self.v102_state_machine_min_history_keep_frac,
+            "v102_state_machine_attention_mass_max_queries": self.v102_state_machine_attention_mass_max_queries,
             "swa_overlap_feature_dump_dir": "" if is_identity else self.swa_overlap_feature_dump_dir,
             "swa_overlap_feature_dump_dtype": self.swa_overlap_feature_dump_dtype,
+            "swa_raw_transport_trace_dir": "" if is_identity else self.swa_raw_transport_trace_dir,
+            "swa_raw_transport_trace_layer_mode": self.swa_raw_transport_trace_layer_mode,
+            "swa_raw_transport_trace_single_layer": self.swa_raw_transport_trace_single_layer,
+            "swa_raw_transport_trace_max_queries": self.swa_raw_transport_trace_max_queries,
+            "swa_raw_transport_trace_topk": self.swa_raw_transport_trace_topk,
+            "swa_raw_transport_trace_direct_match_only": (
+                False if is_identity else self.swa_raw_transport_trace_direct_match_only
+            ),
+            "swa_raw_transport_trace_query_block_size": self.swa_raw_transport_trace_query_block_size,
             "enable_context_source_skip": context_source_skip_enabled,
             "context_source_skip_impl": "bias" if is_identity else self.context_source_skip_impl,
             "context_source_skip_scope": self.context_source_skip_scope,
             "context_source_skip_mode": self.context_source_skip_mode,
             "context_source_skip_mask": self.context_source_skip_mask,
             "context_source_skip_frame_region": self.context_source_skip_frame_region,
+            "context_source_skip_query_region": self.context_source_skip_query_region,
             "context_source_skip_layer_mode": self.context_source_skip_layer_mode,
             "context_source_skip_single_layer": self.context_source_skip_single_layer,
+            "context_source_skip_head_indices": "" if is_identity else self.context_source_skip_head_indices,
             "context_source_skip_soft_rho": 0.0 if is_identity else self.context_source_skip_soft_rho,
             "context_source_skip_soft_min_keep": self.context_source_skip_soft_min_keep,
+            "context_source_skip_source_attention_top_quantile": (
+                -1.0 if is_identity else self.context_source_skip_source_attention_top_quantile
+            ),
+            "context_source_skip_source_attention_top_random_same_mass": (
+                False if is_identity else self.context_source_skip_source_attention_top_random_same_mass
+            ),
             "context_source_skip_record_attention_mass": False if is_identity else self.context_source_skip_record_attention_mass,
             "context_source_skip_attention_mass_max_queries": self.context_source_skip_attention_mass_max_queries,
             "context_source_skip_attention_map_dump_dir": "" if is_identity else self.context_source_skip_attention_map_dump_dir,
@@ -7706,6 +9978,9 @@ class HybridMemoryController:
             "context_source_skip_attention_map_dump_dtype": self.context_source_skip_attention_map_dump_dtype,
             "context_source_skip_attention_map_dump_full_query_marginal": (
                 False if is_identity else self.context_source_skip_attention_map_dump_full_query_marginal
+            ),
+            "context_source_skip_attention_map_dump_head_marginal": (
+                False if is_identity else self.context_source_skip_attention_map_dump_head_marginal
             ),
             "context_source_skip_attention_map_dump_query_block": self.context_source_skip_attention_map_dump_query_block,
             "swa_write_cache_store_post": self.enable_swa_write_control and self.swa_write_cache_blend_alpha > 0.0,
@@ -7720,6 +9995,10 @@ class HybridMemoryController:
             "beta_policy": self.beta_policy,
             "beta_energy_target": self.beta_energy_target,
             "frame_bias_mode": self.frame_bias_mode,
+            "frame_bias_query_region": self.frame_bias_query_region,
+            "frame_bias_head_indices": self.frame_bias_head_indices,
+            "frame_attention_record_bias_mass": False if is_identity else self.frame_attention_record_bias_mass,
+            "frame_attention_bias_mass_max_queries": self.frame_attention_bias_mass_max_queries,
             "chunk_bias_mode": self.chunk_bias_mode,
             "swa_bias_mode": self.swa_bias_mode,
             "ttt_apply_min_gate": 0.0 if is_identity else self.ttt_apply_min_gate,
@@ -7788,9 +10067,126 @@ class HybridMemoryController:
         return state
 
     @staticmethod
+    def _pose_step_scale_summary(geo: GeometryOutput) -> Dict[str, Any]:
+        poses = getattr(geo, "camera_poses", None)
+        if not isinstance(poses, torch.Tensor):
+            return {"available": False, "reason": "missing_camera_poses"}
+        try:
+            p = poses.detach().cpu().float()
+            if p.ndim != 3 or p.shape[-2:] != (4, 4) or p.shape[0] < 2:
+                return {"available": False, "reason": "invalid_camera_pose_shape"}
+            t = p[:, :3, 3]
+            step = torch.linalg.norm(t[1:] - t[:-1], dim=-1)
+            finite = step[torch.isfinite(step) & (step > 1e-12)]
+            if int(finite.numel()) <= 0:
+                return {"available": False, "reason": "empty_finite_pose_steps"}
+            return {
+                "available": True,
+                "step_count": int(finite.numel()),
+                "pose_step_median": float(torch.median(finite).item()),
+                "pose_step_mean": float(finite.mean().item()),
+                "pose_step_p90": float(torch.quantile(finite, 0.90).item()) if int(finite.numel()) > 1 else float(finite.mean().item()),
+            }
+        except RuntimeError as exc:
+            return {"available": False, "reason": "pose_step_runtime_error", "error": str(exc)}
+
+    @staticmethod
+    def _positive_float(value: Any) -> Optional[float]:
+        try:
+            out = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(out) or out <= 1e-12:
+            return None
+        return out
+
+    def _configure_ttt_write_scale_state(
+        self,
+        geo: GeometryOutput,
+        prev_control_summary: Optional[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        ctrl = self.ttt_update_controller
+        mode_text = str(getattr(ctrl, "scale_state_mode", "none") or "none").strip().lower()
+        proxy_text = str(getattr(ctrl, "scale_state_proxy", "pose_step_ema") or "pose_step_ema").strip().lower()
+        alpha = max(float(getattr(ctrl, "scale_state_alpha", 0.0) or 0.0), 0.0)
+        chunk_idx = int(getattr(self, "current_chunk_idx", -1))
+        ctrl.scale_state_active = False
+        ctrl.scale_state_chunk_idx = chunk_idx
+        ctrl.scale_state_log_ratio = 0.0
+        ctrl.scale_state_reason = "not_configured"
+        ctrl.scale_state_payload = {}
+
+        pose_summary = self._pose_step_scale_summary(geo)
+        debug: Dict[str, Any] = {
+            "schema": "acl2_v96_ttt_write_scale_state_pose_step_proxy_v1",
+            "mode": mode_text,
+            "proxy": proxy_text,
+            "alpha": float(alpha),
+            "chunk_idx": int(chunk_idx),
+            "active": False,
+            "reason": "not_configured",
+            "pose_step_summary": pose_summary,
+            "runtime_action_allowed": False,
+        }
+
+        def finish(reason: str, *, active: bool = False, log_ratio: float = 0.0) -> Dict[str, Any]:
+            ctrl.scale_state_active = bool(active)
+            ctrl.scale_state_log_ratio = float(log_ratio)
+            ctrl.scale_state_reason = reason
+            debug["active"] = bool(active)
+            debug["reason"] = reason
+            debug["log_ratio"] = float(log_ratio)
+            debug["scale_weight_estimate"] = float(min(1.0, abs(float(log_ratio)) * alpha))
+            ctrl.scale_state_payload = dict(debug)
+            return debug
+
+        if mode_text in {"", "none", "off"}:
+            return finish("mode_off")
+        if getattr(ctrl, "scale_state_chunks", None) and chunk_idx not in ctrl.scale_state_chunks:
+            debug["configured_chunks"] = sorted(int(x) for x in ctrl.scale_state_chunks)
+            return finish("chunk_not_selected")
+        if alpha <= 0.0:
+            return finish("alpha_zero")
+        if proxy_text not in {"pose_step_ema", "pose_step", "pose_step_median", "trajectory_pose_step"}:
+            return finish("unsupported_proxy")
+        if not bool(pose_summary.get("available", False)):
+            return finish(str(pose_summary.get("reason", "missing_pose_step")))
+
+        current = self._positive_float(pose_summary.get("pose_step_median"))
+        prev_summary = prev_control_summary if isinstance(prev_control_summary, dict) else {}
+        reference = (
+            self._positive_float(prev_summary.get("ttt_scale_state_pose_step_ema"))
+            if proxy_text == "pose_step_ema"
+            else None
+        )
+        if reference is None:
+            reference = self._positive_float(prev_summary.get("ttt_pose_step_median"))
+        debug["current_pose_step_median"] = current
+        debug["reference_pose_step"] = reference
+        debug["reference_source"] = (
+            "prev_pose_step_ema"
+            if self._positive_float(prev_summary.get("ttt_scale_state_pose_step_ema")) is not None and proxy_text == "pose_step_ema"
+            else "prev_pose_step_median"
+            if reference is not None
+            else "missing"
+        )
+        if current is None:
+            return finish("current_pose_step_unavailable")
+        if reference is None:
+            return finish("previous_pose_step_unavailable")
+        log_ratio = math.log(max(current, 1e-12) / max(reference, 1e-12))
+        if abs(log_ratio) <= 1e-8:
+            return finish("proxy_zero", active=False, log_ratio=log_ratio)
+        return finish("active", active=True, log_ratio=log_ratio)
+
+    @staticmethod
     def _build_prev_control_summary(
         control_prior: Optional[HybridMemoryControlPrior],
         geo: GeometryOutput,
+        *,
+        prev_control_summary: Optional[Dict[str, Any]] = None,
+        ttt_token_contribution_diagnostic: Optional[Dict[str, Any]] = None,
+        chunk_idx: int = -1,
     ) -> Optional[Dict[str, Any]]:
         if control_prior is None or control_prior.D_tok is None:
             return None
@@ -7812,9 +10208,37 @@ class HybridMemoryController:
             "patch_grid": tuple(int(x) for x in geo.patch_grid),
             "D_patch": source_tok[patch_mask].detach().cpu().float() if patch_mask.any() else None,
         }
+        pose_summary = HybridMemoryController._pose_step_scale_summary(geo)
+        out["ttt_pose_step_summary"] = pose_summary
+        if bool(pose_summary.get("available", False)):
+            current = HybridMemoryController._positive_float(pose_summary.get("pose_step_median"))
+            if current is not None:
+                out["ttt_pose_step_median"] = float(current)
+                out["ttt_pose_step_mean"] = float(pose_summary.get("pose_step_mean", current))
+                prev_summary = prev_control_summary if isinstance(prev_control_summary, dict) else {}
+                prev_ema = HybridMemoryController._positive_float(
+                    prev_summary.get("ttt_scale_state_pose_step_ema")
+                )
+                ema_alpha = 0.5
+                out["ttt_scale_state_pose_step_ema"] = (
+                    float(current)
+                    if prev_ema is None
+                    else float((1.0 - ema_alpha) * prev_ema + ema_alpha * current)
+                )
+                out["ttt_scale_state_pose_step_ema_alpha"] = float(ema_alpha)
         for field_name, tensor, dtype in (
             ("G_patch", control_prior.G_sem_tok, torch.long),
             ("L_patch", control_prior.L_sem_tok, torch.long),
+            (
+                "stage_c_seed_global_track_idx_patch",
+                control_prior.stage_c_seed_global_track_idx_tok,
+                torch.long,
+            ),
+            (
+                "stage_c_masklet_instance_idx_patch",
+                control_prior.stage_c_masklet_instance_idx_tok,
+                torch.long,
+            ),
         ):
             if tensor is None:
                 continue
@@ -7823,6 +10247,103 @@ class HybridMemoryController:
                 out[field_name] = flat[patch_mask]
             elif int(flat.numel()) == int(patch_mask.sum().item()):
                 out[field_name] = flat
+        diag = ttt_token_contribution_diagnostic if isinstance(ttt_token_contribution_diagnostic, dict) else {}
+        stable_mask_tok = diag.get("stable_anchor_mask_tok")
+        if torch.is_tensor(stable_mask_tok):
+            stable_flat = stable_mask_tok.detach().cpu().bool().reshape(-1)
+            patch_count = int(patch_mask.sum().item())
+            stable_patch: Optional[torch.Tensor] = None
+            if int(stable_flat.numel()) == int(token_type.numel()):
+                stable_patch = stable_flat[patch_mask]
+            elif int(stable_flat.numel()) == patch_count:
+                stable_patch = stable_flat
+            if stable_patch is not None:
+                out["ttt_stable_anchor_mask_patch"] = stable_patch.cpu()
+                out["ttt_stable_anchor_token_count"] = int(stable_patch.sum().item())
+                out["ttt_stable_anchor_source"] = "probe_ttt_write_token_contribution_diagnostic"
+                out["ttt_stable_anchor_source_chunk_idx"] = int(chunk_idx)
+                patch_ids = torch.arange(patch_count, dtype=torch.int64)
+                if int(chunk_idx) >= 0:
+                    patch_ids = patch_ids + int(chunk_idx) * 1_000_000
+                out["ttt_stable_anchor_id_patch"] = torch.where(
+                    stable_patch,
+                    patch_ids,
+                    torch.full_like(patch_ids, -1),
+                )
+                for diag_key, out_key, dtype in (
+                    ("stable_anchor_retention_tok", "ttt_stable_anchor_retention_patch", torch.float32),
+                    ("stable_anchor_residual_tok", "ttt_stable_anchor_residual_patch", torch.float32),
+                    ("z_write_key_norm_tok", "ttt_stable_anchor_z_write_key_norm_patch", torch.float32),
+                ):
+                    diag_tensor = diag.get(diag_key)
+                    if not torch.is_tensor(diag_tensor):
+                        continue
+                    diag_flat = diag_tensor.detach().cpu().to(dtype=dtype).reshape(-1)
+                    if int(diag_flat.numel()) == int(token_type.numel()):
+                        out[out_key] = diag_flat[patch_mask]
+                    elif int(diag_flat.numel()) == patch_count:
+                        out[out_key] = diag_flat
+                z_write_key_vec = diag.get("z_write_key_vec_tok")
+                if torch.is_tensor(z_write_key_vec):
+                    vec_flat = z_write_key_vec.detach().cpu().to(dtype=torch.float32).reshape(
+                        int(z_write_key_vec.shape[0]),
+                        -1,
+                    )
+                    if int(vec_flat.shape[0]) == int(token_type.numel()):
+                        out["ttt_stable_anchor_z_write_key_vec_patch"] = vec_flat[patch_mask]
+                    elif int(vec_flat.shape[0]) == patch_count:
+                        out["ttt_stable_anchor_z_write_key_vec_patch"] = vec_flat
+                z_write_key_sketch = diag.get("z_write_key_sketch_tok")
+                if torch.is_tensor(z_write_key_sketch):
+                    sketch_flat = z_write_key_sketch.detach().cpu().to(dtype=torch.float32).reshape(
+                        int(z_write_key_sketch.shape[0]),
+                        -1,
+                    )
+                    if int(sketch_flat.shape[0]) == int(token_type.numel()):
+                        out["ttt_stable_anchor_z_write_key_sketch_patch"] = sketch_flat[patch_mask]
+                    elif int(sketch_flat.shape[0]) == patch_count:
+                        out["ttt_stable_anchor_z_write_key_sketch_patch"] = sketch_flat
+                z_write_hidden_vec = diag.get("z_write_hidden_vec_tok")
+                if torch.is_tensor(z_write_hidden_vec):
+                    hidden_flat = z_write_hidden_vec.detach().cpu().to(dtype=torch.float32).reshape(
+                        int(z_write_hidden_vec.shape[0]),
+                        -1,
+                    )
+                    if int(hidden_flat.shape[0]) == int(token_type.numel()):
+                        out["ttt_stable_anchor_z_write_hidden_vec_patch"] = hidden_flat[patch_mask]
+                    elif int(hidden_flat.shape[0]) == patch_count:
+                        out["ttt_stable_anchor_z_write_hidden_vec_patch"] = hidden_flat
+        seed_patch = out.get("stage_c_seed_global_track_idx_patch")
+        masklet_instance_patch = out.get("stage_c_masklet_instance_idx_patch")
+        if torch.is_tensor(masklet_instance_patch):
+            inst_flat = masklet_instance_patch.detach().cpu().long().reshape(-1)
+            patch_count = int(patch_mask.sum().item())
+            if int(inst_flat.numel()) == patch_count:
+                tracked_mask = inst_flat >= 0
+                seed_flat: Optional[torch.Tensor] = None
+                if torch.is_tensor(seed_patch):
+                    seed_flat = seed_patch.detach().cpu().long().reshape(-1)
+                    if int(seed_flat.numel()) == patch_count:
+                        tracked_mask = tracked_mask & (seed_flat >= 0)
+                    else:
+                        seed_flat = None
+                out["ttt_tracked_instance_anchor_mask_patch"] = tracked_mask.cpu()
+                out["ttt_tracked_instance_anchor_id_patch"] = torch.where(
+                    tracked_mask,
+                    inst_flat,
+                    torch.full_like(inst_flat, -1),
+                ).cpu()
+                if seed_flat is not None:
+                    out["ttt_tracked_instance_anchor_seed_patch"] = torch.where(
+                        tracked_mask,
+                        seed_flat,
+                        torch.full_like(seed_flat, -1),
+                    ).cpu()
+                out["ttt_tracked_instance_anchor_token_count"] = int(tracked_mask.sum().item())
+                out["ttt_tracked_instance_anchor_source"] = (
+                    "diagnostic_stage_c_masklet_instance_patch_counterfactual_no_runtime"
+                )
+                out["ttt_tracked_instance_anchor_source_chunk_idx"] = int(chunk_idx)
         return out
 
 

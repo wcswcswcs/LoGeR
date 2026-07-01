@@ -366,6 +366,123 @@ PHASE9_CASES: Dict[str, Dict[str, Any]] = {
         "semantic_role_policy": "none",
         "semantic_memory_paths": "",
     },
+    "P9_42_ATTENTION_BIAS_SEMANTIC_SAMEGROUP_STABLE_AGREEMENT_MASS_AUDIT_LAST": {
+        "family": "swa_overlap_bias_semantic",
+        "enable_swa_overlap_bias": 1,
+        "swa_overlap_bias_mode": "semantic_same_group_boost_stable_agreement",
+        "swa_overlap_bias_record_attention_mass": 1,
+        "semantic_role_policy": "fine_ttt_lowstuff_highd_short",
+        "semantic_memory_paths": "swa",
+    },
+    "P9_43_ATTENTION_BIAS_SEMANTIC_SAMEGROUP_STABLE_AGREEMENT_RANDOM_SAME_MASS_MASS_AUDIT_LAST": {
+        "family": "swa_overlap_bias_semantic_control",
+        "enable_swa_overlap_bias": 1,
+        "swa_overlap_bias_mode": "semantic_same_group_boost_stable_agreement_random_same_mass",
+        "swa_overlap_bias_record_attention_mass": 1,
+        "semantic_role_policy": "fine_ttt_lowstuff_highd_short",
+        "semantic_memory_paths": "swa",
+    },
+    "P9_44_ATTENTION_BIAS_SEMANTIC_SAMEGROUP_STABLE_AGREEMENT_SHUFFLED_SEMANTIC_MASS_AUDIT_LAST": {
+        "family": "swa_overlap_bias_semantic_control",
+        "enable_swa_overlap_bias": 1,
+        "swa_overlap_bias_mode": "semantic_same_group_boost_stable_agreement_shuffled_semantic",
+        "swa_overlap_bias_record_attention_mass": 1,
+        "semantic_role_policy": "fine_ttt_lowstuff_highd_short",
+        "semantic_memory_paths": "swa",
+    },
+    "P9_45_ATTENTION_BIAS_SEMANTIC_SAMEGROUP_STABLE_AGREEMENT_HEAD15_MASS_AUDIT_LAST": {
+        "family": "swa_overlap_bias_semantic",
+        "enable_swa_overlap_bias": 1,
+        "swa_overlap_bias_mode": "semantic_same_group_boost_stable_agreement",
+        "swa_overlap_bias_head_indices": "15",
+        "swa_overlap_bias_record_attention_mass": 1,
+        "semantic_role_policy": "fine_ttt_lowstuff_highd_short",
+        "semantic_memory_paths": "swa",
+    },
+    "P9_46_ATTENTION_BIAS_SEMANTIC_SAMEGROUP_STABLE_AGREEMENT_RANDOM_SAME_MASS_HEAD15_MASS_AUDIT_LAST": {
+        "family": "swa_overlap_bias_semantic_control",
+        "enable_swa_overlap_bias": 1,
+        "swa_overlap_bias_mode": "semantic_same_group_boost_stable_agreement_random_same_mass",
+        "swa_overlap_bias_head_indices": "15",
+        "swa_overlap_bias_record_attention_mass": 1,
+        "semantic_role_policy": "fine_ttt_lowstuff_highd_short",
+        "semantic_memory_paths": "swa",
+    },
+    "P9_47_ATTENTION_BIAS_SEMANTIC_SAMEGROUP_STABLE_AGREEMENT_SHUFFLED_SEMANTIC_HEAD15_MASS_AUDIT_LAST": {
+        "family": "swa_overlap_bias_semantic_control",
+        "enable_swa_overlap_bias": 1,
+        "swa_overlap_bias_mode": "semantic_same_group_boost_stable_agreement_shuffled_semantic",
+        "swa_overlap_bias_head_indices": "15",
+        "swa_overlap_bias_record_attention_mass": 1,
+        "semantic_role_policy": "fine_ttt_lowstuff_highd_short",
+        "semantic_memory_paths": "swa",
+    },
+    "P9_48_ATTENTION_BIAS_V84_EXTERNAL_ANCHOR_MASS_AUDIT_LAST": {
+        "family": "swa_overlap_bias_v84_external_anchor",
+        "enable_swa_overlap_bias": 1,
+        "swa_overlap_bias_mode": "external_v84_anchor_mask",
+        "swa_overlap_bias_record_attention_mass": 1,
+        "semantic_role_policy": "none",
+        "semantic_memory_paths": "",
+    },
+    "P9_49_ATTENTION_BIAS_V84_EXTERNAL_ANCHOR_RANDOM_SAME_MASS_MASS_AUDIT_LAST": {
+        "family": "swa_overlap_bias_v84_external_anchor_control",
+        "enable_swa_overlap_bias": 1,
+        "swa_overlap_bias_mode": "external_v84_anchor_mask_random_same_mass",
+        "swa_overlap_bias_record_attention_mass": 1,
+        "semantic_role_policy": "none",
+        "semantic_memory_paths": "",
+    },
+    "P9_50_ATTENTION_BIAS_V84_EXTERNAL_ANCHOR_HEAD13_MASS_AUDIT_LAST": {
+        "family": "swa_overlap_bias_v84_external_anchor_head13",
+        "enable_swa_overlap_bias": 1,
+        "swa_overlap_bias_mode": "external_v84_anchor_mask",
+        "swa_overlap_bias_head_indices": "13",
+        "swa_overlap_bias_record_attention_mass": 1,
+        "semantic_role_policy": "none",
+        "semantic_memory_paths": "",
+    },
+    "P9_51_ATTENTION_BIAS_V84_EXTERNAL_ANCHOR_RANDOM_SAME_MASS_HEAD13_MASS_AUDIT_LAST": {
+        "family": "swa_overlap_bias_v84_external_anchor_head13_control",
+        "enable_swa_overlap_bias": 1,
+        "swa_overlap_bias_mode": "external_v84_anchor_mask_random_same_mass",
+        "swa_overlap_bias_head_indices": "13",
+        "swa_overlap_bias_record_attention_mass": 1,
+        "semantic_role_policy": "none",
+        "semantic_memory_paths": "",
+    },
+    "P9_52_ATTENTION_BIAS_V92_POLICY_QUERY_MASS_AUDIT_LAST": {
+        "family": "swa_overlap_bias",
+        "enable_swa_overlap_bias": 1,
+        "swa_overlap_bias_mode": "external_v92_policy_query_mask",
+        "swa_overlap_bias_record_attention_mass": 1,
+        "semantic_role_policy": "none",
+        "semantic_memory_paths": "",
+    },
+    "P9_53_ATTENTION_BIAS_V92_POLICY_QUERY_RANDOM_SAME_MASS_MASS_AUDIT_LAST": {
+        "family": "swa_overlap_bias_control",
+        "enable_swa_overlap_bias": 1,
+        "swa_overlap_bias_mode": "external_v92_policy_query_mask_random_same_mass",
+        "swa_overlap_bias_record_attention_mass": 1,
+        "semantic_role_policy": "none",
+        "semantic_memory_paths": "",
+    },
+    "P9_54_ATTENTION_BIAS_V92_POLICY_PAIR_MASS_AUDIT_LAST": {
+        "family": "swa_overlap_bias",
+        "enable_swa_overlap_bias": 1,
+        "swa_overlap_bias_mode": "external_v92_policy_pair_mask",
+        "swa_overlap_bias_record_attention_mass": 1,
+        "semantic_role_policy": "none",
+        "semantic_memory_paths": "",
+    },
+    "P9_55_ATTENTION_BIAS_V92_POLICY_PAIR_RANDOM_SAME_MASS_MASS_AUDIT_LAST": {
+        "family": "swa_overlap_bias_control",
+        "enable_swa_overlap_bias": 1,
+        "swa_overlap_bias_mode": "external_v92_policy_pair_mask_random_same_mass",
+        "swa_overlap_bias_record_attention_mass": 1,
+        "semantic_role_policy": "none",
+        "semantic_memory_paths": "",
+    },
     "P9_40_SOURCE_REPLACE_STABLE_AGREEMENT_TOPQ80_V_LAST": {
         "family": "swa_source_replace",
         "enable_swa_overlap_source_replace": 1,
@@ -555,6 +672,12 @@ def _build_command(args: argparse.Namespace, *, chunk: int, case: str, out_dir: 
         str(int(_case_value(cfg, "swa_overlap_bias_record_attention_mass", 0))),
         "--swa_overlap_bias_attention_mass_max_queries",
         str(args.swa_bias_attention_mass_max_queries),
+        "--swa_overlap_external_mask_csv",
+        str(args.swa_overlap_external_mask_csv),
+        "--swa_overlap_external_mask_variant",
+        str(args.swa_overlap_external_mask_variant),
+        "--swa_overlap_external_mask_seq",
+        str(args.swa_overlap_external_mask_seq),
         "--enable_swa_overlap_source_gate",
         str(int(_case_value(cfg, "enable_swa_overlap_source_gate", 0))),
         "--swa_overlap_source_gate_rho",
@@ -823,6 +946,10 @@ def _build_phase9_decision(
         family = "swa_source_gate"
     if family == "swa_overlap_bias_control":
         family = "swa_overlap_bias"
+    if family == "swa_overlap_bias_semantic":
+        family = "swa_overlap_bias"
+    if family == "swa_overlap_bias_semantic_control":
+        family = "swa_overlap_bias"
     action_fidelity = _action_fidelity(cand, family=family)
 
     comparisons: Dict[str, Dict[str, Any]] = {}
@@ -915,7 +1042,11 @@ def _evaluate(args: argparse.Namespace, jobs: Sequence[Dict[str, Any]]) -> Dict[
         "P9_34_ATTENTION_BIAS_STABLE_AGREEMENT_TOPQ80_MASS_AUDIT_LAST",
         "P9_36_ATTENTION_BIAS_STABLE_AGREEMENT_TOPQ80_HEAD6_LAST",
         "P9_38_ATTENTION_BIAS_STABLE_AGREEMENT_TOPQ80_HEADS0_6_8_LAST",
+        "P9_42_ATTENTION_BIAS_SEMANTIC_SAMEGROUP_STABLE_AGREEMENT_MASS_AUDIT_LAST",
+        "P9_45_ATTENTION_BIAS_SEMANTIC_SAMEGROUP_STABLE_AGREEMENT_HEAD15_MASS_AUDIT_LAST",
         "P9_40_SOURCE_REPLACE_STABLE_AGREEMENT_TOPQ80_V_LAST",
+        "P9_52_ATTENTION_BIAS_V92_POLICY_QUERY_MASS_AUDIT_LAST",
+        "P9_54_ATTENTION_BIAS_V92_POLICY_PAIR_MASS_AUDIT_LAST",
     ]
     controls_by_candidate = {
         "P9_1_CACHEV_STATIC_BLEND_L18": ["P9_3_CACHEV_ALL_BLEND_L18_CONTROL"],
@@ -972,8 +1103,22 @@ def _evaluate(args: argparse.Namespace, jobs: Sequence[Dict[str, Any]]) -> Dict[
         "P9_38_ATTENTION_BIAS_STABLE_AGREEMENT_TOPQ80_HEADS0_6_8_LAST": [
             "P9_39_ATTENTION_BIAS_STABLE_AGREEMENT_TOPQ80_RANDOM_SAME_MASS_HEADS0_6_8_LAST"
         ],
+        "P9_42_ATTENTION_BIAS_SEMANTIC_SAMEGROUP_STABLE_AGREEMENT_MASS_AUDIT_LAST": [
+            "P9_43_ATTENTION_BIAS_SEMANTIC_SAMEGROUP_STABLE_AGREEMENT_RANDOM_SAME_MASS_MASS_AUDIT_LAST",
+            "P9_44_ATTENTION_BIAS_SEMANTIC_SAMEGROUP_STABLE_AGREEMENT_SHUFFLED_SEMANTIC_MASS_AUDIT_LAST",
+        ],
+        "P9_45_ATTENTION_BIAS_SEMANTIC_SAMEGROUP_STABLE_AGREEMENT_HEAD15_MASS_AUDIT_LAST": [
+            "P9_46_ATTENTION_BIAS_SEMANTIC_SAMEGROUP_STABLE_AGREEMENT_RANDOM_SAME_MASS_HEAD15_MASS_AUDIT_LAST",
+            "P9_47_ATTENTION_BIAS_SEMANTIC_SAMEGROUP_STABLE_AGREEMENT_SHUFFLED_SEMANTIC_HEAD15_MASS_AUDIT_LAST",
+        ],
         "P9_40_SOURCE_REPLACE_STABLE_AGREEMENT_TOPQ80_V_LAST": [
             "P9_41_SOURCE_REPLACE_STABLE_AGREEMENT_TOPQ80_RANDOM_SAME_MASS_V_LAST"
+        ],
+        "P9_52_ATTENTION_BIAS_V92_POLICY_QUERY_MASS_AUDIT_LAST": [
+            "P9_53_ATTENTION_BIAS_V92_POLICY_QUERY_RANDOM_SAME_MASS_MASS_AUDIT_LAST"
+        ],
+        "P9_54_ATTENTION_BIAS_V92_POLICY_PAIR_MASS_AUDIT_LAST": [
+            "P9_55_ATTENTION_BIAS_V92_POLICY_PAIR_RANDOM_SAME_MASS_MASS_AUDIT_LAST"
         ],
     }
     decisions = {
@@ -1009,7 +1154,9 @@ def _evaluate(args: argparse.Namespace, jobs: Sequence[Dict[str, Any]]) -> Dict[
             "P9_32 lightly replaces only q80 stable-agreement SWA overlap source K toward aligned current overlap K; "
             "P9_34 repeats P9_26 with sampled selected-token attention-mass diagnostics; "
             "P9_40 replaces only q80 stable-agreement SWA overlap source V after selected-mask-conditioned "
-            "Q/K/V alignment indicated stronger value-side than key-side carry-over. "
+            "Q/K/V alignment indicated stronger value-side than key-side carry-over; "
+            "P9_52/P9_54 add v92 semantic-policy query-side and query-source pair attention-bias route "
+            "diagnostics with same-mass controls. "
             "No C9 chunk-wise replay parameters are used."
         ),
         "control_gap_note": (
@@ -1102,6 +1249,25 @@ def main() -> None:
     parser.add_argument("--swa-bias-beta", type=float, default=0.35)
     parser.add_argument("--swa-bias-min-keep", type=float, default=1e-4)
     parser.add_argument("--swa-bias-attention-mass-max-queries", type=int, default=64)
+    parser.add_argument(
+        "--swa-overlap-external-mask-csv",
+        type=Path,
+        default=Path(
+            "results/acl2_v84tf_memory_ruler_audit/"
+            "phase15_anchor_route_mask_materialization/anchor_route_mask_positions.csv"
+        ),
+        help="External v84 anchor route mask CSV for SWA overlap bias audit cases.",
+    )
+    parser.add_argument(
+        "--swa-overlap-external-mask-variant",
+        default="current_role_anchor",
+        help="Variant column value selected from --swa-overlap-external-mask-csv.",
+    )
+    parser.add_argument(
+        "--swa-overlap-external-mask-seq",
+        default="00",
+        help="Optional seq column filter for --swa-overlap-external-mask-csv.",
+    )
     parser.add_argument("--swa-write-scope", default="tail_overlap", choices=("all", "tail_overlap", "head_overlap", "both_overlap"))
     parser.add_argument("--semantic-role-highd-quantile", type=float, default=0.75)
     parser.add_argument("--semantic-role-low-trust", type=float, default=0.55)
@@ -1186,6 +1352,9 @@ def main() -> None:
                     ),
                     "swa_bias_attention_mass_max_queries_effective": int(args.swa_bias_attention_mass_max_queries),
                     "swa_bias_head_indices_effective": str(_case_value(cfg, "swa_overlap_bias_head_indices", "")),
+                    "swa_overlap_external_mask_csv": str(args.swa_overlap_external_mask_csv),
+                    "swa_overlap_external_mask_variant": str(args.swa_overlap_external_mask_variant),
+                    "swa_overlap_external_mask_seq": str(args.swa_overlap_external_mask_seq),
                     "cuda_alloc_conf": str(args.cuda_alloc_conf),
                     "skipped": skipped,
                     "returncode": 0 if skipped else None,

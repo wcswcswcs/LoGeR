@@ -4,7 +4,7 @@ import unittest
 
 import numpy as np
 
-from stream4d_native.frozen_feature_adapter import FrozenFeatureAdapter
+from stream4d_native.frozen_feature_adapter import FeatureMap, FrozenFeatureAdapter
 
 
 class V42FrozenFeatureAdapterTests(unittest.TestCase):
@@ -25,7 +25,18 @@ class V42FrozenFeatureAdapterTests(unittest.TestCase):
         self.assertLess(adapter.compute_token_affinity(left_feature, right_feature), 0.95)
         self.assertGreaterEqual(adapter.compute_boundary_contrast(fmap, left), 0.0)
 
+    def test_tiny_nonempty_mask_maps_to_nearest_feature_token(self) -> None:
+        features = np.zeros((2, 2, 3), dtype=np.float32)
+        features[0, 0] = np.asarray([1.0, 0.0, 0.0], dtype=np.float32)
+        features[0, 1] = np.asarray([0.0, 1.0, 0.0], dtype=np.float32)
+        features[1, 0] = np.asarray([0.0, 0.0, 1.0], dtype=np.float32)
+        features[1, 1] = np.asarray([1.0, 1.0, 0.0], dtype=np.float32)
+        tiny = np.zeros((20, 20), dtype=bool)
+        tiny[1, 1] = True
+        adapter = FrozenFeatureAdapter(backend="rgb_stats")
+        pooled = adapter.pool_mask_feature(FeatureMap(features, 20, 20, backend="unit"), tiny)
+        self.assertGreater(float(np.linalg.norm(pooled)), 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()
-

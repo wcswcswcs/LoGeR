@@ -6,7 +6,7 @@ from typing import Any
 
 import numpy as np
 
-from .v47_common import ROOT, load_mask_label, parse_float, parse_int, read_csv, utc_now, write_csv, write_json
+from .v47_common import ROOT, load_mask_label_from_root, parse_float, parse_int, read_csv, utc_now, write_csv, write_json
 from .v53_mask_component_support import _build_components, _carrier_global_id, _collect_support, _is_visible_row
 
 
@@ -166,6 +166,7 @@ def build_reprojection_ledger(
     repeated_support_min_w_visible: float = 0.50,
     repeated_support_max_components: int = 128,
     repeated_support_max_groups_per_scene: int = 80,
+    deduplicate_component_sets: bool = True,
 ) -> dict[str, Any]:
     carrier_rows = read_csv(_project(carrier_table_path))
     mask_rows = read_csv(_project(mask_table_path))
@@ -223,9 +224,10 @@ def build_reprojection_ledger(
         if not components:
             continue
         key = (scene, tuple(components))
-        if key in seen_component_sets:
+        if deduplicate_component_sets and key in seen_component_sets:
             continue
-        seen_component_sets.add(key)
+        if deduplicate_component_sets:
+            seen_component_sets.add(key)
         candidates.append(
             {
                 "candidate_id": f"cand{len(candidates):05d}",
@@ -450,7 +452,7 @@ def _passes_candidate_conflict_veto(
     return float(conflict_rate or 0.0) <= float(max_candidate_conflict_rate)
 
 
-def _write_visualizations(output_root: Path, vis_root: Path, payload: dict[str, Any]) -> list[dict[str, Any]]:
+def _write_visualizations(output_root: Path, vis_root: Path, payload: dict[str, Any], mask_root: str | Path | None = None) -> list[dict[str, Any]]:
     manifest: list[dict[str, Any]] = []
     try:
         import matplotlib.pyplot as plt
@@ -470,7 +472,7 @@ def _write_visualizations(output_root: Path, vis_root: Path, payload: dict[str, 
             frame_id = parse_int(row.get("target_frame_id"))
             best = str(row.get("best_mask_observation_id") or "")
             mask_id = parse_int(best.split(":")[-1]) if best else 0
-            label = load_mask_label(scene, frame_id)
+            label = load_mask_label_from_root(scene, frame_id, mask_root)
             image = np.zeros((64, 64), dtype=np.uint8) if label is None or mask_id <= 0 else (label == mask_id).astype(np.uint8)
             ax.imshow(image, cmap="gray", interpolation="nearest")
             ax.set_title(f"f{frame_id} in{parse_float(row.get('inside_best_mask_ratio')):.2f} out{parse_float(row.get('outside_all_related_masks_ratio')):.2f}")
@@ -515,13 +517,14 @@ def write_reprojection_ledger(
     output_root: str | Path,
     payload: dict[str, Any],
     visualization_root: str | Path = "outputs/audit/v53_visualizations/reprojection",
+    mask_root: str | Path | None = None,
 ) -> None:
     out = _project(output_root)
     vis = _project(visualization_root)
     write_json(out / "reprojection_summary.json", payload["summary"])
     write_csv(out / "reprojection_ledger_rows.csv", payload["reprojection_ledger_rows"])
     write_csv(out / "candidate_rows.csv", payload["candidate_rows"])
-    manifest = _write_visualizations(out, vis, payload)
+    manifest = _write_visualizations(out, vis, payload, mask_root=mask_root)
     write_json(out / "visualization_manifest.json", {"phase": "v53_reprojection_ledger", "files": manifest})
 
 

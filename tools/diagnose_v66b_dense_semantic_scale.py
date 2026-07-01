@@ -685,6 +685,8 @@ def _strategy_weights(
         boundary = _road_boundary(ground)
 
     info: Dict[str, Any] = {}
+    radio_stable_for_weighted_qscale: Optional[torch.Tensor] = None
+    radio_risk_for_weighted_qscale: Optional[torch.Tensor] = None
     core = strategy
     control = None
     if strategy.endswith("_RANDOM"):
@@ -803,6 +805,139 @@ def _strategy_weights(
                 "overlap_support_weighted_mass": float(w.sum().item()),
             }
         )
+    elif core == "V80_OVERLAP_OUTLIER_DOWNWEIGHT":
+        support = masks.get("overlap_support")
+        if not torch.is_tensor(support):
+            raise ValueError("V80_OVERLAP_OUTLIER_DOWNWEIGHT requires overlap_support tensor")
+        support = support.to(device=base_w.device, dtype=base_w.dtype).clamp(0.0, 1.0)
+        floor_raw = masks.get("overlap_support_floor", 0.25)
+        try:
+            support_floor = float(floor_raw)
+        except (TypeError, ValueError):
+            support_floor = 0.25
+        support_floor = min(1.0, max(0.0, support_floor))
+        support_weight = (support_floor + (1.0 - support_floor) * support).clamp(0.0, 1.0)
+        outlier = (1.0 - support).clamp(0.0, 1.0)
+        risk = dyn | sky | veg | void
+        low_support = support < 0.25
+        hard_veto = risk & low_support
+        residual_proxy = torch.reciprocal(1.0 + torch.square(outlier / 0.35)).clamp(0.0, 1.0)
+        w = (base_w * support_weight * residual_proxy).masked_fill(hard_veto, 0.0)
+        valid_support = support[base_valid]
+        valid_outlier = outlier[base_valid]
+        info.update(
+            {
+                "v80_overlap_outlier_downweight": True,
+                "overlap_support_weight_floor": float(support_floor),
+                "overlap_support_score_mean": float(valid_support.mean().item()) if bool(valid_support.numel()) else 0.0,
+                "overlap_support_score_q90": float(torch.quantile(valid_support.float(), 0.90).item()) if bool(valid_support.numel()) else 0.0,
+                "overlap_outlier_proxy_mean": float(valid_outlier.mean().item()) if bool(valid_outlier.numel()) else 0.0,
+                "overlap_outlier_proxy_q90": float(torch.quantile(valid_outlier.float(), 0.90).item()) if bool(valid_outlier.numel()) else 0.0,
+                "overlap_outlier_hard_veto_count": int((hard_veto & base_valid).sum().item()),
+                "overlap_outlier_hard_veto_mass": float((base_w * hard_veto.float()).sum().item()),
+                "overlap_support_weight_mean": float(support_weight[base_valid].mean().item())
+                if bool(base_valid.any().item())
+                else 0.0,
+                "overlap_support_weight_q90": float(torch.quantile(support_weight[base_valid].float(), 0.90).item())
+                if bool(base_valid.any().item())
+                else 0.0,
+                "overlap_support_weighted_mass": float(w.sum().item()),
+            }
+        )
+    elif core == "V81_RETRIEVAL_STATIC_OVERLAP":
+        support = masks.get("retrieval_static_overlap")
+        if not torch.is_tensor(support):
+            raise ValueError("V81_RETRIEVAL_STATIC_OVERLAP requires retrieval_static_overlap tensor")
+        support = support.to(device=base_w.device, dtype=base_w.dtype).clamp(0.0, 1.0)
+        if control in {"random", "shuffled"}:
+            flat = support.reshape(-1)
+            gen = torch.Generator().manual_seed(int(random_seed) + int(chunk_id) * 173 + len(strategy))
+            support = flat[torch.randperm(flat.numel(), generator=gen, device=flat.device)].reshape_as(support)
+        retrieval_floor = 0.05
+        retrieval_weight = (retrieval_floor + (1.0 - retrieval_floor) * support).clamp(0.0, 1.0)
+        static_anchor = vert | ground | boundary
+        hard_veto = dyn | sky | veg | void
+        static_base = base_w.masked_fill(~static_anchor, 0.0).masked_fill(hard_veto, 0.0)
+        w = static_base * retrieval_weight
+        valid_support = support[base_valid]
+        valid_weight = retrieval_weight[base_valid]
+        retrieved_static = support.bool() & static_anchor & base_valid
+        info.update(
+            {
+                "v81_retrieval_static_overlap": True,
+                "retrieval_static_control_type": control or "none",
+                "retrieval_static_floor": float(retrieval_floor),
+                "retrieval_static_support_mean": float(valid_support.mean().item()) if bool(valid_support.numel()) else 0.0,
+                "retrieval_static_support_q90": float(torch.quantile(valid_support.float(), 0.90).item()) if bool(valid_support.numel()) else 0.0,
+                "retrieval_static_support_mass": float(support[base_valid].sum().item()) if bool(base_valid.any().item()) else 0.0,
+                "retrieval_static_anchor_count": int(retrieved_static.sum().item()),
+                "retrieval_static_weight_mean": float(valid_weight.mean().item()) if bool(valid_weight.numel()) else 0.0,
+                "retrieval_static_weighted_mass": float(w.sum().item()),
+            }
+        )
+    elif core == "V81_LATENT_KALMAN_OVERLAP":
+        support = masks.get("latent_kalman_support")
+        gain = masks.get("latent_kalman_gain")
+        updated = masks.get("latent_kalman_updated_confidence")
+        preserve = masks.get("latent_kalman_preserve")
+        prior_unc = masks.get("latent_kalman_prior_uncertainty")
+        if not all(torch.is_tensor(x) for x in (support, gain, updated, preserve, prior_unc)):
+            raise ValueError("V81_LATENT_KALMAN_OVERLAP requires latent_kalman_* tensors")
+        support = support.to(device=base_w.device, dtype=base_w.dtype).clamp(0.0, 1.0)
+        gain = gain.to(device=base_w.device, dtype=base_w.dtype).clamp(0.0, 1.0)
+        updated = updated.to(device=base_w.device, dtype=base_w.dtype).clamp(0.0, 1.0)
+        preserve = preserve.to(device=base_w.device, dtype=base_w.dtype).clamp(0.0, 1.0)
+        prior_unc = prior_unc.to(device=base_w.device, dtype=base_w.dtype).clamp(0.0, 1.0)
+        if control in {"random", "shuffled"}:
+            gen = torch.Generator().manual_seed(int(random_seed) + int(chunk_id) * 211 + len(strategy))
+            for name, tensor in (
+                ("support", support),
+                ("gain", gain),
+                ("updated", updated),
+                ("preserve", preserve),
+                ("prior_unc", prior_unc),
+            ):
+                flat = tensor.reshape(-1)
+                shuffled_tensor = flat[torch.randperm(flat.numel(), generator=gen, device=flat.device)].reshape_as(tensor)
+                if name == "support":
+                    support = shuffled_tensor
+                elif name == "gain":
+                    gain = shuffled_tensor
+                elif name == "updated":
+                    updated = shuffled_tensor
+                elif name == "preserve":
+                    preserve = shuffled_tensor
+                else:
+                    prior_unc = shuffled_tensor
+        static_anchor = vert | ground | boundary
+        hard_veto = dyn | sky | veg | void
+        update_signal = (gain * updated).clamp(0.0, 1.0)
+        preserve_signal = (preserve * (1.0 - prior_unc)).clamp(0.0, 1.0)
+        latent_signal = torch.maximum(update_signal, preserve_signal).clamp(0.0, 1.0)
+        w = (base_w * latent_signal).masked_fill(~static_anchor | hard_veto, 0.0)
+        valid_support = support[base_valid]
+        valid_gain = gain[base_valid]
+        valid_updated = updated[base_valid]
+        valid_preserve = preserve[base_valid]
+        valid_prior_unc = prior_unc[base_valid]
+        info.update(
+            {
+                "v81_latent_kalman_overlap": True,
+                "latent_kalman_control_type": control or "none",
+                "latent_kalman_support_mean": float(valid_support.mean().item()) if bool(valid_support.numel()) else 0.0,
+                "latent_kalman_support_q90": float(torch.quantile(valid_support.float(), 0.90).item()) if bool(valid_support.numel()) else 0.0,
+                "latent_kalman_gain_mean": float(valid_gain.mean().item()) if bool(valid_gain.numel()) else 0.0,
+                "latent_kalman_gain_q90": float(torch.quantile(valid_gain.float(), 0.90).item()) if bool(valid_gain.numel()) else 0.0,
+                "latent_kalman_updated_mean": float(valid_updated.mean().item()) if bool(valid_updated.numel()) else 0.0,
+                "latent_kalman_preserve_mean": float(valid_preserve.mean().item()) if bool(valid_preserve.numel()) else 0.0,
+                "latent_kalman_prior_uncertainty_mean": float(valid_prior_unc.mean().item()) if bool(valid_prior_unc.numel()) else 0.0,
+                "latent_kalman_update_mass": float(update_signal[base_valid].sum().item()) if bool(base_valid.any().item()) else 0.0,
+                "latent_kalman_preserve_mass": float(preserve_signal[base_valid].sum().item()) if bool(base_valid.any().item()) else 0.0,
+                "latent_kalman_weighted_mass": float(w.sum().item()),
+                "latent_kalman_update_count": int(((gain > 0.5) & base_valid).sum().item()),
+                "latent_kalman_preserve_count": int(((preserve > 0.5) & base_valid).sum().item()),
+            }
+        )
     elif core == "V73_RADIO_COMPONENT_HANDOFF":
         radio_stable = masks.get("radio_component_stable")
         radio_risk = masks.get("radio_component_risk")
@@ -865,6 +1000,8 @@ def _strategy_weights(
             risk_flat = radio_risk.reshape(-1)
             radio_stable = stable_flat[torch.randperm(stable_flat.numel(), generator=gen, device=stable_flat.device)].reshape_as(radio_stable)
             radio_risk = risk_flat[torch.randperm(risk_flat.numel(), generator=gen, device=risk_flat.device)].reshape_as(radio_risk)
+        radio_stable_for_weighted_qscale = radio_stable
+        radio_risk_for_weighted_qscale = radio_risk
         support = masks.get("overlap_support")
         if not torch.is_tensor(support):
             raise ValueError("V73_RADIO_QSCALE_HANDOFF requires overlap_support tensor")
@@ -911,6 +1048,8 @@ def _strategy_weights(
             risk_flat = radio_risk.reshape(-1)
             radio_stable = stable_flat[torch.randperm(stable_flat.numel(), generator=gen, device=stable_flat.device)].reshape_as(radio_stable)
             radio_risk = risk_flat[torch.randperm(risk_flat.numel(), generator=gen, device=risk_flat.device)].reshape_as(radio_risk)
+        radio_stable_for_weighted_qscale = radio_stable
+        radio_risk_for_weighted_qscale = radio_risk
         support = masks.get("overlap_support")
         support_weight = torch.ones_like(base_w)
         support_floor = 0.25
@@ -975,6 +1114,26 @@ def _strategy_weights(
         if idx.numel() > 0:
             rw[idx] = flat_base[idx]
         w = rw.reshape_as(base_w)
+
+    if radio_stable_for_weighted_qscale is not None and radio_risk_for_weighted_qscale is not None:
+        radio_weight = w.clamp_min(0.0) * base_valid.float()
+        radio_weight_sum = float(radio_weight.sum().item())
+        if radio_weight_sum > 1.0e-12:
+            weighted_stable = float((radio_stable_for_weighted_qscale * radio_weight).sum().item() / radio_weight_sum)
+            weighted_risk = float((radio_risk_for_weighted_qscale * radio_weight).sum().item() / radio_weight_sum)
+            weighted_qscale = weighted_stable / (weighted_stable + weighted_risk + 1.0e-12)
+        else:
+            weighted_stable = 0.0
+            weighted_risk = 0.0
+            weighted_qscale = 0.0
+        info.update(
+            {
+                "radio_handoff_weighted_qscale_observability": float(weighted_qscale),
+                "radio_handoff_weighted_stable_mean": float(weighted_stable),
+                "radio_handoff_weighted_risk_mean": float(weighted_risk),
+                "radio_handoff_weighted_mass": float(radio_weight_sum),
+            }
+        )
 
     before = float(base_w.sum().item())
     remaining = float(w.sum().item())
@@ -1110,9 +1269,19 @@ PHASE3_STRATEGIES = [
     "S11_SEMANTIC_GEOMETRY_WEIGHTED",
     "V68_ROBUST_SEMOVERLAP_WEIGHT",
     "V68_ROBUST_SEMOVERLAP_WEIGHT_RANDOM",
+    "V68_ROBUST_SEMOVERLAP_WEIGHT_SHUFFLED",
     "V68_OVERLAP_SUPPORT_WEIGHT",
     "V68_OVERLAP_SUPPORT_WEIGHT_RANDOM",
     "V68_OVERLAP_SUPPORT_WEIGHT_SHUFFLED",
+    "V80_OVERLAP_OUTLIER_DOWNWEIGHT",
+    "V80_OVERLAP_OUTLIER_DOWNWEIGHT_RANDOM",
+    "V80_OVERLAP_OUTLIER_DOWNWEIGHT_SHUFFLED",
+    "V81_RETRIEVAL_STATIC_OVERLAP",
+    "V81_RETRIEVAL_STATIC_OVERLAP_RANDOM",
+    "V81_RETRIEVAL_STATIC_OVERLAP_SHUFFLED",
+    "V81_LATENT_KALMAN_OVERLAP",
+    "V81_LATENT_KALMAN_OVERLAP_RANDOM",
+    "V81_LATENT_KALMAN_OVERLAP_SHUFFLED",
     "V73_RADIO_COMPONENT_HANDOFF",
     "V73_RADIO_COMPONENT_HANDOFF_RANDOM",
     "V73_RADIO_COMPONENT_HANDOFF_SHUFFLED",
@@ -1292,9 +1461,19 @@ PHASE4_STRATEGIES = [
     "S11_SEMANTIC_GEOMETRY_WEIGHTED",
     "V68_ROBUST_SEMOVERLAP_WEIGHT",
     "V68_ROBUST_SEMOVERLAP_WEIGHT_RANDOM",
+    "V68_ROBUST_SEMOVERLAP_WEIGHT_SHUFFLED",
     "V68_OVERLAP_SUPPORT_WEIGHT",
     "V68_OVERLAP_SUPPORT_WEIGHT_RANDOM",
     "V68_OVERLAP_SUPPORT_WEIGHT_SHUFFLED",
+    "V80_OVERLAP_OUTLIER_DOWNWEIGHT",
+    "V80_OVERLAP_OUTLIER_DOWNWEIGHT_RANDOM",
+    "V80_OVERLAP_OUTLIER_DOWNWEIGHT_SHUFFLED",
+    "V81_RETRIEVAL_STATIC_OVERLAP",
+    "V81_RETRIEVAL_STATIC_OVERLAP_RANDOM",
+    "V81_RETRIEVAL_STATIC_OVERLAP_SHUFFLED",
+    "V81_LATENT_KALMAN_OVERLAP",
+    "V81_LATENT_KALMAN_OVERLAP_RANDOM",
+    "V81_LATENT_KALMAN_OVERLAP_SHUFFLED",
     "V73_RADIO_COMPONENT_HANDOFF",
     "V73_RADIO_COMPONENT_HANDOFF_RANDOM",
     "V73_RADIO_COMPONENT_HANDOFF_SHUFFLED",

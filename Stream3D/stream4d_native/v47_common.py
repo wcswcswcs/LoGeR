@@ -107,6 +107,36 @@ def load_mask_label(scene: str, frame_id: int) -> np.ndarray | None:
     return load_label(ROOT / "data/scannet/processed" / scene / "output_Cropformer/mask" / f"{int(frame_id)}.png")
 
 
+def project_path(path: str | Path) -> Path:
+    path_obj = Path(path)
+    if path_obj.is_absolute():
+        return path_obj
+    if path_obj.parts and path_obj.parts[0] == ROOT.name:
+        return ROOT.parent / path_obj
+    return ROOT / path_obj
+
+
+def resolve_mask_dir(mask_root: str | Path | None, scene: str) -> Path:
+    if mask_root is None or str(mask_root).strip() == "":
+        return ROOT / "data/scannet/processed" / scene / "output_Cropformer/mask"
+    base = project_path(mask_root)
+    candidates = [
+        base / scene / "output_Cropformer" / "mask",
+        base / scene / "mask",
+        base / "output_Cropformer" / "mask",
+        base / "mask",
+        base,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def load_mask_label_from_root(scene: str, frame_id: int, mask_root: str | Path | None = None) -> np.ndarray | None:
+    return load_label(resolve_mask_dir(mask_root, scene) / f"{int(frame_id)}.png")
+
+
 def load_gt_label(scene: str, frame_id: int) -> np.ndarray | None:
     return load_label(ROOT / "data/scannet/processed" / scene / "instance/instance" / f"{int(frame_id)}.png")
 
@@ -286,4 +316,3 @@ class UnionFind:
         self.members[root_l].update(self.members[root_r])
         del self.members[root_r]
         return True
-

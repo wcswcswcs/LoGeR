@@ -83,8 +83,9 @@ def _compact_kv_sdpa(
             for b in range(int(q.shape[0])):
                 keep_b = source_keep_mask[b]
                 removed_b = ~keep_b
-                n_tokens = int(keep_b.numel())
-                if n_tokens <= 0:
+                source_tokens = int(keep_b.numel())
+                query_tokens = int(q.shape[2])
+                if source_tokens <= 0 or query_tokens <= 0:
                     continue
                 if int(removed_b.sum().item()) <= 0:
                     removed_before_vals.append(0.0)
@@ -93,10 +94,10 @@ def _compact_kv_sdpa(
                     kept_tokens.append(int(keep_b.sum().item()))
                     query_samples.append(0)
                     continue
-                if n_tokens > max_q:
-                    q_idx = torch.linspace(0, n_tokens - 1, steps=max_q, device=q.device).round().long().unique()
+                if query_tokens > max_q:
+                    q_idx = torch.linspace(0, query_tokens - 1, steps=max_q, device=q.device).round().long().unique()
                 else:
-                    q_idx = torch.arange(n_tokens, device=q.device)
+                    q_idx = torch.arange(query_tokens, device=q.device)
                 qb = q[b : b + 1, :, q_idx, :].float()
                 kb = k[b : b + 1].float()
                 scores = torch.matmul(qb, kb.transpose(-2, -1)) * scale
@@ -139,14 +140,42 @@ def _sample_query_indices(n_tokens: int, max_queries: int, device: torch.device)
     return torch.arange(int(n_tokens), device=device)
 
 
+def _source_attention_head_mask(control: dict, head_count: int, device: torch.device, dtype: torch.dtype) -> Tensor | None:
+    raw = control.get("source_attention_head_indices")
+    if raw is None or str(raw).strip() == "":
+        return None
+    if isinstance(raw, str):
+        items = [item.strip() for item in raw.split(",") if item.strip()]
+    elif isinstance(raw, (list, tuple, set)):
+        items = list(raw)
+    else:
+        items = [raw]
+    indices: list[int] = []
+    for item in items:
+        try:
+            idx = int(item)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= idx < int(head_count):
+            indices.append(idx)
+    if not indices:
+        return None
+    mask = torch.zeros((int(head_count),), device=device, dtype=dtype)
+    mask[torch.tensor(sorted(set(indices)), device=device, dtype=torch.long)] = 1.0
+    return mask.reshape(1, int(head_count), 1, 1)
+
+
 def _append_source_soft_mass_stats(
     q: Tensor,
     k: Tensor,
     *,
     affected_mask: Tensor,
+    stable_anchor_mask: Tensor | None,
+    query_mask: Tensor | None,
     base_attn_mask: Tensor | None,
     source_bias_values: Tensor | None,
     source_weights: Tensor | None,
+    source_head_mask: Tensor | None,
     attention_mass_stats: list | None,
     attention_mass_max_queries: int,
     metric_type: str,
@@ -166,10 +195,21 @@ def _append_source_soft_mass_stats(
     base_bias = base_attn_mask.to(device=q.device, dtype=torch.float32) if base_attn_mask is not None else None
     bias = source_bias_values.to(device=q.device, dtype=torch.float32) if source_bias_values is not None else None
     weights = source_weights.to(device=q.device, dtype=torch.float32) if source_weights is not None else None
+    qmask = query_mask.to(device=q.device, dtype=torch.bool) if query_mask is not None else None
     if bias is not None and tuple(bias.shape) != tuple(affected_mask.shape):
         raise ValueError(f"source soft bias shape mismatch: bias={tuple(bias.shape)} mask={tuple(affected_mask.shape)}")
     if weights is not None and tuple(weights.shape) != tuple(affected_mask.shape):
         raise ValueError(f"source soft weight shape mismatch: weights={tuple(weights.shape)} mask={tuple(affected_mask.shape)}")
+    if qmask is not None and (int(qmask.shape[0]) != int(q.shape[0]) or int(qmask.shape[1]) != int(q.shape[2])):
+        raise ValueError(f"source soft query mask shape mismatch: query_mask={tuple(qmask.shape)} q={tuple(q.shape)}")
+    stable_mask = None
+    if stable_anchor_mask is not None:
+        stable_mask = stable_anchor_mask.to(device=q.device, dtype=torch.bool)
+        if tuple(stable_mask.shape) != tuple(affected_mask.shape):
+            raise ValueError(
+                "source soft stable_anchor_mask shape mismatch: "
+                f"stable={tuple(stable_mask.shape)} mask={tuple(affected_mask.shape)}"
+            )
 
     with torch.no_grad():
         before_vals = []
@@ -179,39 +219,64 @@ def _append_source_soft_mass_stats(
         retained_after_vals = []
         affected_tokens = []
         source_weight_vals = []
+        query_mask_vals = []
         query_samples = []
+        stable_before_vals = []
+        stable_after_vals = []
+        stable_actual_after_vals = []
+        stable_tokens = []
         head_dim = max(1, int(q.shape[-1]))
         scale = 1.0 / math.sqrt(float(head_dim))
+        query_tokens = int(q.shape[2])
         for b in range(int(q.shape[0])):
             affected_b = affected_mask[b]
-            n_tokens = int(affected_b.numel())
-            if n_tokens <= 0:
+            source_tokens = int(affected_b.numel())
+            if source_tokens <= 0 or query_tokens <= 0:
                 continue
-            q_idx = _sample_query_indices(n_tokens, attention_mass_max_queries, q.device)
+            q_idx = _sample_query_indices(query_tokens, attention_mass_max_queries, q.device)
             qb = q[b : b + 1, :, q_idx, :].float()
             kb = k[b : b + 1].float()
+            q_selected = qmask[b, q_idx] if qmask is not None else None
             scores = torch.matmul(qb, kb.transpose(-2, -1)) * scale
             if base_bias is not None:
                 scores = scores + base_bias[b : b + 1, :, q_idx, :]
             attn_full = torch.softmax(scores, dim=-1)
             affected_mass_before = attn_full[..., affected_b].sum(dim=-1)
             retained_mass_before = attn_full[..., ~affected_b].sum(dim=-1)
+            stable_b = stable_mask[b] if stable_mask is not None else None
+            stable_mass_before = None
+            if stable_b is not None and bool(stable_b.any()):
+                stable_mass_before = attn_full[..., stable_b].sum(dim=-1)
 
             if bias is not None:
-                scores_after = scores + bias[b].reshape(1, 1, 1, n_tokens)
+                bias_after = bias[b].reshape(1, 1, 1, source_tokens)
+                if source_head_mask is not None:
+                    bias_after = bias_after * source_head_mask.to(device=q.device, dtype=bias_after.dtype)
+                if q_selected is not None:
+                    bias_after = bias_after * q_selected.reshape(1, 1, -1, 1).to(dtype=bias_after.dtype)
+                scores_after = scores + bias_after
                 attn_after = torch.softmax(scores_after, dim=-1)
                 affected_mass_actual_after = attn_after[..., affected_b].sum(dim=-1)
                 affected_mass_after = affected_mass_actual_after
                 retained_mass_after = attn_after[..., ~affected_b].sum(dim=-1)
+                stable_mass_actual_after = attn_after[..., stable_b].sum(dim=-1) if stable_mass_before is not None else None
+                stable_mass_after = stable_mass_actual_after
             elif weights is not None:
-                weight_b = weights[b].reshape(1, 1, 1, n_tokens)
+                weight_b = weights[b].reshape(1, 1, 1, source_tokens)
                 affected_mass_actual_after = affected_mass_before
                 affected_mass_after = (attn_full[..., affected_b] * weight_b[..., affected_b]).sum(dim=-1)
                 retained_mass_after = retained_mass_before
+                stable_mass_actual_after = stable_mass_before
+                stable_mass_after = (
+                    (attn_full[..., stable_b] * weight_b[..., stable_b]).sum(dim=-1)
+                    if stable_mass_before is not None else None
+                )
             else:
                 affected_mass_actual_after = affected_mass_before
                 affected_mass_after = affected_mass_before
                 retained_mass_after = retained_mass_before
+                stable_mass_actual_after = stable_mass_before
+                stable_mass_after = stable_mass_before
 
             before_vals.append(float(affected_mass_before.mean().item()))
             after_vals.append(float(affected_mass_after.mean().item()))
@@ -222,8 +287,17 @@ def _append_source_soft_mass_stats(
             query_samples.append(int(q_idx.numel()))
             if weights is not None and bool(affected_b.any()):
                 source_weight_vals.append(float(weights[b][affected_b].mean().item()))
+            if q_selected is not None:
+                query_mask_vals.append(float(q_selected.float().mean().item()))
+            if stable_mass_before is not None and stable_mass_after is not None:
+                stable_before_vals.append(float(stable_mass_before.mean().item()))
+                stable_after_vals.append(float(stable_mass_after.mean().item()))
+                stable_actual_after_vals.append(float(stable_mass_actual_after.mean().item()))
+                stable_tokens.append(int(stable_b.sum().item()))
 
         if before_vals:
+            stable_before = float(torch.tensor(stable_before_vals).mean().item()) if stable_before_vals else None
+            stable_after = float(torch.tensor(stable_after_vals).mean().item()) if stable_after_vals else None
             attention_mass_stats.append({
                 "attention_mass_metric": str(metric_type),
                 "attention_mass_removed_before": float(torch.tensor(before_vals).mean().item()),
@@ -236,6 +310,21 @@ def _append_source_soft_mass_stats(
                 "source_value_weight_mean": (
                     float(torch.tensor(source_weight_vals).mean().item()) if source_weight_vals else None
                 ),
+                "attention_mass_query_mask_selected_ratio": (
+                    float(torch.tensor(query_mask_vals).mean().item()) if query_mask_vals else None
+                ),
+                "attention_mass_stable_anchor_before": stable_before,
+                "attention_mass_stable_anchor_after": stable_after,
+                "attention_mass_stable_anchor_actual_after": (
+                    float(torch.tensor(stable_actual_after_vals).mean().item()) if stable_actual_after_vals else None
+                ),
+                "attention_mass_stable_anchor_tokens_mean": (
+                    float(torch.tensor(stable_tokens, dtype=torch.float32).mean().item()) if stable_tokens else None
+                ),
+                "attention_mass_stable_anchor_preservation_ratio": (
+                    float(stable_after / max(abs(stable_before), 1e-12))
+                    if stable_before is not None and stable_after is not None else None
+                ),
                 "attention_mass_sampled": bool(max(affected_tokens or [0]) > 0),
             })
 
@@ -245,6 +334,7 @@ def _dump_source_soft_attention_sample(
     k: Tensor,
     *,
     affected_mask: Tensor,
+    query_mask: Tensor | None,
     base_attn_mask: Tensor | None,
     source_bias_values: Tensor | None,
     source_weights: Tensor | None,
@@ -273,6 +363,8 @@ def _dump_source_soft_attention_sample(
         chunk = int(control.get("source_attention_map_dump_chunk_idx", -1))
         n_tokens = int(k.shape[2])
         full_query_marginal = bool(control.get("source_attention_map_dump_full_query_marginal", False))
+        head_marginal = bool(control.get("source_attention_map_dump_head_marginal", False))
+        source_head_mask = _source_attention_head_mask(control, int(q.shape[1]), q.device, torch.float32)
         query_block = max(1, int(control.get("source_attention_map_dump_query_block", 32) or 32))
         if full_query_marginal:
             head_dim = max(1, int(q.shape[-1]))
@@ -286,6 +378,18 @@ def _dump_source_soft_attention_sample(
                 source_sum_after = (
                     torch.zeros_like(source_sum_before) if source_bias_values is not None else None
                 )
+                source_sum_before_head = (
+                    torch.zeros(
+                        (int(q.shape[0]), int(q.shape[1]), int(k.shape[2])),
+                        device=q.device,
+                        dtype=torch.float32,
+                    )
+                    if head_marginal else None
+                )
+                source_sum_after_head = (
+                    torch.zeros_like(source_sum_before_head)
+                    if head_marginal and source_bias_values is not None else None
+                )
                 base_bias = (
                     base_attn_mask.to(device=q.device, dtype=torch.float32)
                     if base_attn_mask is not None else None
@@ -294,6 +398,7 @@ def _dump_source_soft_attention_sample(
                     source_bias_values.to(device=q.device, dtype=torch.float32)
                     if source_bias_values is not None else None
                 )
+                qmask = query_mask.to(device=q.device, dtype=torch.bool) if query_mask is not None else None
                 kb = k.float()
                 query_count = int(q.shape[2])
                 denom = max(1, int(q.shape[1]) * query_count)
@@ -305,10 +410,24 @@ def _dump_source_soft_attention_sample(
                         scores = scores + base_bias[:, :, q0:q1, :]
                     attn_before = torch.softmax(scores, dim=-1)
                     source_sum_before += attn_before.sum(dim=(1, 2))
+                    if source_sum_before_head is not None:
+                        source_sum_before_head += attn_before.sum(dim=2)
                     if bias is not None and source_sum_after is not None:
-                        attn_after = torch.softmax(scores + bias[:, None, None, :], dim=-1)
+                        bias_after = bias[:, None, None, :]
+                        if source_head_mask is not None:
+                            bias_after = bias_after * source_head_mask
+                        if qmask is not None:
+                            bias_after = bias_after * qmask[:, None, q0:q1, None].to(dtype=bias_after.dtype)
+                        attn_after = torch.softmax(scores + bias_after, dim=-1)
                         source_sum_after += attn_after.sum(dim=(1, 2))
+                        if source_sum_after_head is not None:
+                            source_sum_after_head += attn_after.sum(dim=2)
                 before_marginal = (source_sum_before / float(denom)).detach().cpu().to(dtype=dump_dtype)
+                before_head_marginal = (
+                    (source_sum_before_head / float(max(1, query_count))).detach().cpu().to(dtype=dump_dtype)
+                    if source_sum_before_head is not None else None
+                )
+                affected_cpu_float = affected_mask.detach().cpu().float()
 
                 payload = {
                     "schema": "acl2_v68_fullquery_source_attention_marginal_v1",
@@ -318,10 +437,14 @@ def _dump_source_soft_attention_sample(
                     "sampled_not_full_attention_map": False,
                     "full_query_source_marginal": True,
                     "pairwise_attention_matrix_stored": False,
+                    "per_head_source_marginal": bool(before_head_marginal is not None),
+                    "source_attention_head_limited": bool(source_head_mask is not None),
+                    "source_attention_head_indices": str(control.get("source_attention_head_indices", "") or ""),
                     "query_axis_fully_covered": True,
                     "attention_source": "raw_qk_softmax_inside_source_soft_sdpa",
                     "source_attention_before_marginal": before_marginal,
                     "affected_mask": affected_mask.detach().cpu().to(dtype=torch.bool),
+                    "query_mask": qmask.detach().cpu().to(dtype=torch.bool) if qmask is not None else None,
                     "source_attention_top_quantile": control.get("source_attention_top_quantile"),
                     "attention_mass_metric": control.get("attention_mass_metric"),
                     "dump_dtype": str(dump_dtype),
@@ -331,15 +454,28 @@ def _dump_source_soft_attention_sample(
                     "full_query_count": query_count,
                     "source_token_count": int(k.shape[2]),
                     "source_attention_before_affected_mass_mean": float(
-                        (before_marginal.float() * affected_mask.detach().cpu().float()).sum(dim=-1).mean().item()
+                        (before_marginal.float() * affected_cpu_float).sum(dim=-1).mean().item()
                     ),
                 }
+                if before_head_marginal is not None:
+                    payload["source_attention_before_head_marginal"] = before_head_marginal
+                    payload["source_attention_before_head_affected_mass_mean"] = float(
+                        (before_head_marginal.float() * affected_cpu_float[:, None, :]).sum(dim=-1).mean().item()
+                    )
                 if source_sum_after is not None:
                     after_marginal = (source_sum_after / float(denom)).detach().cpu().to(dtype=dump_dtype)
                     payload["source_attention_after_bias_marginal"] = after_marginal
                     payload["source_attention_after_affected_mass_mean"] = float(
-                        (after_marginal.float() * affected_mask.detach().cpu().float()).sum(dim=-1).mean().item()
+                        (after_marginal.float() * affected_cpu_float).sum(dim=-1).mean().item()
                     )
+                    if source_sum_after_head is not None:
+                        after_head_marginal = (
+                            source_sum_after_head / float(max(1, query_count))
+                        ).detach().cpu().to(dtype=dump_dtype)
+                        payload["source_attention_after_bias_head_marginal"] = after_head_marginal
+                        payload["source_attention_after_head_affected_mass_mean"] = float(
+                            (after_head_marginal.float() * affected_cpu_float[:, None, :]).sum(dim=-1).mean().item()
+                        )
                 if source_weights is not None:
                     payload["source_weights"] = source_weights.detach().cpu().to(dtype=dump_dtype)
 
@@ -353,8 +489,12 @@ def _dump_source_soft_attention_sample(
             return {
                 "source_attention_map_dump_path": str(out_path),
                 "source_attention_map_dump_full_query_marginal": True,
+                "source_attention_map_dump_head_marginal": bool(before_head_marginal is not None),
                 "source_attention_map_dump_pairwise_matrix_stored": False,
                 "source_attention_map_dump_shape": [int(v) for v in before_marginal.shape],
+                "source_attention_map_dump_head_shape": (
+                    [int(v) for v in before_head_marginal.shape] if before_head_marginal is not None else None
+                ),
             }
 
         q_idx = _sample_query_indices(n_tokens, max_queries, q.device)
@@ -376,6 +516,8 @@ def _dump_source_soft_attention_sample(
                 "layer": layer,
                 "hook_path": hook_path,
                 "sampled_not_full_attention_map": True,
+                "pairwise_attention_matrix_stored": False,
+                "sampled_pairwise_attention_matrix_stored": True,
                 "attention_source": "raw_qk_softmax_inside_source_soft_sdpa",
                 "query_indices": q_idx.detach().cpu().long(),
                 "attention_before_control": attention_before.detach().cpu().to(dtype=dump_dtype),
@@ -385,11 +527,21 @@ def _dump_source_soft_attention_sample(
                 "dump_dtype": str(dump_dtype),
                 "q_shape": [int(v) for v in q.shape],
                 "k_shape": [int(v) for v in k.shape],
+                "source_token_count": int(k.shape[2]),
             }
             if source_bias_values is not None:
                 bias = source_bias_values.to(device=q.device, dtype=torch.float32)
-                scores_after = scores + bias[:, None, None, :]
+                bias_after = bias[:, None, None, :]
+                if source_head_mask is not None:
+                    bias_after = bias_after * source_head_mask
+                qmask = query_mask.to(device=q.device, dtype=torch.bool) if query_mask is not None else None
+                if qmask is not None:
+                    bias_after = bias_after * qmask[:, None, q_idx, None].to(dtype=bias_after.dtype)
+                    payload["query_mask"] = qmask.detach().cpu().to(dtype=torch.bool)
+                scores_after = scores + bias_after
                 payload["attention_after_bias_control"] = torch.softmax(scores_after, dim=-1).detach().cpu().to(dtype=dump_dtype)
+                payload["source_attention_head_limited"] = bool(source_head_mask is not None)
+                payload["source_attention_head_indices"] = str(control.get("source_attention_head_indices", "") or "")
             if source_weights is not None:
                 payload["source_weights"] = source_weights.detach().cpu().to(dtype=dump_dtype)
 
@@ -415,6 +567,7 @@ def _select_source_attention_top_mask(
     k: Tensor,
     *,
     eligible_mask: Tensor,
+    query_mask: Tensor | None,
     base_attn_mask: Tensor | None,
     attention_mass_max_queries: int,
     quantile: float,
@@ -431,6 +584,9 @@ def _select_source_attention_top_mask(
             f"mask={tuple(eligible_mask.shape)} q={tuple(q.shape)} k={tuple(k.shape)}"
         )
     eligible_mask = eligible_mask.to(device=q.device, dtype=torch.bool)
+    qmask = query_mask.to(device=q.device, dtype=torch.bool) if query_mask is not None else None
+    if qmask is not None and (int(qmask.shape[0]) != int(q.shape[0]) or int(qmask.shape[1]) != int(q.shape[2])):
+        raise ValueError(f"source attention query_mask shape mismatch: query_mask={tuple(qmask.shape)} q={tuple(q.shape)}")
     base_bias = base_attn_mask.to(device=q.device, dtype=torch.float32) if base_attn_mask is not None else None
     out = torch.zeros_like(eligible_mask, dtype=torch.bool)
     head_dim = max(1, int(q.shape[-1]))
@@ -443,7 +599,14 @@ def _select_source_attention_top_mask(
             if int(valid.sum().item()) <= 0:
                 continue
             n_tokens = int(valid.numel())
-            q_idx = _sample_query_indices(n_tokens, attention_mass_max_queries, q.device)
+            if qmask is not None:
+                query_valid = torch.nonzero(qmask[b], as_tuple=False).reshape(-1)
+                if int(query_valid.numel()) <= 0:
+                    continue
+                sampled_local = _sample_query_indices(int(query_valid.numel()), attention_mass_max_queries, q.device)
+                q_idx = query_valid[sampled_local]
+            else:
+                q_idx = _sample_query_indices(n_tokens, attention_mass_max_queries, q.device)
             qb = q[b : b + 1, :, q_idx, :].float()
             kb = k[b : b + 1].float()
             scores = torch.matmul(qb, kb.transpose(-2, -1)) * scale
@@ -481,15 +644,24 @@ def _source_soft_sdpa(
     """Run SDPA with source-column soft bias or V-only attenuation."""
 
     affected_mask = control["affected_mask"].to(device=q.device, dtype=torch.bool)
+    query_mask = control.get("query_mask")
+    if query_mask is not None:
+        query_mask = query_mask.to(device=q.device, dtype=torch.bool)
+        if int(query_mask.shape[0]) != int(q.shape[0]) or int(query_mask.shape[1]) != int(q.shape[2]):
+            raise ValueError(f"source soft query_mask shape mismatch: query_mask={tuple(query_mask.shape)} q={tuple(q.shape)}")
     base_attn_mask = control.get("base_attn_mask")
     source_bias_values = control.get("source_bias_values")
     source_weights = control.get("source_weights")
+    stable_anchor_mask = control.get("stable_anchor_mask")
+    source_head_mask = _source_attention_head_mask(control, int(q.shape[1]), q.device, torch.float32)
     if base_attn_mask is not None:
         base_attn_mask = base_attn_mask.to(device=q.device, dtype=q.dtype)
     if source_bias_values is not None:
         source_bias_values = source_bias_values.to(device=q.device, dtype=q.dtype)
     if source_weights is not None:
         source_weights = source_weights.to(device=q.device, dtype=v.dtype)
+    if stable_anchor_mask is not None:
+        stable_anchor_mask = stable_anchor_mask.to(device=q.device, dtype=torch.bool)
     top_quantile = control.get("source_attention_top_quantile")
     if top_quantile is not None:
         eligible_mask = control.get("source_attention_top_eligible_mask", affected_mask)
@@ -497,6 +669,7 @@ def _source_soft_sdpa(
             q,
             k,
             eligible_mask=eligible_mask,
+            query_mask=query_mask,
             base_attn_mask=base_attn_mask,
             attention_mass_max_queries=int(control.get("attention_mass_max_queries", 512) or 512),
             quantile=float(top_quantile),
@@ -504,17 +677,44 @@ def _source_soft_sdpa(
             random_salt=int(control.get("source_attention_top_random_salt", 0) or 0),
         )
         rho = float(control.get("source_attention_top_rho", 0.5) or 0.5)
-        min_keep = float(control.get("source_attention_top_min_keep", 0.5) or 0.5)
-        keep = (1.0 - rho * affected_mask.to(dtype=torch.float32)).clamp(min_keep, 1.0)
-        source_bias_values = torch.log(keep.clamp_min(1e-4)).to(device=q.device, dtype=q.dtype)
+        if bool(control.get("source_attention_top_boost_action", False)):
+            source_bias_values = torch.log1p((rho * affected_mask.to(dtype=torch.float32)).clamp_min(0.0)).to(
+                device=q.device, dtype=q.dtype
+            )
+        else:
+            min_keep = float(control.get("source_attention_top_min_keep", 0.5) or 0.5)
+            keep = (1.0 - rho * affected_mask.to(dtype=torch.float32)).clamp(min_keep, 1.0)
+            source_bias_values = torch.log(keep.clamp_min(1e-4)).to(device=q.device, dtype=q.dtype)
+        source_weights = None
+    anchor_mask = control.get("source_attention_top_anchor_boost_mask")
+    if anchor_mask is not None:
+        anchor_mask = anchor_mask.to(device=q.device, dtype=torch.bool)
+        anchor_score = control.get("source_attention_top_anchor_boost_score")
+        if anchor_score is None:
+            anchor_score = anchor_mask.to(dtype=torch.float32)
+        else:
+            anchor_score = anchor_score.to(device=q.device, dtype=torch.float32).clamp_min(0.0)
+        anchor_rho = float(control.get("source_attention_top_anchor_boost_rho", 0.5) or 0.5)
+        anchor_bias = torch.log1p((anchor_rho * anchor_score).clamp_min(0.0)).to(device=q.device, dtype=q.dtype)
+        if source_bias_values is None:
+            source_bias_values = torch.zeros_like(anchor_bias, device=q.device, dtype=q.dtype)
+        source_bias_values = source_bias_values + torch.where(
+            anchor_mask,
+            anchor_bias,
+            torch.zeros_like(source_bias_values),
+        )
+        stable_anchor_mask = anchor_mask if stable_anchor_mask is None else (stable_anchor_mask | anchor_mask)
         source_weights = None
     _append_source_soft_mass_stats(
         q,
         k,
         affected_mask=affected_mask,
+        stable_anchor_mask=stable_anchor_mask,
+        query_mask=query_mask,
         base_attn_mask=base_attn_mask,
         source_bias_values=source_bias_values,
         source_weights=source_weights,
+        source_head_mask=source_head_mask,
         attention_mass_stats=control.get("attention_mass_stats"),
         attention_mass_max_queries=int(control.get("attention_mass_max_queries", 512) or 512),
         metric_type=str(control.get("attention_mass_metric", "source_soft")),
@@ -523,6 +723,7 @@ def _source_soft_sdpa(
         q,
         k,
         affected_mask=affected_mask,
+        query_mask=query_mask,
         base_attn_mask=base_attn_mask,
         source_bias_values=source_bias_values,
         source_weights=source_weights,
@@ -540,12 +741,447 @@ def _source_soft_sdpa(
     attn_mask = base_attn_mask
     if source_bias_values is not None:
         source_bias = source_bias_values[:, None, None, :]
+        if source_head_mask is not None:
+            source_bias = source_bias * source_head_mask.to(device=q.device, dtype=source_bias.dtype)
+        if query_mask is not None:
+            source_bias = source_bias * query_mask[:, None, :, None].to(dtype=source_bias.dtype)
         attn_mask = source_bias if attn_mask is None else attn_mask + source_bias
     if attn_mask is None and q.dtype == torch.bfloat16:
         with nn.attention.sdpa_kernel(SDPBackend.FLASH_ATTENTION):
             return scaled_dot_product_attention(q, k, v_eff)
     with nn.attention.sdpa_kernel([SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION]):
         return scaled_dot_product_attention(q, k, v_eff, attn_mask=attn_mask)
+
+
+def _plain_sdpa(q: Tensor, k: Tensor, v: Tensor) -> Tensor:
+    if q.dtype == torch.bfloat16:
+        with nn.attention.sdpa_kernel(SDPBackend.FLASH_ATTENTION):
+            return scaled_dot_product_attention(q, k, v)
+    with nn.attention.sdpa_kernel([SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION]):
+        return scaled_dot_product_attention(q, k, v)
+
+
+def _prev_ttt_anchor_query_soft_sdpa(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    control: dict,
+) -> Tensor:
+    """Downweight or trace previous-anchor sources only for risky query rows."""
+
+    stats = control.get("attention_mass_stats")
+    stat_prefix = str(control.get("stat_prefix", "prev_ttt_anchor_query_soft") or "prev_ttt_anchor_query_soft")
+    metric_type = str(control.get("attention_mass_metric", stat_prefix) or stat_prefix)
+    trace_only = (
+        str(control.get("mode", "") or "").strip().lower() == "trace_only"
+        or bool(control.get("trace_only", False))
+    )
+
+    def stat_key(suffix: str) -> str:
+        return f"{stat_prefix}_{suffix}"
+
+    def plain() -> Tensor:
+        return _plain_sdpa(q, k, v)
+
+    history_tokens = min(max(0, int(control.get("history_tokens", 0) or 0)), int(k.shape[2]))
+    stable_anchor_mask = control.get("stable_anchor_mask")
+    if stable_anchor_mask is None or history_tokens <= 0:
+        if isinstance(stats, list):
+            stats.append({
+                "attention_mass_metric": metric_type,
+                stat_key("applied"): False,
+                stat_key("trace_only"): bool(trace_only),
+                stat_key("reason"): "missing_stable_anchor_mask_or_history",
+            })
+        return plain()
+
+    stable_hist = stable_anchor_mask.to(device=q.device, dtype=torch.bool)
+    if stable_hist.ndim == 1:
+        stable_hist = stable_hist.reshape(1, -1).expand(int(q.shape[0]), -1)
+    if stable_hist.ndim != 2 or int(stable_hist.shape[0]) != int(q.shape[0]):
+        raise ValueError(
+            f"{stat_prefix} stable_anchor_mask must be [B,N_hist], "
+            f"got {tuple(stable_hist.shape)} q={tuple(q.shape)}"
+        )
+    if int(stable_hist.shape[1]) < history_tokens:
+        pad = torch.zeros(
+            int(stable_hist.shape[0]),
+            history_tokens - int(stable_hist.shape[1]),
+            device=q.device,
+            dtype=torch.bool,
+        )
+        stable_hist = torch.cat([pad, stable_hist], dim=1)
+    elif int(stable_hist.shape[1]) > history_tokens:
+        stable_hist = stable_hist[:, -history_tokens:]
+
+    source_seed_ids = control.get("source_seed_ids")
+    seed_hist = None
+    if source_seed_ids is not None:
+        seed_hist = source_seed_ids.to(device=q.device, dtype=torch.long)
+        if seed_hist.ndim == 1:
+            seed_hist = seed_hist.reshape(1, -1).expand(int(q.shape[0]), -1)
+        if seed_hist.ndim != 2 or int(seed_hist.shape[0]) != int(q.shape[0]):
+            raise ValueError(
+                f"{stat_prefix} source_seed_ids must be [B,N_hist], "
+                f"got {tuple(seed_hist.shape)} q={tuple(q.shape)}"
+            )
+        if int(seed_hist.shape[1]) < history_tokens:
+            seed_pad = torch.full(
+                (int(seed_hist.shape[0]), history_tokens - int(seed_hist.shape[1])),
+                -1,
+                device=q.device,
+                dtype=torch.long,
+            )
+            seed_hist = torch.cat([seed_pad, seed_hist], dim=1)
+        elif int(seed_hist.shape[1]) > history_tokens:
+            seed_hist = seed_hist[:, -history_tokens:]
+
+    def _normalize_history_ids(raw: Tensor | None, name: str) -> Tensor | None:
+        if raw is None:
+            return None
+        ids = raw.to(device=q.device, dtype=torch.long)
+        if ids.ndim == 1:
+            ids = ids.reshape(1, -1).expand(int(q.shape[0]), -1)
+        if ids.ndim != 2 or int(ids.shape[0]) != int(q.shape[0]):
+            raise ValueError(
+                f"{stat_prefix} {name} must be [B,N_hist], "
+                f"got {tuple(ids.shape)} q={tuple(q.shape)}"
+            )
+        if int(ids.shape[1]) < history_tokens:
+            pad = torch.full(
+                (int(ids.shape[0]), history_tokens - int(ids.shape[1])),
+                -1,
+                device=q.device,
+                dtype=torch.long,
+            )
+            ids = torch.cat([pad, ids], dim=1)
+        elif int(ids.shape[1]) > history_tokens:
+            ids = ids[:, -history_tokens:]
+        return ids
+
+    def _normalize_query_ids(raw: Tensor | None, name: str) -> Tensor | None:
+        if raw is None:
+            return None
+        ids = raw.to(device=q.device, dtype=torch.long)
+        query_tokens = int(q.shape[2])
+        if ids.ndim == 1:
+            ids = ids.reshape(1, -1).expand(int(q.shape[0]), -1)
+        if ids.ndim != 2 or int(ids.shape[0]) != int(q.shape[0]):
+            raise ValueError(
+                f"{stat_prefix} {name} must be [B,N_query], "
+                f"got {tuple(ids.shape)} q={tuple(q.shape)}"
+            )
+        if int(ids.shape[1]) < query_tokens:
+            pad = torch.full(
+                (int(ids.shape[0]), query_tokens - int(ids.shape[1])),
+                -1,
+                device=q.device,
+                dtype=torch.long,
+            )
+            ids = torch.cat([ids, pad], dim=1)
+        elif int(ids.shape[1]) > query_tokens:
+            ids = ids[:, :query_tokens]
+        return ids
+
+    source_instance_hist = _normalize_history_ids(control.get("source_instance_ids"), "source_instance_ids")
+    query_seed_ids = _normalize_query_ids(control.get("query_seed_ids"), "query_seed_ids")
+    query_instance_ids = _normalize_query_ids(control.get("query_instance_ids"), "query_instance_ids")
+    direct_match_mode = str(control.get("direct_match_mode", "any") or "any").strip().lower()
+    if direct_match_mode not in {"any", "same_seed", "same_masklet"}:
+        direct_match_mode = "any"
+    direct_match_available = (
+        direct_match_mode == "any"
+        or (direct_match_mode == "same_seed" and seed_hist is not None and query_seed_ids is not None)
+        or (
+            direct_match_mode == "same_masklet"
+            and source_instance_hist is not None
+            and query_instance_ids is not None
+        )
+    )
+    direct_match_missing_reason = ""
+    if not direct_match_available:
+        direct_match_missing_reason = (
+            "missing_seed_ids_for_same_seed"
+            if direct_match_mode == "same_seed"
+            else "missing_instance_ids_for_same_masklet"
+        )
+
+    affected_full = torch.zeros((int(q.shape[0]), int(k.shape[2])), device=q.device, dtype=torch.bool)
+    affected_full[:, :history_tokens] = stable_hist
+    topk = min(max(1, int(control.get("topk", 8) or 8)), history_tokens)
+    threshold_raw = control.get("query_head_frac_threshold", 0.75)
+    threshold = min(max(float(0.75 if threshold_raw is None else threshold_raw), 0.0), 1.0)
+    query_block_size = max(1, int(control.get("query_block_size", 64) or 64))
+    min_direct_witness_seeds = max(0, int(control.get("min_direct_witness_seeds", 0) or 0))
+    with torch.no_grad():
+        k_hist = k[:, :, :history_tokens, :].detach()
+        scale = 1.0 / math.sqrt(float(max(1, int(q.shape[-1]))))
+        query_head_frac = torch.zeros(
+            int(q.shape[0]),
+            int(q.shape[2]),
+            device=q.device,
+            dtype=torch.float32,
+        )
+        direct_witness_hit_count = 0
+        witness_seed_parts = []
+        expanded = stable_hist[:, None, None, :].expand(
+            int(q.shape[0]),
+            int(q.shape[1]),
+            query_block_size,
+            history_tokens,
+        )
+        expanded_seed = None
+        if seed_hist is not None:
+            expanded_seed = seed_hist[:, None, None, :].expand(
+                int(q.shape[0]),
+                int(q.shape[1]),
+                query_block_size,
+                history_tokens,
+            )
+        expanded_instance = None
+        if source_instance_hist is not None:
+            expanded_instance = source_instance_hist[:, None, None, :].expand(
+                int(q.shape[0]),
+                int(q.shape[1]),
+                query_block_size,
+                history_tokens,
+            )
+        for q0 in range(0, int(q.shape[2]), query_block_size):
+            q1 = min(q0 + query_block_size, int(q.shape[2]))
+            qb = q[:, :, q0:q1, :].detach()
+            scores_hist = torch.matmul(qb, k_hist.transpose(-2, -1)) * scale
+            _, topk_indices = torch.topk(scores_hist, k=topk, dim=-1)
+            expanded_block = expanded[:, :, : q1 - q0, :]
+            hits = torch.gather(expanded_block, -1, topk_indices.long())
+            if direct_match_mode == "same_seed":
+                if expanded_seed is not None and query_seed_ids is not None:
+                    seed_block = expanded_seed[:, :, : q1 - q0, :]
+                    seed_topk = torch.gather(seed_block, -1, topk_indices.long())
+                    query_seed = query_seed_ids[:, None, q0:q1, None].expand_as(seed_topk)
+                    hits = hits & (seed_topk == query_seed) & (seed_topk >= 0)
+                else:
+                    hits = torch.zeros_like(hits)
+            elif direct_match_mode == "same_masklet":
+                if expanded_instance is not None and query_instance_ids is not None:
+                    inst_block = expanded_instance[:, :, : q1 - q0, :]
+                    inst_topk = torch.gather(inst_block, -1, topk_indices.long())
+                    query_inst = query_instance_ids[:, None, q0:q1, None].expand_as(inst_topk)
+                    hits = hits & (inst_topk == query_inst) & (inst_topk >= 0)
+                else:
+                    hits = torch.zeros_like(hits)
+            query_head_frac[:, q0:q1] = hits.any(dim=-1).float().mean(dim=1)
+            direct_witness_hit_count += int(hits.sum().item())
+            if expanded_seed is not None:
+                seed_block = expanded_seed[:, :, : q1 - q0, :]
+                seed_hits = torch.gather(seed_block, -1, topk_indices.long())
+                seed_hits = torch.where(hits, seed_hits, torch.full_like(seed_hits, -1))
+                witness_seed_parts.append(seed_hits.detach().reshape(-1).cpu())
+        query_mask = query_head_frac >= threshold
+        source_count = int(stable_hist.sum().item())
+        selected_query_count = int(query_mask.sum().item())
+        direct_witness_seed_count = 0
+        if witness_seed_parts:
+            witness_seeds = torch.cat(witness_seed_parts, dim=0)
+            witness_seeds = witness_seeds[witness_seeds >= 0]
+            if int(witness_seeds.numel()) > 0:
+                direct_witness_seed_count = int(torch.unique(witness_seeds).numel())
+        carrier_rule_pass = bool(
+            selected_query_count > 0
+            and (min_direct_witness_seeds <= 0 or direct_witness_seed_count >= min_direct_witness_seeds)
+        )
+
+    if source_count <= 0 or selected_query_count <= 0:
+        if isinstance(stats, list):
+            stats.append({
+                "attention_mass_metric": metric_type,
+                stat_key("applied"): False,
+                stat_key("trace_only"): bool(trace_only),
+                stat_key("reason"): "empty_sources_or_queries",
+                stat_key("source_tokens"): source_count,
+                stat_key("selected_query_count"): selected_query_count,
+                stat_key("query_selected_frac"): float(query_mask.float().mean().item())
+                if query_mask.numel() else 0.0,
+                stat_key("topk"): int(topk),
+                stat_key("head_frac_threshold"): float(threshold),
+                stat_key("query_block_size"): int(query_block_size),
+                stat_key("direct_witness_hit_count"): int(direct_witness_hit_count),
+                stat_key("direct_witness_seed_count"): int(direct_witness_seed_count),
+                stat_key("min_direct_witness_seeds"): int(min_direct_witness_seeds),
+                stat_key("carrier_rule_pass"): bool(carrier_rule_pass),
+                stat_key("direct_match_mode"): str(direct_match_mode),
+                stat_key("direct_match_available"): bool(direct_match_available),
+                stat_key("direct_match_missing_reason"): str(direct_match_missing_reason),
+            })
+        return plain()
+
+    rho_raw = control.get("rho", 0.5)
+    min_keep_raw = control.get("min_keep", 0.5)
+    rho = min(max(float(0.5 if rho_raw is None else rho_raw), 0.0), 1.0)
+    min_keep = min(max(float(0.5 if min_keep_raw is None else min_keep_raw), 1e-4), 1.0)
+    keep = max(min_keep, 1.0 - rho)
+    source_bias_values = torch.zeros((int(q.shape[0]), int(k.shape[2])), device=q.device, dtype=q.dtype)
+    source_bias_values[:, :history_tokens] = torch.where(
+        stable_hist,
+        torch.full_like(stable_hist, math.log(max(keep, 1e-4)), dtype=q.dtype),
+        torch.zeros_like(stable_hist, dtype=q.dtype),
+    )
+    _append_source_soft_mass_stats(
+        q,
+        k,
+        affected_mask=affected_full,
+        stable_anchor_mask=affected_full,
+        query_mask=query_mask,
+        base_attn_mask=None,
+        source_bias_values=source_bias_values,
+        source_weights=None,
+        source_head_mask=None,
+        attention_mass_stats=stats,
+        attention_mass_max_queries=int(control.get("attention_mass_max_queries", 512) or 512),
+        metric_type=metric_type,
+    )
+    if trace_only:
+        if isinstance(stats, list) and stats:
+            stats[-1].update({
+                stat_key("applied"): False,
+                stat_key("trace_only"): True,
+                stat_key("reason"): "trace_only_ok",
+                stat_key("source_tokens"): source_count,
+                stat_key("selected_query_count"): selected_query_count,
+                stat_key("query_selected_frac"): float(query_mask.float().mean().item())
+                if query_mask.numel() else 0.0,
+                stat_key("topk"): int(topk),
+                stat_key("head_frac_threshold"): float(threshold),
+                stat_key("query_block_size"): int(query_block_size),
+                stat_key("rho"): float(rho),
+                stat_key("min_keep"): float(min_keep),
+                stat_key("keep"): float(keep),
+                stat_key("direct_witness_hit_count"): int(direct_witness_hit_count),
+                stat_key("direct_witness_seed_count"): int(direct_witness_seed_count),
+                stat_key("min_direct_witness_seeds"): int(min_direct_witness_seeds),
+                stat_key("carrier_rule_pass"): bool(carrier_rule_pass),
+                stat_key("direct_match_mode"): str(direct_match_mode),
+                stat_key("direct_match_available"): bool(direct_match_available),
+                stat_key("direct_match_missing_reason"): str(direct_match_missing_reason),
+            })
+        return plain()
+
+    out = plain()
+    out = out.clone()
+    local_bias_base = torch.zeros(
+        1,
+        1,
+        1,
+        int(k.shape[2]),
+        device=q.device,
+        dtype=q.dtype,
+    )
+    local_bias_base[..., :history_tokens] = torch.where(
+        stable_hist[:1, None, None, :],
+        torch.full_like(stable_hist[:1, None, None, :], math.log(max(keep, 1e-4)), dtype=q.dtype),
+        torch.zeros_like(stable_hist[:1, None, None, :], dtype=q.dtype),
+    )
+    for b_idx in range(int(q.shape[0])):
+        query_idx = torch.nonzero(query_mask[b_idx], as_tuple=False).reshape(-1)
+        if int(query_idx.numel()) <= 0:
+            continue
+        bias_b = local_bias_base
+        if int(q.shape[0]) != 1:
+            bias_b = torch.zeros(
+                1,
+                1,
+                1,
+                int(k.shape[2]),
+                device=q.device,
+                dtype=q.dtype,
+            )
+            bias_b[..., :history_tokens] = torch.where(
+                stable_hist[b_idx : b_idx + 1, None, None, :],
+                torch.full_like(stable_hist[b_idx : b_idx + 1, None, None, :], math.log(max(keep, 1e-4)), dtype=q.dtype),
+                torch.zeros_like(stable_hist[b_idx : b_idx + 1, None, None, :], dtype=q.dtype),
+            )
+        for q_start in range(0, int(query_idx.numel()), query_block_size):
+            q_sel = query_idx[q_start : q_start + query_block_size]
+            local_bias = bias_b.expand(1, 1, int(q_sel.numel()), int(k.shape[2]))
+            with nn.attention.sdpa_kernel([SDPBackend.MATH, SDPBackend.EFFICIENT_ATTENTION]):
+                out[b_idx : b_idx + 1, :, q_sel, :] = scaled_dot_product_attention(
+                    q[b_idx : b_idx + 1, :, q_sel, :],
+                    k[b_idx : b_idx + 1],
+                    v[b_idx : b_idx + 1],
+                    attn_mask=local_bias,
+                )
+    if isinstance(stats, list) and stats:
+        stats[-1].update({
+            stat_key("applied"): True,
+            stat_key("trace_only"): False,
+            stat_key("reason"): "ok",
+            stat_key("source_tokens"): source_count,
+            stat_key("selected_query_count"): selected_query_count,
+            stat_key("query_selected_frac"): float(query_mask.float().mean().item())
+            if query_mask.numel() else 0.0,
+            stat_key("topk"): int(topk),
+            stat_key("head_frac_threshold"): float(threshold),
+            stat_key("query_block_size"): int(query_block_size),
+            stat_key("rho"): float(rho),
+            stat_key("min_keep"): float(min_keep),
+            stat_key("keep"): float(keep),
+            stat_key("direct_witness_hit_count"): int(direct_witness_hit_count),
+            stat_key("direct_witness_seed_count"): int(direct_witness_seed_count),
+            stat_key("min_direct_witness_seeds"): int(min_direct_witness_seeds),
+            stat_key("carrier_rule_pass"): bool(carrier_rule_pass),
+        })
+    return out
+
+
+def _record_source_soft_trace_only(q: Tensor, k: Tensor, control: dict) -> None:
+    """Record raw Q/K source-attention diagnostics without changing attention output."""
+
+    affected_mask = control["affected_mask"].to(device=q.device, dtype=torch.bool)
+    query_mask = control.get("query_mask")
+    if query_mask is not None:
+        query_mask = query_mask.to(device=q.device, dtype=torch.bool)
+    base_attn_mask = control.get("base_attn_mask")
+    source_bias_values = control.get("source_bias_values")
+    source_weights = control.get("source_weights")
+    stable_anchor_mask = control.get("stable_anchor_mask")
+    source_head_mask = _source_attention_head_mask(control, int(q.shape[1]), q.device, torch.float32)
+    if base_attn_mask is not None:
+        base_attn_mask = base_attn_mask.to(device=q.device, dtype=q.dtype)
+    if source_bias_values is not None:
+        source_bias_values = source_bias_values.to(device=q.device, dtype=q.dtype)
+    if source_weights is not None:
+        source_weights = source_weights.to(device=q.device, dtype=q.dtype)
+    if stable_anchor_mask is not None:
+        stable_anchor_mask = stable_anchor_mask.to(device=q.device, dtype=torch.bool)
+    _append_source_soft_mass_stats(
+        q,
+        k,
+        affected_mask=affected_mask,
+        stable_anchor_mask=stable_anchor_mask,
+        query_mask=query_mask,
+        base_attn_mask=base_attn_mask,
+        source_bias_values=source_bias_values,
+        source_weights=source_weights,
+        source_head_mask=source_head_mask,
+        attention_mass_stats=control.get("attention_mass_stats"),
+        attention_mass_max_queries=int(control.get("attention_mass_max_queries", 512) or 512),
+        metric_type=str(control.get("attention_mass_metric", "source_soft_trace_only")),
+    )
+    dump_info = _dump_source_soft_attention_sample(
+        q,
+        k,
+        affected_mask=affected_mask,
+        query_mask=query_mask,
+        base_attn_mask=base_attn_mask,
+        source_bias_values=source_bias_values,
+        source_weights=source_weights,
+        control=control,
+    )
+    stats = control.get("attention_mass_stats")
+    if dump_info and isinstance(stats, list):
+        if stats:
+            stats[-1].update(dump_info)
+        else:
+            stats.append(dump_info)
 
 
 def _append_overlap_bias_mass_stats(
@@ -1000,6 +1636,28 @@ class MemEffAttentionRope(AttentionRope):
     def forward(self, x: Tensor, attn_bias=None, xpos=None, attn_mask=None) -> Tensor:
         compact_kv = attn_mask if isinstance(attn_mask, dict) and attn_mask.get("type") == "compact_kv" else None
         source_soft = attn_mask if isinstance(attn_mask, dict) and attn_mask.get("type") == "source_soft" else None
+        source_trace_only = (
+            source_soft is not None and str(source_soft.get("mode", "")).lower() == "trace_only"
+        )
+        if source_trace_only:
+            B, N, C = x.shape
+            qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).transpose(1, 3)
+            q, k, v = [qkv[:, :, i] for i in range(3)]
+            q, k = self.q_norm(q).to(v.dtype), self.k_norm(k).to(v.dtype)
+
+            if self.rope is not None:
+                q = self.rope(q, xpos)
+                k = self.rope(k, xpos)
+
+            target_dtype = v.dtype
+            if q.dtype != target_dtype:
+                q = q.to(target_dtype)
+            if k.dtype != target_dtype:
+                k = k.to(target_dtype)
+
+            _record_source_soft_trace_only(q, k, source_soft)
+            source_soft = None
+            attn_mask = None
         if compact_kv is not None or source_soft is not None:
             B, N, C = x.shape
             qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).transpose(1, 3)
@@ -1097,16 +1755,22 @@ class MemEffAttentionRope(AttentionRope):
 
     
 class FlashAttentionRope(AttentionRope):
-    def compute_kv(self, x: Tensor, xpos=None) -> tuple[Tensor, Tensor]:
-        """Compute K, V for caching. Returns (K, V) after norm and RoPE."""
+    def compute_qkv(self, x: Tensor, xpos=None) -> tuple[Tensor, Tensor, Tensor]:
+        """Compute Q, K, V after norm/RoPE for cache diagnostics."""
         B, N, C = x.shape
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).transpose(1, 3)
-        q, k, v = [qkv[:,:,i] for i in range(3)]
+        q, k, v = [qkv[:, :, i] for i in range(3)]
         q, k = self.q_norm(q).to(v.dtype), self.k_norm(k).to(v.dtype)
-        
+
         if self.rope is not None:
+            q = self.rope(q, xpos)
             k = self.rope(k, xpos)
-        
+
+        return q, k, v
+
+    def compute_kv(self, x: Tensor, xpos=None) -> tuple[Tensor, Tensor]:
+        """Compute K, V for caching. Returns (K, V) after norm and RoPE."""
+        _, k, v = self.compute_qkv(x, xpos=xpos)
         return k, v
     
     def forward_with_kv_cache(
@@ -1151,15 +1815,40 @@ class FlashAttentionRope(AttentionRope):
         # Compute attention.  SWA overlap control can pass a compact descriptor
         # instead of a dense mask; in that case we run the native full attention
         # first and then recompute only the affected overlap query rows.
+        compact_kv = attn_mask if isinstance(attn_mask, dict) and attn_mask.get("type") == "compact_kv" else None
+        source_soft = attn_mask if isinstance(attn_mask, dict) and attn_mask.get("type") == "source_soft" else None
         overlap_bias = attn_mask if isinstance(attn_mask, dict) and attn_mask.get("type") == "overlap_bias" else None
-        dense_attn_mask = None if overlap_bias is not None else attn_mask
+        prev_ttt_anchor_query_soft = (
+            attn_mask
+            if isinstance(attn_mask, dict) and attn_mask.get("type") == "prev_ttt_anchor_query_soft"
+            else None
+        )
+        dense_attn_mask = None if (
+            compact_kv is not None
+            or source_soft is not None
+            or overlap_bias is not None
+            or prev_ttt_anchor_query_soft is not None
+        ) else attn_mask
         is_float_mask = (
             dense_attn_mask is not None
             and torch.is_tensor(dense_attn_mask)
             and torch.is_floating_point(dense_attn_mask)
         )
         
-        if dense_attn_mask is not None and FLEX_ATTENTION_AVAILABLE and not is_float_mask:
+        if compact_kv is not None:
+            x = _compact_kv_sdpa(
+                q,
+                k_full,
+                v_full,
+                compact_kv["source_keep_mask"],
+                compact_kv.get("attention_mass_stats"),
+                int(compact_kv.get("attention_mass_max_queries", 512) or 512),
+            )
+        elif source_soft is not None:
+            x = _source_soft_sdpa(q, k_full, v_full, source_soft)
+        elif prev_ttt_anchor_query_soft is not None:
+            x = _prev_ttt_anchor_query_soft_sdpa(q, k_full, v_full, prev_ttt_anchor_query_soft)
+        elif dense_attn_mask is not None and FLEX_ATTENTION_AVAILABLE and not is_float_mask:
             target_dtype = v_full.dtype
             if q.dtype != target_dtype:
                 q = q.to(target_dtype)
@@ -1257,6 +1946,10 @@ class FlashAttentionRope(AttentionRope):
 
         compact_kv = attn_mask if isinstance(attn_mask, dict) and attn_mask.get("type") == "compact_kv" else None
         source_soft = attn_mask if isinstance(attn_mask, dict) and attn_mask.get("type") == "source_soft" else None
+        if source_soft is not None and str(source_soft.get("mode", "")).lower() == "trace_only":
+            _record_source_soft_trace_only(q, k, source_soft)
+            source_soft = None
+            attn_mask = None
         if compact_kv is not None or source_soft is not None:
             if compact_kv is not None:
                 x = _compact_kv_sdpa(

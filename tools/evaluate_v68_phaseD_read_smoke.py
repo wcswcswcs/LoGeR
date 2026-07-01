@@ -147,6 +147,42 @@ def _aggregate_hmc_debug(run_dir: Path) -> Dict[str, Any]:
         "implemented_paths_all": implemented,
         "v68_read_available_count": int(sum(1 for row in rows if bool(row.get("prior_v68_read_available", False)))),
         "v68_read_reason_set": sorted({str(row.get("prior_v68_read_reason")) for row in rows if row.get("prior_v68_read_reason") is not None}),
+        "v78_l07_l13_available_count": int(sum(1 for row in rows if bool(row.get("prior_v78_l07_l13_available", False)))),
+        "v78_l07_l13_reason_set": sorted({
+            str(row.get("prior_v78_l07_l13_reason"))
+            for row in rows
+            if row.get("prior_v78_l07_l13_reason") is not None
+        }),
+        "v78_l07_l13_control_applied_count": int(sum(1 for row in rows if bool(row.get("prior_v78_l07_l13_control_applied", False)))),
+        "v78_l07_l13_control_effective_set": sorted({
+            str(row.get("prior_v78_l07_l13_control_effective"))
+            for row in rows
+            if row.get("prior_v78_l07_l13_control_effective") is not None
+        }),
+        "v78_l07_l13_output_mean_mean": _finite_mean(row.get("prior_v78_l07_l13_output_mean") for row in rows),
+        "v78_l07_l13_output_gt050_mass_mean": _finite_mean(row.get("prior_v78_l07_l13_output_gt050_mass") for row in rows),
+        "v95_trackH_gate_active_count": int(sum(1 for row in rows if bool(row.get("prior_v95_trackH_gate_active", False)))),
+        "v95_trackH_gate_direction_set": sorted({
+            str(row.get("prior_v95_trackH_gate_direction"))
+            for row in rows
+            if row.get("prior_v95_trackH_gate_direction") is not None
+        }),
+        "v95_trackH_gate_min_chunk_idx_set": sorted({
+            str(row.get("prior_v95_trackH_gate_min_chunk_idx"))
+            for row in rows
+            if row.get("prior_v95_trackH_gate_min_chunk_idx") is not None
+        }),
+        "v95_trackH_gate_score_mean": _finite_mean(row.get("prior_v95_trackH_gate_score") for row in rows),
+        "v95_trackH_gate_threshold_mean": _finite_mean(row.get("prior_v95_trackH_gate_threshold") for row in rows),
+        "v95_trackH_gate_min_mean_R_tok_mean": _finite_mean(
+            row.get("prior_v95_trackH_gate_min_mean_R_tok") for row in rows
+        ),
+        "v95_trackH_gate_mean_R_tok_mean": _finite_mean(
+            row.get("prior_v95_trackH_gate_mean_R_tok") for row in rows
+        ),
+        "v95_trackH_gate_mean_R_tok_pass_count": int(
+            sum(1 for row in rows if bool(row.get("prior_v95_trackH_gate_mean_R_tok_pass", False)))
+        ),
         "swa_num_calls_sum": int(sum(int(row.get("num_calls", 0) or 0) for row in swa_rows)),
         "swa_num_overlap_source_gate_applied_sum": int(sum(int(row.get("num_swa_overlap_source_gate_applied", 0) or 0) for row in swa_rows)),
         "swa_num_overlap_source_replace_applied_sum": int(sum(int(row.get("num_swa_overlap_source_replace_applied", 0) or 0) for row in swa_rows)),
@@ -222,8 +258,14 @@ def _parse_run_arg(base_dir: Path, spec: str) -> Tuple[str, Path]:
     return spec, base_dir / spec
 
 
-def _eval_run(run_name: str, run_dir: Path, gt_poses_all: np.ndarray, gt_pos_all: np.ndarray) -> Dict[str, Any]:
-    traj_path = run_dir / "01.txt"
+def _eval_run(
+    run_name: str,
+    run_dir: Path,
+    gt_poses_all: np.ndarray,
+    gt_pos_all: np.ndarray,
+    trajectory_name: str = "01.txt",
+) -> Dict[str, Any]:
+    traj_path = run_dir / str(trajectory_name)
     frames, raw_poses, raw_pos = _load_tum_prediction(traj_path, gt_pos_all.shape[0])
     if frames.size < 3:
         raise ValueError(f"{traj_path}: need at least 3 valid frames, got {frames.size}")
@@ -320,6 +362,41 @@ def _eval_run(run_name: str, run_dir: Path, gt_poses_all: np.ndarray, gt_pos_all
         "prior_v68_read_semantic_trust_mean": hmc.get("prior_v68_read_semantic_trust_mean"),
         "prior_v68_read_corr_output_motion": hmc.get("prior_v68_read_corr_output_motion"),
         "prior_v68_read_corr_output_sem_risk": hmc.get("prior_v68_read_corr_output_sem_risk"),
+        "prior_v78_l07_l13_available": hmc.get("prior_v78_l07_l13_available"),
+        "prior_v78_l07_l13_reason": hmc.get("prior_v78_l07_l13_reason"),
+        "prior_v78_l07_l13_mode": hmc.get("prior_v78_l07_l13_mode"),
+        "prior_v78_l07_l13_control": hmc.get("prior_v78_l07_l13_control"),
+        "prior_v78_l07_l13_control_applied": hmc.get("prior_v78_l07_l13_control_applied"),
+        "prior_v78_l07_l13_control_effective": hmc.get("prior_v78_l07_l13_control_effective"),
+        "prior_v78_l07_l13_control_shuffle_mode": hmc.get("prior_v78_l07_l13_control_shuffle_mode"),
+        "prior_v78_l07_l13_control_eligible_tokens": hmc.get("prior_v78_l07_l13_control_eligible_tokens"),
+        "prior_v78_l07_l13_control_shuffle_groups": hmc.get("prior_v78_l07_l13_control_shuffle_groups"),
+        "prior_v78_l07_l13_control_shuffle_reason": hmc.get("prior_v78_l07_l13_control_shuffle_reason"),
+        "prior_v78_l07_l13_l07_layout_mean": hmc.get("prior_v78_l07_l13_l07_layout_mean"),
+        "prior_v78_l07_l13_l07_layout_q90": hmc.get("prior_v78_l07_l13_l07_layout_q90"),
+        "prior_v78_l07_l13_l07_layout_gt050_mass": hmc.get("prior_v78_l07_l13_l07_layout_gt050_mass"),
+        "prior_v78_l07_l13_l13_neg_mean": hmc.get("prior_v78_l07_l13_l13_neg_mean"),
+        "prior_v78_l07_l13_l13_neg_q90": hmc.get("prior_v78_l07_l13_l13_neg_q90"),
+        "prior_v78_l07_l13_output_mean_before_control": hmc.get("prior_v78_l07_l13_output_mean_before_control"),
+        "prior_v78_l07_l13_output_q90_before_control": hmc.get("prior_v78_l07_l13_output_q90_before_control"),
+        "prior_v78_l07_l13_output_gt050_mass_before_control": hmc.get("prior_v78_l07_l13_output_gt050_mass_before_control"),
+        "prior_v78_l07_l13_output_mean": hmc.get("prior_v78_l07_l13_output_mean"),
+        "prior_v78_l07_l13_output_q90": hmc.get("prior_v78_l07_l13_output_q90"),
+        "prior_v78_l07_l13_output_gt050_mass": hmc.get("prior_v78_l07_l13_output_gt050_mass"),
+        "prior_v78_l07_l13_corr_output_l07_layout": hmc.get("prior_v78_l07_l13_corr_output_l07_layout"),
+        "prior_v78_l07_l13_corr_output_l13_neg": hmc.get("prior_v78_l07_l13_corr_output_l13_neg"),
+        "prior_v78_l07_l13_corr_l07_l13": hmc.get("prior_v78_l07_l13_corr_l07_l13"),
+        "prior_v95_trackH_gate_source": hmc.get("prior_v95_trackH_gate_source"),
+        "prior_v95_trackH_gate_direction": hmc.get("prior_v95_trackH_gate_direction"),
+        "prior_v95_trackH_gate_min_chunk_idx": hmc.get("prior_v95_trackH_gate_min_chunk_idx"),
+        "prior_v95_trackH_gate_threshold": hmc.get("prior_v95_trackH_gate_threshold"),
+        "prior_v95_trackH_gate_score": hmc.get("prior_v95_trackH_gate_score"),
+        "prior_v95_trackH_gate_min_mean_R_tok": hmc.get("prior_v95_trackH_gate_min_mean_R_tok"),
+        "prior_v95_trackH_gate_mean_R_tok": hmc.get("prior_v95_trackH_gate_mean_R_tok"),
+        "prior_v95_trackH_gate_mean_R_tok_pass": hmc.get("prior_v95_trackH_gate_mean_R_tok_pass"),
+        "prior_v95_trackH_gate_active": hmc.get("prior_v95_trackH_gate_active"),
+        "prior_v95_trackH_gate_chunk_idx": hmc.get("prior_v95_trackH_gate_chunk_idx"),
+        "prior_v95_trackH_gate_active_read_cue": hmc.get("prior_v95_trackH_gate_active_read_cue"),
         "prior_beta_frame_effective": hmc.get("prior_beta_frame_effective"),
         "pass1_pass2_pose_t_mean": hmc.get("pass1_pass2_pose_t_mean"),
         "pass1_pass2_pose_t_max": hmc.get("pass1_pass2_pose_t_max"),

@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from stream4d_native.soma_inference_policy import normalize_reportability
+
 
 MANIFEST_NAME = "config_manifest.json"
 SCHEMA_VERSION = "stream4d_prediction_manifest_v1"
@@ -133,7 +135,7 @@ def build_prediction_manifest(
         "support_policy": str(support_policy),
         "eval_policy": str(extra.get("eval_policy", pre_points_policy)) if extra else str(pre_points_policy),
         "support_source": str(extra.get("support_source", "unknown")) if extra else "unknown",
-        "geometry_source": str(extra.get("geometry_source", "rgbd_eval_bridge")) if extra else "rgbd_eval_bridge",
+        "geometry_source": str(extra.get("geometry_source", "unknown")) if extra else "unknown",
         "chunking_policy": str(extra.get("chunking_policy", "unknown")) if extra else "unknown",
         "opend4rt_reference_policy": str(extra.get("opend4rt_reference_policy", "unknown")) if extra else "unknown",
         "command": command if command is not None else " ".join(sys.argv),
@@ -144,6 +146,7 @@ def build_prediction_manifest(
     }
     if extra:
         payload.update(extra)
+    payload = normalize_reportability(payload, context=f"prediction manifest {output_config}")
     return json_safe(payload)
 
 
@@ -159,6 +162,7 @@ def write_prediction_manifest(
     payload = dict(payload)
     payload.setdefault("schema_version", SCHEMA_VERSION)
     payload.setdefault("output_config", output_config)
+    payload = normalize_reportability(payload, context=f"prediction manifest {output_config}")
     written: list[Path] = []
     for path in manifest_paths(root, output_config, pred_suffix):
         path.parent.mkdir(parents=True, exist_ok=True)

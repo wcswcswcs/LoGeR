@@ -43,7 +43,13 @@ def _resize_mask(mask: np.ndarray, height: int, width: int) -> np.ndarray:
     mask_u8 = np.asarray(mask, dtype=np.uint8)
     if mask_u8.shape == (height, width):
         return mask_u8.astype(bool)
-    return cv2.resize(mask_u8, (int(width), int(height)), interpolation=cv2.INTER_NEAREST).astype(bool)
+    resized = cv2.resize(mask_u8, (int(width), int(height)), interpolation=cv2.INTER_NEAREST).astype(bool)
+    if not np.any(resized) and np.any(mask_u8):
+        ys, xs = np.nonzero(mask_u8)
+        cy = int(np.clip(round(float(ys.mean()) * float(height) / max(mask_u8.shape[0], 1)), 0, int(height) - 1))
+        cx = int(np.clip(round(float(xs.mean()) * float(width) / max(mask_u8.shape[1], 1)), 0, int(width) - 1))
+        resized[cy, cx] = True
+    return resized
 
 
 def _mask_boundary(mask: np.ndarray) -> np.ndarray:
@@ -184,7 +190,10 @@ class FrozenFeatureAdapter:
         radio_root = Path(__file__).resolve().parents[2] / "third_party" / "RADIO-ViPE"
         if str(radio_root) not in sys.path:
             sys.path.insert(0, str(radio_root))
-        os.environ.setdefault("CONDA_PREFIX", sys.prefix)
+        # RADIO-ViPE's JIT extension reads CONDA_PREFIX/include for Eigen.
+        # Shell sessions may keep CONDA_PREFIX pointed at base conda even when
+        # this adapter runs inside the project env, so use the live interpreter.
+        os.environ["CONDA_PREFIX"] = sys.prefix
         import torch
         from vipe.priors.embedding.radseg_encoder import RADSegEncoder
 
