@@ -90,7 +90,13 @@ def _load_phase4_scene(phase4_root: Path, scene: str) -> dict[str, Any]:
     return torch.load(path, map_location="cpu")
 
 
-def _load_reliability(phase3_root: Path, scene: str, carrier_id: np.ndarray) -> np.ndarray:
+def _load_reliability(
+    phase3_root: Path,
+    scene: str,
+    carrier_id: np.ndarray,
+    embedded_reliability: np.ndarray | None = None,
+    embedded_broad_risk: np.ndarray | None = None,
+) -> np.ndarray:
     path = phase3_root / scene / "carrier_reliability_rows.parquet"
     if not path.exists():
         raise FileNotFoundError(path)
@@ -100,8 +106,20 @@ def _load_reliability(phase3_root: Path, scene: str, carrier_id: np.ndarray) -> 
     ids_sorted = ids[order]
     rel_sorted = df["reliability_s2"].to_numpy(dtype=np.float32, copy=False)[order]
     broad_sorted = df["broad_mask_participation_rate"].to_numpy(dtype=np.float32, copy=False)[order]
-    rel = np.zeros((carrier_id.shape[0],), dtype=np.float32)
-    broad = np.ones((carrier_id.shape[0],), dtype=np.float32)
+    rel = (
+        np.asarray(embedded_reliability, dtype=np.float32).copy()
+        if embedded_reliability is not None
+        else np.zeros((carrier_id.shape[0],), dtype=np.float32)
+    )
+    broad = (
+        np.asarray(embedded_broad_risk, dtype=np.float32).copy()
+        if embedded_broad_risk is not None
+        else np.ones((carrier_id.shape[0],), dtype=np.float32)
+    )
+    if rel.shape[0] != carrier_id.shape[0]:
+        raise ValueError(f"embedded_reliability length mismatch: {rel.shape[0]} vs {carrier_id.shape[0]}")
+    if broad.shape[0] != carrier_id.shape[0]:
+        raise ValueError(f"embedded_broad_risk length mismatch: {broad.shape[0]} vs {carrier_id.shape[0]}")
     if ids_sorted.size:
         pos = np.searchsorted(ids_sorted, np.asarray(carrier_id, dtype=np.int64))
         found = (pos < ids_sorted.shape[0]) & (ids_sorted[np.minimum(pos, ids_sorted.shape[0] - 1)] == carrier_id)
@@ -387,7 +405,25 @@ def _run_scene(scene: str, args: argparse.Namespace, device: torch.device) -> tu
     mask_is_object = data["mask_is_object_like"].cpu().numpy().astype(bool)
     mask_is_broad = data["mask_is_broad"].cpu().numpy().astype(bool)
     mask_weight = data["mask_weight"].cpu().numpy().astype(np.float32)
-    reliability, carrier_broad = _load_reliability(phase3_root, scene, carrier_id)
+    embedded_reliability = data.get("carrier_reliability")
+    embedded_broad = data.get("carrier_broad_risk")
+    embedded_reliability_np = (
+        embedded_reliability.cpu().numpy().astype(np.float32)
+        if torch.is_tensor(embedded_reliability)
+        else None
+    )
+    embedded_broad_np = (
+        embedded_broad.cpu().numpy().astype(np.float32)
+        if torch.is_tensor(embedded_broad)
+        else None
+    )
+    reliability, carrier_broad = _load_reliability(
+        phase3_root,
+        scene,
+        carrier_id,
+        embedded_reliability=embedded_reliability_np,
+        embedded_broad_risk=embedded_broad_np,
+    )
     alpha = (reliability[carrier_idx] * b_ia).astype(np.float32)
     incidence_by_mask = [np.flatnonzero(mask_idx == m).astype(np.int64) for m in range(mask_frame.shape[0])]
     support_count = np.bincount(mask_idx, minlength=int(mask_frame.shape[0])).astype(np.int64, copy=False)

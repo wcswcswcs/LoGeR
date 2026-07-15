@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import hashlib
 import json
 import sys
@@ -44,18 +43,15 @@ def _write_json(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(_jsonable(payload), indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
-    keys: list[str] = []
-    for row in rows:
-        for key in row:
-            if key not in keys:
-                keys.append(key)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=keys)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(_jsonable(row))
+def _write_records_json(path: Path, rows: list[dict[str, Any]], *, schema_version: str) -> None:
+    _write_json(
+        path,
+        {
+            "schema_version": schema_version,
+            "row_count": len(rows),
+            "rows": rows,
+        },
+    )
 
 
 def _write_sha256sums(path: Path, files: list[Path]) -> None:
@@ -92,7 +88,7 @@ def _hash_text(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
-def _parse_csv_list(value: str) -> list[str]:
+def _parse_comma_list(value: str) -> list[str]:
     return [part.strip() for part in str(value).split(",") if part.strip()]
 
 
@@ -711,17 +707,17 @@ def _run_one(
         "top_iou_pairs": top_rows,
         "outputs": {
             "summary_json": _rel(output_dir / "summary.json"),
-            "frame_rows_csv": _rel(output_dir / "frame_rows.csv"),
-            "top_iou_pairs_csv": _rel(output_dir / "top_iou_pairs.csv"),
+            "frame_records_json": _rel(output_dir / "frame_records.json"),
+            "top_iou_pair_records_json": _rel(output_dir / "top_iou_pair_records.json"),
         },
     }
-    _write_csv(output_dir / "frame_rows.csv", frame_rows)
-    _write_csv(output_dir / "top_iou_pairs.csv", top_rows)
+    _write_records_json(output_dir / "frame_records.json", frame_rows, schema_version="stream4d_v65_frame_records_v1")
+    _write_records_json(output_dir / "top_iou_pair_records.json", top_rows, schema_version="stream4d_v65_top_iou_pair_records_v1")
     _write_json(output_dir / "summary.json", payload)
     payload["outputs"].update(
         {
-            "frame_rows_csv_sha256": _sha256(output_dir / "frame_rows.csv"),
-            "top_iou_pairs_csv_sha256": _sha256(output_dir / "top_iou_pairs.csv"),
+            "frame_records_json_sha256": _sha256(output_dir / "frame_records.json"),
+            "top_iou_pair_records_json_sha256": _sha256(output_dir / "top_iou_pair_records.json"),
             "sha256_note": "summary_json hash is recorded in the aggregate SHA256SUMS.txt sidecar to avoid self-referential hashes.",
         }
     )
@@ -733,8 +729,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     output_root = _project(args.output_root)
     pipeline_root = _project(args.pipeline_root)
     vertex_cache_root = _project(args.vertex_cache_root)
-    methods = _parse_csv_list(args.methods)
-    strides = [int(value) for value in _parse_csv_list(args.strides)]
+    methods = _parse_comma_list(args.methods)
+    strides = [int(value) for value in _parse_comma_list(args.strides)]
     rows: list[dict[str, Any]] = []
     summaries: list[dict[str, Any]] = []
     for method in methods:
@@ -787,20 +783,20 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "note": "This diagnostic isolates scene-level multi-view mask grouping from 3D AP's D4RT geometry materialization; it is not the official ScanNet 3D AP.",
         "rows": rows,
     }
-    _write_csv(output_root / "aggregate_rows.csv", rows)
+    _write_records_json(output_root / "aggregate_records.json", rows, schema_version="stream4d_v65_aggregate_records_v1")
     aggregate["outputs"] = {
         "aggregate_summary_json": _rel(output_root / "aggregate_summary.json"),
-        "aggregate_rows_csv": _rel(output_root / "aggregate_rows.csv"),
+        "aggregate_records_json": _rel(output_root / "aggregate_records.json"),
         "sha256sums": _rel(output_root / "SHA256SUMS.txt"),
         "hash_policy": "Final file hashes are stored in SHA256SUMS.txt, outside the JSON files being hashed.",
     }
     _write_json(output_root / "aggregate_summary.json", aggregate)
-    hash_files = [output_root / "aggregate_summary.json", output_root / "aggregate_rows.csv"]
+    hash_files = [output_root / "aggregate_summary.json", output_root / "aggregate_records.json"]
     for payload in summaries:
         summary_path = _project(payload["outputs"]["summary_json"])
-        frame_rows_path = _project(payload["outputs"]["frame_rows_csv"])
-        top_pairs_path = _project(payload["outputs"]["top_iou_pairs_csv"])
-        hash_files.extend([summary_path, frame_rows_path, top_pairs_path])
+        frame_records_path = _project(payload["outputs"]["frame_records_json"])
+        top_pairs_path = _project(payload["outputs"]["top_iou_pair_records_json"])
+        hash_files.extend([summary_path, frame_records_path, top_pairs_path])
     _write_sha256sums(output_root / "SHA256SUMS.txt", hash_files)
     print(json.dumps(aggregate, indent=2, sort_keys=True), flush=True)
     return aggregate

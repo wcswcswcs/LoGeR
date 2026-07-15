@@ -112,6 +112,151 @@ VARIANTS = [
         "node_policy": "all_supported",
         "emit_policy": "all_supported",
     },
+    {
+        "variant_id": "M4_repair_non_broad_strict_l2o_tau060_top8_min2",
+        "clusterer": "constrained_union_find",
+        "pair_affinity_mode": "strict_leave_two_out_bucket_zeroed",
+        "threshold": 0.60,
+        "topk_per_mask": 8,
+        "min_object_frames": 2,
+        "use_cannot_link": True,
+        "cannot_link_policy": "specific_non_broad_same_frame",
+        "node_policy": "supported_non_broad",
+        "emit_policy": "non_broad_only_skip",
+        "score_policy": "selected_broad_risk",
+    },
+    {
+        "variant_id": "M4_repair_non_broad_strict_l2o_tau070_top8_min2",
+        "clusterer": "constrained_union_find",
+        "pair_affinity_mode": "strict_leave_two_out_bucket_zeroed",
+        "threshold": 0.70,
+        "topk_per_mask": 8,
+        "min_object_frames": 2,
+        "use_cannot_link": True,
+        "cannot_link_policy": "specific_non_broad_same_frame",
+        "node_policy": "supported_non_broad",
+        "emit_policy": "non_broad_only_skip",
+        "score_policy": "selected_broad_risk",
+    },
+    {
+        "variant_id": "M5_repair_all_supported_emit_object_like_only_tau070_top8_min2",
+        "clusterer": "constrained_union_find",
+        "pair_affinity_mode": "strict_leave_two_out_bucket_zeroed",
+        "threshold": 0.70,
+        "topk_per_mask": 8,
+        "min_object_frames": 2,
+        "use_cannot_link": True,
+        "cannot_link_policy": "specific_non_broad_same_frame",
+        "node_policy": "all_supported",
+        "emit_policy": "object_like_only_skip",
+        "score_policy": "selected_broad_risk",
+    },
+    {
+        "variant_id": "M5_repair_all_supported_emit_non_broad_only_tau070_top8_min2",
+        "clusterer": "constrained_union_find",
+        "pair_affinity_mode": "strict_leave_two_out_bucket_zeroed",
+        "threshold": 0.70,
+        "topk_per_mask": 8,
+        "min_object_frames": 2,
+        "use_cannot_link": True,
+        "cannot_link_policy": "specific_non_broad_same_frame",
+        "node_policy": "all_supported",
+        "emit_policy": "non_broad_only_skip",
+        "score_policy": "selected_broad_risk",
+    },
+    {
+        "variant_id": "M6_repair_all_supported_emit_object_like_only_tau060_top8_min2",
+        "clusterer": "constrained_union_find",
+        "pair_affinity_mode": "strict_leave_two_out_bucket_zeroed",
+        "threshold": 0.60,
+        "topk_per_mask": 8,
+        "min_object_frames": 2,
+        "use_cannot_link": True,
+        "cannot_link_policy": "specific_non_broad_same_frame",
+        "node_policy": "all_supported",
+        "emit_policy": "object_like_only_skip",
+        "score_policy": "selected_broad_risk",
+    },
+    {
+        "variant_id": "M7_repair_all_supported_broad_support_veto_tau070_top8_min2",
+        "clusterer": "constrained_union_find",
+        "pair_affinity_mode": "strict_leave_two_out_bucket_zeroed",
+        "threshold": 0.70,
+        "topk_per_mask": 8,
+        "min_object_frames": 2,
+        "use_cannot_link": True,
+        "cannot_link_policy": "specific_non_broad_same_frame",
+        "node_policy": "all_supported_broad_support_veto",
+        "emit_policy": "prefer_object_like",
+        "score_policy": "selected_broad_risk",
+        "broad_support_min_support_count": 1000,
+    },
+    {
+        "variant_id": "M7_repair_all_supported_broad_support_veto_tau080_top4_min2",
+        "clusterer": "constrained_union_find",
+        "pair_affinity_mode": "strict_leave_two_out_bucket_zeroed",
+        "threshold": 0.80,
+        "topk_per_mask": 4,
+        "min_object_frames": 2,
+        "use_cannot_link": True,
+        "cannot_link_policy": "specific_non_broad_same_frame",
+        "node_policy": "all_supported_broad_support_veto",
+        "emit_policy": "prefer_object_like",
+        "score_policy": "selected_broad_risk",
+        "broad_support_min_support_count": 1000,
+    },
+    {
+        "variant_id": "M8_lingbot_mutual_topk_tau080_top2_min2",
+        "clusterer": "constrained_union_find",
+        "pair_affinity_mode": "strict_leave_two_out_bucket_zeroed",
+        "threshold": 0.80,
+        "topk_per_mask": 2,
+        "edge_selection_policy": "mutual_topk",
+        "min_object_frames": 2,
+        "use_cannot_link": True,
+        "node_policy": "all_supported",
+        "emit_policy": "prefer_object_like",
+        "cannot_link_policy": "all_node_same_frame",
+    },
+    {
+        "variant_id": "M8_lingbot_mutual_topk_tau085_top2_min2",
+        "clusterer": "constrained_union_find",
+        "pair_affinity_mode": "strict_leave_two_out_bucket_zeroed",
+        "threshold": 0.85,
+        "topk_per_mask": 2,
+        "edge_selection_policy": "mutual_topk",
+        "min_object_frames": 2,
+        "use_cannot_link": True,
+        "node_policy": "all_supported",
+        "emit_policy": "prefer_object_like",
+        "cannot_link_policy": "all_node_same_frame",
+    },
+    {
+        "variant_id": "M9_lingbot_mutual_top1_tau085_min2",
+        "clusterer": "constrained_union_find",
+        "pair_affinity_mode": "strict_leave_two_out_bucket_zeroed",
+        "threshold": 0.85,
+        "topk_per_mask": 1,
+        "edge_selection_policy": "mutual_topk",
+        "min_object_frames": 2,
+        "use_cannot_link": True,
+        "node_policy": "all_supported",
+        "emit_policy": "prefer_object_like",
+        "cannot_link_policy": "all_node_same_frame",
+    },
+    {
+        "variant_id": "M9_lingbot_mutual_top1_tau090_min2",
+        "clusterer": "constrained_union_find",
+        "pair_affinity_mode": "strict_leave_two_out_bucket_zeroed",
+        "threshold": 0.90,
+        "topk_per_mask": 1,
+        "edge_selection_policy": "mutual_topk",
+        "min_object_frames": 2,
+        "use_cannot_link": True,
+        "node_policy": "all_supported",
+        "emit_policy": "prefer_object_like",
+        "cannot_link_policy": "all_node_same_frame",
+    },
 ]
 
 
@@ -333,20 +478,38 @@ def _candidate_edges(
     topk = int(variant["topk_per_mask"])
     if topk > 0:
         selected = np.zeros((pair_arr.shape[0],), dtype=bool)
+        selected_by_mask: dict[int, set[int]] = {}
         by_mask: dict[int, list[int]] = defaultdict(list)
         for idx, (a, b) in enumerate(pair_arr.tolist()):
             by_mask[int(a)].append(idx)
             by_mask[int(b)].append(idx)
-        for indices in by_mask.values():
+        edge_selection_policy = str(variant.get("edge_selection_policy", "either_topk"))
+        for mask, indices in by_mask.items():
             order = sorted(indices, key=lambda i: float(vals[i]), reverse=True)[:topk]
-            selected[np.asarray(order, dtype=np.int64)] = True
+            if edge_selection_policy == "mutual_topk":
+                for idx in order:
+                    selected_by_mask.setdefault(int(mask), set()).add(int(idx))
+            elif edge_selection_policy == "either_topk":
+                selected[np.asarray(order, dtype=np.int64)] = True
+            else:
+                raise ValueError(f"unsupported edge_selection_policy={edge_selection_policy}")
+        if edge_selection_policy == "mutual_topk":
+            for idx, (a, b) in enumerate(pair_arr.tolist()):
+                selected[idx] = idx in selected_by_mask.get(int(a), set()) and idx in selected_by_mask.get(int(b), set())
         pair_arr = pair_arr[selected]
         vals = vals[selected]
     order = np.argsort(vals)[::-1]
     return pair_arr[order], vals[order]
 
 
-def _cannot_links(mask_frame: np.ndarray, node_mask: np.ndarray) -> set[tuple[int, int]]:
+def _cannot_links(
+    mask_frame: np.ndarray,
+    node_mask: np.ndarray,
+    *,
+    mask_is_object: np.ndarray,
+    mask_is_broad: np.ndarray,
+    policy: str,
+) -> set[tuple[int, int]]:
     out: set[tuple[int, int]] = set()
     by_frame: dict[int, list[int]] = defaultdict(list)
     for idx, frame in enumerate(mask_frame.tolist()):
@@ -355,8 +518,70 @@ def _cannot_links(mask_frame: np.ndarray, node_mask: np.ndarray) -> set[tuple[in
     for masks in by_frame.values():
         for i, a in enumerate(masks[:-1]):
             for b in masks[i + 1 :]:
+                if policy == "specific_non_broad_same_frame":
+                    a_specific = (not bool(mask_is_broad[int(a)])) and bool(mask_is_object[int(a)])
+                    b_specific = (not bool(mask_is_broad[int(b)])) and bool(mask_is_object[int(b)])
+                    if not (a_specific and b_specific):
+                        continue
+                elif policy != "all_node_same_frame":
+                    raise ValueError(f"unsupported cannot_link_policy={policy}")
                 out.add((min(int(a), int(b)), max(int(a), int(b))))
     return out
+
+
+def _node_mask_from_policy(
+    *,
+    support_count: np.ndarray,
+    mask_is_object: np.ndarray,
+    mask_is_broad: np.ndarray,
+    node_policy: str,
+    broad_support_min_support_count: int = 1000,
+) -> np.ndarray:
+    if node_policy == "all_supported":
+        return support_count > 0
+    if node_policy == "all_supported_broad_support_veto":
+        high_support_broad = (
+            (support_count >= int(broad_support_min_support_count))
+            & mask_is_broad.astype(bool)
+            & (~mask_is_object.astype(bool))
+        )
+        return (support_count > 0) & (~high_support_broad)
+    if node_policy == "supported_non_broad":
+        return (support_count > 0) & (~mask_is_broad.astype(bool))
+    if node_policy == "object_like":
+        return mask_is_object.astype(bool)
+    raise ValueError(f"unsupported node_policy={node_policy}")
+
+
+def _choose_emit_mask(
+    *,
+    candidates: list[int],
+    emit_policy: str,
+    mask_label: np.ndarray,
+    mask_is_object: np.ndarray,
+    mask_is_broad: np.ndarray,
+    support_count: np.ndarray,
+) -> int | None:
+    if not candidates:
+        return None
+    if emit_policy == "object_like_only_skip":
+        filtered = [m for m in candidates if bool(mask_is_object[m]) and not bool(mask_is_broad[m])]
+        if not filtered:
+            return None
+        return max(filtered, key=lambda m: (int(support_count[m]), -int(mask_label[m])))
+    if emit_policy == "non_broad_only_skip":
+        filtered = [m for m in candidates if not bool(mask_is_broad[m])]
+        if not filtered:
+            return None
+        return max(filtered, key=lambda m: (int(mask_is_object[m]), int(support_count[m]), -int(mask_label[m])))
+    if emit_policy == "prefer_object_like":
+        return max(candidates, key=lambda m: (int(mask_is_object[m]), -int(mask_is_broad[m]), int(support_count[m]), -int(mask_label[m])))
+    return max(candidates, key=lambda m: (int(support_count[m]), -int(mask_label[m])))
+
+
+def _cluster_score(*, emitted_frame_count: int, broad_member_ratio: float, selected_broad_ratio: float, score_policy: str) -> float:
+    risk = selected_broad_ratio if score_policy == "selected_broad_risk" else broad_member_ratio
+    return float(emitted_frame_count / 32.0) * max(0.05, 1.0 - 0.50 * float(risk))
 
 
 def _cluster_scene(
@@ -376,10 +601,13 @@ def _cluster_scene(
     mask_is_object = feature_payload["mask_is_object_like"].cpu().numpy().astype(bool)
     mask_is_broad = feature_payload["mask_is_broad"].cpu().numpy().astype(bool)
     support_count = feature_payload["support_count"].cpu().numpy().astype(np.int64)
-    if str(variant.get("node_policy", "object_like")) == "all_supported":
-        node_mask = support_count > 0
-    else:
-        node_mask = mask_is_object.astype(bool)
+    node_mask = _node_mask_from_policy(
+        support_count=support_count,
+        mask_is_object=mask_is_object,
+        mask_is_broad=mask_is_broad,
+        node_policy=str(variant.get("node_policy", "object_like")),
+        broad_support_min_support_count=int(variant.get("broad_support_min_support_count", 1000)),
+    )
 
     edges, edge_vals = _candidate_edges(
         feature=feature,
@@ -389,7 +617,17 @@ def _cluster_scene(
         device=device,
         batch_size=batch_size,
     )
-    cannot = _cannot_links(mask_frame, node_mask) if bool(variant["use_cannot_link"]) else set()
+    cannot = (
+        _cannot_links(
+            mask_frame,
+            node_mask,
+            mask_is_object=mask_is_object,
+            mask_is_broad=mask_is_broad,
+            policy=str(variant.get("cannot_link_policy", "all_node_same_frame")),
+        )
+        if bool(variant["use_cannot_link"])
+        else set()
+    )
     uf = UnionFind(len(mask_frame))
     comp_members: dict[int, set[int]] = {idx: {idx} for idx in range(len(mask_frame))}
     rejected = 0
@@ -424,6 +662,7 @@ def _cluster_scene(
                 "accepted_union": bool(accepted),
                 "reject_reason": reject_reason,
                 "pair_affinity_mode": variant["pair_affinity_mode"],
+                "edge_selection_policy": str(variant.get("edge_selection_policy", "either_topk")),
             }
         )
 
@@ -436,12 +675,35 @@ def _cluster_scene(
     object_idx = 0
     for _root, masks in sorted(groups.items(), key=lambda item: (-len(set(mask_frame[item[1]].tolist())), item[0])):
         frames = sorted({int(mask_frame[m]) for m in masks})
-        if len(frames) < int(variant["min_object_frames"]):
+        by_frame: dict[int, list[int]] = defaultdict(list)
+        for mask_idx in masks:
+            by_frame[int(mask_frame[mask_idx])].append(int(mask_idx))
+        selected_by_frame: dict[int, int] = {}
+        for frame, candidates in by_frame.items():
+            best = _choose_emit_mask(
+                candidates=candidates,
+                emit_policy=str(variant.get("emit_policy", "default")),
+                mask_label=mask_label,
+                mask_is_object=mask_is_object,
+                mask_is_broad=mask_is_broad,
+                support_count=support_count,
+            )
+            if best is not None:
+                selected_by_frame[int(frame)] = int(best)
+        if len(selected_by_frame) < int(variant["min_object_frames"]):
             continue
         broad_member_ratio = float(np.mean(mask_is_broad[masks])) if masks else 0.0
+        selected_masks = list(selected_by_frame.values())
+        selected_broad_ratio = float(np.mean(mask_is_broad[selected_masks])) if selected_masks else 0.0
+        selected_object_like_ratio = float(np.mean(mask_is_object[selected_masks])) if selected_masks else 0.0
         object_id = f"{variant['variant_id']}:{scene}:c0000:obj_{object_idx:05d}"
         object_idx += 1
-        score = float(len(frames) / 32.0) * max(0.05, 1.0 - 0.50 * broad_member_ratio)
+        score = _cluster_score(
+            emitted_frame_count=len(selected_by_frame),
+            broad_member_ratio=broad_member_ratio,
+            selected_broad_ratio=selected_broad_ratio,
+            score_policy=str(variant.get("score_policy", "member_broad_risk")),
+        )
         cluster_rows.append(
             {
                 "schema_version": "stream4d_v103_phase6_mask_cluster_row_v1",
@@ -451,25 +713,22 @@ def _cluster_scene(
                 "window_id": "c0000",
                 "mv_object_id": object_id,
                 "mask_count": int(len(masks)),
-                "frame_count": int(len(frames)),
+                "raw_frame_count": int(len(frames)),
+                "frame_count": int(len(selected_by_frame)),
                 "object_score": score,
                 "mean_support_count": float(np.mean(support_count[masks])) if masks else 0.0,
                 "node_policy": str(variant.get("node_policy", "object_like")),
                 "broad_mask_member_count": int(np.count_nonzero(mask_is_broad[masks])) if masks else 0,
                 "broad_mask_member_ratio": broad_member_ratio,
+                "selected_broad_mask_ratio": selected_broad_ratio,
+                "selected_object_like_mask_ratio": selected_object_like_ratio,
                 "emit_policy": str(variant.get("emit_policy", "default")),
+                "score_policy": str(variant.get("score_policy", "member_broad_risk")),
                 "uses_gt_for_prediction": False,
                 "uses_future": False,
             }
         )
-        by_frame: dict[int, list[int]] = defaultdict(list)
-        for mask_idx in masks:
-            by_frame[int(mask_frame[mask_idx])].append(int(mask_idx))
-        for frame, candidates in by_frame.items():
-            if str(variant.get("emit_policy", "default")) == "prefer_object_like":
-                best = max(candidates, key=lambda m: (int(mask_is_object[m]), -int(mask_is_broad[m]), int(support_count[m]), -int(mask_label[m])))
-            else:
-                best = max(candidates, key=lambda m: (int(support_count[m]), -int(mask_label[m])))
+        for frame, best in selected_by_frame.items():
             frame_rows.append(
                 {
                     "schema_version": "stream4d_v103_phase6_local_object_frame_mask_row_v1",
@@ -506,7 +765,7 @@ def _cluster_scene(
             "mask_a": int(a),
             "mask_b": int(b),
             "frame_id_local": int(mask_frame[int(a)]),
-            "cannot_link_reason": "same_frame_object_like_competing_masks",
+            "cannot_link_reason": str(variant.get("cannot_link_policy", "all_node_same_frame")),
             "uses_gt_for_prediction": False,
         }
         for a, b in sorted(cannot)
@@ -742,6 +1001,10 @@ def main() -> int:
                 "pair_affinity_mode": variant["pair_affinity_mode"],
                 "node_policy": variant.get("node_policy", "object_like"),
                 "emit_policy": variant.get("emit_policy", "default"),
+                "cannot_link_policy": variant.get("cannot_link_policy", "all_node_same_frame"),
+                "score_policy": variant.get("score_policy", "member_broad_risk"),
+                "edge_selection_policy": variant.get("edge_selection_policy", "either_topk"),
+                "broad_support_min_support_count": int(variant.get("broad_support_min_support_count", 0)),
                 "rejected_union_due_cannot_link_count": rejected_total,
             }
         )

@@ -371,7 +371,7 @@ COMPETING_REPAIR5_VARIANTS = [
         "top_rate": 0.10,
         "hard_veto": True,
         "score_mode": "broad_jitter_semantic_competing_strong",
-        "source_penalty": {1: 1.15, 2: 1.0, 3: 0.35, 4: 0.05, 5: 0.15, 6: 0.05, 7: 1.0},
+        "source_penalty": {1: 1.15, 2: 1.0, 3: 0.35, 4: 0.05, 5: 0.15, 6: 0.05, 7: 1.0, 8: 1.0},
         "max_broad_rate": 0.85,
         "max_jitter": 0.004,
         "max_competing_conflict_rate": 0.20,
@@ -384,7 +384,7 @@ COMPETING_REPAIR5_VARIANTS = [
         "top_rate": 0.12,
         "hard_veto": True,
         "score_mode": "broad_jitter_semantic_competing_strong",
-        "source_penalty": {1: 1.10, 2: 1.0, 3: 0.30, 4: 0.05, 5: 0.12, 6: 0.05, 7: 1.0},
+        "source_penalty": {1: 1.10, 2: 1.0, 3: 0.30, 4: 0.05, 5: 0.12, 6: 0.05, 7: 1.0, 8: 1.0},
         "max_broad_rate": 0.85,
         "max_jitter": 0.005,
         "max_competing_conflict_rate": 0.15,
@@ -397,7 +397,7 @@ COMPETING_REPAIR5_VARIANTS = [
         "top_rate": 0.10,
         "hard_veto": True,
         "score_mode": "broad_jitter_semantic_competing_strong",
-        "source_penalty": {1: 1.15, 2: 1.0, 3: 0.40, 4: 0.08, 5: 0.18, 6: 0.08, 7: 1.0},
+        "source_penalty": {1: 1.15, 2: 1.0, 3: 0.40, 4: 0.08, 5: 0.18, 6: 0.08, 7: 1.0, 8: 1.0},
         "max_broad_rate": 0.90,
         "max_jitter": 0.004,
         "min_object_like_support_per_mask": 60,
@@ -409,7 +409,7 @@ COMPETING_REPAIR5_VARIANTS = [
         "top_rate": 0.12,
         "hard_veto": True,
         "score_mode": "broad_jitter_semantic_competing_strong",
-        "source_penalty": {1: 1.10, 2: 1.0, 3: 0.55, 4: 0.12, 5: 0.25, 6: 0.08, 7: 1.0},
+        "source_penalty": {1: 1.10, 2: 1.0, 3: 0.55, 4: 0.12, 5: 0.25, 6: 0.08, 7: 1.0, 8: 1.0},
         "max_broad_rate": 0.90,
         "max_jitter": 0.005,
         "max_competing_conflict_rate": 0.25,
@@ -422,13 +422,56 @@ COMPETING_REPAIR5_VARIANTS = [
         "top_rate": 0.12,
         "hard_veto": True,
         "score_mode": "broad_jitter_semantic_competing_strong",
-        "allowed_query_sources": [1, 2, 3, 7],
-        "source_penalty": {1: 1.10, 2: 1.0, 3: 0.45, 7: 1.0},
+        "allowed_query_sources": [1, 2, 3, 7, 8],
+        "source_penalty": {1: 1.10, 2: 1.0, 3: 0.45, 7: 1.0, 8: 1.0},
         "max_broad_rate": 0.85,
         "max_jitter": 0.006,
         "max_competing_conflict_rate": 0.10,
         "min_object_like_support_per_mask": 50,
         "min_boundary_support_per_mask": 10,
+    },
+]
+
+SEMANTIC_VETO_REPAIR6_VARIANTS = [
+    {
+        "variant_id": "V1_s0_compveto010_srcpen_broad085_jitter006_semhard_top12_floor50b10",
+        "semantic": False,
+        "top_rate": 0.12,
+        "hard_veto": True,
+        "score_mode": "broad_jitter_competing_no_sempos",
+        "allowed_query_sources": [1, 2, 3, 7, 8],
+        "source_penalty": {1: 1.10, 2: 1.0, 3: 0.45, 7: 1.0, 8: 1.0},
+        "max_broad_rate": 0.85,
+        "max_jitter": 0.006,
+        "max_competing_conflict_rate": 0.10,
+        "min_object_like_support_per_mask": 50,
+        "min_boundary_support_per_mask": 10,
+    },
+    {
+        "variant_id": "V2_s0_compveto020_srcpen_broad090_jitter006_semhard_top15_floor60b12",
+        "semantic": False,
+        "top_rate": 0.15,
+        "hard_veto": True,
+        "score_mode": "broad_jitter_competing_no_sempos",
+        "allowed_query_sources": [1, 2, 3, 7, 8],
+        "source_penalty": {1: 1.15, 2: 1.0, 3: 0.45, 7: 1.0, 8: 1.0},
+        "max_broad_rate": 0.90,
+        "max_jitter": 0.006,
+        "max_competing_conflict_rate": 0.20,
+        "min_object_like_support_per_mask": 60,
+        "min_boundary_support_per_mask": 12,
+    },
+    {
+        "variant_id": "V3_s0_compsoft_srcpen_broad090_jitter004_semhard_top10_floor60b12",
+        "semantic": False,
+        "top_rate": 0.10,
+        "hard_veto": True,
+        "score_mode": "broad_jitter_competing_no_sempos",
+        "source_penalty": {1: 1.15, 2: 1.0, 3: 0.40, 4: 0.08, 5: 0.18, 6: 0.08, 7: 1.0, 8: 1.0},
+        "max_broad_rate": 0.90,
+        "max_jitter": 0.004,
+        "min_object_like_support_per_mask": 60,
+        "min_boundary_support_per_mask": 12,
     },
 ]
 
@@ -438,6 +481,7 @@ ALL_SUPPORT_BALANCED_VARIANTS = (
     + SOURCE_BALANCED_REPAIR3_VARIANTS
     + FALSE_BRIDGE_REPAIR4_VARIANTS
     + COMPETING_REPAIR5_VARIANTS
+    + SEMANTIC_VETO_REPAIR6_VARIANTS
 )
 
 
@@ -822,6 +866,7 @@ def _source_risk_score(query_source_code: np.ndarray) -> np.ndarray:
     risk[source == 4] = 1.00
     risk[source == 5] = 0.75
     risk[source == 6] = 1.00
+    risk[source == 8] = 0.0
     return risk
 
 
@@ -849,6 +894,16 @@ def _variant_scores_and_candidate(variant: dict[str, Any], arrays: dict[str, np.
             source_risk = np.asarray(arrays.get("source_risk_score", np.zeros_like(scores)), dtype=np.float64)
             clean *= np.power(np.clip(1.0 - competing, 0.0, 1.0), 4.0)
             clean *= np.square(np.clip(1.0 - source_risk, 0.0, 1.0))
+        scores *= clean
+    if mode == "broad_jitter_competing_no_sempos":
+        broad = np.asarray(arrays["broad_mask_participation_rate"], dtype=np.float64)
+        jitter = np.asarray(arrays["normalized_jitter"], dtype=np.float64)
+        competing = np.asarray(arrays["competing_mask_conflict_rate"], dtype=np.float64)
+        source_risk = np.asarray(arrays.get("source_risk_score", np.zeros_like(scores)), dtype=np.float64)
+        clean = np.power(np.clip(1.0 - broad, 0.0, 1.0), 4.0)
+        clean *= np.exp(-jitter / 0.0025)
+        clean *= np.power(np.clip(1.0 - competing, 0.0, 1.0), 4.0)
+        clean *= np.square(np.clip(1.0 - source_risk, 0.0, 1.0))
         scores *= clean
     if variant.get("source_penalty"):
         source = np.asarray(arrays["query_source_code"], dtype=np.int16)
@@ -1337,6 +1392,7 @@ def build_parser() -> argparse.ArgumentParser:
             "source_balanced_repair3",
             "false_bridge_repair4",
             "competing_repair5",
+            "semantic_veto_repair6",
         ],
         default="base",
     )
@@ -1369,8 +1425,10 @@ def main() -> int:
         variants = SOURCE_BALANCED_REPAIR3_VARIANTS
     elif args.variant_family == "false_bridge_repair4":
         variants = FALSE_BRIDGE_REPAIR4_VARIANTS
-    else:
+    elif args.variant_family == "competing_repair5":
         variants = COMPETING_REPAIR5_VARIANTS
+    else:
+        variants = SEMANTIC_VETO_REPAIR6_VARIANTS
     for scene in scene_ids:
         diag, _unused_a, _unused_b, arrays = _compute_scene_arrays(scene, specs[scene], output_root, int(args.cupy_device_id))
         semantic_rows.append(

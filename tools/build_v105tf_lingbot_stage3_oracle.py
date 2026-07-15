@@ -229,8 +229,12 @@ class SemanticFrameLoader:
         self.cache_name = ""
         self.cache: dict[str, Any] | None = None
         self.coords: tuple[np.ndarray, np.ndarray] | None = None
+        self.frame_cache: dict[int, dict[str, Any]] = {}
 
     def load_frame(self, frame: int) -> dict[str, Any]:
+        frame = int(frame)
+        if frame in self.frame_cache:
+            return self.frame_cache[frame]
         chunk = find_chunk(self.chunks, frame)
         chunk_name = str(chunk["chunk"])
         if self.cache_name != chunk_name:
@@ -262,7 +266,7 @@ class SemanticFrameLoader:
         patch_conf = conf_np[ys, xs].astype(np.float32)
         label_names = list(sem.get("label_names", []))
         role_names = [semantic_role(label_names[int(x)] if int(x) < len(label_names) else "void") for x in patch_labels]
-        return {
+        frame_semantics = {
             "frame": int(frame),
             "chunk": chunk_name,
             "label_names": label_names,
@@ -271,6 +275,8 @@ class SemanticFrameLoader:
             "patch_roles": role_names,
             "semantic_source": sem.get("source", ""),
         }
+        self.frame_cache[frame] = frame_semantics
+        return frame_semantics
 
 
 def summarize_frame_semantics(seq: str, sample_pos: int, frame: int, loader: SemanticFrameLoader) -> dict[str, Any]:

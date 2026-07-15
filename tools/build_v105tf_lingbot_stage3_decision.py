@@ -77,6 +77,17 @@ def build() -> dict[str, Any]:
     predefined_pass = parse_bool(predefined_summary.get("stage3_lingbot_oracle_pass"))
     sweep_pass = parse_bool(sweep_summary.get("stage3_sweep_pass")) and bool(passing)
     stage3_pass = predefined_pass or sweep_pass
+    if stage3_pass:
+        decision_boundary_note = (
+            "Predefined policies failed; a trace32 diagnostic repair-space sweep found at least one candidate "
+            "meeting the Stage3 oracle thresholds. This is not a full-sequence or heldout result and no runtime "
+            "action has been run."
+        )
+    else:
+        decision_boundary_note = (
+            "Predefined policies and the trace32 diagnostic repair-space sweep both failed the Stage3 oracle "
+            "thresholds. No LingBot routing action is allowed from these evidence rows."
+        )
 
     selected_rows: list[dict[str, Any]] = []
     if best_policy:
@@ -125,11 +136,7 @@ def build() -> dict[str, Any]:
         "stage4_action_permission_scope": (
             "guarded_action_pilot_allowed_by_sweep_candidate" if stage3_pass else "blocked"
         ),
-        "decision_boundary_note": (
-            "Predefined policies failed; a trace32 diagnostic repair-space sweep found one candidate meeting "
-            "the Stage3 oracle thresholds. This is not a full-sequence or heldout result and no runtime action "
-            "has been run."
-        ),
+        "decision_boundary_note": decision_boundary_note,
         "best_sweep_policy": best_policy,
         "best_sweep_policy_metrics": {
             key: best_row.get(key)

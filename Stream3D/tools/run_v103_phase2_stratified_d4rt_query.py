@@ -35,9 +35,10 @@ SOURCE_CODEBOOK = {
     5: "semantic_gradient",
     6: "high_risk_broad_mask_interior",
     7: "overlap_frame_anchor",
+    8: "mask_balanced_view_probe",
 }
 
-REQUIRED_STRATA = list(SOURCE_CODEBOOK.values())
+REQUIRED_STRATA = [name for code, name in SOURCE_CODEBOOK.items() if int(code) != 8]
 SEMANTIC_FEATURE_ROOTS = {
     "scene0011_00": "outputs/audit/v91_radio_mask_features_npz_scene0011/mask_feature_rows.csv",
     "scene0050_00": "outputs/audit/v91_radio_mask_features_npz_scene0050/mask_feature_rows.csv",
@@ -404,6 +405,21 @@ def generate_sources(
                     continue
             mask_strata_ids.append(int(mask_id))
 
+        for mask_id in mask_ids:
+            binary = mask == int(mask_id)
+            interior = eroded_or_all(binary, kernel_size=int(args.interior_kernel_size))
+            ys, xs = np.where(interior)
+            xs, ys = take_even(xs, ys, int(args.mask_balanced_points_per_mask))
+            added = builder.add_points(
+                frame_id=int(frame_id),
+                local_idx=int(local_idx),
+                source_code=8,
+                xs=xs,
+                ys=ys,
+                mask_values=np.full(xs.shape[0], int(mask_id), dtype=np.int64),
+            )
+            frame_counts["mask_balanced_view_probe"] += added
+
         for mask_id in broad_ids:
             binary = mask == int(mask_id)
             pts = eroded_or_all(binary, kernel_size=int(args.interior_kernel_size))
@@ -527,6 +543,176 @@ def generate_sources(
     return builder.build(), frame_rows
 
 
+def _slice_sources(sources: SourceArrays, keep: np.ndarray) -> SourceArrays:
+    keep = np.asarray(keep, dtype=bool)
+    return SourceArrays(
+        carrier_id=sources.carrier_id[keep],
+        src_frame=sources.src_frame[keep],
+        src_frame_global=sources.src_frame_global[keep],
+        src_xy=sources.src_xy[keep],
+        src_uv=sources.src_uv[keep],
+        src_mask_id=sources.src_mask_id[keep],
+        query_source_code=sources.query_source_code[keep],
+    )
+
+
+def _even_take(indices: np.ndarray, quota: int, carrier_id: np.ndarray) -> np.ndarray:
+    indices = np.asarray(indices, dtype=np.int64)
+    quota = int(quota)
+    if quota <= 0 or indices.size == 0:
+        return np.empty((0,), dtype=np.int64)
+    if indices.size <= quota:
+        return indices
+    ordered = indices[np.argsort(carrier_id[indices], kind="mergesort")]
+    selected = ordered[np.linspace(0, ordered.shape[0] - 1, num=quota, dtype=np.int64)]
+    return np.unique(selected).astype(np.int64)
+
+
+def cap_sources_per_frame(
+    sources: SourceArrays,
+    frame_rows: list[dict[str, Any]],
+    *,
+    max_per_frame: int,
+) -> tuple[SourceArrays, list[dict[str, Any]], list[dict[str, Any]], bool]:
+    max_per_frame = int(max_per_frame)
+    if max_per_frame <= 0 or sources.carrier_id.size == 0:
+        return sources, frame_rows, [], False
+    keep = np.zeros((sources.carrier_id.shape[0],), dtype=bool)
+    cap_rows: list[dict[str, Any]] = []
+    cap_applied = False
+    for local_idx in sorted(np.unique(sources.src_frame).astype(np.int64).tolist()):
+        frame_indices = np.flatnonzero(sources.src_frame == int(local_idx)).astype(np.int64)
+        total = int(frame_indices.shape[0])
+        if total <= max_per_frame:
+            keep[frame_indices] = True
+            kept_by_code = {
+                int(code): int(np.count_nonzero(sources.query_source_code[frame_indices] == int(code)))
+                for code in sorted(np.unique(sources.query_source_code[frame_indices]).astype(np.int64).tolist())
+            }
+            reserved_count = int(kept_by_code.get(8, 0))
+            effective_max = max_per_frame
+        else:
+            cap_applied = True
+            codes = sorted(np.unique(sources.query_source_code[frame_indices]).astype(np.int64).tolist())
+            per_code_indices = {
+                int(code): frame_indices[sources.query_source_code[frame_indices] == int(code)]
+                for code in codes
+            }
+            reserved = per_code_indices.get(8, np.empty((0,), dtype=np.int64))
+            if reserved.shape[0] > max_per_frame:
+                reserved = _even_take(reserved, max_per_frame, sources.carrier_id)
+            keep[reserved] = True
+            reserved_count = int(reserved.shape[0])
+            effective_max = max(0, max_per_frame - reserved_count)
+            alloc_codes = [int(code) for code in codes if int(code) != 8]
+            raw_quota = {
+                int(code): float(effective_max) * float(per_code_indices[int(code)].shape[0]) / float(max(total - reserved_count, 1))
+                for code in alloc_codes
+            }
+            quota = {int(code): min(int(np.floor(raw_quota[int(code)])), int(per_code_indices[int(code)].shape[0])) for code in alloc_codes}
+            for code in alloc_codes:
+                if per_code_indices[int(code)].shape[0] > 0 and quota[int(code)] == 0 and sum(quota.values()) < effective_max:
+                    quota[int(code)] = 1
+            while sum(quota.values()) < effective_max:
+                candidates = [
+                    code
+                    for code in alloc_codes
+                    if quota[int(code)] < int(per_code_indices[int(code)].shape[0])
+                ]
+                if not candidates:
+                    break
+                code = max(candidates, key=lambda c: (raw_quota[int(c)] - np.floor(raw_quota[int(c)]), per_code_indices[int(c)].shape[0]))
+                quota[int(code)] += 1
+            selected_parts: list[np.ndarray] = []
+            for code in alloc_codes:
+                selected_parts.append(_even_take(per_code_indices[int(code)], quota[int(code)], sources.carrier_id))
+            selected = np.concatenate(selected_parts, axis=0) if selected_parts else np.empty((0,), dtype=np.int64)
+            keep[selected] = True
+            kept_by_code = {int(code): int(np.count_nonzero(sources.query_source_code[selected] == int(code))) for code in codes}
+            kept_by_code[8] = reserved_count
+        for code, name in SOURCE_CODEBOOK.items():
+            original = int(np.count_nonzero(sources.query_source_code[frame_indices] == int(code)))
+            kept = int(kept_by_code.get(int(code), 0))
+            cap_rows.append(
+                {
+                    "schema_version": "stream4d_v103_phase2_source_cap_row_v1",
+                    "phase_id": "v103_phase2_stratified_d4rt_query",
+                    "frame_local_index": int(local_idx),
+                    "frame_id": int(sources.src_frame_global[frame_indices[0]]) if frame_indices.size else "",
+                    "query_source": name,
+                    "source_code": int(code),
+                    "original_source_count": original,
+                    "kept_source_count": kept,
+                    "max_query_count_per_frame": max_per_frame,
+                    "cap_applied_to_frame": bool(total > max_per_frame),
+                    "mask_balanced_reserved_count": reserved_count,
+                    "remaining_cap_after_mask_balanced_reserve": effective_max,
+                }
+            )
+    capped = _slice_sources(sources, keep)
+    kept_counts = {
+        (int(frame), SOURCE_CODEBOOK[int(code)]): int(np.count_nonzero((capped.src_frame == int(frame)) & (capped.query_source_code == int(code))))
+        for frame in np.unique(capped.src_frame).astype(np.int64).tolist()
+        for code in SOURCE_CODEBOOK
+    }
+    updated_frame_rows: list[dict[str, Any]] = []
+    for row in frame_rows:
+        new = dict(row)
+        key = (int(new["frame_local_index"]), str(new["query_source"]))
+        new["source_count_before_cap"] = int(new["source_count"])
+        new["source_count"] = int(kept_counts.get(key, 0))
+        new["source_cap_applied"] = bool(cap_applied)
+        new["max_query_count_per_frame"] = max_per_frame
+        updated_frame_rows.append(new)
+    return capped, updated_frame_rows, cap_rows, cap_applied
+
+
+def mask_balance_rows(sources: SourceArrays, frame_rows: list[dict[str, Any]], requested_per_mask: int) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    frame_meta = {
+        int(row["frame_local_index"]): row
+        for row in frame_rows
+        if str(row.get("query_source")) == "uniform_grid"
+    }
+    for local_idx in sorted(np.unique(sources.src_frame).astype(np.int64).tolist()):
+        idx = sources.src_frame == int(local_idx)
+        if not np.any(idx):
+            continue
+        positive = sources.src_mask_id[idx]
+        positive = positive[positive > 0]
+        any_masks = sorted(np.unique(positive).astype(np.int64).tolist()) if positive.size else []
+        any_counts = np.asarray([int(np.count_nonzero(positive == int(mask_id))) for mask_id in any_masks], dtype=np.int64)
+
+        balanced_idx = idx & (sources.query_source_code == 8)
+        balanced = sources.src_mask_id[balanced_idx]
+        balanced = balanced[balanced > 0]
+        balanced_masks = sorted(np.unique(balanced).astype(np.int64).tolist()) if balanced.size else []
+        balanced_counts = np.asarray(
+            [int(np.count_nonzero(balanced == int(mask_id))) for mask_id in balanced_masks],
+            dtype=np.int64,
+        )
+        meta = frame_meta.get(int(local_idx), {})
+        mask_count = int(meta.get("mask_count_in_frame", len(any_masks)) or len(any_masks))
+        rows.append(
+            {
+                "schema_version": "stream4d_v103_phase2_mask_balance_row_v1",
+                "phase_id": "v103_phase2_stratified_d4rt_query",
+                "frame_local_index": int(local_idx),
+                "frame_id": int(sources.src_frame_global[np.flatnonzero(idx)[0]]),
+                "mask_count_in_frame": mask_count,
+                "positive_mask_count_with_any_query": int(len(any_masks)),
+                "positive_mask_count_with_mask_balanced_probe": int(len(balanced_masks)),
+                "mask_balanced_points_per_mask_requested": int(requested_per_mask),
+                "mask_balanced_probe_min_per_mask": int(balanced_counts.min()) if balanced_counts.size else 0,
+                "mask_balanced_probe_p10_per_mask": float(np.quantile(balanced_counts, 0.10)) if balanced_counts.size else 0.0,
+                "any_query_min_per_mask": int(any_counts.min()) if any_counts.size else 0,
+                "any_query_p10_per_mask": float(np.quantile(any_counts, 0.10)) if any_counts.size else 0.0,
+                "all_positive_masks_have_mask_balanced_probe": bool(mask_count == len(balanced_masks)),
+            }
+        )
+    return rows
+
+
 def rate(num: int | float, den: int | float) -> float:
     den_f = float(den)
     if den_f <= 0:
@@ -639,6 +825,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-frames", type=int, default=32)
     parser.add_argument("--chunk-size", type=int, default=32)
     parser.add_argument("--overlap-frames", type=int, default=3)
+    parser.add_argument(
+        "--frame-offset",
+        type=int,
+        default=0,
+        help="Offset in the stride-sampled frame list. Default 0 preserves the first32 contract.",
+    )
+    parser.add_argument(
+        "--chunk-index",
+        type=int,
+        default=-1,
+        help="Optional overlap-aware chunk index. If set, frame_offset = chunk_index * (chunk_size - overlap_frames).",
+    )
     parser.add_argument("--d4rt-root", default="Open-d4rt")
     parser.add_argument("--d4rt-config", default="Open-d4rt/checkpoints/OpenD4RT_32CLIP_9Dataset_NoAUG/model.yaml")
     parser.add_argument("--d4rt-ckpt", default="Open-d4rt/checkpoints/OpenD4RT_32CLIP_9Dataset_NoAUG/opend4rt.ckpt")
@@ -648,6 +846,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--grid-margin-ratio", type=float, default=0.02)
     parser.add_argument("--interior-points-per-mask", type=int, default=2)
     parser.add_argument("--boundary-points-per-mask", type=int, default=2)
+    parser.add_argument(
+        "--mask-balanced-points-per-mask",
+        type=int,
+        default=0,
+        help="Optional reserved per-view/per-mask interior probes. These are kept preferentially under source capping.",
+    )
     parser.add_argument("--semantic-top-masks-per-frame", type=int, default=4)
     parser.add_argument("--semantic-points-per-mask", type=int, default=2)
     parser.add_argument("--broad-interior-points-per-mask", type=int, default=2)
@@ -667,6 +871,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=16384.0,
         help="Minimum generated query density required by the current v103 run contract.",
+    )
+    parser.add_argument(
+        "--max-query-count-per-frame",
+        type=int,
+        default=0,
+        help="Optional deterministic per-frame source cap. 0 disables capping and preserves legacy behavior.",
     )
     parser.add_argument("--dry-run-sources-only", action="store_true")
     parser.add_argument(
@@ -688,7 +898,18 @@ def main() -> int:
     errors = stream.validate(require_masks=False)
     if errors:
         raise RuntimeError("; ".join(errors))
-    frame_ids = stream.frame_ids(stride=int(args.stride), max_frames=int(args.max_frames))
+    chunk_step = int(args.chunk_size) - int(args.overlap_frames)
+    if chunk_step <= 0:
+        raise ValueError(f"chunk_step must be positive, got chunk_size={args.chunk_size} overlap_frames={args.overlap_frames}")
+    frame_offset = int(args.frame_offset)
+    if int(args.chunk_index) >= 0:
+        if frame_offset not in {0, int(args.chunk_index) * chunk_step}:
+            raise ValueError("--frame-offset conflicts with --chunk-index derived offset")
+        frame_offset = int(args.chunk_index) * chunk_step
+    if frame_offset < 0:
+        raise ValueError(f"frame_offset must be non-negative, got {frame_offset}")
+    all_stride_frame_ids = stream.frame_ids(stride=int(args.stride), max_frames=None)
+    frame_ids = all_stride_frame_ids[frame_offset : frame_offset + int(args.max_frames)]
     if len(frame_ids) != int(args.chunk_size):
         raise RuntimeError(f"Expected chunk_size={args.chunk_size} frames, got {len(frame_ids)}")
     mask_root = default_mask_root(args.scene, stream, str(args.mask_root).strip() or None)
@@ -698,6 +919,11 @@ def main() -> int:
     mask = np.stack(masks, axis=0)
     semantic_rows = load_semantic_rows(args.scene)
     sources, frame_rows = generate_sources(masks=mask, frame_ids=frame_ids, semantic_rows=semantic_rows, args=args)
+    sources, frame_rows, source_cap_rows, source_cap_applied = cap_sources_per_frame(
+        sources,
+        frame_rows,
+        max_per_frame=int(args.max_query_count_per_frame),
+    )
     source_count = int(sources.carrier_id.shape[0])
     if source_count <= 0:
         raise RuntimeError("No query sources generated")
@@ -729,7 +955,10 @@ def main() -> int:
     )
     write_json(out / "query_source_codebook.json", SOURCE_CODEBOOK)
     write_csv(out / "query_source_count_rows.csv", source_counts)
+    write_csv(out / "source_cap_rows.csv", source_cap_rows)
     write_csv(out / "frame_query_rows.csv", frame_rows)
+    mask_balance_path = out / "mask_balance_rows.csv"
+    write_csv(mask_balance_path, mask_balance_rows(sources, frame_rows, int(args.mask_balanced_points_per_mask)))
 
     decode_error_count = 0
     batch = None
@@ -882,12 +1111,18 @@ def main() -> int:
         "frame_stride": int(args.stride),
         "chunk_size": int(args.chunk_size),
         "overlap_frames": int(args.overlap_frames),
+        "chunk_step": int(chunk_step),
+        "chunk_index": int(args.chunk_index),
+        "frame_offset": int(frame_offset),
+        "available_stride_frame_count": int(len(all_stride_frame_ids)),
         "frame_count": len(frame_ids),
         "frame_ids": [int(v) for v in frame_ids],
         "mask_root": rel(mask_root),
         "source_count": source_count,
         "query_count_per_frame": avg_query_count_per_frame,
         "min_query_count_per_frame_required": float(args.min_query_count_per_frame),
+        "max_query_count_per_frame_cap": int(args.max_query_count_per_frame),
+        "source_cap_applied": bool(source_cap_applied),
         "present_strata": present_strata,
         "all_required_query_strata_present": all_required_present,
         "query_generation_policy": {
@@ -901,6 +1136,8 @@ def main() -> int:
                 else "all positive CropFormer masks"
             ),
             "broad_mask_diagnostic_stratum_retained": True,
+            "mask_balanced_view_probe_points_per_mask": int(args.mask_balanced_points_per_mask),
+            "mask_balanced_view_probe_reserved_under_cap": True,
             "uses_gt": False,
         },
         "decode_error_count": decode_error_count,
@@ -922,7 +1159,9 @@ def main() -> int:
             "carrier_batch": rel(out / "carrier_batch.npz") if not args.dry_run_sources_only else "",
             "query_source_codebook": rel(out / "query_source_codebook.json"),
             "query_source_count_rows": rel(out / "query_source_count_rows.csv"),
+            "source_cap_rows": rel(out / "source_cap_rows.csv"),
             "frame_query_rows": rel(out / "frame_query_rows.csv"),
+            "mask_balance_rows": rel(mask_balance_path),
             "gate_rows": rel(out / "gate_rows.csv"),
             "failure_rows": rel(out / "failure_rows.csv"),
             "last_command": rel(out / "last_command.txt"),

@@ -212,6 +212,42 @@ SEMANTIC_VARIANTS = [
         "ratio_min": 0.001,
         "broad_limit": 0.20,
     },
+    {
+        "variant_id": "semantic_tau0p75_gap4_missing_block_highbarrier",
+        "semantic_cosine_min": 0.75,
+        "missing_feature_policy": "block",
+        "max_gap": 4,
+        "min_shared": 1,
+        "ratio_min": 0.001,
+        "broad_limit": 0.20,
+    },
+    {
+        "variant_id": "semantic_tau0p80_gap4_missing_block_highbarrier",
+        "semantic_cosine_min": 0.80,
+        "missing_feature_policy": "block",
+        "max_gap": 4,
+        "min_shared": 1,
+        "ratio_min": 0.001,
+        "broad_limit": 0.20,
+    },
+    {
+        "variant_id": "semantic_tau0p85_gap4_missing_block_highbarrier",
+        "semantic_cosine_min": 0.85,
+        "missing_feature_policy": "block",
+        "max_gap": 4,
+        "min_shared": 1,
+        "ratio_min": 0.001,
+        "broad_limit": 0.20,
+    },
+    {
+        "variant_id": "semantic_tau0p90_gap4_missing_block_highbarrier",
+        "semantic_cosine_min": 0.90,
+        "missing_feature_policy": "block",
+        "max_gap": 4,
+        "min_shared": 1,
+        "ratio_min": 0.001,
+        "broad_limit": 0.20,
+    },
 ]
 
 
@@ -266,7 +302,31 @@ def _prop(vertex_data: np.ndarray, name: str) -> np.ndarray:
     return np.full(len(vertex_data), np.nan)
 
 
-def _artifact_paths(spec: dict[str, Any]) -> tuple[Path | None, Path | None]:
+def _attempt_id(scene_id: str, frame_count: int, process_res: int, frame_start_index: int) -> str:
+    base = f"{scene_id}_chunk{int(frame_count)}"
+    if int(frame_start_index) != 0:
+        base += f"_start{int(frame_start_index):03d}"
+    return f"{base}_process{int(process_res)}"
+
+
+def _artifact_paths(
+    scene_id: str,
+    spec: dict[str, Any],
+    *,
+    phase9a_root: Path,
+    frame_count: int,
+    process_res: int,
+    frame_start_index: int,
+) -> tuple[Path | None, Path | None]:
+    attempt_id = _attempt_id(scene_id, frame_count, process_res, frame_start_index)
+    dynamic = (
+        phase9a_root / attempt_id / "gs_ply" / "0000.ply",
+        phase9a_root / attempt_id / "exports" / "mini_npz" / "results.npz",
+    )
+    if dynamic[0].exists() and dynamic[1].exists():
+        return dynamic
+    if int(frame_start_index) != 0:
+        return None, None
     for ply, mini_npz in spec["artifact_candidates"]:
         if ply.exists() and mini_npz.exists():
             return ply, mini_npz
@@ -291,9 +351,9 @@ def _homogeneous_extrinsic(extrinsic: np.ndarray) -> np.ndarray:
     raise ValueError(f"Unsupported extrinsic shape: {extrinsic.shape}")
 
 
-def _frame_manifest(path: Path, camera_count: int) -> pd.DataFrame:
+def _frame_manifest(path: Path, camera_count: int, frame_start_index: int) -> pd.DataFrame:
     df = pd.read_csv(path)
-    df = df.sort_values("da3_frame_index").head(camera_count).copy()
+    df = df.sort_values("da3_frame_index").iloc[int(frame_start_index) : int(frame_start_index) + int(camera_count)].copy()
     df["da3_frame_index"] = df["da3_frame_index"].astype(int)
     df["frame_id"] = df["frame_id"].astype(int)
     return df
@@ -503,8 +563,8 @@ def _build_bridge_rows(scene_id: str, provider_id: str, mask_by_frame: np.ndarra
                             "final_bridge_score": ratio_min,
                             "broad_contamination_score": max(area_a, area_b),
                             "broad_contamination_risk": max(area_a, area_b) > BROAD_MASK_AREA_RATIO,
-                            "diagnostic_gt_a": int(gt_a) if np.isfinite(gt_a) else "",
-                            "diagnostic_gt_b": int(gt_b) if np.isfinite(gt_b) else "",
+                            "diagnostic_gt_a": int(gt_a) if np.isfinite(gt_a) else -1,
+                            "diagnostic_gt_b": int(gt_b) if np.isfinite(gt_b) else -1,
                             "diagnostic_semantic_label_a": sem_a,
                             "diagnostic_semantic_label_b": sem_b,
                             "diagnostic_same_semantic": same_semantic,
@@ -772,8 +832,24 @@ def _scene_failure(scene_id: str, reason: str) -> dict[str, Any]:
     }
 
 
-def _process_scene(scene_id: str, spec: dict[str, Any], out_dir: Path) -> tuple[dict[str, Any], dict[str, Any]]:
-    ply_path, mini_npz = _artifact_paths(spec)
+def _process_scene(
+    scene_id: str,
+    spec: dict[str, Any],
+    out_dir: Path,
+    *,
+    phase9a_root: Path,
+    frame_count: int,
+    process_res: int,
+    frame_start_index: int,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    ply_path, mini_npz = _artifact_paths(
+        scene_id,
+        spec,
+        phase9a_root=phase9a_root,
+        frame_count=frame_count,
+        process_res=process_res,
+        frame_start_index=frame_start_index,
+    )
     if ply_path is None or mini_npz is None:
         row = _scene_failure(scene_id, "DA3_CHUNK32_3DGS_ARTIFACT_MISSING")
         return row, {"failure_rows": [row]}
@@ -783,7 +859,7 @@ def _process_scene(scene_id: str, spec: dict[str, Any], out_dir: Path) -> tuple[
     with np.load(mini_npz) as data:
         mini = {key: np.asarray(data[key]) for key in data.files}
     camera_count = int(min(len(mini["extrinsics"]), len(mini["intrinsics"]), len(mini["depth"])))
-    frame_df = _frame_manifest(spec["input_manifest"], camera_count)
+    frame_df = _frame_manifest(spec["input_manifest"], camera_count, int(frame_start_index))
     frame_ids = frame_df["frame_id"].astype(int).tolist()
     meta = _mask_meta(scene_id, frame_ids, spec)
     mask_by_frame, source_rows, reprojection_valid_any = _project_masks(
@@ -808,8 +884,12 @@ def _process_scene(scene_id: str, spec: dict[str, Any], out_dir: Path) -> tuple[
     mask_summary_path = scene_dir / "chunk32_mask_primitive_summary_rows.csv"
     geom_path = scene_dir / "geometric_variant_rows.csv"
     sem_path = scene_dir / "semantic_barrier_variant_rows.csv"
+    mask_by_frame_path = scene_dir / "mask_by_frame.npy"
+    xyz_path = scene_dir / "xyz.npy"
     bridge_df.to_parquet(bridge_path, index=False)
     bridge_sem_df.to_parquet(bridge_sem_path, index=False)
+    np.save(mask_by_frame_path, mask_by_frame.astype(np.uint16, copy=False))
+    np.save(xyz_path, xyz.astype(np.float32, copy=False))
     _write_csv(source_path, source_rows)
     _write_csv(mask_summary_path, mask_summary_rows)
     _write_csv(geom_path, geom_rows)
@@ -848,6 +928,8 @@ def _process_scene(scene_id: str, spec: dict[str, Any], out_dir: Path) -> tuple[
         "ply_file": _rel(ply_path),
         "mini_npz_file": _rel(mini_npz),
         "frame_count": camera_count,
+        "frame_start_index": int(frame_start_index),
+        "frame_ids": frame_ids,
         "process_res": int(np.asarray(mini["depth"]).shape[-1]) if "depth" in mini else "",
         "gaussian_or_surfel_count": int(len(xyz)),
         "reprojection_valid_rate": reprojection_valid_any,
@@ -886,6 +968,8 @@ def _process_scene(scene_id: str, spec: dict[str, Any], out_dir: Path) -> tuple[
             "chunk32_mask_primitive_summary_rows": _rel(mask_summary_path),
             "geometric_variant_rows": _rel(geom_path),
             "semantic_barrier_variant_rows": _rel(sem_path),
+            "mask_by_frame": _rel(mask_by_frame_path),
+            "xyz": _rel(xyz_path),
         },
     }
     return row, {"failure_rows": []}
@@ -894,26 +978,45 @@ def _process_scene(scene_id: str, spec: dict[str, Any], out_dir: Path) -> tuple[
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--scene", choices=["all", *SCENES.keys()], default="all")
+    parser.add_argument("--output-root", default=str(OUT_DIR))
+    parser.add_argument("--phase9a-root", default=str(AUDIT_ROOT / "v103_phase9a_da3_chunk32_provider_export"))
+    parser.add_argument("--frame-count", type=int, default=32)
+    parser.add_argument("--frame-start-index", type=int, default=0)
+    parser.add_argument("--process-res", type=int, default=252)
     args = parser.parse_args()
 
     t0 = time.time()
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    out_dir = Path(args.output_root)
+    if not out_dir.is_absolute():
+        out_dir = ROOT / out_dir
+    phase9a_root = Path(args.phase9a_root)
+    if not phase9a_root.is_absolute():
+        phase9a_root = ROOT / phase9a_root
+    out_dir.mkdir(parents=True, exist_ok=True)
     scene_ids = list(SCENES) if args.scene == "all" else [args.scene]
     scene_rows: list[dict[str, Any]] = []
     failure_rows: list[dict[str, Any]] = []
     for scene_id in scene_ids:
-        row, extra = _process_scene(scene_id, SCENES[scene_id], OUT_DIR)
+        row, extra = _process_scene(
+            scene_id,
+            SCENES[scene_id],
+            out_dir,
+            phase9a_root=phase9a_root,
+            frame_count=int(args.frame_count),
+            process_res=int(args.process_res),
+            frame_start_index=int(args.frame_start_index),
+        )
         scene_rows.append(row)
         failure_rows.extend(extra["failure_rows"])
 
-    scene_summary_path = OUT_DIR / "provider_scene_summary_rows.csv"
-    failure_path = OUT_DIR / "failure_rows.csv"
-    gate_path = OUT_DIR / "provider_gate_rows.csv"
+    scene_summary_path = out_dir / "provider_scene_summary_rows.csv"
+    failure_path = out_dir / "failure_rows.csv"
+    gate_path = out_dir / "provider_gate_rows.csv"
     _write_csv(scene_summary_path, scene_rows)
     _write_csv(failure_path, failure_rows)
     ready_scene_count = sum(bool(row.get("provider_ready")) for row in scene_rows)
     phase3 = _read_json(PHASE3_SUMMARY) if PHASE3_SUMMARY.exists() else {}
-    phase9a_rows_available = PHASE9A_ROWS.exists()
+    phase9a_rows_available = (phase9a_root / "chunk32_export_rows.csv").exists()
     gate_rows = [
         {
             "gate_id": "d4rt_phase3_blocker_triggers_da3_branch",
@@ -961,6 +1064,9 @@ def main() -> int:
         "plan_doc": _rel(PLAN_DOC),
         "phase3_trigger_decision": phase3.get("decision", ""),
         "scene_count": len(scene_rows),
+        "frame_count": int(args.frame_count),
+        "frame_start_index": int(args.frame_start_index),
+        "phase9a_root": _rel(phase9a_root),
         "ready_scene_count": ready_scene_count,
         "failure_count": len(failure_rows),
         "truthfulness_note": (
@@ -968,13 +1074,13 @@ def main() -> int:
             "Diagnostic GT labels score bridge recall/false-bridge; they are not used to accept prediction edges or tune AP."
         ),
         "outputs": {
-            "summary": _rel(OUT_DIR / "summary.json"),
+            "summary": _rel(out_dir / "summary.json"),
             "provider_scene_summary_rows": _rel(scene_summary_path),
             "provider_gate_rows": _rel(gate_path),
             "failure_rows": _rel(failure_path),
         },
     }
-    _write_json(OUT_DIR / "summary.json", summary)
+    _write_json(out_dir / "summary.json", summary)
     print(json.dumps(_jsonable(summary), indent=2, sort_keys=True))
     return 0 if ready_scene_count == len(scene_rows) and scene_rows else 2
 

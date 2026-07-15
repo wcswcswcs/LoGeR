@@ -2833,8 +2833,203 @@ class VideoMaskletFrontend:
             obj_scores[obj_id] = max(obj_scores.get(obj_id, 0.0), float(det.get("confidence", 0.0)))
             dets_by_prompt_frame.setdefault(prompt_frame, []).append((obj_id, det))
 
+        def _sam31_seed_mask(det: Dict[str, Any]) -> np.ndarray:
+            mask = np.asarray(det.get("mask", np.zeros((H, W), dtype=np.uint8)))
+            if mask.ndim == 3:
+                if mask.shape[0] == 1:
+                    mask = mask[0]
+                elif mask.shape[-1] == 1:
+                    mask = mask[..., 0]
+                else:
+                    mask = np.max(mask, axis=-1 if mask.shape[:2] == (H, W) else 0)
+            mask = mask.astype(bool)
+            if mask.shape[:2] != (H, W):
+                mask = cv2.resize(mask.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST) > 0
+            return mask.astype(np.float32)
+
+        def _record_sam31_outputs(outputs: Dict[str, Any], frame_idx: int) -> None:
+            out_obj_ids = outputs.get("out_obj_ids", [])
+            out_masks = outputs.get("out_binary_masks", [])
+            out_probs = outputs.get("out_probs", [])
+            if isinstance(out_obj_ids, torch.Tensor):
+                out_obj_ids = out_obj_ids.detach().cpu().numpy()
+            if isinstance(out_masks, torch.Tensor):
+                out_masks = out_masks.detach().cpu().numpy()
+            if isinstance(out_probs, torch.Tensor):
+                out_probs = out_probs.detach().cpu().numpy()
+            for idx, out_obj_id in enumerate(out_obj_ids):
+                out_obj_id = int(out_obj_id)
+                if out_obj_id not in obj_to_det:
+                    continue
+                if idx < len(out_masks):
+                    mask_np = np.asarray(out_masks[idx])
+                    if mask_np.ndim == 3:
+                        if mask_np.shape[0] == 1:
+                            mask_np = mask_np[0]
+                        elif mask_np.shape[-1] == 1:
+                            mask_np = mask_np[..., 0]
+                        else:
+                            mask_np = np.max(mask_np, axis=-1 if mask_np.shape[:2] == (H, W) else 0)
+                    mask_np = mask_np.astype(np.uint8)
+                    if mask_np.any():
+                        obj_segments.setdefault(out_obj_id, {})[int(frame_idx)] = mask_np
+                if idx < len(out_probs):
+                    obj_scores[out_obj_id] = max(obj_scores.get(out_obj_id, 0.0), float(out_probs[idx]))
+
+        def _add_sam31_mask_seed_internal(
+            prompt_frame: int,
+            mask_obj_ids: List[int],
+            mask_inputs: List[np.ndarray],
+        ) -> None:
+            if not hasattr(self.video_predictor, "_get_session"):
+                raise RuntimeError("SAM3.1 predictor session access is unavailable for mask prompts")
+            session = self.video_predictor._get_session(session_id)
+            if hasattr(self.video_predictor, "_extend_expiration_time"):
+                self.video_predictor._extend_expiration_time(session)
+            inference_state = session["state"]
+            model = getattr(self.video_predictor, "model", None)
+            if model is None or not hasattr(model, "_tracker_add_new_objects"):
+                raise RuntimeError("SAM3.1 multiplex model does not expose tracker mask seeding")
+            if int(getattr(model, "rank", 0)) != 0 or int(getattr(model, "world_size", 1)) != 1:
+                raise RuntimeError("SAM3.1 internal mask seeding currently supports single-rank sessions only")
+
+            tracker_metadata = inference_state["tracker_metadata"]
+            if tracker_metadata == {}:
+                if not hasattr(model, "_initialize_metadata"):
+                    raise RuntimeError("SAM3.1 model cannot initialize tracker metadata")
+                tracker_metadata.update(model._initialize_metadata())
+
+            device = getattr(model, "device", inference_state.get("device", None))
+            if device is None:
+                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            elif not isinstance(device, torch.device):
+                device = torch.device(device)
+
+            if hasattr(model, "_prepare_backbone_feats"):
+                model._prepare_backbone_feats(inference_state, int(prompt_frame), reverse=False)
+
+            mask_tensor = torch.as_tensor(
+                np.stack(mask_inputs, axis=0).astype(np.float32),
+                dtype=torch.float32,
+                device=device,
+            )
+            inference_state["sam2_inference_states"] = model._tracker_add_new_objects(
+                frame_idx=int(prompt_frame),
+                num_frames=int(inference_state["num_frames"]),
+                new_obj_ids=[int(obj_id) for obj_id in mask_obj_ids],
+                new_obj_masks=mask_tensor,
+                tracker_states_local=inference_state["sam2_inference_states"],
+                orig_vid_height=int(inference_state["orig_height"]),
+                orig_vid_width=int(inference_state["orig_width"]),
+                feature_cache=inference_state["feature_cache"],
+            )
+
+            current_ids = np.asarray(tracker_metadata["obj_ids_per_gpu"][0], dtype=np.int64)
+            current_set = {int(value) for value in current_ids.tolist()}
+            new_ids = np.asarray(
+                [int(obj_id) for obj_id in mask_obj_ids if int(obj_id) not in current_set],
+                dtype=np.int64,
+            )
+            if new_ids.size > 0:
+                tracker_metadata["obj_ids_per_gpu"][0] = np.concatenate([current_ids, new_ids])
+                tracker_metadata["num_obj_per_gpu"][0] = len(tracker_metadata["obj_ids_per_gpu"][0])
+                tracker_metadata["obj_ids_all_gpu"] = np.concatenate(tracker_metadata["obj_ids_per_gpu"])
+                tracker_metadata["max_obj_id"] = max(
+                    int(tracker_metadata.get("max_obj_id", -1)),
+                    int(new_ids.max()),
+                )
+            if "num_buc_per_gpu" in tracker_metadata and hasattr(model, "_count_buckets_in_states"):
+                tracker_metadata["num_buc_per_gpu"] = np.asarray(
+                    [int(model._count_buckets_in_states(inference_state["sam2_inference_states"]))],
+                    dtype=np.int64,
+                )
+
+            score_frame_key = (
+                "obj_id_to_sam2_score_frame_wise"
+                if "obj_id_to_sam2_score_frame_wise" in tracker_metadata
+                else "obj_id_to_tracker_score_frame_wise"
+            )
+            score_frame = tracker_metadata.get(score_frame_key)
+            for obj_id in [int(value) for value in mask_obj_ids]:
+                tracker_metadata["obj_id_to_score"][obj_id] = 1.0
+                if score_frame is not None:
+                    score_frame[int(prompt_frame)][obj_id] = torch.tensor(
+                        1.0,
+                        dtype=torch.float32,
+                        device=device,
+                    )
+
+            rank0_metadata = tracker_metadata.get("rank0_metadata", {})
+            if "removed_obj_ids" in rank0_metadata:
+                for obj_id in mask_obj_ids:
+                    rank0_metadata["removed_obj_ids"].discard(int(obj_id))
+            if "suppressed_obj_ids" in rank0_metadata:
+                for frame_id in rank0_metadata["suppressed_obj_ids"]:
+                    for obj_id in mask_obj_ids:
+                        rank0_metadata["suppressed_obj_ids"][frame_id].discard(int(obj_id))
+            if "masklet_confirmation" in rank0_metadata:
+                obj_ids_all = np.asarray(tracker_metadata["obj_ids_all_gpu"], dtype=np.int64)
+                confirmation = rank0_metadata["masklet_confirmation"]
+                target_len = int(len(obj_ids_all))
+                for key in ("status", "consecutive_det_num"):
+                    arr = np.asarray(confirmation[key], dtype=np.int64)
+                    if len(arr) < target_len:
+                        confirmation[key] = np.pad(arr, (0, target_len - len(arr)), mode="constant")
+                for obj_id in mask_obj_ids:
+                    hits = np.where(obj_ids_all == int(obj_id))[0]
+                    if len(hits) > 0:
+                        idx = int(hits[0])
+                        confirmation["status"][idx] = 1
+                        confirmation["consecutive_det_num"][idx] = int(
+                            getattr(model, "masklet_confirmation_consecutive_det_thresh", 1)
+                        )
+
+            if hasattr(model, "add_action_history"):
+                model.add_action_history(
+                    inference_state,
+                    "add",
+                    frame_idx=int(prompt_frame),
+                    obj_ids=[int(obj_id) for obj_id in mask_obj_ids],
+                )
+            # SAM3.1's interactive partial propagation merges refined SAM2 masks
+            # through _build_sam2_output(), which returns early when a frame has
+            # no cached entry. This baseline starts from pure mask seeds, not a
+            # prior VG pass, so every video frame needs an empty cache slot.
+            for frame_idx in range(int(inference_state["num_frames"])):
+                inference_state["cached_frame_outputs"].setdefault(int(frame_idx), {})
+            if 0 <= int(prompt_frame) < len(inference_state.get("previous_stages_out", [])):
+                inference_state["previous_stages_out"][int(prompt_frame)] = "_THIS_FRAME_HAS_OUTPUTS_"
+
         for prompt_frame in sorted(dets_by_prompt_frame.keys()):
             frame_entries = dets_by_prompt_frame[prompt_frame]
+            mask_obj_ids: List[int] = []
+            mask_inputs: List[np.ndarray] = []
+            for obj_id, det in frame_entries:
+                seed_mask = _sam31_seed_mask(det)
+                if seed_mask.any():
+                    mask_obj_ids.append(int(obj_id))
+                    mask_inputs.append(seed_mask)
+            used_mask_seed = False
+            if mask_inputs:
+                try:
+                    _add_sam31_mask_seed_internal(int(prompt_frame), mask_obj_ids, mask_inputs)
+                    for obj_id, seed_mask in zip(mask_obj_ids, mask_inputs):
+                        obj_to_det[int(obj_id)]["_sam31_prompt_type"] = "mask_seed_internal"
+                        obj_segments.setdefault(int(obj_id), {})[int(prompt_frame)] = (
+                            np.asarray(seed_mask) > 0
+                        ).astype(np.uint8)
+                    used_mask_seed = True
+                except Exception as exc:
+                    for obj_id in mask_obj_ids:
+                        obj_to_det[int(obj_id)]["_sam31_mask_prompt_error"] = repr(exc)
+                    raise RuntimeError(
+                        f"SAM3.1 mask seed failed at frame_idx={int(prompt_frame)} "
+                        f"for obj_ids={mask_obj_ids}: {exc!r}"
+                    ) from exc
+
+            if used_mask_seed:
+                continue
+
             for obj_id, det in frame_entries:
                 points, labels = self._build_sam31_object_prompt(det, H=H, W=W)
                 response = self.video_predictor.handle_request(
@@ -2847,20 +3042,8 @@ class VideoMaskletFrontend:
                         obj_id=int(obj_id),
                     )
                 )
-                outputs = response["outputs"]
-                out_obj_ids = outputs.get("out_obj_ids", [])
-                out_masks = outputs.get("out_binary_masks", [])
-                out_probs = outputs.get("out_probs", [])
-                for idx, out_obj_id in enumerate(out_obj_ids):
-                    out_obj_id = int(out_obj_id)
-                    if out_obj_id not in obj_to_det:
-                        continue
-                    if idx < len(out_masks):
-                        obj_segments.setdefault(out_obj_id, {})[int(prompt_frame)] = (
-                            out_masks[idx].astype(np.uint8)
-                        )
-                    if idx < len(out_probs):
-                        obj_scores[out_obj_id] = max(obj_scores.get(out_obj_id, 0.0), float(out_probs[idx]))
+                obj_to_det[int(obj_id)]["_sam31_prompt_type"] = "point_no_mask_input"
+                _record_sam31_outputs(response["outputs"], int(prompt_frame))
 
         def _consume(direction: str, start_frame: int) -> None:
             for prop_response in self.video_predictor.handle_stream_request(
@@ -2872,20 +3055,7 @@ class VideoMaskletFrontend:
                 )
             ):
                 out_frame_idx = int(prop_response["frame_index"])
-                outputs = prop_response["outputs"]
-                out_obj_ids = outputs.get("out_obj_ids", [])
-                out_masks = outputs.get("out_binary_masks", [])
-                out_probs = outputs.get("out_probs", [])
-                for idx, out_obj_id in enumerate(out_obj_ids):
-                    out_obj_id = int(out_obj_id)
-                    if out_obj_id not in obj_to_det:
-                        continue
-                    if idx < len(out_masks):
-                        obj_segments.setdefault(out_obj_id, {})[out_frame_idx] = (
-                            out_masks[idx].astype(np.uint8)
-                        )
-                    if idx < len(out_probs):
-                        obj_scores[out_obj_id] = max(obj_scores.get(out_obj_id, 0.0), float(out_probs[idx]))
+                _record_sam31_outputs(prop_response["outputs"], out_frame_idx)
 
         _consume("forward", int(start_frame_idx))
         if self.sam31_enable_backward and int(last_prompt_frame_idx) > 0:

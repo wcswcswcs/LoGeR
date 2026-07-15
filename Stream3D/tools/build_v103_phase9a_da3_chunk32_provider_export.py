@@ -91,15 +91,23 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
             writer.writerow({key: _jsonable(row.get(key, "")) for key in fields})
 
 
-def _read_manifest(path: Path, frame_count: int) -> list[Path]:
+def _attempt_id(scene_id: str, frame_count: int, process_res: int, frame_start_index: int) -> str:
+    base = f"{scene_id}_chunk{int(frame_count)}"
+    if int(frame_start_index) != 0:
+        base += f"_start{int(frame_start_index):03d}"
+    return f"{base}_process{int(process_res)}"
+
+
+def _read_manifest(path: Path, frame_count: int, frame_start_index: int) -> tuple[list[Path], list[dict[str, Any]]]:
     rows = list(csv.DictReader(path.open("r", encoding="utf-8")))
     rows = sorted(rows, key=lambda row: int(row["da3_frame_index"]))
+    rows = rows[int(frame_start_index) : int(frame_start_index) + int(frame_count)]
     image_paths: list[Path] = []
-    for row in rows[:frame_count]:
+    for row in rows:
         symlink = Path(row.get("symlink_path", ""))
         source = Path(row.get("source_rgb", ""))
         image_paths.append(symlink if symlink.exists() else source)
-    return image_paths
+    return image_paths, rows
 
 
 def _infer_script(output_dir: Path, image_paths: list[Path], model_id: str, process_res: int) -> str:
@@ -151,14 +159,16 @@ def _run_scene(
     *,
     frame_count: int,
     process_res: int,
+    frame_start_index: int,
+    output_root: Path,
     cuda_device: str | None,
     model_id: str,
     force: bool,
     timeout_sec: int,
 ) -> dict[str, Any]:
     spec = SCENES[scene_id]
-    attempt_id = f"{scene_id}_chunk32_process{process_res}"
-    attempt_dir = OUT_DIR / attempt_id
+    attempt_id = _attempt_id(scene_id, frame_count, process_res, frame_start_index)
+    attempt_dir = output_root / attempt_id
     ply = attempt_dir / "gs_ply" / "0000.ply"
     mini_npz = attempt_dir / "exports" / "mini_npz" / "results.npz"
     device = cuda_device or str(spec.get("default_cuda", "6"))
@@ -170,6 +180,8 @@ def _run_scene(
         "model_id": model_id,
         "cuda_device": device,
         "frame_count": frame_count,
+        "frame_start_index": int(frame_start_index),
+        "frame_ids": "",
         "process_res": process_res,
         "export_format": "official_DA3_GIANT_1_1_gs_ply_plus_mini_npz",
         "output_dir": _rel(attempt_dir),
@@ -202,7 +214,15 @@ def _run_scene(
 
     reuse_ply = spec.get("reuse_ply")
     reuse_mini = spec.get("reuse_mini_npz")
-    if not force and isinstance(reuse_ply, Path) and isinstance(reuse_mini, Path) and reuse_ply.exists() and reuse_mini.exists():
+    if (
+        int(frame_start_index) == 0
+        and int(frame_count) == 32
+        and not force
+        and isinstance(reuse_ply, Path)
+        and isinstance(reuse_mini, Path)
+        and reuse_ply.exists()
+        and reuse_mini.exists()
+    ):
         row.update(
             {
                 "reused_from": "v102_phase2b_da3_giant_chunk32_audit",
@@ -216,12 +236,14 @@ def _run_scene(
         )
         return row
 
-    image_paths = _read_manifest(Path(spec["input_manifest"]), frame_count)
+    image_paths, manifest_rows = _read_manifest(Path(spec["input_manifest"]), frame_count, int(frame_start_index))
     missing = [p for p in image_paths if not p.exists()]
     if len(image_paths) < frame_count or missing:
         row["exit_code"] = "skipped_missing_input_images"
         row["stderr_tail"] = f"image_count={len(image_paths)} missing_count={len(missing)}"
+        row["frame_ids"] = [int(r["frame_id"]) for r in manifest_rows]
         return row
+    row["frame_ids"] = [int(r["frame_id"]) for r in manifest_rows]
 
     attempt_dir.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
@@ -265,7 +287,9 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--scene", choices=["all", *SCENES.keys()], default="all")
     parser.add_argument("--frame-count", type=int, default=32)
+    parser.add_argument("--frame-start-index", type=int, default=0)
     parser.add_argument("--process-res", type=int, default=252)
+    parser.add_argument("--output-root", default=str(OUT_DIR))
     parser.add_argument("--cuda-device", default=None)
     parser.add_argument("--model-id", default=os.environ.get("V103_DA3_GIANT_MODEL", "depth-anything/DA3-GIANT-1.1"))
     parser.add_argument("--force", action="store_true")
@@ -273,13 +297,18 @@ def main() -> int:
     args = parser.parse_args()
 
     t0 = time.time()
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
+    output_root = Path(args.output_root)
+    if not output_root.is_absolute():
+        output_root = ROOT / output_root
+    output_root.mkdir(parents=True, exist_ok=True)
     scenes = list(SCENES) if args.scene == "all" else [args.scene]
     rows = [
         _run_scene(
             scene_id,
             frame_count=args.frame_count,
             process_res=args.process_res,
+            frame_start_index=args.frame_start_index,
+            output_root=output_root,
             cuda_device=args.cuda_device,
             model_id=args.model_id,
             force=args.force,
@@ -287,11 +316,11 @@ def main() -> int:
         )
         for scene_id in scenes
     ]
-    row_path = OUT_DIR / "chunk32_export_rows.csv"
+    row_path = output_root / "chunk32_export_rows.csv"
     _write_csv(row_path, rows)
     success_scenes = [row["scene_id"] for row in rows if bool(row.get("export_success"))]
     failure_rows = [row for row in rows if not bool(row.get("export_success"))]
-    failure_path = OUT_DIR / "failure_rows.csv"
+    failure_path = output_root / "failure_rows.csv"
     _write_csv(failure_path, failure_rows)
     summary = {
         "schema_version": "stream4d_v103_phase9a_da3_chunk32_export_summary_v1",
@@ -300,6 +329,8 @@ def main() -> int:
         "runtime_sec": time.time() - t0,
         "plan_doc": _rel(PLAN_DOC),
         "scene_count": len(rows),
+        "frame_count": int(args.frame_count),
+        "frame_start_index": int(args.frame_start_index),
         "success_scene_count": len(success_scenes),
         "success_scenes": success_scenes,
         "failure_count": len(failure_rows),
@@ -311,12 +342,12 @@ def main() -> int:
             "It does not claim primitive bridge quality, AP, or DA3_PROVIDER_READY."
         ),
         "outputs": {
-            "summary": _rel(OUT_DIR / "summary.json"),
+            "summary": _rel(output_root / "summary.json"),
             "chunk32_export_rows": _rel(row_path),
             "failure_rows": _rel(failure_path),
         },
     }
-    _write_json(OUT_DIR / "summary.json", summary)
+    _write_json(output_root / "summary.json", summary)
     print(json.dumps(_jsonable(summary), indent=2, sort_keys=True))
     return 0 if not failure_rows else 1
 

@@ -117,7 +117,7 @@ if __name__ == "__main__":
             selected_scores, ranks = torch.sort(selected_scores)
 
             if len(ranks) == 0:
-                mask_image = np.ones((m_H, m_W), dtype=np.uint8)
+                mask_image = np.zeros((m_H, m_W), dtype=np.uint8)
                 cv2.imwrite(os.path.join(output_dir, os.path.basename(path).split('.')[0] + '.png'), mask_image)
                 continue
 

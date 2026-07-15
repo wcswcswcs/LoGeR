@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import hashlib
 import json
 import sys
@@ -58,23 +57,34 @@ def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _read_record_manifest(path: Path) -> list[dict[str, Any]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(payload, list):
+        return [row for row in payload if isinstance(row, dict)]
+    if isinstance(payload, dict) and isinstance(payload.get("rows"), list):
+        return [row for row in payload["rows"] if isinstance(row, dict)]
+    return []
+
+
+def _read_support_records(json_path: Path) -> tuple[list[dict[str, Any]], str]:
+    if json_path.exists():
+        return _read_record_manifest(json_path), "json_manifest"
+    raise RuntimeError(f"pipeline support records missing: {json_path}")
+
+
 def _write_json(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
-    keys: list[str] = []
-    for row in rows:
-        for key in row:
-            if key not in keys:
-                keys.append(key)
+def _write_records_json(path: Path, rows: list[dict[str, Any]], *, schema_version: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=keys)
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row)
+    payload = {
+        "schema_version": schema_version,
+        "row_count": len(rows),
+        "rows": rows,
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def _parse_bool(value: Any) -> bool:
@@ -145,23 +155,24 @@ def _load_pipeline_support(
     objectlet_variant: str,
     success_only: bool,
 ) -> tuple[dict[int, list[tuple[int, int, str]]], dict[tuple[int, int], int], dict[str, Any]]:
-    objectlet_rows_path = pipeline_root / "local_objectlets" / "objectlet_rows.csv"
-    ledger_rows_path = pipeline_root / "reprojection_ledger" / "reprojection_ledger_rows.csv"
+    objectlet_json_path = pipeline_root / "local_objectlets" / "objectlet_records.json"
+    ledger_json_path = pipeline_root / "reprojection_ledger" / "reprojection_ledger_records.json"
+    objectlet_records, objectlet_record_format = _read_support_records(objectlet_json_path)
+    ledger_records, ledger_record_format = _read_support_records(ledger_json_path)
     selected_by_candidate: dict[str, tuple[str, int]] = {}
     object_to_idx: dict[str, int] = {}
     selected_rows = 0
-    with objectlet_rows_path.open(newline="", encoding="utf-8") as handle:
-        for row in csv.DictReader(handle):
-            if row.get("scene") != scene or row.get("variant") != objectlet_variant:
-                continue
-            object_id = str(row.get("objectlet_id") or "").strip()
-            candidate_id = str(row.get("candidate_id") or "").strip()
-            if not object_id or not candidate_id:
-                continue
-            if object_id not in object_to_idx:
-                object_to_idx[object_id] = len(object_to_idx) + 1
-            selected_by_candidate[candidate_id] = (object_id, object_to_idx[object_id])
-            selected_rows += 1
+    for row in objectlet_records:
+        if row.get("scene") != scene or row.get("variant") != objectlet_variant:
+            continue
+        object_id = str(row.get("objectlet_id") or "").strip()
+        candidate_id = str(row.get("candidate_id") or "").strip()
+        if not object_id or not candidate_id:
+            continue
+        if object_id not in object_to_idx:
+            object_to_idx[object_id] = len(object_to_idx) + 1
+        selected_by_candidate[candidate_id] = (object_id, object_to_idx[object_id])
+        selected_rows += 1
 
     by_frame: dict[int, set[tuple[int, int, str]]] = defaultdict(set)
     mask_to_object_idx: dict[tuple[int, int], int] = {}
@@ -169,33 +180,34 @@ def _load_pipeline_support(
     ledger_rows = 0
     used_ledger_rows = 0
     skipped_failed_rows = 0
-    with ledger_rows_path.open(newline="", encoding="utf-8") as handle:
-        for row in csv.DictReader(handle):
-            ledger_rows += 1
-            selected = selected_by_candidate.get(str(row.get("candidate_id") or ""))
-            if not selected:
-                continue
-            if success_only and not _parse_bool(row.get("reprojection_success")):
-                skipped_failed_rows += 1
-                continue
-            parsed = _parse_mask_observation_id(str(row.get("best_mask_observation_id") or ""))
-            if parsed is None:
-                continue
-            row_scene, frame_id, mask_id = parsed
-            if row_scene != scene or mask_id <= 0:
-                continue
-            object_id, object_idx = selected
-            key = (frame_id, mask_id)
-            if key in mask_to_object_idx and mask_to_object_idx[key] != object_idx:
-                duplicate_frame_mask_conflicts += 1
-                object_idx = min(mask_to_object_idx[key], object_idx)
-            mask_to_object_idx[key] = object_idx
-            by_frame[frame_id].add((object_idx, mask_id, object_id))
-            used_ledger_rows += 1
+    for row in ledger_records:
+        ledger_rows += 1
+        selected = selected_by_candidate.get(str(row.get("candidate_id") or ""))
+        if not selected:
+            continue
+        if success_only and not _parse_bool(row.get("reprojection_success")):
+            skipped_failed_rows += 1
+            continue
+        parsed = _parse_mask_observation_id(str(row.get("best_mask_observation_id") or ""))
+        if parsed is None:
+            continue
+        row_scene, frame_id, mask_id = parsed
+        if row_scene != scene or mask_id <= 0:
+            continue
+        object_id, object_idx = selected
+        key = (frame_id, mask_id)
+        if key in mask_to_object_idx and mask_to_object_idx[key] != object_idx:
+            duplicate_frame_mask_conflicts += 1
+            object_idx = min(mask_to_object_idx[key], object_idx)
+        mask_to_object_idx[key] = object_idx
+        by_frame[frame_id].add((object_idx, mask_id, object_id))
+        used_ledger_rows += 1
 
     support_by_frame = {frame: sorted(items) for frame, items in by_frame.items()}
     diag = {
         "objectlet_variant": objectlet_variant,
+        "objectlet_record_format": objectlet_record_format,
+        "ledger_record_format": ledger_record_format,
         "objectlet_row_count": int(selected_rows),
         "object_count": int(len(object_to_idx)),
         "ledger_row_count": int(ledger_rows),
@@ -391,10 +403,11 @@ def export_2d_videos(
         for writer in writers.values():
             writer.release()
 
-    _write_csv(output_root / "pipeline_2d_frame_rows.csv", frame_rows)
+    frame_records_json = output_root / "pipeline_2d_frame_records.json"
+    _write_records_json(frame_records_json, frame_rows, schema_version="stream4d_v65_soma_pipeline_2d_frame_record_v1")
     color_rows = _soma_object_color_rows(support_by_frame)
-    color_csv = output_root / "pipeline_2d_soma_object_colors.csv"
-    _write_csv(color_csv, color_rows)
+    color_records_json = output_root / "pipeline_2d_soma_object_color_records.json"
+    _write_records_json(color_records_json, color_rows, schema_version="stream4d_v65_soma_pipeline_2d_object_color_record_v1")
     color_tuples = [(int(row["color_r"]), int(row["color_g"]), int(row["color_b"])) for row in color_rows]
     unique_color_count = len(set(color_tuples))
     status = {
@@ -409,8 +422,8 @@ def export_2d_videos(
         "missing_gt_instance_frame_count": int(counters["missing_gt_instance"]),
         "missing_gt_sem_frame_count": int(counters["missing_gt_sem"]),
         "total_soma_overlay_pixels": int(counters["soma_overlay_pixels"]),
-        "frame_rows_csv": _rel(output_root / "pipeline_2d_frame_rows.csv"),
-        "soma_object_color_rows_csv": _rel(color_csv),
+        "frame_records_json": _rel(frame_records_json),
+        "soma_object_color_records_json": _rel(color_records_json),
         "soma_object_count": int(len(color_rows)),
         "soma_unique_color_count": int(unique_color_count),
         "soma_color_collision_count": int(len(color_rows) - unique_color_count),
